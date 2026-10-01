@@ -2,6 +2,7 @@ import Link from "next/link";
 import { Clock, Hammer, PenLine, Trophy } from "lucide-react";
 import { cn } from "cn";
 
+import { LessonNumber } from "@/components/progress/lesson-status";
 import { Badge } from "@/components/ui/badge";
 import { GlassCard } from "@/components/ui/glass-card";
 import type { CourseLevel, CourseModule } from "@/lib/content";
@@ -41,15 +42,12 @@ function ModuleCard({ module, tone }: { module: CourseModule; tone: Tone }) {
                 href={lesson.permalink}
                 className="group flex items-center gap-3 rounded-xl px-2 py-2 transition hover:bg-white/6"
               >
-                <span
-                  className={cn(
-                    "flex size-7 shrink-0 items-center justify-center rounded-lg font-mono text-xs font-semibold",
-                    t.soft,
-                    t.text,
-                  )}
-                >
-                  {i + 1}
-                </span>
+                <LessonNumber
+                  language={lesson.language}
+                  slug={lesson.slug}
+                  number={i + 1}
+                  className={cn(t.soft, t.text)}
+                />
                 <span className="flex-1 text-sm text-white/85 group-hover:text-white">
                   {lesson.title}
                 </span>

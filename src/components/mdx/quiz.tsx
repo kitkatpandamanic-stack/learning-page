@@ -4,6 +4,9 @@ import * as React from "react";
 import { CheckCircle2, HelpCircle, RotateCcw, XCircle } from "lucide-react";
 import { cn } from "cn";
 
+import { usePathname } from "next/navigation";
+
+import { languageFromPath, useAward } from "@/components/progress/use-progress";
 import { Button } from "@/components/ui/button";
 
 export function Quiz({
@@ -11,13 +14,19 @@ export function Quiz({
   options,
   answer,
   explanation,
+  activityId,
 }: {
   question: string;
   options: string[];
   /** Index of the correct option (0-based) */
   answer: number;
   explanation?: string;
+  /** Added at build time ("quiz-1", …); used to award XP once */
+  activityId?: string;
 }) {
+  const pathname = usePathname();
+  const award = useAward(languageFromPath(pathname));
+  const attempts = React.useRef(0);
   const id = React.useId();
   const [selected, setSelected] = React.useState<number | null>(null);
   const [checked, setChecked] = React.useState(false);
@@ -75,7 +84,14 @@ export function Quiz({
             size="lg"
             className="px-5"
             disabled={selected === null}
-            onClick={() => setChecked(true)}
+            onClick={() => {
+              setChecked(true);
+              attempts.current += 1;
+              // XP only for getting it right on the first try.
+              if (activityId && attempts.current === 1 && selected === answer) {
+                void award.recordActivity(pathname, activityId);
+              }
+            }}
           >
             Check answer
           </Button>

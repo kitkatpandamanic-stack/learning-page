@@ -14,6 +14,7 @@ export function Exercise({
   language = "javascript",
   tests,
   expectedOutput,
+  activityId,
   children,
 }: {
   title?: string;
@@ -22,6 +23,8 @@ export function Exercise({
   language?: RunLanguage;
   tests?: TestSpec[];
   expectedOutput?: string;
+  /** Added at build time ("exercise-1", …); used to award XP once */
+  activityId?: string;
   children: ReactNode;
 }) {
   // Show the task first, then the editor, then the hint/solution reveals.
@@ -49,6 +52,7 @@ export function Exercise({
               tests={tests}
               expectedOutput={expectedOutput}
               storageId={title}
+              activityId={activityId}
             />
           )}
           {reveals}

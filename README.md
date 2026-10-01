@@ -33,6 +33,10 @@ sign-in isn't switched on yet.
    Environment Variables, with `BETTER_AUTH_URL` set to the live domain and
    production OAuth callback URLs (`https://<domain>/api/auth/callback/github` and `/google`).
 
+XP rules live in `src/lib/gamification.ts` (lesson XP comes from each lesson's frontmatter;
+exercises +10, quizzes answered right first time +5). The server validates every award
+against the content and the database's unique index means each activity pays out once.
+
 Schema changes: edit `src/db/schema.ts`, then `npm run db:generate` and `npm run db:migrate`.
 
 ## Writing content

@@ -1,7 +1,8 @@
 import Link from "next/link";
-import { ArrowLeft, ChevronRight, Circle, CircleDot } from "lucide-react";
+import { ArrowLeft, ChevronRight } from "lucide-react";
 import { cn } from "cn";
 
+import { LessonStatusIcon } from "@/components/progress/lesson-status";
 import type { CourseLevel } from "@/lib/content";
 import type { Language } from "@/lib/languages";
 import { toneClasses } from "@/lib/tones";
@@ -74,13 +75,12 @@ export function LessonSidebar({
                                     "bg-gradient-to-r from-neon-violet/25 to-transparent text-white",
                                 )}
                               >
-                                {active ? (
-                                  <CircleDot
-                                    className={cn("size-3.5 shrink-0", t.text)}
-                                  />
-                                ) : (
-                                  <Circle className="size-3.5 shrink-0 text-white/30" />
-                                )}
+                                <LessonStatusIcon
+                                  language={language.slug}
+                                  slug={lesson.slug}
+                                  active={active}
+                                  activeClassName={t.text}
+                                />
                                 {lesson.title}
                               </Link>
                             </li>

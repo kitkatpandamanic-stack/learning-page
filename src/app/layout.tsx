@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import { SpaceBackground } from "@/components/layout/space-background";
 import { MotionProvider } from "@/components/motion/motion-provider";
+import { Providers } from "@/components/progress/providers";
 import { siteUrl } from "@/lib/site";
 import "./globals.css";
 
@@ -34,7 +35,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
     >
       <body className="flex min-h-full flex-col">
         <SpaceBackground />
-        <MotionProvider>{children}</MotionProvider>
+        <MotionProvider>
+          <Providers>{children}</Providers>
+        </MotionProvider>
       </body>
     </html>
   );

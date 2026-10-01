@@ -179,7 +179,7 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 4. `/api/run` route: sends code to Judge0, keeps the key secret, rate-limits requests
 5. Exercise checker: runs tests or compares output, then marks the lesson complete
 
-### Phase 7: Progress & gamification
+### Phase 7: Progress & gamification ✅
 
 1. Server Actions to save progress, with TanStack Query on the client
 2. XP, user levels, daily streaks, achievement badges

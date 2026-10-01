@@ -57,6 +57,12 @@ export const xpEvent = pgTable(
   },
   (table) => [
     index("xp_event_user_created_idx").on(table.userId, table.createdAt),
+    // Each activity pays out once: the same (user, reason, ref) can't repeat.
+    uniqueIndex("xp_event_user_reason_ref_idx").on(
+      table.userId,
+      table.reason,
+      table.ref,
+    ),
   ],
 );
 

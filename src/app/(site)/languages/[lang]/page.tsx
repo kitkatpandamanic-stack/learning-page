@@ -14,6 +14,7 @@ import { cn } from "cn";
 
 import { CourseRoadmap } from "@/components/languages/course-roadmap";
 import { LanguageMonogram } from "@/components/languages/language-card";
+import { CourseProgress } from "@/components/progress/lesson-status";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Container } from "@/components/ui/container";
@@ -155,6 +156,14 @@ export default async function LanguagePage({
                   </>
                 )}
               </ul>
+              {course && (
+                <CourseProgress
+                  language={language.slug}
+                  slugs={course.levels.flatMap((l) =>
+                    l.modules.flatMap((m) => m.lessons.map((x) => x.slug)),
+                  )}
+                />
+              )}
             </div>
           </div>
 

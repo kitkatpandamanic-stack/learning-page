@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "xp_event_user_reason_ref_idx" ON "xp_event" USING btree ("user_id","reason","ref");

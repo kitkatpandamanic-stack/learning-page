@@ -1,5 +1,6 @@
 import rehypePrettyCode, { type Options } from "rehype-pretty-code";
 import rehypeSlug from "rehype-slug";
+import { visit } from "unist-util-visit";
 import { defineCollection, defineConfig, s } from "velite";
 
 import { languages } from "./src/lib/languages";
@@ -17,6 +18,35 @@ const prettyCode: Options = {
   keepBackground: false,
   defaultLang: { block: "text", inline: "text" },
 };
+
+/**
+ * Gives every <Exercise> and <Quiz> a stable id ("exercise-1", "quiz-2", …) in
+ * document order. The server uses these ids to award XP once per activity.
+ */
+function remarkActivityIds() {
+  return (tree: Parameters<typeof visit>[0]) => {
+    const counters: Record<string, number> = { Exercise: 0, Quiz: 0 };
+    visit(tree, "mdxJsxFlowElement", (node) => {
+      const el = node as {
+        name?: string | null;
+        attributes: { type: string; name: string; value: string }[];
+      };
+      if (el.name === "Exercise" || el.name === "Quiz") {
+        const n = ++counters[el.name];
+        el.attributes.push({
+          type: "mdxJsxAttribute",
+          name: "activityId",
+          value: `${el.name.toLowerCase()}-${n}`,
+        });
+      }
+    });
+  };
+}
+
+/** Counts activities with the same rule as remarkActivityIds (top-level tags in order). */
+function countTags(raw: string, tag: string) {
+  return raw.match(new RegExp(`^<${tag}\\b`, "gm"))?.length ?? 0;
+}
 
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
@@ -66,8 +96,9 @@ const lessons = defineCollection({
       path: s.path(),
       toc: s.toc(),
       body: s.mdx(),
+      raw: s.raw(),
     })
-    .transform(({ path, ...data }) => {
+    .transform(({ path, raw, ...data }) => {
       const [, language, module, file] = path.split("/");
       const match = /^(\d+)-(.+)$/.exec(file);
       return {
@@ -78,6 +109,8 @@ const lessons = defineCollection({
         order: match ? Number(match[1]) : -1,
         slug: match ? match[2] : file,
         permalink: `/learn/${language}/${match ? match[2] : file}`,
+        exerciseCount: countTags(raw, "Exercise"),
+        quizCount: countTags(raw, "Quiz"),
       };
     }),
 });
@@ -94,6 +127,7 @@ export default defineConfig({
   },
   collections: { courses, lessons },
   mdx: {
+    remarkPlugins: [remarkActivityIds],
     rehypePlugins: [rehypeSlug, [rehypePrettyCode, prettyCode]],
   },
   // Cross-file checks that a single schema can't express. Any problem fails the build.

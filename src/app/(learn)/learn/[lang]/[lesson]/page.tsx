@@ -9,6 +9,7 @@ import { LessonSidebar } from "@/components/lesson/lesson-sidebar";
 import { MobileContents } from "@/components/lesson/mobile-contents";
 import { TableOfContents } from "@/components/lesson/table-of-contents";
 import { MDXContent } from "@/components/mdx/mdx-content";
+import { CompleteLesson } from "@/components/progress/complete-lesson";
 import { Badge } from "@/components/ui/badge";
 import { getAllLessons, getLanguage, getLessonContext } from "@/lib/content";
 import { toneClasses } from "@/lib/tones";
@@ -129,7 +130,18 @@ export default async function LessonPage({
           <MDXContent code={lesson.body} />
         </div>
 
-        <div className="mt-14 border-t border-white/10 pt-8">
+        <div className="mt-14 flex flex-col gap-4 border-t border-white/10 pt-8">
+          <CompleteLesson
+            language={language.slug}
+            slug={lesson.slug}
+            permalink={lesson.permalink}
+            xp={lesson.xp}
+            next={
+              ctx.next
+                ? { title: ctx.next.title, href: ctx.next.permalink }
+                : undefined
+            }
+          />
           <LessonNav
             prev={ctx.prev}
             next={ctx.next}

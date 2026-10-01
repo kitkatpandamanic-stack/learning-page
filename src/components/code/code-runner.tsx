@@ -15,6 +15,7 @@ import {
 import { cn } from "cn";
 
 import { CodeEditor } from "@/components/code/code-editor";
+import { languageFromPath, useAward } from "@/components/progress/use-progress";
 import { Button } from "@/components/ui/button";
 import {
   compareOutput,
@@ -68,7 +69,7 @@ export function CodeRunner({
   expectedOutput,
   storageId,
   minHeight,
-  onSolved,
+  activityId,
 }: {
   starter: string;
   language?: RunLanguage;
@@ -78,9 +79,12 @@ export function CodeRunner({
   /** Saves the learner's code in this browser under this id */
   storageId?: string;
   minHeight?: string;
-  onSolved?: () => void;
+  /** Lesson activity to reward with XP when solved */
+  activityId?: string;
 }) {
   const pathname = usePathname();
+  const award = useAward(languageFromPath(pathname));
+  const [reward, setReward] = React.useState<string | null>(null);
   const storageKey = storageId
     ? `pandadev:code:${pathname}:${storageId}`
     : null;
@@ -129,7 +133,19 @@ export function CodeRunner({
         (res.tests ?? []).every((t) => t.passed) &&
         (output?.passed ?? true);
       setCheck({ tests: res.tests, output, solved });
-      if (solved) onSolved?.();
+      setReward(null);
+      if (solved && activityId) {
+        const result = await award.recordActivity(pathname, activityId);
+        setReward(
+          !result.ok
+            ? result.reason === "signed-out"
+              ? "Sign in to earn XP for exercises."
+              : null
+            : result.xpAwarded > 0
+              ? `+${result.xpAwarded} XP`
+              : "XP already earned for this one.",
+        );
+      }
     }
   }
 
@@ -260,6 +276,11 @@ export function CodeRunner({
           {check.solved ? (
             <p className="flex items-center gap-2 rounded-xl bg-neon-lime/12 px-3 py-2.5 font-semibold text-lime-200 ring-1 ring-neon-lime/40">
               <CheckCircle2 className="size-5" /> Solved! Great work 🎉
+              {reward && (
+                <span className="ml-auto text-sm font-medium text-amber-200">
+                  {reward}
+                </span>
+              )}
             </p>
           ) : (
             <p className="flex items-center gap-2 font-semibold text-rose-200">
