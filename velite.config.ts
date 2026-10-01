@@ -160,7 +160,22 @@ const courses = defineCollection({
           s.object({
             level: s.number().int().min(0).max(3),
             summary: s.string(),
-            capstone: s.string(),
+            /**
+             * A title, or a module of lessons that builds the project:
+             * { slug, title, description } with lessons in <language>/<slug>/.
+             */
+            capstone: s.union([
+              s.string().transform((title) => ({
+                title,
+                slug: undefined as string | undefined,
+                description: undefined as string | undefined,
+              })),
+              s.object({
+                slug: s.string().regex(slugPattern),
+                title: s.string(),
+                description: s.string(),
+              }),
+            ]),
             modules: s
               .array(
                 s.object({
@@ -245,9 +260,10 @@ export default defineConfig({
           `courses/${course.language}: levels must be 0, 1, 2, 3 in order`,
         );
       }
-      const moduleSlugs = course.levels.flatMap((l) =>
-        l.modules.map((m) => m.slug),
-      );
+      const moduleSlugs = course.levels.flatMap((l) => [
+        ...l.modules.map((m) => m.slug),
+        ...(l.capstone.slug ? [l.capstone.slug] : []),
+      ]);
       const dupes = moduleSlugs.filter((m, i) => moduleSlugs.indexOf(m) !== i);
       if (dupes.length) {
         problems.push(
@@ -265,8 +281,10 @@ export default defineConfig({
         continue;
       }
       if (
-        !course.levels.some((l) =>
-          l.modules.some((m) => m.slug === lesson.module),
+        !course.levels.some(
+          (l) =>
+            l.capstone.slug === lesson.module ||
+            l.modules.some((m) => m.slug === lesson.module),
         )
       ) {
         problems.push(

@@ -8,6 +8,7 @@ import { RUN_TIMEOUT_MS, type RunResult } from "./run-code";
 
 type FrameMessage =
   | { type: "line"; token: string; line: OutputLine }
+  | { type: "storage"; token: string; data: Record<string, string> }
   | { type: "done"; token: string; result: DomRunResult };
 
 export type DomRun = {
@@ -32,6 +33,10 @@ export function runDom(
     container?: HTMLElement;
     onLine?: (line: OutputLine) => void;
     timeoutMs?: number;
+    /** What the page's localStorage starts with */
+    storage?: Record<string, string>;
+    /** Called with all of localStorage whenever the page changes it */
+    onStorage?: (data: Record<string, string>) => void;
   },
 ): DomRun {
   const {
@@ -40,6 +45,8 @@ export function runDom(
     container,
     onLine,
     timeoutMs = RUN_TIMEOUT_MS,
+    storage,
+    onStorage,
   } = options;
   const token = Math.random().toString(36).slice(2);
   const started = performance.now();
@@ -102,6 +109,8 @@ export function runDom(
     if (message.type === "line") {
       lines.push(message.line);
       onLine?.(message.line);
+    } else if (message.type === "storage") {
+      onStorage?.(message.data);
     } else if (message.type === "done") {
       const { error, tests: results } = message.result;
       finish({
@@ -133,6 +142,7 @@ export function runDom(
         token,
         code: prepareDomCode(code),
         checks: (tests ?? []).map((t) => t.check),
+        storage: storage ?? {},
       },
       "*",
     ),

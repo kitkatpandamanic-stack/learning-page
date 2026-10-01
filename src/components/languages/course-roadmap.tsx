@@ -85,6 +85,7 @@ export function CourseRoadmap({ levels }: { levels: CourseLevel[] }) {
         const t = toneClasses[level.tone];
         const Icon = level.icon;
         const isLast = index === levels.length - 1;
+        const capstone = level.modules.find((m) => m.capstone);
 
         return (
           <section
@@ -136,13 +137,15 @@ export function CourseRoadmap({ levels }: { levels: CourseLevel[] }) {
             </header>
 
             <div className="grid gap-4 md:grid-cols-2">
-              {level.modules.map((module) => (
-                <ModuleCard
-                  key={module.slug}
-                  module={module}
-                  tone={level.tone}
-                />
-              ))}
+              {level.modules
+                .filter((m) => !m.capstone)
+                .map((module) => (
+                  <ModuleCard
+                    key={module.slug}
+                    module={module}
+                    tone={level.tone}
+                  />
+                ))}
             </div>
 
             <div
@@ -151,22 +154,63 @@ export function CourseRoadmap({ levels }: { levels: CourseLevel[] }) {
                 t.gradient,
               )}
             >
-              <div className="flex items-center gap-4 rounded-[calc(1rem-1px)] bg-space-900/90 px-5 py-4 backdrop-blur-xl">
-                <span
-                  className={cn(
-                    "flex size-10 shrink-0 items-center justify-center rounded-xl",
-                    t.soft,
-                    t.text,
+              <div className="flex flex-col gap-4 rounded-[calc(1rem-1px)] bg-space-900/90 px-5 py-4 backdrop-blur-xl">
+                <div className="flex items-center gap-4">
+                  <span
+                    className={cn(
+                      "flex size-10 shrink-0 items-center justify-center rounded-xl",
+                      t.soft,
+                      t.text,
+                    )}
+                  >
+                    <Trophy className="size-5" />
+                  </span>
+                  <div className="flex-1">
+                    <p className="text-xs text-white/55">
+                      Level {level.level} capstone project
+                    </p>
+                    <h3 className="font-semibold text-white">
+                      {level.capstone}
+                    </h3>
+                  </div>
+                  {capstone && capstone.lessons.length > 0 && (
+                    <Badge tone="neutral">
+                      {capstone.lessons.length}{" "}
+                      {capstone.lessons.length === 1 ? "part" : "parts"}
+                    </Badge>
                   )}
-                >
-                  <Trophy className="size-5" />
-                </span>
-                <div>
-                  <p className="text-xs text-white/55">
-                    Level {level.level} capstone project
-                  </p>
-                  <p className="font-semibold text-white">{level.capstone}</p>
                 </div>
+                {capstone?.description && (
+                  <p className="text-sm text-muted-foreground">
+                    {capstone.description}
+                  </p>
+                )}
+                {capstone && capstone.lessons.length > 0 && (
+                  <ol className="grid gap-1 sm:grid-cols-2">
+                    {capstone.lessons.map((lesson, i) => (
+                      <li key={lesson.slug}>
+                        <Link
+                          href={lesson.permalink}
+                          className="group flex items-center gap-3 rounded-xl px-2 py-2 transition hover:bg-white/6"
+                        >
+                          <LessonNumber
+                            language={lesson.language}
+                            slug={lesson.slug}
+                            number={i + 1}
+                            className={cn(t.soft, t.text)}
+                          />
+                          <span className="flex-1 text-sm text-white/85 group-hover:text-white">
+                            {lesson.title}
+                          </span>
+                          <span className="flex items-center gap-1 text-xs text-white/45">
+                            <Clock className="size-3" />
+                            {lesson.duration} min
+                          </span>
+                        </Link>
+                      </li>
+                    ))}
+                  </ol>
+                )}
               </div>
             </div>
           </section>

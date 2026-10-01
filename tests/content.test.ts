@@ -185,7 +185,10 @@ describe("Code + Output examples", () => {
       /<CodeExample output=(?:"([^"]*)"|\{`([\s\S]*?)`\})>\s*```(js|ts|python)[^\n]*\n([\s\S]*?)```\s*<\/CodeExample>/g;
     return [...source.matchAll(pattern)].map((m, i) => ({
       name: `${file.slice(ROOT.length + 1)} #${i + 1}`,
-      expected: (m[1] ?? m[2]).trim(),
+      // Evaluate `…` the way the page does, so escapes like \n match.
+      expected: (
+        m[1] ?? (new Function(`return \`${m[2]}\`;`)() as string)
+      ).trim(),
       language: ({ js: "javascript", ts: "typescript", python: "python" }[
         m[3]
       ] ?? "javascript") as RunLanguage,
@@ -231,4 +234,22 @@ describe("TryIt live previews", () => {
       expect(result.error, JSON.stringify(result.output)).toBeUndefined();
     },
   );
+});
+
+describe("links between lessons", () => {
+  const slugs = new Set(
+    files.map((file) => {
+      const [language, , name] = file.slice(ROOT.length + 1).split("/");
+      return `/learn/${language}/${name.replace(/^\d+-/, "").replace(/\.mdx$/, "")}`;
+    }),
+  );
+  const links = files.flatMap((file) =>
+    [...readFileSync(file, "utf8").matchAll(/\]\((\/learn\/[^)#\s]+)/g)].map(
+      (m) => [file.slice(ROOT.length + 1), m[1]] as const,
+    ),
+  );
+
+  it.each(links)("%s links to %s", (_file, href) => {
+    expect(slugs.has(href), `${href} is not a lesson`).toBe(true);
+  });
 });

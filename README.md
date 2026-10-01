@@ -96,6 +96,13 @@ with a live preview, and each check is evaluated in the page afterwards, in orde
 checks can click (`document.querySelector("#add").click()`) and then inspect the page.
 `<TryIt html={`…`} code={`…`} />` (closing `/>` on its own line) is an editable demo with
 the same preview and no checks; `npm test` runs each one in jsdom to make sure it works.
+Previews have an in-memory `localStorage` (the sandboxed page can't use the real one). The
+site keeps its contents between runs, so pressing Run again behaves like reloading a page;
+Reset clears it, and checks always start with empty storage.
+
+Each level ends with a capstone project. In `course.yml` a level's `capstone` is either a
+title, or `{ slug, title, description }` with its lessons ("parts") in
+`content/courses/<language>/<slug>/`, listed after the level's modules.
 
 The lesson URL is `/learn/<language>/<slug>` (the file name without its number).
 `npm run content` validates everything: unknown modules, missing number prefixes and

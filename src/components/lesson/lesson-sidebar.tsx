@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { ArrowLeft, ChevronRight } from "lucide-react";
+import { ArrowLeft, ChevronRight, Trophy } from "lucide-react";
 import { cn } from "cn";
 
 import { LessonStatusIcon } from "@/components/progress/lesson-status";
@@ -57,7 +57,10 @@ export function LessonSidebar({
               <div className="mt-1 ml-3 flex flex-col gap-3 border-l border-white/10 pb-2 pl-3">
                 {level.modules.map((module) => (
                   <div key={module.slug}>
-                    <p className="px-2 py-1 text-xs font-medium tracking-wide text-white/50 uppercase">
+                    <p className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium tracking-wide text-white/50 uppercase">
+                      {module.capstone && (
+                        <Trophy className={cn("size-3.5", t.text)} />
+                      )}
                       {module.title}
                     </p>
                     {module.lessons.length > 0 ? (

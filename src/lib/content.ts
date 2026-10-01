@@ -8,14 +8,18 @@ export type CourseModule = {
   title: string;
   description: string;
   project?: string;
-  /** 1-based position across the whole course */
+  /** 1-based position across the whole course (capstones aren't numbered) */
   number: number;
+  /** The level's final project, listed after its modules */
+  capstone?: boolean;
   lessons: Lesson[];
 };
 
 export type CourseLevel = (typeof levels)[number] & {
   summary: string;
+  /** Capstone project title */
   capstone: string;
+  /** Regular modules, then the capstone module when it has a slug */
   modules: CourseModule[];
 };
 
@@ -41,16 +45,30 @@ export function getCourse(language: string) {
   if (!course) return undefined;
 
   let number = 0;
-  const courseLevels: CourseLevel[] = course.levels.map((lvl) => ({
-    ...levels[lvl.level],
-    summary: lvl.summary,
-    capstone: lvl.capstone,
-    modules: lvl.modules.map((m) => ({
+  const courseLevels: CourseLevel[] = course.levels.map((lvl) => {
+    const { slug, title, description } = lvl.capstone;
+    const modules: CourseModule[] = lvl.modules.map((m) => ({
       ...m,
       number: ++number,
       lessons: lessonsFor(language, m.slug),
-    })),
-  }));
+    }));
+    if (slug) {
+      modules.push({
+        slug,
+        title: `Capstone: ${title}`,
+        description: description ?? "",
+        number: 0,
+        capstone: true,
+        lessons: lessonsFor(language, slug),
+      });
+    }
+    return {
+      ...levels[lvl.level],
+      summary: lvl.summary,
+      capstone: title,
+      modules,
+    };
+  });
 
   const allLessons = courseLevels.flatMap((l) =>
     l.modules.flatMap((m) => m.lessons),

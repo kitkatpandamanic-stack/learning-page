@@ -173,8 +173,45 @@ const HARNESS = String.raw`
       (reason instanceof Error ? reason.name + ": " + reason.message : String(reason)));
   });
 
-  window.__pandaRun = async function (code, checks, emitLine) {
+  // The preview's origin is sandboxed, so the real localStorage is off
+  // limits. This in-memory one starts from data the parent page kept from
+  // earlier runs and reports every change, so saved data survives pressing
+  // Run again, just like reloading a real page.
+  var stored = Object.create(null);
+  var onStorageChange = function () {};
+  var memoryStorage = {
+    getItem: function (key) {
+      key = String(key);
+      return key in stored ? stored[key] : null;
+    },
+    setItem: function (key, value) {
+      stored[String(key)] = String(value);
+      onStorageChange(Object.assign({}, stored));
+    },
+    removeItem: function (key) {
+      delete stored[String(key)];
+      onStorageChange(Object.assign({}, stored));
+    },
+    clear: function () {
+      stored = Object.create(null);
+      onStorageChange({});
+    },
+    key: function (index) {
+      var keys = Object.keys(stored);
+      return index < keys.length ? keys[index] : null;
+    },
+    get length() {
+      return Object.keys(stored).length;
+    },
+  };
+  try {
+    Object.defineProperty(window, "localStorage", { value: memoryStorage, configurable: true });
+  } catch (e) {}
+
+  window.__pandaRun = async function (code, checks, emitLine, storage, onStorage) {
     emitTo = emitLine;
+    stored = Object.assign(Object.create(null), storage || {});
+    if (onStorage) onStorageChange = onStorage;
     insertScript("window.__pandaProbe = new Error().stack;");
     var probe = /:(\d+):\d+\)?\s*$/m.exec(String(window.__pandaProbe).split("\n")[1] || "");
     lineBase = probe ? Number(probe[1]) - 1 : 0;
@@ -209,6 +246,8 @@ const HARNESS = String.raw`
       };
       window.__pandaRun(data.code, data.checks, function (level, text) {
         post({ type: "line", line: { level: level, text: text } });
+      }, data.storage, function (snapshot) {
+        post({ type: "storage", data: snapshot });
       }).then(function (result) {
         post({ type: "done", result: result });
       });

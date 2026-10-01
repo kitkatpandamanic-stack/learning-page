@@ -120,4 +120,23 @@ describe("preview harness", () => {
     );
     expect(r.output[0].text).toBe("undefined");
   });
+
+  it("gives the page a localStorage that survives the next run", async () => {
+    const storage: Record<string, string> = {};
+    const code = `
+      const saved = JSON.parse(localStorage.getItem("tasks") ?? "[]");
+      console.log(saved.length, localStorage.length);
+      saved.push("task " + (saved.length + 1));
+      localStorage.setItem("tasks", JSON.stringify(saved));`;
+    const first = await runDomInNode(code, html, [], storage);
+    expect(first.output.map((l) => l.text)).toEqual(["0 0"]);
+    expect(JSON.parse(storage.tasks)).toEqual(["task 1"]);
+
+    const second = await runDomInNode(code, html, [], storage);
+    expect(second.output.map((l) => l.text)).toEqual(["1 1"]);
+    expect(JSON.parse(storage.tasks)).toEqual(["task 1", "task 2"]);
+
+    await runDomInNode("localStorage.clear();", html, [], storage);
+    expect(storage).toEqual({});
+  });
 });

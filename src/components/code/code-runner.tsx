@@ -113,6 +113,29 @@ export function CodeRunner({
   const cancelRef = React.useRef<(() => void) | null>(null);
   const previewRef = React.useRef<HTMLDivElement>(null);
   const previewRun = React.useRef<DomRun | null>(null);
+  // The preview page's localStorage, kept between runs (and in this browser
+  // for exercises), so apps that save data still have it after Run.
+  const pageStorage = React.useRef<Record<string, string> | null>(null);
+  const pageStorageKey = storageKey ? `${storageKey}:page-storage` : null;
+
+  function readPageStorage() {
+    if (!pageStorage.current) {
+      try {
+        pageStorage.current = JSON.parse(readSaved(pageStorageKey) ?? "{}");
+      } catch {
+        pageStorage.current = {};
+      }
+    }
+    return pageStorage.current ?? {};
+  }
+
+  function savePageStorage(data: Record<string, string>) {
+    pageStorage.current = data;
+    writeSaved(
+      pageStorageKey,
+      Object.keys(data).length > 0 ? JSON.stringify(data) : null,
+    );
+  }
   const canCheck = Boolean(tests?.length || expectedOutput !== undefined);
   const hasPreview = html !== undefined;
 
@@ -133,6 +156,8 @@ export function CodeRunner({
       onLine: autoRun
         ? (line) => setLines((prev) => [...prev, line])
         : undefined,
+      storage: readPageStorage(),
+      onStorage: savePageStorage,
     });
     previewRun.current = preview;
     return () => preview.dispose();
@@ -222,6 +247,8 @@ export function CodeRunner({
       html: page,
       container: previewRef.current ?? undefined,
       onLine: (line) => setLines((prev) => [...prev, line]),
+      storage: readPageStorage(),
+      onStorage: savePageStorage,
     });
     previewRun.current = visible;
     const hidden =
@@ -237,6 +264,7 @@ export function CodeRunner({
 
   function reset() {
     cancelRef.current?.();
+    if (hasPreview) savePageStorage({});
     updateCode(starter);
     setLines([]);
     setResult(null);

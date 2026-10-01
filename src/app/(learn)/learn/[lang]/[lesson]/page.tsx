@@ -108,7 +108,8 @@ export default async function LessonPage({
               Level {level.level} · {level.name}
             </Badge>
             <span className={cn("font-mono text-xs", t.text)}>
-              Module {module.number} · Lesson {lessonNumber} of{" "}
+              {module.capstone ? "Capstone" : `Module ${module.number}`} ·{" "}
+              {module.capstone ? "Part" : "Lesson"} {lessonNumber} of{" "}
               {module.lessons.length}
             </span>
           </div>

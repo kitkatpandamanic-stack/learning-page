@@ -22,6 +22,8 @@ export async function runDomInNode(
   code: string,
   html: string,
   tests: TestSpec[] = [],
+  /** localStorage before the run; updated in place as the page saves */
+  storage?: Record<string, string>,
 ): Promise<ExecuteResult> {
   const dom = openPreview(html);
   const window = dom.window as unknown as {
@@ -29,6 +31,8 @@ export async function runDomInNode(
       code: string,
       checks: string[],
       emit: (level: OutputLine["level"], text: string) => void,
+      storage?: Record<string, string>,
+      onStorage?: (data: Record<string, string>) => void,
     ): Promise<DomRunResult>;
   };
   const output: OutputLine[] = [];
@@ -36,6 +40,12 @@ export async function runDomInNode(
     prepareDomCode(code),
     tests.map((t) => t.check),
     (level, text) => output.push({ level, text }),
+    storage,
+    (data) => {
+      if (!storage) return;
+      for (const key of Object.keys(storage)) delete storage[key];
+      Object.assign(storage, data);
+    },
   );
   dom.window.close();
   return {
