@@ -64,6 +64,11 @@ export default function PrivacyPage() {
         pages load (for example, time until the main content appears), also
         without cookies, so we can keep the site quick.
       </p>
+      <p>
+        If the site crashes, an error report (what went wrong, on which page,
+        and your browser type) goes to Sentry so we can fix it. Reports
+        don&apos;t include your name, email, cookies or the code you write.
+      </p>
 
       <h2>Who processes the data</h2>
       <ul>
@@ -72,6 +77,9 @@ export default function PrivacyPage() {
         </li>
         <li>
           <strong>Neon</strong> stores the database with accounts and progress.
+        </li>
+        <li>
+          <strong>Sentry</strong> receives error reports when something breaks.
         </li>
         <li>
           <strong>GitHub</strong> and <strong>Google</strong> handle sign-in if

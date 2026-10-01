@@ -120,13 +120,15 @@ build on every push and pull request.
 
 Production environment variables (Vercel → Project → Settings → Environment Variables):
 
-| Variable                                    | Value                                                                          |
-| ------------------------------------------- | ------------------------------------------------------------------------------ |
-| `DATABASE_URL`                              | Neon connection string                                                         |
-| `BETTER_AUTH_SECRET`                        | Its own random secret (`openssl rand -base64 32`), not the local one           |
-| `BETTER_AUTH_URL`                           | The production URL, e.g. `https://pandadev.vercel.app`                         |
-| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | A separate GitHub OAuth app whose callback is `<url>/api/auth/callback/github` |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Optional, same idea with callback `<url>/api/auth/callback/google`             |
+| Variable                                            | Value                                                                          |
+| --------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `DATABASE_URL`                                      | Neon connection string                                                         |
+| `BETTER_AUTH_SECRET`                                | Its own random secret (`openssl rand -base64 32`), not the local one           |
+| `BETTER_AUTH_URL`                                   | The production URL, e.g. `https://pandadev.vercel.app`                         |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`         | A separate GitHub OAuth app whose callback is `<url>/api/auth/callback/github` |
+| `NEXT_PUBLIC_SENTRY_DSN`                            | Optional: turns on Sentry error reports (browser and server)                   |
+| `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT` | Optional: upload source maps so Sentry shows real code lines                   |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`         | Optional, same idea with callback `<url>/api/auth/callback/google`             |
 
 Without the database or auth variables the site still works, just without sign-in and
 saved progress.
