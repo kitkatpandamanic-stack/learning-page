@@ -310,6 +310,12 @@ def _panda_run(code, checks, emit):
     with open(_PANDA_FILE, "w") as f:
         f.write(code)
     sys.modules.pop("lesson", None)
+    if "logging" in sys.modules:
+        # Handlers from an earlier run still write to that run's output.
+        import logging
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+        logging.root.setLevel(logging.WARNING)
     output = []
     out = _PandaStream("log", emit, output)
     err = _PandaStream("error", emit)

@@ -1,0 +1,940 @@
+---
+title: "Часть 1: Проектирование и ядро"
+description: "Напишите короткий дизайн-документ для сокращателя ссылок, сделайте прикидочные расчёты и постройте доменное ядро в стиле чистой архитектуры: объекты-значения, порт репозитория и сервис с тестами."
+duration: 25
+xp: 30
+---
+
+Добро пожаловать в **итоговый проект уровня 3** — финальный проект всего курса Python! 🎓 За три части вы спроектируете, соберёте и выпустите в продакшен **PandaLink**, сокращатель ссылок (URL shortener): вы отдаёте ему длинный URL вроде `https://pandas.org/conservation/2026/bamboo-forests?ref=newsletter`, а он возвращает `https://pandalink.example/k3Xp9Qa`. Каждого, кто откроет короткую ссылку, сервис **перенаправит (redirect)** на длинную, а владелец ссылки сможет посмотреть, сколько по ней было кликов.
+
+Звучит как мелочь, и именно поэтому это самая известная задача по проектированию систем на собеседованиях: все функции помещаются на салфетке, но сделать их **хорошо** для миллионов пользователей — значит затронуть почти всё, что важно senior-инженеру. Вам пригодится весь уровень 3:
+
+| Часть | Что строим | На какие уроки опираемся |
+| --- | --- | --- |
+| 1 | Дизайн-документ и доменное ядро, полностью покрытое тестами | [Проектирование систем](/learn/python/designing-systems), [Чистая архитектура](/learn/python/clean-architecture), [Внедрение зависимостей и DDD](/learn/python/dependency-injection-and-ddd) |
+| 2 | SQL-репозиторий, кэш, ограничение частоты запросов, API-ключи, логи, приложение FastAPI | [Шаблоны отказоустойчивости](/learn/python/resilience-patterns), [Аутентификация и авторизация в API](/learn/python/auth-for-apis), [Контейнеры и развёртывание](/learn/python/containers-and-deployment) |
+| 3 | Настройки, корень композиции, Docker, CI, мониторинг, нагрузочные тесты | [Контейнеры и развёртывание](/learn/python/containers-and-deployment), [Безопасный код](/learn/python/secure-coding) |
+
+Как и в итоговом проекте уровня 2, код растёт от части к части: упражнение каждой части начинается с готового кода предыдущей, поэтому имена остаются одними и теми же до самого конца.
+
+## Начинаем с дизайн-документа
+
+Senior-разработчики начинают не с кода, а с **дизайн-документа (design doc)**: одной-двух страниц о том, что мы строим, чего мы *не* строим и какие компромиссы (trade-offs) выбрали. На него уходит час, а экономит он недели работы над не тем. Вот наш — в той форме, которую вы видели в уроке [Проектирование систем](/learn/python/designing-systems).
+
+### Требования
+
+| Вид | Требование |
+| --- | --- |
+| Функциональное | Создать короткую ссылку для URL, по желанию со своим псевдонимом (`/pandas`) и сроком действия в днях |
+| Функциональное | Открытие короткой ссылки перенаправляет на целевой URL; на неизвестные ссылки ответ 404, на истёкшие — 410 Gone |
+| Функциональное | Владелец видит число кликов по ссылке; создавать ссылки могут только клиенты с **API-ключом** |
+| Нефункциональное | Перенаправления быстрые: p99 меньше 50 мс, ведь каждый клик ждёт нас |
+| Нефункциональное | Доступность перенаправлений 99,9% (у создания ссылок она может быть чуть ниже) |
+| Нефункциональное | Коды короткие, никогда не совпадают, и их нельзя подобрать один за другим |
+| Нефункциональное | Счётчики кликов могут отставать до минуты (здесь согласованность в конечном счёте (eventual consistency) нас устраивает) |
+
+**Не входит в версию 1:** аккаунты пользователей и веб-интерфейс, изменение адреса, на который ведёт ссылка, собственные домены, подробная аналитика (страны, браузеры). Если записать это явно, проект не будет незаметно разрастаться.
+
+### API
+
+| Запрос | Что делает | Ответы |
+| --- | --- | --- |
+| `POST /links` | `{"url": ..., "alias": ..., "ttl_days": ...}`, нужен API-ключ | 201 + ссылка, 409 псевдоним занят, 422 некорректные данные, 429 слишком много запросов |
+| `GET /{code}` | переход по короткой ссылке, публичный | редирект 307, 404, 410 |
+| `GET /links/{code}` | статистика ссылки, нужен API-ключ | 200 + ссылка, 404 |
+| `GET /health/live`, `GET /health/ready` | для балансировщика нагрузки | 200 или 503 |
+
+### Модель данных
+
+Хватит одной таблицы: `links(code PRIMARY KEY, url, created_at, expires_at, clicks)`. **Код — это первичный ключ (primary key)**, поэтому сама база данных гарантирует, что у двух ссылок никогда не будет одного кода.
+
+## Прикидочные расчёты
+
+Оценим нагрузку на довольно популярный сервис: миллион новых ссылок в день, и каждую в среднем открывают сто раз. Сокращатель ссылок — классическая система **с преобладанием чтения (read-heavy)**:
+
+<CodeExample output={`Новых ссылок: 12/с (пик 35/с)
+Редиректов: 1,157/с (пик 3,472/с)
+Данных через 5 лет: 730 ГБ
+Кодов из 7 символов: 3,521,614,606,208
+Занято через 5 лет: 0.052%`}>
+
+```python
+new_links_per_day = 1_000_000
+redirects_per_link = 100          # чтений на одну запись
+seconds_per_day = 86_400
+peak = 3                          # часы пик против среднего
+
+writes = new_links_per_day / seconds_per_day
+reads = writes * redirects_per_link
+print(f"Новых ссылок: {writes:,.0f}/с (пик {writes * peak:,.0f}/с)")
+print(f"Редиректов: {reads:,.0f}/с (пик {reads * peak:,.0f}/с)")
+
+bytes_per_link = 400              # код, URL, даты, счётчик
+links_in_5_years = new_links_per_day * 365 * 5
+gigabytes = links_in_5_years * bytes_per_link / 1e9
+print(f"Данных через 5 лет: {gigabytes:,.0f} ГБ")
+
+possible_codes = 62 ** 7
+print(f"Кодов из 7 символов: {possible_codes:,}")
+print(f"Занято через 5 лет: {links_in_5_years / possible_codes:.3%}")
+```
+
+</CodeExample>
+
+Что говорят нам эти числа:
+
+- **12 записей в секунду** — пустяк для одного сервера PostgreSQL. Никакого шардирования и никаких экзотических баз данных.
+- **3 500 перенаправлений в секунду** в пик — это много для одной базы данных, но каждое перенаправление задаёт один и тот же вопрос («куда ведёт `k3Xp9Qa`?»), а ответ почти никогда не меняется. Идеальный случай для **кэша (cache)** и нескольких API-серверов **без состояния (stateless)** за балансировщиком нагрузки.
+- **730 ГБ** за пять лет помещаются на один диск. Старые, истёкшие ссылки можно потом отправить в архив.
+- **Семь символов base62** дают 3,5 триллиона кодов. Через пять лет мы займём 0,05% из них, так что случайный новый код совпадёт с существующим примерно один раз на 2 000 попыток. Коллизии редки, но возможны, и код должен их обрабатывать.
+
+### Какие компромиссы мы выбрали
+
+| Решение | Мы выбрали | Потому что | Цена |
+| --- | --- | --- | --- |
+| Коды | случайные, 7 символов | их нельзя угадать или перебрать; не нужен центральный счётчик | приходится обрабатывать (редкие) коллизии |
+| Статус перенаправления | 307 Temporary Redirect | браузер каждый раз спрашивает нас заново, поэтому мы можем считать клики и отключать истёкшие ссылки | больше трафика, чем с кэшируемым 301 |
+| Хранилище | PostgreSQL | данных немного, и они реляционные; уникальный первичный ключ — ровно то, что нужно | ещё один сервис, который надо поддерживать |
+| Быстрые перенаправления | cache-aside с коротким TTL | 100 чтений на одну запись, данные меняются редко | статистика может немного отставать |
+| Злоупотребления | API-ключи + token bucket на каждый ключ | ссылки создают только известные клиенты; никто не сможет нас завалить запросами | нужно управлять ключами |
+
+<Callout type="tip" title="301 или 307?">
+
+**301 Moved Permanently** говорит браузеру: «больше никогда не спрашивай меня про этот URL». Это отлично для сайта, который действительно переехал, но для сокращателя ссылок это значит, что второй клик до вас уже не дойдёт: ни счётчика кликов, ни возможности отключить или исправить ссылку — возможно, годами. Временное перенаправление (302 или 307) возвращает к нам каждый клик. Выбор кода ответа — это **продуктовое** решение, поэтому ему место в дизайн-документе.
+
+</Callout>
+
+## Коды base62
+
+Код **base62** состоит из цифр, строчных и заглавных латинских букв: 62 символа, безопасных в любом URL. Есть два классических способа получать коды:
+
+<CodeExample output={`0 -> 0
+61 -> Z
+62 -> 10
+125,000,000 -> 8sud2
+3,521,614,606,207 -> ZZZZZZZ
+E71Lhfe 8L6HLVy`}>
+
+```python
+import random
+import string
+
+ALPHABET = string.digits + string.ascii_letters   # 62 символа
+
+def encode_base62(n: int) -> str:
+    if n == 0:
+        return ALPHABET[0]
+    digits = []
+    while n:
+        n, rest = divmod(n, 62)
+        digits.append(ALPHABET[rest])
+    return "".join(reversed(digits))
+
+for n in [0, 61, 62, 125_000_000, 62 ** 7 - 1]:
+    print(f"{n:,} -> {encode_base62(n)}")
+
+def random_code(length=7, choice=random.choice) -> str:
+    return "".join(choice(ALPHABET) for _ in range(length))
+
+rng = random.Random(42)            # seed: каждый раз те же коды
+print(random_code(choice=rng.choice), random_code(choice=rng.choice))
+```
+
+</CodeExample>
+
+- **Счётчик**: дать каждой ссылке номер (1, 2, 3...) и **закодировать** его в base62 — так же, как число записывают в десятичной или двоичной системе. Коды получаются максимально короткими и никогда не совпадают. Но они **предсказуемы**: любой может пройтись по `8sud1`, `8sud2`, `8sud3`... и прочитать все ссылки, которые сокращали люди, включая личные документы. К тому же нужен один центральный счётчик, о котором договорятся все серверы.
+- **Случайность**: выбрать 7 случайных символов. Следующий код никто не угадает, и любой сервер может создавать коды сам. Цена: нужно проверять коллизии.
+
+Мы выбираем случайные коды. В продакшене `choice` должен быть **`secrets.choice`** — криптографически стойким генератором из урока [Безопасный код](/learn/python/secure-coding), а не `random.choice`. Обратите внимание, что `random_code` принимает `choice` как **параметр (parameter)**: именно поэтому пример выше выдаёт одни и те же «случайные» коды при каждом запуске, и именно так тесты остаются детерминированными. Это приём с внедрением часов из урока об отказоустойчивости, только применённый к случайности.
+
+## Объекты-значения для кодов и URL
+
+Код и URL — не просто строки: у каждого есть свои правила. Следуя уроку [Внедрение зависимостей и DDD](/learn/python/dependency-injection-and-ddd), мы превратим их в **объекты-значения (value objects)** — замороженные dataclass, которые сами себя проверяют, так что некорректный объект просто не может существовать. Для URL возьмём один новый инструмент из стандартной библиотеки — **`urllib.parse.urlsplit`**, который разбивает URL на части:
+
+<CodeExample output={`https pandas.org /bamboo size=xl
+javascript
+True
+TargetUrl(value='https://pandas.org/bamboo')
+'abc': a code has 4 to 16 characters
+'my-link': a code uses only 0-9, a-z, A-Z
+'Docs': 'Docs' is reserved
+'pandas.org': only http(s) URLs with a host
+'javascript:alert(1)': only http(s) URLs with a host`}>
+
+```python
+import string
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+ALPHABET = string.digits + string.ascii_letters
+RESERVED = {"docs", "redoc", "links", "health"}
+
+parts = urlsplit("https://pandas.org/bamboo?size=xl")
+print(parts.scheme, parts.netloc, parts.path, parts.query)
+print(urlsplit("javascript:alert(1)").scheme)
+
+@dataclass(frozen=True)
+class ShortCode:
+    value: str
+
+    def __post_init__(self):
+        if not 4 <= len(self.value) <= 16:
+            raise ValueError("a code has 4 to 16 characters")
+        if any(ch not in ALPHABET for ch in self.value):
+            raise ValueError("a code uses only 0-9, a-z, A-Z")
+        if self.value.lower() in RESERVED:
+            raise ValueError(f"{self.value!r} is reserved")
+
+@dataclass(frozen=True)
+class TargetUrl:
+    value: str
+
+    def __post_init__(self):
+        clean = self.value.strip()
+        parts = urlsplit(clean)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError("only http(s) URLs with a host")
+        if len(clean) > 2048:
+            raise ValueError("URL is too long")
+        object.__setattr__(self, "value", clean)
+
+print(ShortCode("pandas") == ShortCode("pandas"))
+print(TargetUrl("  https://pandas.org/bamboo "))
+for make, raw in [(ShortCode, "abc"), (ShortCode, "my-link"),
+                  (ShortCode, "Docs"), (TargetUrl, "pandas.org"),
+                  (TargetUrl, "javascript:alert(1)")]:
+    try:
+        make(raw)
+    except ValueError as error:
+        print(f"{raw!r}: {error}")
+```
+
+</CodeExample>
+
+У каждого правила есть причина:
+
+- **Только `http` и `https`, и обязательно с хостом.** Сокращатель, который перенаправляет на URL вида `javascript:...` или `data:...`, превращает ваш доверенный домен в инструмент для злоумышленников. Это проверка на границе, как с Pydantic в уроке [Безопасный код](/learn/python/secure-coding), только в домене — так её получает каждая точка входа.
+- **Не больше 2 048 символов** — распространённое ограничение для URL; заодно оно ограничивает, сколько клиент может заставить нас хранить.
+- **Коды — от 4 до 16 символов base62**, а некоторые слова **зарезервированы**: псевдоним `docs` или `health` спрятал бы нашу собственную страницу `/docs` и проверки работоспособности за чьей-то ссылкой. Проверка через `.lower()` резервирует и `Docs` тоже.
+- `TargetUrl` сам себя **нормализует**, обрезая пробелы, с помощью идиомы `object.__setattr__` из объекта-значения Email.
+
+## Сущность ссылки и порт репозитория
+
+`ShortLink` — это **сущность (entity)**: у неё есть идентичность (её код), а её данные со временем меняются (счётчик кликов). Ещё ей принадлежит одно бизнес-правило — «истекла ли ссылка?», — и время она получает параметром, а не читает часы сама.
+
+Сервису нужно хранилище, поэтому мы определяем **порт (port)**: `Protocol`, описывающий, что умеет репозиторий ссылок. (В уроке [Чистая архитектура](/learn/python/clean-architecture) мы использовали `abc.ABC`; `Protocol` работает не хуже и не требует наследования. Оба варианта хороши.) Адаптер в памяти хранит ссылки в словаре и, как настоящая база данных, сохраняет и возвращает **копии**. Чтобы пример был коротким, коды и URL здесь — обычные строки:
+
+<CodeExample output={`True False
+None
+занят: pandas
+False
+True`}>
+
+```python
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
+from typing import Protocol
+
+class CodeTaken(Exception):
+    pass
+
+@dataclass
+class ShortLink:
+    code: str                 # в настоящем коде ShortCode
+    url: str                  # и TargetUrl; str для краткости
+    created_at: datetime
+    expires_at: datetime | None = None
+    clicks: int = 0
+
+    def is_expired(self, now: datetime) -> bool:
+        return self.expires_at is not None and now >= self.expires_at
+
+class LinkRepository(Protocol):
+    def get(self, code: str) -> ShortLink | None: ...
+    def add(self, link: ShortLink) -> None: ...  # или CodeTaken
+    def record_click(self, code: str) -> None: ...
+
+class InMemoryLinkRepository:
+    def __init__(self):
+        self._links: dict[str, ShortLink] = {}
+
+    def get(self, code):
+        link = self._links.get(code)
+        return replace(link) if link else None
+
+    def add(self, link):
+        if link.code in self._links:
+            raise CodeTaken(link.code)
+        self._links[link.code] = replace(link)
+
+now = datetime(2026, 1, 1, 12, 0)
+link = ShortLink("pandas", "https://pandas.org", now,
+                 expires_at=now + timedelta(days=30))
+repo = InMemoryLinkRepository()
+repo.add(link)
+print(repo.get("pandas") == link, repo.get("pandas") is link)
+print(repo.get("koalas"))
+try:
+    repo.add(ShortLink("pandas", "https://evil.example", now))
+except CodeTaken as error:
+    print("занят:", error)
+print(link.is_expired(now + timedelta(days=29)))
+print(link.is_expired(now + timedelta(days=30)))
+```
+
+</CodeExample>
+
+Присмотритесь к `add`. Здесь нет отдельного метода `exists(code)`, который сервис вызывал бы сначала. Почему?
+
+<Callout type="warning" title="«Проверить, потом вставить» — это гонка">
+
+«Если код свободен — вставь его» звучит надёжно, но с двумя серверами это не так: оба одновременно проверяют `k3Xp9Qa`, оба видят, что он свободен, оба вставляют — и одна ссылка молча затирает другую. Решение — доверить выбор **хранилищу**: `add` либо сохраняет ссылку, либо выбрасывает `CodeTaken`, за один шаг. В PostgreSQL этим занимается ограничение уникальности первичного ключа; в части 2 вы превратите его `IntegrityError` в `CodeTaken`. С кликами то же самое: `record_click(code)` просит хранилище прибавить единицу, вместо «прочитай счётчик, прибавь один, сохрани», что теряет клики, когда два приходят одновременно.
+
+</Callout>
+
+## LinkService
+
+**Сервис** — это слой сценариев использования (use cases): по одному методу на каждое действие клиента. Всё необходимое он получает через конструктор: репозиторий, **часы** и **генератор кодов**. Тесты передают `FakeClock` и список заранее заданных кодов, поэтому одной строкой могут устроить коллизию или перескочить на 30 дней вперёд. Вот `shorten` с добавленным `print`, чтобы было видно повторную попытку:
+
+<CodeExample output={`k3Xp9Qa 2026-01-01 12:00:00 None
+  k3Xp9Qa занят, попытка 1
+Zt81bYc 2026-01-01 12:05:00 2026-01-08 12:05:00
+  about занят, попытка 1
+псевдоним занят: about`}>
+
+```python
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
+
+class CodeTaken(Exception):
+    pass
+
+@dataclass
+class ShortLink:
+    code: str
+    url: str
+    created_at: datetime
+    expires_at: datetime | None = None
+    clicks: int = 0
+
+class InMemoryLinkRepository:
+    def __init__(self):
+        self._links = {}
+
+    def get(self, code):
+        link = self._links.get(code)
+        return replace(link) if link else None
+
+    def add(self, link):
+        if link.code in self._links:
+            raise CodeTaken(link.code)
+        self._links[link.code] = replace(link)
+
+class FakeClock:
+    """Время идёт, только когда так решит тест."""
+
+    def __init__(self, now: datetime):
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kwargs) -> None:
+        self.now += timedelta(**kwargs)
+
+class LinkService:
+    def __init__(self, repo, clock, make_code, max_attempts=5):
+        self.repo = repo
+        self.clock = clock
+        self.make_code = make_code
+        self.max_attempts = max_attempts
+
+    def shorten(self, url, alias=None, ttl_days=None):
+        now = self.clock()
+        expires = None
+        if ttl_days:
+            expires = now + timedelta(days=ttl_days)
+        attempts = 1 if alias else self.max_attempts
+        for attempt in range(attempts):
+            code = alias or self.make_code()
+            link = ShortLink(code, url, now, expires)
+            try:
+                self.repo.add(link)
+                return link
+            except CodeTaken:
+                print(f"  {code} занят, попытка {attempt + 1}")
+                if attempt == attempts - 1:
+                    raise
+
+clock = FakeClock(datetime(2026, 1, 1, 12, 0))
+codes = iter(["k3Xp9Qa", "k3Xp9Qa", "Zt81bYc"])
+links = LinkService(InMemoryLinkRepository(), clock,
+                    make_code=lambda: next(codes))
+
+first = links.shorten("https://pandas.org")
+print(first.code, first.created_at, first.expires_at)
+clock.advance(minutes=5)
+second = links.shorten("https://bamboo.shop", ttl_days=7)
+print(second.code, second.created_at, second.expires_at)
+links.shorten("https://pandas.org/about", alias="about")
+try:
+    links.shorten("https://evil.example", alias="about")
+except CodeTaken as error:
+    print("псевдоним занят:", error)
+```
+
+</CodeExample>
+
+Заданный генератор дважды вернул `k3Xp9Qa`, поэтому вторая ссылка получила `CodeTaken`, и цикл просто попробовал следующий код. **Сгенерированный** код повторяется до `max_attempts` раз (если пять случайных кодов подряд заняты, значит, сломалось что-то другое, и ошибка — правильный ответ). Свой **псевдоним** не повторяется никогда: клиент попросил именно это имя, поэтому он получает ошибку, которую API превратит в **409 Conflict**.
+
+`FakeClock` — небольшое улучшение часов из уроков об отказоустойчивости: вызов возвращает `datetime`, поэтому их можно передать везде, где ожидается функция `clock`, а `advance(days=30)` принимает те же аргументы, что и `timedelta`. В продакшене сервис получает вместо них настоящую функцию часов.
+
+Два других сценария вы напишете сами в упражнении:
+
+- **`resolve(code)`** — это перенаправление: найти ссылку, отказать с `LinkExpired`, если она истекла, засчитать клик и вернуть целевой URL.
+- **`stats(code)`** возвращает ссылку с её счётчиком кликов.
+
+Оба выбрасывают **`LinkNotFound`** для неизвестного кода, а также для кода, который даже не является корректным (`/no`, `/bad code!`). Снаружи «это не может быть кодом» и «такого кода нет» — одно и то же: по этому адресу ничего нет.
+
+## Тестируем ядро
+
+Ядро — это обычный Python с внедрёнными зависимостями, поэтому его тестам не нужны ни база данных, ни HTTP, ни моки. Всю подготовку делают две фикстуры (fixtures). Фикстура `links` задаёт коды заранее, включая намеренную коллизию на втором:
+
+```python
+START = datetime(2026, 1, 1, 12, 0)
+
+@pytest.fixture
+def clock():
+    return FakeClock(START)
+
+@pytest.fixture
+def links(clock):
+    codes = iter(["abc1234", "abc1234", "xyz9876", "Qq77777"])
+    return LinkService(InMemoryLinkRepository(), clock,
+                       make_code=lambda: next(codes))
+
+def test_a_taken_code_is_retried(links):
+    links.shorten("https://pandas.org/a")       # abc1234
+    second = links.shorten("https://pandas.org/b")
+    assert second.code.value == "xyz9876"       # дубликат пропущен
+```
+
+Тест, которому нужно, чтобы прошло время, запрашивает обе фикстуры, `def test_...(links, clock):`, и pytest даёт ему **те же самые** часы, что использует сервис, поэтому `clock.advance(days=30)` двигает время и для сервиса.
+
+<Quiz
+  question="Почему в дизайне используются случайные коды из 7 символов, а не автоинкрементный id, закодированный в base62?"
+  options={[
+    "Случайные коды короче закодированных id",
+    "Закодированные id предсказуемы, так что любой может перебрать все ссылки, и для них нужен один центральный счётчик",
+    "base62 не умеет кодировать большие числа",
+    "Случайные коды никогда не совпадают",
+  ]}
+  answer={1}
+  explanation="Последовательные коды короткие и без коллизий, но следующий код легко угадать — а это утечка личных ссылок, — и всем серверам нужен общий счётчик. Случайные коды избавляют от обеих проблем ценой редких коллизий, которые сервис обрабатывает повторной попыткой."
+/>
+
+<Quiz
+  question="Два API-сервера в один и тот же момент создают ссылку с одинаковым случайным кодом. Какое решение не даст одной ссылке молча затереть другую?"
+  options={[
+    "Сервис сначала вызывает repo.get(code) и сохраняет, только если тот вернул None",
+    "Метод add() репозитория вставляет за один шаг и выбрасывает CodeTaken, когда нарушен уникальный ключ базы данных",
+    "Более длинный код",
+    "Кэш перед репозиторием",
+  ]}
+  answer={1}
+  explanation="У подхода «проверить, потом вставить» есть промежуток между проверкой и вставкой, и проверку могут пройти оба сервера. Если решает ограничение уникальности в базе данных, вставка становится атомарной: успешна ровно одна, а другая получает CodeTaken и пробует новый код."
+/>
+
+<Exercise
+  language="python"
+  title="Соберите: доменное ядро"
+  starter={`import secrets
+import string
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
+from typing import Protocol
+from urllib.parse import urlsplit
+
+import pytest
+
+ALPHABET = string.digits + string.ascii_letters   # 62 символа
+CODE_LENGTH = 7
+RESERVED = {"docs", "redoc", "links", "health"}
+
+
+# ---------- домен ----------
+
+class LinkNotFound(Exception):
+    pass
+
+
+class LinkExpired(Exception):
+    pass
+
+
+class CodeTaken(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class ShortCode:
+    value: str
+
+    def __post_init__(self):
+        if not 4 <= len(self.value) <= 16:
+            raise ValueError("a code has 4 to 16 characters")
+        if any(ch not in ALPHABET for ch in self.value):
+            raise ValueError("a code uses only 0-9, a-z, A-Z")
+        if self.value.lower() in RESERVED:
+            raise ValueError(f"{self.value!r} is reserved")
+
+
+@dataclass(frozen=True)
+class TargetUrl:
+    value: str
+
+    def __post_init__(self):
+        clean = self.value.strip()
+        parts = urlsplit(clean)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError("only http(s) URLs with a host")
+        if len(clean) > 2048:
+            raise ValueError("URL is too long")
+        object.__setattr__(self, "value", clean)
+
+
+@dataclass
+class ShortLink:
+    code: ShortCode
+    url: TargetUrl
+    created_at: datetime
+    expires_at: datetime | None = None
+    clicks: int = 0
+
+    def is_expired(self, now: datetime) -> bool:
+        return self.expires_at is not None and now >= self.expires_at
+
+
+def random_code(length=CODE_LENGTH, choice=secrets.choice) -> str:
+    return "".join(choice(ALPHABET) for _ in range(length))
+
+
+class FakeClock:
+    """Время идёт, только когда так решит тест."""
+
+    def __init__(self, now: datetime):
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kwargs) -> None:
+        self.now += timedelta(**kwargs)
+
+
+# ---------- порты ----------
+
+class LinkRepository(Protocol):
+    def get(self, code: ShortCode) -> ShortLink | None: ...
+    def add(self, link: ShortLink) -> None: ...  # или CodeTaken
+    def record_click(self, code: ShortCode) -> None: ...
+
+
+Clock = Callable[[], datetime]
+
+
+# ---------- адаптеры ----------
+
+class InMemoryLinkRepository:
+    def __init__(self):
+        self._links: dict[ShortCode, ShortLink] = {}
+
+    # TODO 1: get(code) -> КОПИЯ ссылки или None
+    #         add(link) -> сохранить копию; CodeTaken, если
+    #                      код уже занят
+    #         record_click(code) -> +1 к clicks ссылки
+
+
+# ---------- сервис ----------
+
+class LinkService:
+    def __init__(self, repo: LinkRepository, clock: Clock,
+                 make_code: Callable[[], str] = random_code,
+                 max_attempts: int = 5):
+        self.repo = repo
+        self.clock = clock
+        self.make_code = make_code
+        self.max_attempts = max_attempts
+
+    def shorten(self, url: str, alias: str | None = None,
+                ttl_days: int | None = None) -> ShortLink:
+        # TODO 2: проверьте данные (TargetUrl, ttl_days >= 1),
+        # затем добавьте ShortLink с псевдонимом или
+        # сгенерированным кодом. Занятый сгенерированный код
+        # повторяйте до max_attempts раз, занятый псевдоним — нет.
+        raise NotImplementedError
+
+    def resolve(self, raw_code: str) -> str:
+        # TODO 3: найдите ссылку (LinkNotFound, если код
+        # некорректен или неизвестен), LinkExpired, если срок
+        # истёк, засчитайте клик и верните целевой URL строкой
+        raise NotImplementedError
+
+    def stats(self, raw_code: str) -> ShortLink:
+        # TODO 4: ссылка или LinkNotFound
+        raise NotImplementedError
+
+
+# ---------- тесты ----------
+
+START = datetime(2026, 1, 1, 12, 0)
+
+
+@pytest.fixture
+def clock():
+    return FakeClock(START)
+
+
+@pytest.fixture
+def links(clock):
+    codes = iter(["abc1234", "abc1234", "xyz9876", "Qq77777"])
+    return LinkService(InMemoryLinkRepository(), clock,
+                       make_code=lambda: next(codes))
+
+
+@pytest.mark.parametrize("raw", ["abc", "a" * 17, "ab-cd", "Docs"])
+def test_bad_codes_are_rejected(raw):
+    with pytest.raises(ValueError):
+        ShortCode(raw)
+
+
+@pytest.mark.parametrize("raw", [
+    "example.com", "ftp://example.com", "javascript:alert(1)",
+    "https://", "https://x.io/" + "a" * 2048,
+])
+def test_bad_urls_are_rejected(raw):
+    with pytest.raises(ValueError):
+        TargetUrl(raw)
+
+
+def test_shorten_then_resolve(links):
+    link = links.shorten(" https://pandas.org/bamboo ")
+    assert link.code == ShortCode("abc1234")
+    assert link.created_at == START
+    assert links.resolve("abc1234") == "https://pandas.org/bamboo"
+
+
+def test_a_taken_code_is_retried(links):
+    links.shorten("https://pandas.org/a")
+    second = links.shorten("https://pandas.org/b")
+    assert second.code.value == "xyz9876"
+
+
+def test_custom_alias(links):
+    links.shorten("https://pandas.org", alias="pandas")
+    assert links.resolve("pandas") == "https://pandas.org"
+    with pytest.raises(CodeTaken):
+        links.shorten("https://other.org", alias="pandas")
+
+
+@pytest.mark.parametrize("raw", ["nope1234", "no", "bad code!"])
+def test_unknown_codes(links, raw):
+    with pytest.raises(LinkNotFound):
+        links.resolve(raw)
+
+
+# TODO 5: напишите test_resolve_counts_clicks(links)
+# TODO 6: напишите test_expired_links_are_gone(links, clock)
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "Все тесты в редакторе проходят, включая два ваших новых", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 17" },
+    { name: "Репозиторий в памяти хранит копии, отказывает на занятых кодах и считает клики", check: "[r := InMemoryLinkRepository(), k := ShortCode('kiwi'), l := ShortLink(k, TargetUrl('https://k.io'), START), r.add(l), setattr(l, 'clicks', 99)] and r.get(k) == ShortLink(k, TargetUrl('https://k.io'), START) and r.get(k) is not r.get(k) and r.get(ShortCode('pear')) is None and pytest.raises(CodeTaken, r.add, l) and [r.record_click(k), r.record_click(k)] and r.get(k).clicks == 2" },
+    { name: "shorten() сохраняет ссылку с временем по часам, кодом и сроком действия", check: "[c := FakeClock(datetime(2030, 5, 1, 8, 0)), r := InMemoryLinkRepository(), s := LinkService(r, c, make_code=lambda: 'Kiwi777'), l := s.shorten(' https://kiwi.nz/fruit ', ttl_days=3)] and l == ShortLink(ShortCode('Kiwi777'), TargetUrl('https://kiwi.nz/fruit'), datetime(2030, 5, 1, 8, 0), datetime(2030, 5, 4, 8, 0)) and r.get(ShortCode('Kiwi777')) == l and s.shorten('https://a.io', alias='fruit').expires_at is None" },
+    { name: "shorten() повторяет занятые сгенерированные коды до max_attempts раз, но никогда — псевдоним", check: "[n := [], s := LinkService(InMemoryLinkRepository(), FakeClock(START), make_code=lambda: n.append(1) or ('same111' if len(n) < 4 else 'other22')), s.shorten('https://a.io'), s.shorten('https://b.io')] and s.stats('other22').url.value == 'https://b.io' and len(n) == 4 and pytest.raises(CodeTaken, s.shorten, 'https://c.io', alias='same111') and [s.__setattr__('make_code', lambda: n.append(1) or 'same111'), pytest.raises(CodeTaken, s.shorten, 'https://d.io')] and len(n) == 9" },
+    { name: "shorten() отклоняет плохие URL, плохие псевдонимы и ttl_days меньше 1 через ValueError", check: "[s := LinkService(InMemoryLinkRepository(), FakeClock(START), make_code=lambda: 'abcd123')] and all([pytest.raises(ValueError, s.shorten, 'kiwi.nz'), pytest.raises(ValueError, s.shorten, 'https://k.io', alias='no'), pytest.raises(ValueError, s.shorten, 'https://k.io', alias='health'), pytest.raises(ValueError, s.shorten, 'https://k.io', ttl_days=0)])" },
+    { name: "resolve() возвращает URL, считает клики и отказывает истёкшим ссылкам", check: "[c := FakeClock(START), s := LinkService(InMemoryLinkRepository(), c, make_code=lambda: 'abcd123'), s.shorten('https://kiwi.nz', ttl_days=2)] and [s.resolve('abcd123') for _ in range(4)] == ['https://kiwi.nz'] * 4 and s.stats('abcd123').clicks == 4 and [c.advance(days=2)] and pytest.raises(LinkExpired, s.resolve, 'abcd123') and s.stats('abcd123').clicks == 4" },
+    { name: "Неизвестные и некорректные коды дают LinkNotFound в resolve() и stats()", check: "[s := LinkService(InMemoryLinkRepository(), FakeClock(START), make_code=lambda: 'abcd123')] and all(pytest.raises(LinkNotFound, f, x) for f in (s.resolve, s.stats) for x in ('zzzz999', 'a', 'no way!', 'docs'))" },
+    { name: "Ваш тест кликов ловит репозиторий, который забывает считать", check: "_panda_pytest(patch={'InMemoryLinkRepository': type('NoClicks', (InMemoryLinkRepository,), {'record_click': lambda self, code: None})})['failed'] > _panda_pytest()['failed']" },
+    { name: "Ваш тест истечения ловит часы, которые стоят на месте", check: "_panda_pytest(patch={'FakeClock': type('StuckClock', (FakeClock,), {'advance': lambda self, **kw: None})})['failed'] > _panda_pytest()['failed']" },
+  ]}
+>
+
+Соберите ядро PandaLink. Объекты-значения, сущность `ShortLink`, `random_code`, `FakeClock`, порт репозитория и большая часть тестов уже готовы. Вы пишете адаптер, сервис и два теста:
+
+1. **`InMemoryLinkRepository`**: `get(code)` возвращает **копию** ссылки или `None`; `add(link)` сохраняет копию или выбрасывает `CodeTaken`, если код занят; `record_click(code)` прибавляет 1 к `clicks` сохранённой ссылки.
+2. **`LinkService.shorten(url, alias=None, ttl_days=None)`**: создайте `TargetUrl` (он выбрасывает `ValueError` для плохих URL), выбросьте `ValueError`, если `ttl_days` меньше 1, возьмите `created_at` из `self.clock()`, а `expires_at` сделайте равным ему плюс `ttl_days` дней (или `None`). Создайте `ShortCode` из псевдонима или из `self.make_code()` и добавьте ссылку через `add`. Занятый **сгенерированный** код повторяйте — всего не больше `max_attempts` кодов; для занятого псевдонима или когда попытки кончились, выбросьте `CodeTaken` дальше. Верните ссылку.
+3. **`resolve(code)`**: выбросьте `LinkNotFound`, если код некорректен (`ShortCode` выбрасывает `ValueError`) или неизвестен, `LinkExpired`, если `link.is_expired(self.clock())`; иначе вызовите `record_click` и верните URL строкой.
+4. **`stats(code)`**: ссылка или `LinkNotFound` (тот же поиск, что и в `resolve`).
+5. Напишите **`test_resolve_counts_clicks(links)`**: сократите URL, трижды вызовите для него `resolve` и проверьте, что `stats` показывает 3 клика.
+6. Напишите **`test_expired_links_are_gone(links, clock)`**: сократите URL с `ttl_days=30`, проверьте, что ссылка ещё работает незадолго до конца 30 дней, затем сдвиньте часы через `advance` и проверьте, что `resolve` выбрасывает `LinkExpired`.
+
+<Hint>
+
+Репозиторий — это `InMemoryProductRepository` из урока о чистой архитектуре с копиями через `replace(link)`; в `record_click` меняйте сохранённую ссылку напрямую: `self._links[code].clicks += 1`. Для `shorten` скопируйте цикл из примера в уроке и оберните код в `ShortCode(...)`. Общий поиск вынесите во вспомогательный метод, например `_find(raw_code)`: `try: code = ShortCode(raw_code)` / `except ValueError: raise LinkNotFound(raw_code) from None`, затем `self.repo.get(code)`. Ваши тесты используют фикстуру `links`, первый сгенерированный код которой — `"abc1234"`, и `clock.advance(days=29, hours=23)`.
+
+</Hint>
+
+<Solution>
+
+```python
+import secrets
+import string
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
+from typing import Protocol
+from urllib.parse import urlsplit
+
+import pytest
+
+ALPHABET = string.digits + string.ascii_letters   # 62 символа
+CODE_LENGTH = 7
+RESERVED = {"docs", "redoc", "links", "health"}
+
+
+# ---------- домен ----------
+
+class LinkNotFound(Exception):
+    pass
+
+
+class LinkExpired(Exception):
+    pass
+
+
+class CodeTaken(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class ShortCode:
+    value: str
+
+    def __post_init__(self):
+        if not 4 <= len(self.value) <= 16:
+            raise ValueError("a code has 4 to 16 characters")
+        if any(ch not in ALPHABET for ch in self.value):
+            raise ValueError("a code uses only 0-9, a-z, A-Z")
+        if self.value.lower() in RESERVED:
+            raise ValueError(f"{self.value!r} is reserved")
+
+
+@dataclass(frozen=True)
+class TargetUrl:
+    value: str
+
+    def __post_init__(self):
+        clean = self.value.strip()
+        parts = urlsplit(clean)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError("only http(s) URLs with a host")
+        if len(clean) > 2048:
+            raise ValueError("URL is too long")
+        object.__setattr__(self, "value", clean)
+
+
+@dataclass
+class ShortLink:
+    code: ShortCode
+    url: TargetUrl
+    created_at: datetime
+    expires_at: datetime | None = None
+    clicks: int = 0
+
+    def is_expired(self, now: datetime) -> bool:
+        return self.expires_at is not None and now >= self.expires_at
+
+
+def random_code(length=CODE_LENGTH, choice=secrets.choice) -> str:
+    return "".join(choice(ALPHABET) for _ in range(length))
+
+
+class FakeClock:
+    """Время идёт, только когда так решит тест."""
+
+    def __init__(self, now: datetime):
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kwargs) -> None:
+        self.now += timedelta(**kwargs)
+
+
+# ---------- порты ----------
+
+class LinkRepository(Protocol):
+    def get(self, code: ShortCode) -> ShortLink | None: ...
+    def add(self, link: ShortLink) -> None: ...  # или CodeTaken
+    def record_click(self, code: ShortCode) -> None: ...
+
+
+Clock = Callable[[], datetime]
+
+
+# ---------- адаптеры ----------
+
+class InMemoryLinkRepository:
+    def __init__(self):
+        self._links: dict[ShortCode, ShortLink] = {}
+
+    def get(self, code):
+        link = self._links.get(code)
+        return replace(link) if link else None
+
+    def add(self, link):
+        if link.code in self._links:
+            raise CodeTaken(link.code.value)
+        self._links[link.code] = replace(link)
+
+    def record_click(self, code):
+        self._links[code].clicks += 1
+
+
+# ---------- сервис ----------
+
+class LinkService:
+    def __init__(self, repo: LinkRepository, clock: Clock,
+                 make_code: Callable[[], str] = random_code,
+                 max_attempts: int = 5):
+        self.repo = repo
+        self.clock = clock
+        self.make_code = make_code
+        self.max_attempts = max_attempts
+
+    def shorten(self, url: str, alias: str | None = None,
+                ttl_days: int | None = None) -> ShortLink:
+        target = TargetUrl(url)
+        if ttl_days is not None and ttl_days < 1:
+            raise ValueError("ttl_days must be at least 1")
+        now = self.clock()
+        expires = None
+        if ttl_days:
+            expires = now + timedelta(days=ttl_days)
+        attempts = 1 if alias else self.max_attempts
+        for attempt in range(attempts):
+            code = ShortCode(alias or self.make_code())
+            link = ShortLink(code, target, now, expires)
+            try:
+                self.repo.add(link)
+                return link
+            except CodeTaken:
+                if attempt == attempts - 1:
+                    raise
+
+    def _find(self, raw_code: str) -> ShortLink:
+        try:
+            code = ShortCode(raw_code)
+        except ValueError:
+            raise LinkNotFound(raw_code) from None
+        link = self.repo.get(code)
+        if link is None:
+            raise LinkNotFound(raw_code)
+        return link
+
+    def resolve(self, raw_code: str) -> str:
+        link = self._find(raw_code)
+        if link.is_expired(self.clock()):
+            raise LinkExpired(raw_code)
+        self.repo.record_click(link.code)
+        return link.url.value
+
+    def stats(self, raw_code: str) -> ShortLink:
+        return self._find(raw_code)
+
+
+# ---------- тесты ----------
+
+START = datetime(2026, 1, 1, 12, 0)
+
+
+@pytest.fixture
+def clock():
+    return FakeClock(START)
+
+
+@pytest.fixture
+def links(clock):
+    codes = iter(["abc1234", "abc1234", "xyz9876", "Qq77777"])
+    return LinkService(InMemoryLinkRepository(), clock,
+                       make_code=lambda: next(codes))
+
+
+@pytest.mark.parametrize("raw", ["abc", "a" * 17, "ab-cd", "Docs"])
+def test_bad_codes_are_rejected(raw):
+    with pytest.raises(ValueError):
+        ShortCode(raw)
+
+
+@pytest.mark.parametrize("raw", [
+    "example.com", "ftp://example.com", "javascript:alert(1)",
+    "https://", "https://x.io/" + "a" * 2048,
+])
+def test_bad_urls_are_rejected(raw):
+    with pytest.raises(ValueError):
+        TargetUrl(raw)
+
+
+def test_shorten_then_resolve(links):
+    link = links.shorten(" https://pandas.org/bamboo ")
+    assert link.code == ShortCode("abc1234")
+    assert link.created_at == START
+    assert links.resolve("abc1234") == "https://pandas.org/bamboo"
+
+
+def test_a_taken_code_is_retried(links):
+    links.shorten("https://pandas.org/a")
+    second = links.shorten("https://pandas.org/b")
+    assert second.code.value == "xyz9876"
+
+
+def test_custom_alias(links):
+    links.shorten("https://pandas.org", alias="pandas")
+    assert links.resolve("pandas") == "https://pandas.org"
+    with pytest.raises(CodeTaken):
+        links.shorten("https://other.org", alias="pandas")
+
+
+@pytest.mark.parametrize("raw", ["nope1234", "no", "bad code!"])
+def test_unknown_codes(links, raw):
+    with pytest.raises(LinkNotFound):
+        links.resolve(raw)
+
+
+def test_resolve_counts_clicks(links):
+    links.shorten("https://pandas.org")
+    for _ in range(3):
+        links.resolve("abc1234")
+    assert links.stats("abc1234").clicks == 3
+
+
+def test_expired_links_are_gone(links, clock):
+    links.shorten("https://pandas.org", ttl_days=30)
+    clock.advance(days=29, hours=23)
+    assert links.resolve("abc1234") == "https://pandas.org"
+    clock.advance(hours=1)
+    with pytest.raises(LinkExpired):
+        links.resolve("abc1234")
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- **Дизайн-документ**: функциональные и нефункциональные требования, что не входит в проект, API, модель данных, оценки (12 записей/с, 3 500 перенаправлений/с в пик, 730 ГБ за 5 лет) и таблица компромиссов.
+- **Коды base62**: почему случайные коды из `secrets.choice` лучше предсказуемого счётчика и почему коллизии всё равно нужно обрабатывать.
+- **Объекты-значения** `ShortCode` и `TargetUrl`, которые отвергают опасные URL и зарезервированные имена, и **сущность `ShortLink`**, которая знает, когда истекает.
+- **Порт репозитория** (`Protocol`), у которого `add` и `record_click` — одиночные шаги, которые хранилище может сделать атомарными, и **адаптер в памяти**, который ведёт себя как база данных.
+- **`LinkService`** с внедрёнными часами и генератором кодов и быстрый набор тестов с заранее заданными кодами и поддельными часами.
+
+Ядро работает, но до него пока никто не может достучаться. В **части 2** мы поставим его за настоящую базу данных, кэш, API-ключи, ограничитель частоты запросов и приложение FastAPI. 🌐

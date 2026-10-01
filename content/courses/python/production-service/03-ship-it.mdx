@@ -1,0 +1,2086 @@
+---
+title: "Part 3: Ship it"
+description: Make the URL shortener production-ready with validated settings, a composition root, Docker and Compose with Postgres and Redis, CI, monitoring, alerts, load tests and a launch checklist.
+duration: 25
+xp: 30
+---
+
+PandaLink works: the core is tested, and the API has a database, a cache, API keys, rate limiting and logs. But it only runs inside tests, wired by hand in fixtures. In this last part we make it **shippable**: one build that runs anywhere, configured from the environment, packaged in a container, tested by CI, watched by monitoring and proven under load. 🚀
+
+Most of this part is the work *around* the code, so you'll see more plain blocks (Dockerfiles, YAML, shell commands) that run on your machine, not in the editor. The Python pieces, settings and the **composition root**, you'll build and test for real. This is where [Containers and Deployment](/learn/python/containers-and-deployment) and [DI and DDD](/learn/python/dependency-injection-and-ddd) come together.
+
+## Settings from the environment
+
+Every value that differs between your laptop, staging and production becomes a setting, read from `APP_*` environment variables and validated **once, at startup**:
+
+| Setting | Example | Why it's a setting |
+| --- | --- | --- |
+| `APP_ENVIRONMENT` | `prod` | some rules depend on it |
+| `APP_DATABASE_URL` | `postgresql+psycopg://...` | different database everywhere, and it contains a password |
+| `APP_API_KEYS` | `blog:9f86d0...,ci:60303a...` | the **hashes** of the clients' keys, with a name for each |
+| `APP_CACHE_TTL_SECONDS` | `60` | how stale redirects and stats may be |
+| `APP_RATE_LIMIT_BURST`, `APP_RATE_LIMIT_PER_SECOND` | `20`, `1` | tuned during load tests, without a new build |
+| `APP_LOG_LEVEL` | `INFO` | `DEBUG` while hunting a bug |
+
+The new parts compared with the containers lesson are the API keys and a cross-field rule:
+
+<CodeExample output={`dev **********
+['blog', 'ci']
+Value error, bad API key entry for 'blog'
+Value error, prod needs a real database`}>
+
+```python
+import hashlib
+import string
+from collections.abc import Mapping
+from typing import Literal
+
+from pydantic import (
+    BaseModel, ConfigDict, SecretStr, ValidationError,
+    model_validator,
+)
+
+def hash_key(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    database_url: SecretStr
+    api_keys: str                    # "name:sha256hex,name:..."
+
+    @model_validator(mode="after")
+    def check(self):
+        self.key_table()             # malformed keys: fail fast
+        url = self.database_url.get_secret_value()
+        if self.environment == "prod" and url.startswith("sqlite"):
+            raise ValueError("prod needs a real database")
+        return self
+
+    def key_table(self) -> dict[str, str]:
+        table = {}
+        for entry in self.api_keys.split(","):
+            name, _, digest = entry.strip().partition(":")
+            if not name or len(digest) != 64 or any(
+                ch not in string.hexdigits for ch in digest
+            ):
+                raise ValueError(f"bad API key entry for {name!r}")
+            table[digest.lower()] = name
+        return table
+
+def load_settings(env: Mapping[str, str]) -> Settings:
+    values = {
+        name.removeprefix("APP_").lower(): value
+        for name, value in env.items()
+        if name.startswith("APP_")
+    }
+    return Settings.model_validate(values)
+
+env = {
+    "APP_DATABASE_URL": "postgresql://app:s3cret@db/pandalink",
+    "APP_API_KEYS": f"blog:{hash_key('k1')}, ci:{hash_key('k2')}",
+}
+settings = load_settings(env)
+print(settings.environment, settings.database_url)
+print(sorted(settings.key_table().values()))
+
+for bad in [{**env, "APP_API_KEYS": "blog:1234"},
+            {**env, "APP_ENVIRONMENT": "prod",
+             "APP_DATABASE_URL": "sqlite://"}]:
+    try:
+        load_settings(bad)
+    except ValidationError as error:
+        print(error.errors()[0]["msg"])
+```
+
+</CodeExample>
+
+- **`database_url` is a `SecretStr`**, because database URLs contain passwords. Printing the settings, or an error page showing them, can't leak it.
+- **`key_table()`** turns `"name:hash, name:hash"` into the `{hash: name}` dict that `create_app` expects. The validator calls it once, so a broken entry stops the service from starting instead of locking out a client at 3 a.m.
+- **No SQLite in production**: a rule that needs two fields belongs in a `model_validator(mode="after")`. An in-memory database in prod would lose every link on restart, and this one-line check makes that mistake impossible.
+- The error message names the client (`'blog'`) but not the hash. Error messages end up in logs too.
+
+To give a new client access, an admin runs a tiny script, sends the key to the client over a safe channel, and adds only the hash to `APP_API_KEYS`:
+
+```python
+# make_key.py: run on your machine, once per client
+import hashlib
+import secrets
+
+key = secrets.token_urlsafe(32)
+print("send to the client:", key)
+digest = hashlib.sha256(key.encode()).hexdigest()
+print("add to APP_API_KEYS:", f"blog:{digest}")
+```
+
+## The composition root
+
+Until now, the fixtures did the wiring. In production one function does it: the **composition root** from the DI lesson, `build_app(settings)`. It's the only place that knows every concrete class, and it builds them in dependency order:
+
+```text
+settings ─┬─▶ engine ─▶ SqlLinkRepository
+          │                     │ wrapped by
+          │             CachedLinkRepository ─▶ LinkService ─┐
+          ├─▶ RateLimiter ───────────────────────────────────┤
+          └─▶ key_table() ───────────────────────────────────┴─▶ create_app
+```
+
+Its signature has defaults for production and seams for tests:
+
+```python
+def build_app(settings: Settings, clock: Clock = utc_now,
+              timer: Callable[[], float] = time.monotonic,
+              make_code: Callable[[], str] = random_code) -> FastAPI:
+```
+
+- **Two kinds of time.** `clock` gives the date and time for `created_at` and `expires_at`. `timer` measures **intervals** for the cache TTL and the token buckets. In production the timer is `time.monotonic()`, because the wall clock can jump (the server syncs its time, or the clocks change), and a jump backwards would make cache entries live forever. Tests pass the same `FakeClock` for both: `clock=fake, timer=fake.time`.
+- **`utc_now()`** returns the current UTC time without a time zone attached. Store times in UTC, always; SQLite drops time zones anyway, and comparing a time with a zone to one without raises a `TypeError`.
+- **`make_engine(url)`** uses `StaticPool` only for the in-memory SQLite of tests. For a real database it sets `pool_pre_ping=True`, which checks a pooled connection before using it, so the app survives the database restarting.
+- **`Base.metadata.create_all(engine)`** is fine for tests and a first prototype. Production schemas change through **migrations** (`alembic revision --autogenerate`, `alembic upgrade head`), run once per deploy, never by every worker at startup.
+
+On your machine, the entry point that uvicorn loads is three lines. This is the **only** place that reads `os.environ` and sets up logging:
+
+```python
+# main.py: uvicorn main:app --host 0.0.0.0 --port 8000
+import os
+
+from pandalink import build_app, configure_logging, load_settings
+
+settings = load_settings(os.environ)   # bad config: refuse to start
+configure_logging(settings.log_level)  # JSON lines to stdout
+app = build_app(settings)
+```
+
+`configure_logging` is the `basicConfig(handlers=[...], force=True)` setup from Part 2 with the `JsonFormatter`. Keeping it out of `build_app` means tests never touch the global logging setup.
+
+## Docker and Compose
+
+The Dockerfile is the multi-stage, non-root image from Containers and Deployment, with the new entry point:
+
+```dockerfile
+FROM python:3.14-slim AS build
+RUN python -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+FROM python:3.14-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    PATH="/venv/bin:$PATH"
+RUN useradd --create-home --uid 10001 app
+WORKDIR /app
+COPY --from=build /venv /venv
+COPY pandalink/ ./pandalink/
+COPY main.py .
+USER app
+EXPOSE 8000
+HEALTHCHECK CMD python -c "import urllib.request; \
+  urllib.request.urlopen('http://localhost:8000/health/live')"
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers"]
+```
+
+For development, Compose starts the whole system, now with **Redis** next to PostgreSQL. A one-off `migrate` service runs Alembic before the API starts:
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENVIRONMENT: dev
+      APP_DATABASE_URL: postgresql+psycopg://app:app@db:5432/app
+      APP_REDIS_URL: redis://cache:6379/0   # see "Moving to Redis"
+    env_file: .env              # APP_API_KEYS lives here, not in git
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      cache:
+        condition: service_healthy
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      APP_DATABASE_URL: postgresql+psycopg://app:app@db:5432/app
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 5s
+      retries: 5
+
+  cache:
+    image: redis:8
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+```
+
+### Moving to Redis
+
+With several workers and servers, a dict per process isn't a shared cache, and a token bucket per process lets a client make N times more requests than you meant. Both move to **Redis**, a shared in-memory store with built-in expiry. Because the service only sees the repository port, the swap is one new adapter, one changed line in `build_app` and a `redis_url` setting (the Compose file above already sets `APP_REDIS_URL`; without the setting, `extra="forbid"` would refuse it):
+
+```python
+import json
+import redis   # pip install redis
+
+class RedisCachedLinkRepository:
+    """Same port as CachedLinkRepository, shared by all workers."""
+
+    def __init__(self, inner, client: redis.Redis, ttl: int):
+        self.inner, self.redis, self.ttl = inner, client, ttl
+
+    def get(self, code):
+        cached = self.redis.get(f"link:{code.value}")
+        if cached is not None:
+            return link_from_json(json.loads(cached))
+        link = self.inner.get(code)
+        if link is not None:   # SET with an expiry, in one command
+            self.redis.set(f"link:{code.value}",
+                           json.dumps(link_to_json(link)), ex=self.ttl)
+        return link
+
+    def add(self, link):
+        self.inner.add(link)
+
+    def record_click(self, code):
+        self.inner.record_click(code)
+```
+
+Redis takes care of the TTL (`ex=60`), and every worker shares the same entries. The rate limiter is trickier, because "read the bucket, update it, write it back" must be **atomic** across servers; teams use a short Lua script that Redis runs in one step, or a library such as `limits`. For tests, the `fakeredis` package gives you an in-memory Redis with the same API.
+
+## Continuous integration
+
+CI runs on every pull request. Besides lint, unit tests and a dependency audit, a second job runs the **same test suite against a real PostgreSQL**, started by GitHub Actions as a service container. That's where you'd catch, for example, a column that's too short in PostgreSQL but not in SQLite:
+
+```yaml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest
+      - run: pip-audit -r requirements.txt
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://postgres:test@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: alembic upgrade head
+      - run: pytest -m integration
+
+  image:
+    needs: [test, postgres]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+```
+
+The `integration` mark selects the tests that take a database URL. Here, that's the repository contract test from Part 2 with a third parameter, `"postgres"`, that is skipped unless `TEST_DATABASE_URL` is set. The image is tagged with the commit hash, and a **rolling** or **canary** deploy rolls it out; readiness checks keep traffic away from new instances until `/health/ready` says the database is reachable.
+
+## Observability and alerts
+
+Before launch, decide what "working" means in numbers, and make sure you can see those numbers. For PandaLink:
+
+| Signal | Metric | Why |
+| --- | --- | --- |
+| Rate | redirects/s and links created/s | traffic, and spotting a sudden drop |
+| Errors | share of 5xx answers on `GET /{code}` | the redirect SLO |
+| Duration | p50 and p99 redirect latency | the 50 ms requirement from the design doc |
+| Cache | hit ratio (`hits / (hits + misses)`) | a falling ratio means more database load |
+| Abuse | 429s per client | a client in a loop, or a limit set too low |
+| Saturation | database connections in use, CPU, memory | what runs out first under load |
+
+In the app you'd expose these with `prometheus-client` or OpenTelemetry metrics (our cache already counts `hits` and `misses`), add OpenTelemetry **tracing** for FastAPI and SQLAlchemy, and ship the JSON logs to your log store. Then back-of-the-envelope maths again, this time for capacity and for the **error budget**:
+
+<CodeExample output={`Requests in flight at peak: 35
+Database reads/s: 175 (without the cache: 3,500)
+Redirects per month: 3,024,000,000
+Error budget: 3,024,000 failed redirects
+That's 43 minutes of full outage`}>
+
+```python
+peak_redirects = 3_500          # per second, from Part 1
+latency = 0.010                 # 10 ms per redirect, measured
+hit_ratio = 0.95                # from the cache metrics
+
+# Little's law: requests in flight = rate x time per request
+in_flight = peak_redirects * latency
+print(f"Requests in flight at peak: {in_flight:.0f}")
+
+db_reads = peak_redirects * (1 - hit_ratio)
+print(f"Database reads/s: {db_reads:,.0f} "
+      f"(without the cache: {peak_redirects:,})")
+
+# The SLO: 99.9% of redirects succeed, measured over 30 days
+monthly = peak_redirects / 3 * 86_400 * 30   # average, not peak
+budget = monthly * (1 - 0.999)
+print(f"Redirects per month: {monthly:,.0f}")
+print(f"Error budget: {budget:,.0f} failed redirects")
+print(f"That's {30 * 24 * 60 * 0.001:.0f} minutes of full outage")
+```
+
+</CodeExample>
+
+**Little's law** says that at 3,500 requests per second and 10 ms each, about 35 requests are in progress at any moment: a few worker processes are enough, as long as the cache keeps database reads down to about 175 per second. The **SLO** of 99.9% allows about three million failed redirects a month, or 43 minutes of complete outage. When a bad deploy burns through that budget quickly, you want a page:
+
+```yaml
+# Prometheus alerting rule
+- alert: RedirectErrorBudgetBurn
+  expr: |
+    sum(rate(http_requests_total{route="/{code}",status=~"5.."}[5m]))
+      / sum(rate(http_requests_total{route="/{code}"}[5m]))
+      > 14.4 * 0.001
+  for: 5m
+  labels:
+    severity: page
+  annotations:
+    summary: "Redirects failing: 30-day error budget gone in ~2 days"
+    runbook: https://wiki.example/runbooks/pandalink-redirects
+```
+
+The factor 14.4 is a common "fast burn" rule: at that rate, a 30-day budget lasts about two days. A slower burn (say 1x over 6 hours) can open a ticket instead of waking someone up. Alert on what users feel, like this, and keep CPU and cache-ratio alerts as **warnings** on a dashboard.
+
+## Load testing
+
+The estimates are guesses; a **load test** checks them before real users do. **Locust** describes user behaviour in plain Python. This one follows links a hundred times more often than it creates them, like real traffic:
+
+```python
+# loadtest.py: locust -f loadtest.py --host https://staging.pandalink.example
+import os
+import random
+
+from locust import HttpUser, between, task
+
+CODES = ["k3Xp9Qa", "Zt81bYc", "pandas"]    # seeded in staging
+
+class Visitor(HttpUser):
+    wait_time = between(0.05, 0.2)
+
+    @task(100)
+    def follow(self):
+        self.client.get(f"/{random.choice(CODES)}",
+                        allow_redirects=False, name="/{code}")
+
+    @task(1)
+    def create(self):
+        self.client.post(
+            "/links", json={"url": "https://pandas.org"},
+            headers={"Authorization": f"Bearer {os.environ['KEY']}"},
+        )
+```
+
+```bash
+locust -f loadtest.py --host https://staging.pandalink.example \
+  --headless --users 400 --spawn-rate 20 --run-time 10m
+```
+
+Some habits that make load tests worth their cost:
+
+- Test **staging**, built and configured like production, with production-like data: a database with 50 rows behaves very differently from one with 50 million.
+- **Ramp up** slowly and look for the **knee**: the point where latency suddenly climbs while throughput stops growing. Then find out what ran out first (database connections, CPU, the rate limiter) from the saturation metrics.
+- Run a **cold-cache** test too (restart Redis first): that's what happens after a deploy or a cache outage, and it's when a stampede hits the database.
+- Expect the creating client to get **429s**: here they're the rate limiter doing its job, not errors.
+
+## The production checklist
+
+Before the first real user, go through a list like this one, ideally with someone who didn't build the service:
+
+| Area | Check |
+| --- | --- |
+| Config | All settings come from `APP_*` variables, are validated at startup, and secrets are `SecretStr` and stored in the platform's secret store |
+| Security | Only http(s) targets; API keys stored hashed; HTTPS only, at the proxy; dependencies audited in CI; the container runs as a non-root user |
+| Data | Migrations run once per deploy; backups are taken **and a restore has been tested**; the codes' unique key is enforced by the database |
+| Reliability | Liveness is trivial and readiness checks the database; timeouts on every connection; several instances behind the load balancer; rate limits tuned by the load test |
+| Observability | JSON logs without secrets or target URLs; RED metrics, cache ratio and 429s on a dashboard; alerts on the SLO with a runbook for each |
+| Delivery | CI runs lint, tests (SQLite and PostgreSQL) and an audit; images are tagged with the commit; a rollback is one command and has been practised |
+
+<Callout type="tip" title="The checklist is a living document">
+
+Every incident teaches you something. After each one, write a short, blameless **post-mortem** (what happened, why, what we'll change) and add a line to this checklist, so the next service never makes the same mistake. That habit, more than any single tool, is what makes a team good at running production systems.
+
+</Callout>
+
+<Quiz
+  question="A team runs PandaLink with 4 uvicorn workers on each of 3 servers, and keeps the in-process RateLimiter with a burst of 20. How many links can one client create in a quick burst?"
+  options={[
+    "20, because the limit is in the settings",
+    "Up to 240, because each of the 12 worker processes has its own token buckets",
+    "60, one bucket per server",
+    "Unlimited, because rate limiters don't work with workers",
+  ]}
+  answer={1}
+  explanation="Every worker process keeps its own dictionary of buckets, so requests spread over 12 processes see 12 separate buckets of 20. Shared limits need shared state, which is why the limiter moves to Redis (or to the proxy) in production."
+/>
+
+<Exercise
+  language="python"
+  title="Build it: The finished service"
+  starter={`import hashlib
+import json
+import logging
+import math
+import secrets
+import string
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Literal, Protocol
+from urllib.parse import urlsplit
+
+import pytest
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.testclient import TestClient
+from pydantic import (
+    BaseModel, ConfigDict, Field, SecretStr, ValidationError,
+    model_validator,
+)
+from sqlalchemy import String, create_engine, text, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, sessionmaker,
+)
+from sqlalchemy.pool import StaticPool
+
+ALPHABET = string.digits + string.ascii_letters   # 62 characters
+CODE_LENGTH = 7
+RESERVED = {"docs", "redoc", "links", "health"}
+
+
+# ---------- domain ----------
+
+class LinkNotFound(Exception):
+    pass
+
+
+class LinkExpired(Exception):
+    pass
+
+
+class CodeTaken(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class ShortCode:
+    value: str
+
+    def __post_init__(self):
+        if not 4 <= len(self.value) <= 16:
+            raise ValueError("a code has 4 to 16 characters")
+        if any(ch not in ALPHABET for ch in self.value):
+            raise ValueError("a code uses only 0-9, a-z, A-Z")
+        if self.value.lower() in RESERVED:
+            raise ValueError(f"{self.value!r} is reserved")
+
+
+@dataclass(frozen=True)
+class TargetUrl:
+    value: str
+
+    def __post_init__(self):
+        clean = self.value.strip()
+        parts = urlsplit(clean)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError("only http(s) URLs with a host")
+        if len(clean) > 2048:
+            raise ValueError("URL is too long")
+        object.__setattr__(self, "value", clean)
+
+
+@dataclass
+class ShortLink:
+    code: ShortCode
+    url: TargetUrl
+    created_at: datetime
+    expires_at: datetime | None = None
+    clicks: int = 0
+
+    def is_expired(self, now: datetime) -> bool:
+        return self.expires_at is not None and now >= self.expires_at
+
+
+def random_code(length=CODE_LENGTH, choice=secrets.choice) -> str:
+    return "".join(choice(ALPHABET) for _ in range(length))
+
+
+class FakeClock:
+    """Time only moves when a test says so."""
+
+    def __init__(self, now: datetime):
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kwargs) -> None:
+        self.now += timedelta(**kwargs)
+
+    def time(self) -> float:          # seconds, like time.monotonic
+        return self.now.timestamp()
+
+
+# ---------- ports ----------
+
+class LinkRepository(Protocol):
+    def get(self, code: ShortCode) -> ShortLink | None: ...
+    def add(self, link: ShortLink) -> None: ...  # or CodeTaken
+    def record_click(self, code: ShortCode) -> None: ...
+
+
+Clock = Callable[[], datetime]
+
+
+# ---------- adapters ----------
+
+class InMemoryLinkRepository:
+    def __init__(self):
+        self._links: dict[ShortCode, ShortLink] = {}
+
+    def get(self, code):
+        link = self._links.get(code)
+        return replace(link) if link else None
+
+    def add(self, link):
+        if link.code in self._links:
+            raise CodeTaken(link.code.value)
+        self._links[link.code] = replace(link)
+
+    def record_click(self, code):
+        self._links[code].clicks += 1
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class LinkRow(Base):
+    __tablename__ = "links"
+    code: Mapped[str] = mapped_column(String(16), primary_key=True)
+    url: Mapped[str] = mapped_column(String(2048))
+    created_at: Mapped[datetime]
+    expires_at: Mapped[datetime | None]
+    clicks: Mapped[int] = mapped_column(default=0)
+
+
+class SqlLinkRepository:
+    """One short transaction per call: a link is one aggregate."""
+
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    def get(self, code):
+        with self.session_factory() as session:
+            row = session.get(LinkRow, code.value)
+            if row is None:
+                return None
+            return ShortLink(ShortCode(row.code), TargetUrl(row.url),
+                             row.created_at, row.expires_at,
+                             row.clicks)
+
+    def add(self, link):
+        with self.session_factory() as session:
+            session.add(LinkRow(
+                code=link.code.value, url=link.url.value,
+                created_at=link.created_at,
+                expires_at=link.expires_at, clicks=link.clicks,
+            ))
+            try:
+                session.commit()
+            except IntegrityError:
+                raise CodeTaken(link.code.value) from None
+
+    def record_click(self, code):
+        with self.session_factory() as session:
+            session.execute(
+                update(LinkRow)
+                .where(LinkRow.code == code.value)
+                .values(clicks=LinkRow.clicks + 1)
+            )
+            session.commit()
+
+    def ping(self) -> bool:
+        with self.session_factory() as session:
+            return session.execute(text("SELECT 1")).scalar() == 1
+
+
+class CachedLinkRepository:
+    """Cache-aside with a TTL, in front of any LinkRepository."""
+
+    def __init__(self, inner, ttl: float,
+                 clock: Callable[[], float]):
+        self.inner = inner
+        self.ttl = ttl
+        self.clock = clock
+        self.hits = 0
+        self.misses = 0
+        self._entries = {}      # code -> (link, expires_at)
+
+    def get(self, code):
+        now = self.clock()
+        entry = self._entries.get(code)
+        if entry is not None and now < entry[1]:
+            self.hits += 1
+            return replace(entry[0])
+        self.misses += 1
+        link = self.inner.get(code)
+        if link is not None:
+            self._entries[code] = (replace(link), now + self.ttl)
+        return link
+
+    def add(self, link):
+        self.inner.add(link)
+
+    def record_click(self, code):
+        self.inner.record_click(code)
+        if code in self._entries:            # keep our copy close
+            self._entries[code][0].clicks += 1
+
+
+class TokenBucket:
+    def __init__(self, capacity, per_second, clock):
+        self.capacity = capacity
+        self.per_second = per_second
+        self.clock = clock
+        self.tokens = capacity
+        self.updated = clock()
+
+    def allow(self):
+        now = self.clock()
+        earned = (now - self.updated) * self.per_second
+        self.tokens = min(self.capacity, self.tokens + earned)
+        self.updated = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+
+class RateLimiter:
+    """One token bucket per client."""
+
+    def __init__(self, capacity: int, per_second: float,
+                 clock: Callable[[], float]):
+        self.capacity = capacity
+        self.per_second = per_second
+        self.clock = clock
+        self._buckets: dict[str, TokenBucket] = {}
+
+    def allow(self, client: str) -> bool:
+        bucket = self._buckets.get(client)
+        if bucket is None:
+            bucket = TokenBucket(self.capacity, self.per_second,
+                                 self.clock)
+            self._buckets[client] = bucket
+        return bucket.allow()
+
+    @property
+    def retry_after(self) -> int:
+        return math.ceil(1 / self.per_second)
+
+
+# ---------- service ----------
+
+class LinkService:
+    def __init__(self, repo: LinkRepository, clock: Clock,
+                 make_code: Callable[[], str] = random_code,
+                 max_attempts: int = 5):
+        self.repo = repo
+        self.clock = clock
+        self.make_code = make_code
+        self.max_attempts = max_attempts
+
+    def shorten(self, url: str, alias: str | None = None,
+                ttl_days: int | None = None) -> ShortLink:
+        target = TargetUrl(url)
+        if ttl_days is not None and ttl_days < 1:
+            raise ValueError("ttl_days must be at least 1")
+        now = self.clock()
+        expires = None
+        if ttl_days:
+            expires = now + timedelta(days=ttl_days)
+        attempts = 1 if alias else self.max_attempts
+        for attempt in range(attempts):
+            code = ShortCode(alias or self.make_code())
+            link = ShortLink(code, target, now, expires)
+            try:
+                self.repo.add(link)
+                return link
+            except CodeTaken:
+                if attempt == attempts - 1:
+                    raise
+
+    def _find(self, raw_code: str) -> ShortLink:
+        try:
+            code = ShortCode(raw_code)
+        except ValueError:
+            raise LinkNotFound(raw_code) from None
+        link = self.repo.get(code)
+        if link is None:
+            raise LinkNotFound(raw_code)
+        return link
+
+    def resolve(self, raw_code: str) -> str:
+        link = self._find(raw_code)
+        if link.is_expired(self.clock()):
+            raise LinkExpired(raw_code)
+        self.repo.record_click(link.code)
+        return link.url.value
+
+    def stats(self, raw_code: str) -> ShortLink:
+        return self._find(raw_code)
+
+
+# ---------- web ----------
+
+log = logging.getLogger("pandalink")
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {"level": record.levelname, "msg": record.getMessage()}
+        entry.update(getattr(record, "fields", {}))
+        return json.dumps(entry)
+
+
+def hash_key(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+class LinkIn(BaseModel):
+    url: str = Field(max_length=2048)
+    alias: str | None = None
+    ttl_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class LinkOut(BaseModel):
+    code: str
+    url: str
+    clicks: int
+    created_at: datetime
+    expires_at: datetime | None
+
+
+def to_out(link: ShortLink) -> LinkOut:
+    return LinkOut(code=link.code.value, url=link.url.value,
+                   clicks=link.clicks, created_at=link.created_at,
+                   expires_at=link.expires_at)
+
+
+bearer = HTTPBearer(auto_error=False)
+
+
+def get_service(request: Request) -> LinkService:
+    return request.app.state.service
+
+
+def current_client(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> str:
+    keys = request.app.state.api_keys
+    client = keys.get(hash_key(creds.credentials)) if creds else None
+    if client is None:
+        raise HTTPException(401, "Invalid or missing API key",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return client
+
+
+def rate_limited(
+    request: Request, client: str = Depends(current_client)
+) -> str:
+    limiter = request.app.state.limiter
+    if not limiter.allow(client):
+        raise HTTPException(
+            429, "Too many requests",
+            headers={"Retry-After": str(limiter.retry_after)},
+        )
+    return client
+
+
+ServiceDep = Annotated[LinkService, Depends(get_service)]
+ClientDep = Annotated[str, Depends(current_client)]
+LimitedClientDep = Annotated[str, Depends(rate_limited)]
+
+
+def create_app(service: LinkService, limiter: RateLimiter,
+               api_keys: dict[str, str],
+               check_db: Callable[[], bool]) -> FastAPI:
+    app = FastAPI(title="PandaLink")
+    app.state.service = service
+    app.state.limiter = limiter
+    app.state.api_keys = api_keys       # sha256 hash -> client
+
+    @app.get("/health/live")
+    def live():
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def ready():
+        try:
+            ok = check_db()
+        except Exception:
+            ok = False
+        if not ok:
+            return JSONResponse(
+                {"status": "unavailable"}, status_code=503
+            )
+        return {"status": "ok"}
+
+    @app.post("/links", status_code=201, response_model=LinkOut)
+    def create_link(body: LinkIn, links: ServiceDep,
+                    client: LimitedClientDep):
+        try:
+            link = links.shorten(body.url, body.alias, body.ttl_days)
+        except CodeTaken:
+            raise HTTPException(409, "That code is taken")
+        except ValueError as error:
+            raise HTTPException(422, str(error))
+        log.info("link created", extra={"fields": {
+            "code": link.code.value, "client": client}})
+        return to_out(link)
+
+    @app.get("/links/{code}", response_model=LinkOut)
+    def link_stats(code: str, links: ServiceDep, client: ClientDep):
+        try:
+            return to_out(links.stats(code))
+        except LinkNotFound:
+            raise HTTPException(404, "Link not found")
+
+    @app.get("/{code}")
+    def follow(code: str, links: ServiceDep):
+        try:
+            url = links.resolve(code)
+        except LinkNotFound:
+            raise HTTPException(404, "Link not found")
+        except LinkExpired:
+            raise HTTPException(410, "Link expired")
+        log.info("redirect", extra={"fields": {"code": code}})
+        return RedirectResponse(url, status_code=307)
+
+    return app
+
+
+# ---------- settings + composition root ----------
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # TODO 1: the seven fields from the table in the task,
+    #         with their types, defaults and limits
+    # TODO 2: a model_validator(mode="after") that fails for
+    #         bad API key entries, and for sqlite in "prod"
+
+    def key_table(self) -> dict[str, str]:
+        # TODO 3: "name:hash, name:hash" -> {hash: name}
+        raise NotImplementedError
+
+
+def load_settings(env: Mapping[str, str]) -> Settings:
+    # TODO 4: APP_* variables -> Settings (prefix removed,
+    #         lower case), everything else ignored
+    raise NotImplementedError
+
+
+def make_engine(url: str):
+    if url == "sqlite://":          # in memory: one shared connection
+        return create_engine(
+            url, poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+    return create_engine(url, pool_pre_ping=True)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def build_app(settings: Settings, clock: Clock = utc_now,
+              timer: Callable[[], float] = time.monotonic,
+              make_code: Callable[[], str] = random_code) -> FastAPI:
+    """The composition root: the one place that wires it all."""
+    # TODO 5: engine -> tables -> SQL repository -> cache ->
+    #         service, plus the limiter and the key table,
+    #         then return create_app(...) with sql.ping as the
+    #         database check
+    raise NotImplementedError
+
+
+# ---------- tests ----------
+
+START = datetime(2026, 1, 1, 12, 0)
+API_KEY = "test-key-123"
+
+
+@pytest.fixture
+def clock():
+    return FakeClock(START)
+
+
+@pytest.fixture
+def links(clock):
+    codes = iter(["abc1234", "abc1234", "xyz9876", "Qq77777"])
+    return LinkService(InMemoryLinkRepository(), clock,
+                       make_code=lambda: next(codes))
+
+
+@pytest.mark.parametrize("raw", ["abc", "a" * 17, "ab-cd", "Docs"])
+def test_bad_codes_are_rejected(raw):
+    with pytest.raises(ValueError):
+        ShortCode(raw)
+
+
+@pytest.mark.parametrize("raw", [
+    "example.com", "ftp://example.com", "javascript:alert(1)",
+    "https://", "https://x.io/" + "a" * 2048,
+])
+def test_bad_urls_are_rejected(raw):
+    with pytest.raises(ValueError):
+        TargetUrl(raw)
+
+
+def test_shorten_then_resolve(links):
+    link = links.shorten(" https://pandas.org/bamboo ")
+    assert link.code == ShortCode("abc1234")
+    assert link.created_at == START
+    assert links.resolve("abc1234") == "https://pandas.org/bamboo"
+
+
+def test_a_taken_code_is_retried(links):
+    links.shorten("https://pandas.org/a")
+    second = links.shorten("https://pandas.org/b")
+    assert second.code.value == "xyz9876"
+
+
+def test_custom_alias(links):
+    links.shorten("https://pandas.org", alias="pandas")
+    assert links.resolve("pandas") == "https://pandas.org"
+    with pytest.raises(CodeTaken):
+        links.shorten("https://other.org", alias="pandas")
+
+
+@pytest.mark.parametrize("raw", ["nope1234", "no", "bad code!"])
+def test_unknown_codes(links, raw):
+    with pytest.raises(LinkNotFound):
+        links.resolve(raw)
+
+
+def test_resolve_counts_clicks(links):
+    links.shorten("https://pandas.org")
+    for _ in range(3):
+        links.resolve("abc1234")
+    assert links.stats("abc1234").clicks == 3
+
+
+def test_expired_links_are_gone(links, clock):
+    links.shorten("https://pandas.org", ttl_days=30)
+    clock.advance(days=29, hours=23)
+    assert links.resolve("abc1234") == "https://pandas.org"
+    clock.advance(hours=1)
+    with pytest.raises(LinkExpired):
+        links.resolve("abc1234")
+
+
+# --- Part 2: adapters and API ---
+
+def sql_repo():
+    engine = create_engine(
+        "sqlite://", poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    return SqlLinkRepository(sessionmaker(engine))
+
+
+@pytest.fixture(params=["memory", "sql"])
+def repo(request):
+    if request.param == "memory":
+        return InMemoryLinkRepository()
+    return sql_repo()
+
+
+def test_repository_contract(repo):
+    link = ShortLink(ShortCode("abcd"), TargetUrl("https://a.io"),
+                     START, START + timedelta(days=1))
+    repo.add(link)
+    assert repo.get(ShortCode("abcd")) == link
+    assert repo.get(ShortCode("zzzz")) is None
+    with pytest.raises(CodeTaken):
+        repo.add(link)
+    repo.record_click(ShortCode("abcd"))
+    assert repo.get(ShortCode("abcd")).clicks == 1
+
+
+def test_cache_aside_with_ttl(clock):
+    inner = InMemoryLinkRepository()
+    cache = CachedLinkRepository(inner, ttl=60, clock=clock.time)
+    code = ShortCode("abcd")
+    inner.add(ShortLink(code, TargetUrl("https://a.io"), START))
+    assert cache.get(code).url.value == "https://a.io"
+    cache.record_click(code)
+    clock.advance(seconds=59)
+    assert cache.get(code).clicks == 1
+    assert (cache.hits, cache.misses) == (1, 1)
+    clock.advance(seconds=1)
+    cache.get(code)
+    assert (cache.hits, cache.misses) == (1, 2)
+
+
+def test_rate_limiter_per_client(clock):
+    limiter = RateLimiter(capacity=2, per_second=0.5,
+                          clock=clock.time)
+    assert [limiter.allow("mei") for _ in range(3)] == [
+        True, True, False]
+    assert limiter.allow("kai")
+    clock.advance(seconds=2)
+    assert limiter.allow("mei")
+
+
+@pytest.fixture
+def app(clock):
+    codes = iter(["abc1234", "xyz9876", "Qq77777", "Pp55555"])
+    repo = CachedLinkRepository(sql_repo(), ttl=60,
+                                clock=clock.time)
+    service = LinkService(repo, clock, lambda: next(codes))
+    limiter = RateLimiter(capacity=3, per_second=0.5,
+                          clock=clock.time)
+    return create_app(service, limiter,
+                      {hash_key(API_KEY): "tester"},
+                      check_db=lambda: True)
+
+
+@pytest.fixture
+def client(app):
+    auth = {"Authorization": f"Bearer {API_KEY}"}
+    return TestClient(app, headers=auth)
+
+
+def test_create_follow_and_stats(client):
+    r = client.post("/links", json={"url": "https://pandas.org"})
+    assert r.status_code == 201
+    assert r.json()["code"] == "abc1234"
+    r = client.get("/abc1234", follow_redirects=False)
+    assert r.status_code == 307
+    assert r.headers["location"] == "https://pandas.org"
+    stats = client.get("/links/abc1234").json()
+    assert stats["clicks"] == 1
+    assert stats["created_at"] == "2026-01-01T12:00:00"
+
+
+def test_api_errors(client, clock):
+    client.post("/links", json={"url": "https://a.io",
+                                "alias": "bamboo", "ttl_days": 1})
+    r = client.post("/links", json={"url": "https://b.io",
+                                    "alias": "bamboo"})
+    assert r.status_code == 409
+    r = client.post("/links", json={"url": "nope"})
+    assert r.status_code == 422
+    assert client.get("/links/zzzz").status_code == 404
+    assert client.get("/zzzzzz").status_code == 404
+    clock.advance(days=1)
+    assert client.get("/bamboo").status_code == 410
+
+
+def test_api_key_required(app):
+    anonymous = TestClient(app)
+    r = anonymous.post("/links", json={"url": "https://a.io"})
+    assert r.status_code == 401
+    wrong = {"Authorization": "Bearer nope"}
+    assert anonymous.get("/links/abc1234",
+                         headers=wrong).status_code == 401
+
+
+def test_rate_limit(client, clock):
+    for _ in range(3):
+        r = client.post("/links", json={"url": "https://a.io"})
+        assert r.status_code == 201
+    r = client.post("/links", json={"url": "https://a.io"})
+    assert r.status_code == 429
+    assert r.headers["retry-after"] == "2"
+    clock.advance(seconds=2)
+    r = client.post("/links", json={"url": "https://a.io"})
+    assert r.status_code == 201
+
+
+def test_override_the_client(app):
+    app.dependency_overrides[current_client] = lambda: "tester"
+    r = TestClient(app).post("/links", json={"url": "https://a.io"})
+    app.dependency_overrides.clear()
+    assert r.status_code == 201
+
+
+def test_health(app):
+    client = TestClient(app)
+    assert client.get("/health/live").json() == {"status": "ok"}
+    assert client.get("/health/ready").status_code == 200
+
+
+# --- Part 3: settings and the whole service ---
+
+GOOD_ENV = {
+    "APP_DATABASE_URL": "sqlite://",
+    "APP_API_KEYS": f"tester:{hash_key(API_KEY)}",
+    "APP_RATE_LIMIT_BURST": "5",
+    "HOME": "/home/panda",
+}
+
+
+def env_with(**changes):
+    env = dict(GOOD_ENV)
+    for name, value in changes.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
+def test_settings_load_from_env():
+    settings = load_settings(GOOD_ENV)
+    assert settings.rate_limit_burst == 5
+    assert settings.cache_ttl_seconds == 60
+    assert settings.key_table() == {hash_key(API_KEY): "tester"}
+    assert "sqlite" not in repr(settings)
+
+
+# TODO 6: test_bad_config_fails_fast, parametrized with at
+#         least four bad environments (use env_with)
+
+
+@pytest.fixture
+def service_client(clock):
+    codes = iter(["abc1234", "xyz9876"])
+    app = build_app(load_settings(GOOD_ENV), clock=clock,
+                    timer=clock.time, make_code=lambda: next(codes))
+    auth = {"Authorization": f"Bearer {API_KEY}"}
+    return TestClient(app, headers=auth)
+
+
+# TODO 7: test_the_whole_service(service_client, clock):
+#         ready -> create -> follow twice -> 2 clicks ->
+#         expired after its ttl_days
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "All the tests in the editor pass, including your new ones", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 33" },
+    { name: "load_settings reads APP_* variables with the right types and defaults", check: "(s := load_settings({'APP_DATABASE_URL': 'postgresql://u:pw@db/x', 'APP_API_KEYS': 'kim:' + 'A' * 64 + ', jo:' + hash_key('j'), 'APP_CACHE_TTL_SECONDS': '30', 'APP_RATE_LIMIT_BURST': '7', 'APP_RATE_LIMIT_PER_SECOND': '0.5', 'APP_LOG_LEVEL': 'DEBUG', 'USER': 'kim'})) and s.cache_ttl_seconds == 30 and s.rate_limit_burst == 7 and s.rate_limit_per_second == 0.5 and s.log_level == 'DEBUG' and s.environment == 'dev' and s.database_url.get_secret_value() == 'postgresql://u:pw@db/x' and 'pw' not in repr(s) and s.key_table() == {'a' * 64: 'kim', hash_key('j'): 'jo'} and (d := load_settings({'APP_DATABASE_URL': 'sqlite://', 'APP_API_KEYS': 'kim:' + 'b' * 64})).cache_ttl_seconds == 60 and d.rate_limit_burst == 20 and d.rate_limit_per_second == 1 and d.log_level == 'INFO'" },
+    { name: "Bad configuration is rejected at startup", check: "[ok := {'APP_DATABASE_URL': 'sqlite://', 'APP_API_KEYS': 'kim:' + 'b' * 64}] and all(pytest.raises(ValidationError, load_settings, {**ok, **bad}) for bad in [{'APP_API_KEYS': 'kim'}, {'APP_API_KEYS': 'kim:' + 'b' * 63}, {'APP_API_KEYS': 'kim:' + 'g' * 64}, {'APP_API_KEYS': ':' + 'b' * 64}, {'APP_CACHE_TTL_SECONDS': '3601'}, {'APP_CACHE_TTL_SECONDS': '-1'}, {'APP_RATE_LIMIT_BURST': '0'}, {'APP_RATE_LIMIT_PER_SECOND': '0'}, {'APP_LOG_LEVEL': 'LOUD'}, {'APP_ENVIRONMENT': 'prod'}, {'APP_ENVIRONMENT': 'live'}, {'APP_RATELIMIT_BURST': '5'}]) and pytest.raises(ValidationError, load_settings, {'APP_API_KEYS': 'kim:' + 'b' * 64}) and load_settings({**ok, 'APP_ENVIRONMENT': 'prod', 'APP_DATABASE_URL': 'postgresql://db/x'}).environment == 'prod'" },
+    { name: "build_app wires the SQL repository, the cache, the service and the limiter from the settings", check: "[c := FakeClock(START), a := build_app(load_settings({'APP_DATABASE_URL': 'sqlite://', 'APP_API_KEYS': 'kim:' + hash_key('k'), 'APP_CACHE_TTL_SECONDS': '45', 'APP_RATE_LIMIT_BURST': '4'}), clock=c, timer=c.time, make_code=lambda: 'Kiwi777')] and isinstance(a, FastAPI) and isinstance(a.state.service, LinkService) and isinstance(a.state.service.repo, CachedLinkRepository) and a.state.service.repo.ttl == 45 and isinstance(a.state.service.repo.inner, SqlLinkRepository) and a.state.limiter.capacity == 4 and a.state.limiter.per_second == 1 and a.state.api_keys == {hash_key('k'): 'kim'} and a.state.service.clock is c" },
+    { name: "The built app creates, redirects, counts in the database, limits and expires", check: "[c := FakeClock(START), a := build_app(load_settings({'APP_DATABASE_URL': 'sqlite://', 'APP_API_KEYS': 'kim:' + hash_key('k'), 'APP_RATE_LIMIT_BURST': '1'}), clock=c, timer=c.time, make_code=lambda: 'Kiwi777'), t := TestClient(a, headers={'Authorization': 'Bearer k'}), r := t.post('/links', json={'url': 'https://kiwi.nz', 'ttl_days': 2}), r2 := t.post('/links', json={'url': 'https://kiwi.nz'}), f := t.get('/Kiwi777', follow_redirects=False)] and r.status_code == 201 and r.json()['expires_at'] == '2026-01-03T12:00:00' and r2.status_code == 429 and f.headers['location'] == 'https://kiwi.nz' and t.get('/links/Kiwi777').json()['clicks'] == 1 and (row := a.state.service.repo.inner.session_factory().get(LinkRow, 'Kiwi777')) is not None and row.clicks == 1 and [c.advance(days=2)] and t.get('/Kiwi777').status_code == 410" },
+    { name: "/health/ready answers 503 when the database fails", check: "[c := FakeClock(START), a := build_app(load_settings({'APP_DATABASE_URL': 'sqlite://', 'APP_API_KEYS': 'kim:' + hash_key('k')}), clock=c, timer=c.time), t := TestClient(a), r1 := t.get('/health/ready'), setattr(a.state.service.repo.inner, 'session_factory', lambda: 1 / 0), r2 := t.get('/health/ready')] and r1.status_code == 200 and r2.status_code == 503 and t.get('/health/live').status_code == 200" },
+    { name: "Your config tests catch a loader that accepts anything", check: "_panda_pytest(patch={'load_settings': lambda env: load_settings(GOOD_ENV)})['failed'] > _panda_pytest()['failed']" },
+    { name: "Your end-to-end test really goes through build_app", check: "(p := _panda_pytest(patch={'build_app': lambda settings, **kw: FastAPI()}))['failed'] + p['errors'] > _panda_pytest()['failed']" },
+  ]}
+>
+
+This is the whole service: your finished Part 2 plus the production wiring. Make it complete, then prove it with two more tests. `Settings` needs these fields:
+
+| Field | Type | Default | Rule |
+| --- | --- | --- | --- |
+| `environment` | `"dev"`, `"staging"` or `"prod"` | `"dev"` | |
+| `database_url` | `SecretStr` | required | |
+| `api_keys` | `str` | required | `"name:hash"` entries, comma-separated |
+| `cache_ttl_seconds` | `float` | `60` | 0 to 3600 |
+| `rate_limit_burst` | `int` | `20` | at least 1 |
+| `rate_limit_per_second` | `float` | `1` | more than 0 |
+| `log_level` | `"DEBUG"`, `"INFO"` or `"WARNING"` | `"INFO"` | |
+
+1. **`Settings`**: add the fields from the table (`model_config` is already there).
+2. A **`model_validator(mode="after")`** that calls `key_table()` and raises `ValueError` when `environment` is `"prod"` and the database URL starts with `sqlite`.
+3. **`key_table()`**: split `api_keys` on commas, strip spaces, split each entry at the first `:`. Raise `ValueError` unless the name is not empty and the hash has exactly 64 hex characters. Return `{hash in lower case: name}`.
+4. **`load_settings(env)`**: the `APP_` loader from the containers lesson.
+5. **`build_app(settings, clock, timer, make_code)`**: create the engine with `make_engine(...)` and the tables, then a `SqlLinkRepository(sessionmaker(engine))`, a `CachedLinkRepository` around it (TTL from the settings, `timer` as its clock), a `LinkService` (with `clock` and `make_code`), a `RateLimiter` (burst and rate from the settings, `timer`), and return `create_app(service, limiter, settings.key_table(), check_db=sql.ping)`.
+6. Write **`test_bad_config_fails_fast`**, parametrized with at least four broken environments built with `env_with(...)`, each expecting `ValidationError`.
+7. Write **`test_the_whole_service(service_client, clock)`**: check `/health/ready`, create a link with `ttl_days`, follow it twice (`follow_redirects=False`), see 2 clicks in the stats, advance the clock past the expiry and get **410**.
+
+<Hint>
+
+Settings is the containers-lesson pattern: `cache_ttl_seconds: float = Field(default=60, ge=0, le=3600)`, `rate_limit_burst: int = Field(default=20, ge=1)`, `rate_limit_per_second: float = Field(default=1, gt=0)`, `Literal[...]` for the two choices. `key_table` and the validator are in the first example of this part; remember that the validator must `return self`. In `build_app`, unwrap the secret with `settings.database_url.get_secret_value()`. For the config test, copy the shape of `test_bad_config_fails_fast` from the containers lesson: `{"APP_DATABASE_URL": None}` removes a variable, and `{"APP_ENVIRONMENT": "prod"}` is bad because `GOOD_ENV` uses SQLite. The `service_client` fixture's first code is `"abc1234"`.
+
+</Hint>
+
+<Solution>
+
+```python
+import hashlib
+import json
+import logging
+import math
+import secrets
+import string
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Literal, Protocol
+from urllib.parse import urlsplit
+
+import pytest
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.testclient import TestClient
+from pydantic import (
+    BaseModel, ConfigDict, Field, SecretStr, ValidationError,
+    model_validator,
+)
+from sqlalchemy import String, create_engine, text, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, sessionmaker,
+)
+from sqlalchemy.pool import StaticPool
+
+ALPHABET = string.digits + string.ascii_letters   # 62 characters
+CODE_LENGTH = 7
+RESERVED = {"docs", "redoc", "links", "health"}
+
+
+# ---------- domain ----------
+
+class LinkNotFound(Exception):
+    pass
+
+
+class LinkExpired(Exception):
+    pass
+
+
+class CodeTaken(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class ShortCode:
+    value: str
+
+    def __post_init__(self):
+        if not 4 <= len(self.value) <= 16:
+            raise ValueError("a code has 4 to 16 characters")
+        if any(ch not in ALPHABET for ch in self.value):
+            raise ValueError("a code uses only 0-9, a-z, A-Z")
+        if self.value.lower() in RESERVED:
+            raise ValueError(f"{self.value!r} is reserved")
+
+
+@dataclass(frozen=True)
+class TargetUrl:
+    value: str
+
+    def __post_init__(self):
+        clean = self.value.strip()
+        parts = urlsplit(clean)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError("only http(s) URLs with a host")
+        if len(clean) > 2048:
+            raise ValueError("URL is too long")
+        object.__setattr__(self, "value", clean)
+
+
+@dataclass
+class ShortLink:
+    code: ShortCode
+    url: TargetUrl
+    created_at: datetime
+    expires_at: datetime | None = None
+    clicks: int = 0
+
+    def is_expired(self, now: datetime) -> bool:
+        return self.expires_at is not None and now >= self.expires_at
+
+
+def random_code(length=CODE_LENGTH, choice=secrets.choice) -> str:
+    return "".join(choice(ALPHABET) for _ in range(length))
+
+
+class FakeClock:
+    """Time only moves when a test says so."""
+
+    def __init__(self, now: datetime):
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kwargs) -> None:
+        self.now += timedelta(**kwargs)
+
+    def time(self) -> float:          # seconds, like time.monotonic
+        return self.now.timestamp()
+
+
+# ---------- ports ----------
+
+class LinkRepository(Protocol):
+    def get(self, code: ShortCode) -> ShortLink | None: ...
+    def add(self, link: ShortLink) -> None: ...  # or CodeTaken
+    def record_click(self, code: ShortCode) -> None: ...
+
+
+Clock = Callable[[], datetime]
+
+
+# ---------- adapters ----------
+
+class InMemoryLinkRepository:
+    def __init__(self):
+        self._links: dict[ShortCode, ShortLink] = {}
+
+    def get(self, code):
+        link = self._links.get(code)
+        return replace(link) if link else None
+
+    def add(self, link):
+        if link.code in self._links:
+            raise CodeTaken(link.code.value)
+        self._links[link.code] = replace(link)
+
+    def record_click(self, code):
+        self._links[code].clicks += 1
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class LinkRow(Base):
+    __tablename__ = "links"
+    code: Mapped[str] = mapped_column(String(16), primary_key=True)
+    url: Mapped[str] = mapped_column(String(2048))
+    created_at: Mapped[datetime]
+    expires_at: Mapped[datetime | None]
+    clicks: Mapped[int] = mapped_column(default=0)
+
+
+class SqlLinkRepository:
+    """One short transaction per call: a link is one aggregate."""
+
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    def get(self, code):
+        with self.session_factory() as session:
+            row = session.get(LinkRow, code.value)
+            if row is None:
+                return None
+            return ShortLink(ShortCode(row.code), TargetUrl(row.url),
+                             row.created_at, row.expires_at,
+                             row.clicks)
+
+    def add(self, link):
+        with self.session_factory() as session:
+            session.add(LinkRow(
+                code=link.code.value, url=link.url.value,
+                created_at=link.created_at,
+                expires_at=link.expires_at, clicks=link.clicks,
+            ))
+            try:
+                session.commit()
+            except IntegrityError:
+                raise CodeTaken(link.code.value) from None
+
+    def record_click(self, code):
+        with self.session_factory() as session:
+            session.execute(
+                update(LinkRow)
+                .where(LinkRow.code == code.value)
+                .values(clicks=LinkRow.clicks + 1)
+            )
+            session.commit()
+
+    def ping(self) -> bool:
+        with self.session_factory() as session:
+            return session.execute(text("SELECT 1")).scalar() == 1
+
+
+class CachedLinkRepository:
+    """Cache-aside with a TTL, in front of any LinkRepository."""
+
+    def __init__(self, inner, ttl: float,
+                 clock: Callable[[], float]):
+        self.inner = inner
+        self.ttl = ttl
+        self.clock = clock
+        self.hits = 0
+        self.misses = 0
+        self._entries = {}      # code -> (link, expires_at)
+
+    def get(self, code):
+        now = self.clock()
+        entry = self._entries.get(code)
+        if entry is not None and now < entry[1]:
+            self.hits += 1
+            return replace(entry[0])
+        self.misses += 1
+        link = self.inner.get(code)
+        if link is not None:
+            self._entries[code] = (replace(link), now + self.ttl)
+        return link
+
+    def add(self, link):
+        self.inner.add(link)
+
+    def record_click(self, code):
+        self.inner.record_click(code)
+        if code in self._entries:            # keep our copy close
+            self._entries[code][0].clicks += 1
+
+
+class TokenBucket:
+    def __init__(self, capacity, per_second, clock):
+        self.capacity = capacity
+        self.per_second = per_second
+        self.clock = clock
+        self.tokens = capacity
+        self.updated = clock()
+
+    def allow(self):
+        now = self.clock()
+        earned = (now - self.updated) * self.per_second
+        self.tokens = min(self.capacity, self.tokens + earned)
+        self.updated = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+
+class RateLimiter:
+    """One token bucket per client."""
+
+    def __init__(self, capacity: int, per_second: float,
+                 clock: Callable[[], float]):
+        self.capacity = capacity
+        self.per_second = per_second
+        self.clock = clock
+        self._buckets: dict[str, TokenBucket] = {}
+
+    def allow(self, client: str) -> bool:
+        bucket = self._buckets.get(client)
+        if bucket is None:
+            bucket = TokenBucket(self.capacity, self.per_second,
+                                 self.clock)
+            self._buckets[client] = bucket
+        return bucket.allow()
+
+    @property
+    def retry_after(self) -> int:
+        return math.ceil(1 / self.per_second)
+
+
+# ---------- service ----------
+
+class LinkService:
+    def __init__(self, repo: LinkRepository, clock: Clock,
+                 make_code: Callable[[], str] = random_code,
+                 max_attempts: int = 5):
+        self.repo = repo
+        self.clock = clock
+        self.make_code = make_code
+        self.max_attempts = max_attempts
+
+    def shorten(self, url: str, alias: str | None = None,
+                ttl_days: int | None = None) -> ShortLink:
+        target = TargetUrl(url)
+        if ttl_days is not None and ttl_days < 1:
+            raise ValueError("ttl_days must be at least 1")
+        now = self.clock()
+        expires = None
+        if ttl_days:
+            expires = now + timedelta(days=ttl_days)
+        attempts = 1 if alias else self.max_attempts
+        for attempt in range(attempts):
+            code = ShortCode(alias or self.make_code())
+            link = ShortLink(code, target, now, expires)
+            try:
+                self.repo.add(link)
+                return link
+            except CodeTaken:
+                if attempt == attempts - 1:
+                    raise
+
+    def _find(self, raw_code: str) -> ShortLink:
+        try:
+            code = ShortCode(raw_code)
+        except ValueError:
+            raise LinkNotFound(raw_code) from None
+        link = self.repo.get(code)
+        if link is None:
+            raise LinkNotFound(raw_code)
+        return link
+
+    def resolve(self, raw_code: str) -> str:
+        link = self._find(raw_code)
+        if link.is_expired(self.clock()):
+            raise LinkExpired(raw_code)
+        self.repo.record_click(link.code)
+        return link.url.value
+
+    def stats(self, raw_code: str) -> ShortLink:
+        return self._find(raw_code)
+
+
+# ---------- web ----------
+
+log = logging.getLogger("pandalink")
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {"level": record.levelname, "msg": record.getMessage()}
+        entry.update(getattr(record, "fields", {}))
+        return json.dumps(entry)
+
+
+def hash_key(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode()).hexdigest()
+
+
+class LinkIn(BaseModel):
+    url: str = Field(max_length=2048)
+    alias: str | None = None
+    ttl_days: int | None = Field(default=None, ge=1, le=3650)
+
+
+class LinkOut(BaseModel):
+    code: str
+    url: str
+    clicks: int
+    created_at: datetime
+    expires_at: datetime | None
+
+
+def to_out(link: ShortLink) -> LinkOut:
+    return LinkOut(code=link.code.value, url=link.url.value,
+                   clicks=link.clicks, created_at=link.created_at,
+                   expires_at=link.expires_at)
+
+
+bearer = HTTPBearer(auto_error=False)
+
+
+def get_service(request: Request) -> LinkService:
+    return request.app.state.service
+
+
+def current_client(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> str:
+    keys = request.app.state.api_keys
+    client = keys.get(hash_key(creds.credentials)) if creds else None
+    if client is None:
+        raise HTTPException(401, "Invalid or missing API key",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return client
+
+
+def rate_limited(
+    request: Request, client: str = Depends(current_client)
+) -> str:
+    limiter = request.app.state.limiter
+    if not limiter.allow(client):
+        raise HTTPException(
+            429, "Too many requests",
+            headers={"Retry-After": str(limiter.retry_after)},
+        )
+    return client
+
+
+ServiceDep = Annotated[LinkService, Depends(get_service)]
+ClientDep = Annotated[str, Depends(current_client)]
+LimitedClientDep = Annotated[str, Depends(rate_limited)]
+
+
+def create_app(service: LinkService, limiter: RateLimiter,
+               api_keys: dict[str, str],
+               check_db: Callable[[], bool]) -> FastAPI:
+    app = FastAPI(title="PandaLink")
+    app.state.service = service
+    app.state.limiter = limiter
+    app.state.api_keys = api_keys       # sha256 hash -> client
+
+    @app.get("/health/live")
+    def live():
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def ready():
+        try:
+            ok = check_db()
+        except Exception:
+            ok = False
+        if not ok:
+            return JSONResponse(
+                {"status": "unavailable"}, status_code=503
+            )
+        return {"status": "ok"}
+
+    @app.post("/links", status_code=201, response_model=LinkOut)
+    def create_link(body: LinkIn, links: ServiceDep,
+                    client: LimitedClientDep):
+        try:
+            link = links.shorten(body.url, body.alias, body.ttl_days)
+        except CodeTaken:
+            raise HTTPException(409, "That code is taken")
+        except ValueError as error:
+            raise HTTPException(422, str(error))
+        log.info("link created", extra={"fields": {
+            "code": link.code.value, "client": client}})
+        return to_out(link)
+
+    @app.get("/links/{code}", response_model=LinkOut)
+    def link_stats(code: str, links: ServiceDep, client: ClientDep):
+        try:
+            return to_out(links.stats(code))
+        except LinkNotFound:
+            raise HTTPException(404, "Link not found")
+
+    @app.get("/{code}")
+    def follow(code: str, links: ServiceDep):
+        try:
+            url = links.resolve(code)
+        except LinkNotFound:
+            raise HTTPException(404, "Link not found")
+        except LinkExpired:
+            raise HTTPException(410, "Link expired")
+        log.info("redirect", extra={"fields": {"code": code}})
+        return RedirectResponse(url, status_code=307)
+
+    return app
+
+
+# ---------- settings + composition root ----------
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    database_url: SecretStr
+    api_keys: str                    # "name:sha256hex,name:..."
+    cache_ttl_seconds: float = Field(default=60, ge=0, le=3600)
+    rate_limit_burst: int = Field(default=20, ge=1)
+    rate_limit_per_second: float = Field(default=1, gt=0)
+    log_level: Literal["DEBUG", "INFO", "WARNING"] = "INFO"
+
+    @model_validator(mode="after")
+    def check(self):
+        self.key_table()             # malformed keys: fail fast
+        url = self.database_url.get_secret_value()
+        if self.environment == "prod" and url.startswith("sqlite"):
+            raise ValueError("prod needs a real database")
+        return self
+
+    def key_table(self) -> dict[str, str]:
+        table = {}
+        for entry in self.api_keys.split(","):
+            name, _, digest = entry.strip().partition(":")
+            if not name or len(digest) != 64 or any(
+                ch not in string.hexdigits for ch in digest
+            ):
+                raise ValueError(f"bad API key entry for {name!r}")
+            table[digest.lower()] = name
+        return table
+
+
+def load_settings(env: Mapping[str, str]) -> Settings:
+    values = {
+        name.removeprefix("APP_").lower(): value
+        for name, value in env.items()
+        if name.startswith("APP_")
+    }
+    return Settings.model_validate(values)
+
+
+def make_engine(url: str):
+    if url == "sqlite://":          # in memory: one shared connection
+        return create_engine(
+            url, poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+    return create_engine(url, pool_pre_ping=True)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def build_app(settings: Settings, clock: Clock = utc_now,
+              timer: Callable[[], float] = time.monotonic,
+              make_code: Callable[[], str] = random_code) -> FastAPI:
+    """The composition root: the one place that wires it all."""
+    engine = make_engine(settings.database_url.get_secret_value())
+    Base.metadata.create_all(engine)   # real projects: Alembic
+    sql = SqlLinkRepository(sessionmaker(engine))
+    repo = CachedLinkRepository(sql, settings.cache_ttl_seconds,
+                                timer)
+    service = LinkService(repo, clock, make_code)
+    limiter = RateLimiter(settings.rate_limit_burst,
+                          settings.rate_limit_per_second, timer)
+    return create_app(service, limiter, settings.key_table(),
+                      check_db=sql.ping)
+
+
+# ---------- tests ----------
+
+START = datetime(2026, 1, 1, 12, 0)
+API_KEY = "test-key-123"
+
+
+@pytest.fixture
+def clock():
+    return FakeClock(START)
+
+
+@pytest.fixture
+def links(clock):
+    codes = iter(["abc1234", "abc1234", "xyz9876", "Qq77777"])
+    return LinkService(InMemoryLinkRepository(), clock,
+                       make_code=lambda: next(codes))
+
+
+@pytest.mark.parametrize("raw", ["abc", "a" * 17, "ab-cd", "Docs"])
+def test_bad_codes_are_rejected(raw):
+    with pytest.raises(ValueError):
+        ShortCode(raw)
+
+
+@pytest.mark.parametrize("raw", [
+    "example.com", "ftp://example.com", "javascript:alert(1)",
+    "https://", "https://x.io/" + "a" * 2048,
+])
+def test_bad_urls_are_rejected(raw):
+    with pytest.raises(ValueError):
+        TargetUrl(raw)
+
+
+def test_shorten_then_resolve(links):
+    link = links.shorten(" https://pandas.org/bamboo ")
+    assert link.code == ShortCode("abc1234")
+    assert link.created_at == START
+    assert links.resolve("abc1234") == "https://pandas.org/bamboo"
+
+
+def test_a_taken_code_is_retried(links):
+    links.shorten("https://pandas.org/a")
+    second = links.shorten("https://pandas.org/b")
+    assert second.code.value == "xyz9876"
+
+
+def test_custom_alias(links):
+    links.shorten("https://pandas.org", alias="pandas")
+    assert links.resolve("pandas") == "https://pandas.org"
+    with pytest.raises(CodeTaken):
+        links.shorten("https://other.org", alias="pandas")
+
+
+@pytest.mark.parametrize("raw", ["nope1234", "no", "bad code!"])
+def test_unknown_codes(links, raw):
+    with pytest.raises(LinkNotFound):
+        links.resolve(raw)
+
+
+def test_resolve_counts_clicks(links):
+    links.shorten("https://pandas.org")
+    for _ in range(3):
+        links.resolve("abc1234")
+    assert links.stats("abc1234").clicks == 3
+
+
+def test_expired_links_are_gone(links, clock):
+    links.shorten("https://pandas.org", ttl_days=30)
+    clock.advance(days=29, hours=23)
+    assert links.resolve("abc1234") == "https://pandas.org"
+    clock.advance(hours=1)
+    with pytest.raises(LinkExpired):
+        links.resolve("abc1234")
+
+
+# --- Part 2: adapters and API ---
+
+def sql_repo():
+    engine = create_engine(
+        "sqlite://", poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    return SqlLinkRepository(sessionmaker(engine))
+
+
+@pytest.fixture(params=["memory", "sql"])
+def repo(request):
+    if request.param == "memory":
+        return InMemoryLinkRepository()
+    return sql_repo()
+
+
+def test_repository_contract(repo):
+    link = ShortLink(ShortCode("abcd"), TargetUrl("https://a.io"),
+                     START, START + timedelta(days=1))
+    repo.add(link)
+    assert repo.get(ShortCode("abcd")) == link
+    assert repo.get(ShortCode("zzzz")) is None
+    with pytest.raises(CodeTaken):
+        repo.add(link)
+    repo.record_click(ShortCode("abcd"))
+    assert repo.get(ShortCode("abcd")).clicks == 1
+
+
+def test_cache_aside_with_ttl(clock):
+    inner = InMemoryLinkRepository()
+    cache = CachedLinkRepository(inner, ttl=60, clock=clock.time)
+    code = ShortCode("abcd")
+    inner.add(ShortLink(code, TargetUrl("https://a.io"), START))
+    assert cache.get(code).url.value == "https://a.io"
+    cache.record_click(code)
+    clock.advance(seconds=59)
+    assert cache.get(code).clicks == 1
+    assert (cache.hits, cache.misses) == (1, 1)
+    clock.advance(seconds=1)
+    cache.get(code)
+    assert (cache.hits, cache.misses) == (1, 2)
+
+
+def test_rate_limiter_per_client(clock):
+    limiter = RateLimiter(capacity=2, per_second=0.5,
+                          clock=clock.time)
+    assert [limiter.allow("mei") for _ in range(3)] == [
+        True, True, False]
+    assert limiter.allow("kai")
+    clock.advance(seconds=2)
+    assert limiter.allow("mei")
+
+
+@pytest.fixture
+def app(clock):
+    codes = iter(["abc1234", "xyz9876", "Qq77777", "Pp55555"])
+    repo = CachedLinkRepository(sql_repo(), ttl=60,
+                                clock=clock.time)
+    service = LinkService(repo, clock, lambda: next(codes))
+    limiter = RateLimiter(capacity=3, per_second=0.5,
+                          clock=clock.time)
+    return create_app(service, limiter,
+                      {hash_key(API_KEY): "tester"},
+                      check_db=lambda: True)
+
+
+@pytest.fixture
+def client(app):
+    auth = {"Authorization": f"Bearer {API_KEY}"}
+    return TestClient(app, headers=auth)
+
+
+def test_create_follow_and_stats(client):
+    r = client.post("/links", json={"url": "https://pandas.org"})
+    assert r.status_code == 201
+    assert r.json()["code"] == "abc1234"
+    r = client.get("/abc1234", follow_redirects=False)
+    assert r.status_code == 307
+    assert r.headers["location"] == "https://pandas.org"
+    stats = client.get("/links/abc1234").json()
+    assert stats["clicks"] == 1
+    assert stats["created_at"] == "2026-01-01T12:00:00"
+
+
+def test_api_errors(client, clock):
+    client.post("/links", json={"url": "https://a.io",
+                                "alias": "bamboo", "ttl_days": 1})
+    r = client.post("/links", json={"url": "https://b.io",
+                                    "alias": "bamboo"})
+    assert r.status_code == 409
+    r = client.post("/links", json={"url": "nope"})
+    assert r.status_code == 422
+    assert client.get("/links/zzzz").status_code == 404
+    assert client.get("/zzzzzz").status_code == 404
+    clock.advance(days=1)
+    assert client.get("/bamboo").status_code == 410
+
+
+def test_api_key_required(app):
+    anonymous = TestClient(app)
+    r = anonymous.post("/links", json={"url": "https://a.io"})
+    assert r.status_code == 401
+    wrong = {"Authorization": "Bearer nope"}
+    assert anonymous.get("/links/abc1234",
+                         headers=wrong).status_code == 401
+
+
+def test_rate_limit(client, clock):
+    for _ in range(3):
+        r = client.post("/links", json={"url": "https://a.io"})
+        assert r.status_code == 201
+    r = client.post("/links", json={"url": "https://a.io"})
+    assert r.status_code == 429
+    assert r.headers["retry-after"] == "2"
+    clock.advance(seconds=2)
+    r = client.post("/links", json={"url": "https://a.io"})
+    assert r.status_code == 201
+
+
+def test_override_the_client(app):
+    app.dependency_overrides[current_client] = lambda: "tester"
+    r = TestClient(app).post("/links", json={"url": "https://a.io"})
+    app.dependency_overrides.clear()
+    assert r.status_code == 201
+
+
+def test_health(app):
+    client = TestClient(app)
+    assert client.get("/health/live").json() == {"status": "ok"}
+    assert client.get("/health/ready").status_code == 200
+
+
+# --- Part 3: settings and the whole service ---
+
+GOOD_ENV = {
+    "APP_DATABASE_URL": "sqlite://",
+    "APP_API_KEYS": f"tester:{hash_key(API_KEY)}",
+    "APP_RATE_LIMIT_BURST": "5",
+    "HOME": "/home/panda",
+}
+
+
+def env_with(**changes):
+    env = dict(GOOD_ENV)
+    for name, value in changes.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
+def test_settings_load_from_env():
+    settings = load_settings(GOOD_ENV)
+    assert settings.rate_limit_burst == 5
+    assert settings.cache_ttl_seconds == 60
+    assert settings.key_table() == {hash_key(API_KEY): "tester"}
+    assert "sqlite" not in repr(settings)
+
+
+@pytest.mark.parametrize("changes", [
+    {"APP_DATABASE_URL": None},
+    {"APP_API_KEYS": "tester:not-a-hash"},
+    {"APP_API_KEYS": f":{hash_key('x')}"},
+    {"APP_RATE_LIMIT_BURST": "0"},
+    {"APP_ENVIRONMENT": "prod"},
+    {"APP_CACHE_TTL": "60"},
+])
+def test_bad_config_fails_fast(changes):
+    with pytest.raises(ValidationError):
+        load_settings(env_with(**changes))
+
+
+@pytest.fixture
+def service_client(clock):
+    codes = iter(["abc1234", "xyz9876"])
+    app = build_app(load_settings(GOOD_ENV), clock=clock,
+                    timer=clock.time, make_code=lambda: next(codes))
+    auth = {"Authorization": f"Bearer {API_KEY}"}
+    return TestClient(app, headers=auth)
+
+
+def test_the_whole_service(service_client, clock):
+    c = service_client
+    assert c.get("/health/ready").json() == {"status": "ok"}
+    r = c.post("/links", json={"url": "https://pandas.org",
+                               "ttl_days": 7})
+    assert r.status_code == 201
+    for _ in range(2):
+        r = c.get("/abc1234", follow_redirects=False)
+        assert r.headers["location"] == "https://pandas.org"
+    assert c.get("/links/abc1234").json()["clicks"] == 2
+    clock.advance(days=7)
+    assert c.get("/abc1234").status_code == 410
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- **Validated settings** from `APP_*` variables: a secret database URL, hashed API keys with names, cache and rate-limit tuning, and rules that refuse to start a broken or unsafe configuration.
+- A **composition root**, `build_app`, that wires settings → engine → SQL repository → cache → service → app, with production defaults and test seams for time and randomness, and a three-line `main.py` for uvicorn.
+- The delivery pipeline: a **non-root Docker image**, **Compose** with PostgreSQL, Redis and migrations, and **CI** that tests against SQLite and a real PostgreSQL before building an image tagged with the commit.
+- A plan for running it: **RED metrics**, cache and 429 dashboards, an **SLO** with an error-budget alert, a **Locust** load test and a **production checklist**.
+- And the finished service itself: about 35 tests covering the domain, both repositories, the cache, the limiter, every endpoint, the settings and the whole wired app, running in well under a second.
+
+## Take it further
+
+PandaLink is a real foundation. Some directions that would each teach you something new:
+
+1. **Go shared**: move the cache and the rate limiter to Redis as shown above, test them with `fakeredis`, and add a short negative-cache TTL against scanners.
+2. **Count clicks asynchronously**: instead of an `UPDATE` per redirect, push a click event to a queue (or Redis `INCR`) and let a background worker write the totals in batches. Redirects get faster, and you can add analytics like countries and referrers.
+3. **Owners and deletion**: store which client created each link, let clients list and delete only their own links, and write the test that proves client A can't read client B's stats (the ownership check from Auth for APIs).
+4. **Safety checks**: before accepting a URL, ask a malware-scanning API whether it's safe. It's an outgoing call, so wrap it in a timeout, retries with backoff and a circuit breaker, and decide what the graceful degradation should be when the scanner is down.
+5. **Deploy it for real** on a platform like Fly.io, Render or a small Kubernetes cluster, with a managed PostgreSQL, and practise a canary release and a rollback.
+
+## Congratulations! 🎉🐼
+
+You've finished the **whole PandaDev Python course**, all four levels. Think back to where you started: `print("Hello")`, variables and your first `if`. Since then you've written functions and classes, built a text adventure and an expense tracker, tested with pytest, built APIs with FastAPI and SQLAlchemy, written async code, analysed real data with pandas, looked inside the interpreter, profiled and optimised, designed clean architectures, secured and deployed services, and reasoned about systems that serve millions of requests. And now you've designed, built, tested and planned the launch of a production service from a blank page.
+
+That's not a beginner's toolkit any more: it's the toolkit of a senior Python engineer. The most important skills from here are the ones no course can finish for you: reading other people's code, shipping small things often, learning from every incident, and helping the people around you grow. Build something you care about, put it in front of real users, and keep going. We're proud of you. 💚

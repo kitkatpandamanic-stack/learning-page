@@ -224,4 +224,15 @@ describe("executePython with packages", () => {
     expect(r.output[0].image).toMatch(/^data:image\/png;base64,/);
     expect(r.output[1].text).toBe("done");
   }, 60_000);
+
+  it("starts every run with fresh logging", async () => {
+    const setup = [
+      "import logging, sys",
+      'logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)',
+      'logging.info("first")',
+    ].join("\n");
+    expect(texts(await executePython(py, setup))).toEqual(["first"]);
+    const again = await executePython(py, setup.replace("first", "second"));
+    expect(texts(again)).toEqual(["second"]);
+  });
 });
