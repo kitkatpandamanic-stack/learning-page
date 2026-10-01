@@ -8,27 +8,27 @@ testimonials, CTA banner). It adds **glassmorphism** and a **brighter, neon-styl
 
 ## 1. Tech stack (Option B: Next.js full-stack)
 
-| Area                          | Choice                                              | Why                                                                    |
-| ----------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------- |
-| Framework                     | **Next.js 16 (App Router) + React 19 + TypeScript** | Frontend and backend in one project, server rendering for SEO          |
-| Styling                       | **Tailwind CSS v4**                                 | Utility classes, `backdrop-blur` for glass, design tokens via `@theme` |
-| Components                    | **shadcn/ui** (Radix UI underneath)                 | Accessible components copied into the repo and restyled to glass       |
-| Animation                     | **Framer Motion** + **GSAP** (ScrollTrigger)        | UI motion, plus scroll-driven effects on the landing page              |
-| 3D hero                       | **Spline** (`@splinetool/react-spline`)             | Glowing orb designed visually; fallback: React Three Fiber             |
-| Icons                         | **Lucide React**                                    | Line icons that match the design                                       |
-| Lesson content                | **MDX + Velite**                                    | Lessons as Markdown files, validated and typed at build time           |
-| Syntax highlighting           | **Shiki** (via `rehype-pretty-code`)                | VS Code-quality highlighting, rendered on the server                   |
-| Code editor                   | **CodeMirror 6** (`@uiw/react-codemirror`)          | Lightweight, works well on mobile                                      |
-| Run code: JS/TS               | **Sandpack**                                        | In-browser bundler, instant feedback                                   |
-| Run code: all other languages | **Judge0** (through our own `/api/run` route)       | Python, Java, C#, Go, Rust, C++… executed on a server                  |
-| Database                      | **PostgreSQL on Neon** + **Drizzle ORM**            | Serverless Postgres with type-safe queries                             |
-| Auth                          | **Auth.js** (NextAuth v5)                           | Sign in with GitHub or Google                                          |
-| Server data                   | **TanStack Query** + Server Actions                 | Fetching, caching and saving progress                                  |
-| Client state                  | **Zustand**                                         | Small UI state (editor, panels, quiz)                                  |
-| Charts                        | **Tremor**                                          | Dashboard cards and charts                                             |
-| Validation                    | **Zod**                                             | Shared schemas for forms, API and content                              |
-| Quality                       | **ESLint, Prettier, Vitest, Playwright**            | Linting, formatting, unit and end-to-end tests                         |
-| Hosting                       | **Vercel** (+ Vercel Analytics)                     | Auto-deploys on every push to `main`                                   |
+| Area                          | Choice                                              | Why                                                                                          |
+| ----------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Framework                     | **Next.js 16 (App Router) + React 19 + TypeScript** | Frontend and backend in one project, server rendering for SEO                                |
+| Styling                       | **Tailwind CSS v4**                                 | Utility classes, `backdrop-blur` for glass, design tokens via `@theme`                       |
+| Components                    | **shadcn/ui** (Radix UI underneath)                 | Accessible components copied into the repo and restyled to glass                             |
+| Animation                     | **Motion** (Framer Motion)                          | Entrance, scroll-reveal and hover animations (GSAP only if a heavier scroll effect needs it) |
+| 3D hero                       | **React Three Fiber** (three.js)                    | Glowing particle orb written in code with custom shaders                                     |
+| Icons                         | **Lucide React**                                    | Line icons that match the design                                                             |
+| Lesson content                | **MDX + Velite**                                    | Lessons as Markdown files, validated and typed at build time                                 |
+| Syntax highlighting           | **Shiki** (via `rehype-pretty-code`)                | VS Code-quality highlighting, rendered on the server                                         |
+| Code editor                   | **CodeMirror 6** (`@uiw/react-codemirror`)          | Lightweight, works well on mobile                                                            |
+| Run code: JS/TS               | **Sandpack**                                        | In-browser bundler, instant feedback                                                         |
+| Run code: all other languages | **Judge0** (through our own `/api/run` route)       | Python, Java, C#, Go, Rust, C++… executed on a server                                        |
+| Database                      | **PostgreSQL on Neon** + **Drizzle ORM**            | Serverless Postgres with type-safe queries                                                   |
+| Auth                          | **Auth.js** (NextAuth v5)                           | Sign in with GitHub or Google                                                                |
+| Server data                   | **TanStack Query** + Server Actions                 | Fetching, caching and saving progress                                                        |
+| Client state                  | **Zustand**                                         | Small UI state (editor, panels, quiz)                                                        |
+| Charts                        | **Recharts**                                        | Dashboard charts (Tremor does not support React 19 yet)                                      |
+| Validation                    | **Zod**                                             | Shared schemas for forms, API and content                                                    |
+| Quality                       | **ESLint, Prettier, Vitest, Playwright**            | Linting, formatting, unit and end-to-end tests                                               |
+| Hosting                       | **Vercel** (+ Vercel Analytics)                     | Auto-deploys on every push to `main`                                                         |
 
 ---
 
@@ -138,15 +138,15 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 4. PandaDev logo (SVG)
 5. Glass `Navbar` (sticky, with a mobile menu) and `Footer`
 
-### Phase 2: Landing page
+### Phase 2: Landing page ✅
 
 1. Hero with the 3D orb and floating glass chips
 2. Languages grid
 3. "Zero → Senior" level track
-4. Dashboard preview (Tremor)
+4. Dashboard preview (Recharts)
 5. Testimonials
 6. CTA banner
-7. Scroll and hover animations (Framer Motion + GSAP)
+7. Scroll and hover animations (Motion)
 8. Mobile layout, Lighthouse check, deploy
 
 ### Phase 3: Content system & catalog
@@ -183,7 +183,7 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 
 1. Server Actions to save progress, with TanStack Query on the client
 2. XP, user levels, daily streaks, achievement badges
-3. `/dashboard` with Tremor charts (activity, per-language progress)
+3. `/dashboard` with Recharts charts (activity, per-language progress)
 4. `/profile` page
 
 ### Phase 8: Content & launch
