@@ -157,7 +157,7 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 4. `/languages/[lang]` visual roadmap (levels → modules → lessons)
 5. Static generation, SEO metadata, sitemap
 
-### Phase 4: Lesson player
+### Phase 4: Lesson player ✅
 
 1. Lesson layout: module sidebar, content, table of contents, prev/next
 2. Shiki code blocks with a copy button

@@ -1,3 +1,5 @@
+import rehypePrettyCode, { type Options } from "rehype-pretty-code";
+import rehypeSlug from "rehype-slug";
 import { defineCollection, defineConfig, s } from "velite";
 
 import { languages } from "./src/lib/languages";
@@ -8,6 +10,13 @@ import { languages } from "./src/lib/languages";
  *   content/courses/<language>/course.yml            levels → modules outline
  *   content/courses/<language>/<module>/<NN-slug>.mdx lessons, ordered by NN
  */
+
+const prettyCode: Options = {
+  theme: "tokyo-night",
+  // Background comes from our glass code block styles
+  keepBackground: false,
+  defaultLang: { block: "text", inline: "text" },
+};
 
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
@@ -84,6 +93,9 @@ export default defineConfig({
     clean: true,
   },
   collections: { courses, lessons },
+  mdx: {
+    rehypePlugins: [rehypeSlug, [rehypePrettyCode, prettyCode]],
+  },
   // Cross-file checks that a single schema can't express. Any problem fails the build.
   prepare: ({ courses, lessons }) => {
     const problems: string[] = [];

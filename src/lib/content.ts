@@ -75,3 +75,29 @@ export function getCourseStats(language: string): CourseStats | undefined {
 export function getAllLessons() {
   return lessons;
 }
+
+/** A lesson plus where it sits in its course: level, module, neighbours and position. */
+export function getLessonContext(language: string, slug: string) {
+  const course = getCourse(language);
+  if (!course) return undefined;
+
+  const ordered = course.levels.flatMap((level) =>
+    level.modules.flatMap((module) =>
+      module.lessons.map((lesson) => ({ lesson, module, level })),
+    ),
+  );
+  const index = ordered.findIndex((entry) => entry.lesson.slug === slug);
+  if (index === -1) return undefined;
+
+  const { lesson, module, level } = ordered[index];
+  return {
+    lesson,
+    module,
+    level,
+    levels: course.levels,
+    prev: ordered[index - 1]?.lesson,
+    next: ordered[index + 1]?.lesson,
+    position: index + 1,
+    total: ordered.length,
+  };
+}
