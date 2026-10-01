@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import { SpaceBackground } from "@/components/layout/space-background";
 import { MotionProvider } from "@/components/motion/motion-provider";
+import { siteUrl } from "@/lib/site";
 import "./globals.css";
 
 const jakarta = Plus_Jakarta_Sans({
@@ -15,12 +16,14 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL(siteUrl),
   title: {
     default: "PandaDev: Learn to code from Zero to Senior",
     template: "%s · PandaDev",
   },
   description:
     "Learn programming languages step by step, from your first line of code to senior level, with interactive lessons, exercises and projects.",
+  openGraph: { siteName: "PandaDev", type: "website" },
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

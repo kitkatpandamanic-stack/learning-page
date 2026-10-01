@@ -149,7 +149,7 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 7. Scroll and hover animations (Motion)
 8. Mobile layout, Lighthouse check, deploy
 
-### Phase 3: Content system & catalog
+### Phase 3: Content system & catalog ✅
 
 1. Velite config with Zod schemas for language, level, module and lesson
 2. `content/` folder with sample MDX

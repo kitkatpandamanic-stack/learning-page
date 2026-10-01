@@ -1,7 +1,6 @@
 "use client";
 
 import { motion } from "motion/react";
-import { Crown, Rocket, Sprout, Wrench, type LucideIcon } from "lucide-react";
 import { cn } from "cn";
 
 import { Reveal } from "@/components/motion/reveal";
@@ -9,64 +8,8 @@ import { Container } from "@/components/ui/container";
 import { GlassCard } from "@/components/ui/glass-card";
 import { GradientText } from "@/components/ui/gradient-text";
 import { SectionHeading } from "@/components/ui/section-heading";
-import { toneClasses, type Tone } from "@/lib/tones";
-
-const levels: {
-  level: number;
-  name: string;
-  tagline: string;
-  icon: LucideIcon;
-  tone: Tone;
-  topics: string[];
-}[] = [
-  {
-    level: 0,
-    name: "Beginner",
-    tagline: "Your first lines of code",
-    icon: Sprout,
-    tone: "lime",
-    topics: [
-      "Variables & types",
-      "Conditions & loops",
-      "Functions",
-      "First mini-games",
-    ],
-  },
-  {
-    level: 1,
-    name: "Junior",
-    tagline: "Build real things",
-    icon: Wrench,
-    tone: "cyan",
-    topics: [
-      "Data structures",
-      "OOP & modules",
-      "Errors & debugging",
-      "Git & tooling",
-    ],
-  },
-  {
-    level: 2,
-    name: "Middle",
-    tagline: "Work like a pro",
-    icon: Rocket,
-    tone: "violet",
-    topics: ["Async & APIs", "Testing", "Design patterns", "Databases"],
-  },
-  {
-    level: 3,
-    name: "Senior",
-    tagline: "Lead and architect",
-    icon: Crown,
-    tone: "amber",
-    topics: [
-      "System design",
-      "Performance",
-      "Security",
-      "Code review & mentoring",
-    ],
-  },
-];
+import { levels } from "@/lib/levels";
+import { toneClasses } from "@/lib/tones";
 
 export function RoadmapSection() {
   return (
