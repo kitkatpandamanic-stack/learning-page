@@ -113,7 +113,10 @@ duplicate slugs fail the build with a clear message. New languages must also be 
 
 The site is hosted on [Vercel](https://vercel.com) and connected to this GitHub repo:
 every push to `main` deploys to production, and other branches get preview deployments.
-Vercel runs `npm run build` (Velite, then Next.js) on Node 24.
+Vercel runs `npm run vercel-build` on Node 24: Velite, then **all tests**, then Next.js.
+If a test fails, the deployment fails and the current version stays live. GitHub
+Actions (`.github/workflows/ci.yml`) also checks formatting, lint, types, tests and the
+build on every push and pull request.
 
 Production environment variables (Vercel → Project → Settings → Environment Variables):
 
