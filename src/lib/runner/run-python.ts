@@ -1,17 +1,19 @@
 import type { OutputLine, TestSpec } from "./execute";
-import { parsePythonResult } from "./execute-python";
+import { parsePythonResult, pythonLine } from "./execute-python";
 import { pythonWorkerSource } from "./python-worker-source";
 import type { RunResult, RunStatus } from "./run-code";
 
 type PythonMessage =
   | { type: "ready" }
   | { type: "load-error"; message: string }
+  | { type: "installing"; id: number; packages: string }
   | { type: "started"; id: number }
-  | { type: "line"; id: number; line: OutputLine }
+  | { type: "line"; id: number; level: string; text: string }
   | { type: "done"; id: number; raw: string };
 
 export const PYTHON_RUN_TIMEOUT_MS = 5000;
-// Pyodide is about 10 MB; give slow mobile connections time to download it.
+// Pyodide is about 10 MB (pandas about 15 MB more); give slow mobile
+// connections time to download it.
 const LOAD_TIMEOUT_MS = 120_000;
 
 /**
@@ -76,7 +78,7 @@ export function runPython(
     tests?: TestSpec[];
     timeoutMs?: number;
     onLine?: (line: OutputLine) => void;
-    onStatus?: (status: RunStatus) => void;
+    onStatus?: (status: RunStatus, detail?: string) => void;
   } = {},
 ): { result: Promise<RunResult>; cancel: () => void } {
   const {
@@ -87,7 +89,7 @@ export function runPython(
   } = options;
   const id = nextId++;
   const lines: OutputLine[] = [];
-  const started = performance.now();
+  let started = performance.now();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let finish: (r: RunResult) => void = () => {};
 
@@ -138,7 +140,21 @@ export function runPython(
   }
 
   handlers.set(id, (message) => {
-    if (message.type === "started") {
+    if (message.type === "installing") {
+      onStatus?.("installing", message.packages);
+      clearTimeout(timer);
+      timer = setTimeout(
+        () =>
+          finish(
+            stopped(
+              "Python packages took too long to download. Check your connection and try again.",
+              true,
+            ),
+          ),
+        LOAD_TIMEOUT_MS,
+      );
+    } else if (message.type === "started") {
+      started = performance.now(); // downloads don't count as running time
       onStatus?.("running");
       clearTimeout(timer);
       timer = setTimeout(
@@ -152,8 +168,9 @@ export function runPython(
         timeoutMs,
       );
     } else if (message.type === "line") {
-      lines.push(message.line);
-      onLine?.(message.line);
+      const line = pythonLine(message.level, message.text);
+      lines.push(line);
+      onLine?.(line);
     } else if (message.type === "done") {
       finish({
         ...parsePythonResult(message.raw, tests ?? [], lines),

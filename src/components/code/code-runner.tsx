@@ -115,6 +115,8 @@ export function CodeRunner({
   const [check, setCheck] = React.useState<Check | null>(null);
   const [running, setRunning] = React.useState(false);
   const [status, setStatus] = React.useState<RunStatus | null>(null);
+  // Packages being installed, e.g. "pandas, numpy"
+  const [installing, setInstalling] = React.useState("");
   const cancelRef = React.useRef<(() => void) | null>(null);
   const previewRef = React.useRef<HTMLDivElement>(null);
   const previewRun = React.useRef<DomRun | null>(null);
@@ -234,7 +236,10 @@ export function CodeRunner({
       language,
       tests: withChecks ? tests : undefined,
       onLine: (line) => setLines((prev) => [...prev, line]),
-      onStatus: setStatus,
+      onStatus: (next, detail) => {
+        setStatus(next);
+        setInstalling(detail ?? "");
+      },
     });
     cancelRef.current = cancel;
     const res = await pending;
@@ -367,7 +372,9 @@ export function CodeRunner({
               <Loader2 className="size-3 animate-spin" />{" "}
               {status === "loading"
                 ? t("loading", { language: languageLabel[language] })
-                : t("running")}
+                : status === "installing"
+                  ? t("installing", { packages: installing })
+                  : t("running")}
             </span>
           ) : (
             result && (
@@ -380,17 +387,31 @@ export function CodeRunner({
         <div
           role="log"
           aria-live="polite"
-          className="max-h-64 overflow-y-auto font-mono text-sm leading-relaxed"
+          className={cn(
+            "overflow-y-auto font-mono text-sm leading-relaxed",
+            lines.some((line) => line.image) ? "max-h-[32rem]" : "max-h-64",
+          )}
         >
           {lines.length > 0 ? (
-            lines.map((line, i) => (
-              <pre
-                key={i}
-                className={cn("whitespace-pre-wrap", lineStyle[line.level])}
-              >
-                {localizeRunnerText(line.text, t)}
-              </pre>
-            ))
+            lines.map((line, i) =>
+              line.image ? (
+                // A data: URL chart from matplotlib; next/image can't help here.
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  key={i}
+                  src={line.image}
+                  alt={t("chartAlt")}
+                  className="my-2 max-w-full rounded-lg bg-white"
+                />
+              ) : (
+                <pre
+                  key={i}
+                  className={cn("whitespace-pre-wrap", lineStyle[line.level])}
+                >
+                  {localizeRunnerText(line.text, t)}
+                </pre>
+              ),
+            )
           ) : (
             <p className="text-white/55">
               {result ? t("noOutput") : t("pressRun")}

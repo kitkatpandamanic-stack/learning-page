@@ -20,6 +20,9 @@ import { typeErrorResult } from "@/lib/runner/typecheck";
 import { runDomInNode } from "./node-dom";
 import { checkTypes } from "./node-typecheck";
 
+/** The first lesson that imports pandas or FastAPI downloads it (cached after). */
+const PACKAGE_TIMEOUT_MS = 120_000;
+
 let pyodide: PyodideInterface;
 beforeAll(async () => {
   pyodide = await loadPyodide();
@@ -175,8 +178,13 @@ describe("interactive exercises", () => {
         "the starter code should not already pass",
       ).toBe(false);
     },
+    PACKAGE_TIMEOUT_MS,
   );
 });
+
+/** pytest says how long tests took ("3 passed in 0.02s"), which varies. */
+const steadyTimes = (text: string) =>
+  text.replace(/ in \d+\.\d+s\b/g, " in 0.01s");
 
 describe("Code + Output examples", () => {
   const examples = files.flatMap((file) => {
@@ -201,11 +209,13 @@ describe("Code + Output examples", () => {
     async (_name, ex) => {
       const result = await run(ex.code, ex.language);
       const got = result.output
+        .filter((l) => !l.image)
         .map((l) => l.text)
         .join("\n")
         .trim();
-      expect(got).toBe(ex.expected);
+      expect(steadyTimes(got)).toBe(steadyTimes(ex.expected));
     },
+    PACKAGE_TIMEOUT_MS,
   );
 });
 

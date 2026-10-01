@@ -31,6 +31,7 @@ const rules: [RegExp, (t: T, m: RegExpExecArray) => string][] = [
   ],
   [/^Python was restarted\./, (t) => t("pythonRestarted")],
   [/^Python took too long to load\./, (t) => t("pythonSlow")],
+  [/^Python packages took too long to download\./, (t) => t("packagesSlow")],
   [
     /^Python couldn't load: ([\s\S]*)$/,
     (t, m) => t("pythonFailed", { error: m[1] }),

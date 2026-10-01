@@ -20,15 +20,18 @@ export type RunResult = ExecuteResult & {
 
 export const RUN_TIMEOUT_MS = 3000;
 
-/** "loading" while Python or the TypeScript checker downloads the first time */
-export type RunStatus = "loading" | "running";
+/**
+ * "loading" while Python or the TypeScript checker downloads the first time,
+ * "installing" while Python downloads packages the code imports.
+ */
+export type RunStatus = "loading" | "installing" | "running";
 
 type RunOptions = {
   language?: RunLanguage;
   tests?: TestSpec[];
   timeoutMs?: number;
   onLine?: (line: OutputLine) => void;
-  onStatus?: (status: RunStatus) => void;
+  onStatus?: (status: RunStatus, detail?: string) => void;
 };
 
 type Run = { result: Promise<RunResult>; cancel: () => void };

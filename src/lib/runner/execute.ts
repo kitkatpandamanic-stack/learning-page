@@ -4,7 +4,12 @@ import { formatArgs } from "./format";
 
 export type RunLanguage = "javascript" | "typescript" | "python";
 export type LogLevel = "log" | "info" | "warn" | "error";
-export type OutputLine = { level: LogLevel; text: string };
+export type OutputLine = {
+  level: LogLevel;
+  text: string;
+  /** A chart drawn by the code (a data: URL); `text` is then empty */
+  image?: string;
+};
 
 /** A check run after the learner's code, in the same scope, e.g. `add(2, 3) === 5`. */
 export type TestSpec = { name: string; check: string };
@@ -257,7 +262,7 @@ export function compareOutput(output: OutputLine[], expected: string) {
   };
   const got = normalize(
     output
-      .filter((l) => l.level === "log" || l.level === "info")
+      .filter((l) => (l.level === "log" || l.level === "info") && !l.image)
       .flatMap((l) => l.text.split("\n")),
   );
   const want = normalize(expected.split("\n"));
