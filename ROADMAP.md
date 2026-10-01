@@ -121,7 +121,7 @@ Each module ends with a **mini-project**, and each level ends with a **capstone 
 
 Steps marked 👤 need you (creating an account or a key). I'll guide you through each one.
 
-### Phase 0: Project setup
+### Phase 0: Project setup ✅
 
 1. Create the Next.js app (TypeScript, Tailwind v4, App Router, `src/`, ESLint)
 2. Add Prettier, path aliases and the folder structure
@@ -130,7 +130,7 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 5. First commit and push to GitHub
 6. 👤 Sign in to Vercel with GitHub and import the repo, which gives a live URL that auto-deploys
 
-### Phase 1: Design system
+### Phase 1: Design system ✅
 
 1. Colour, gradient, radius and shadow tokens in `globals.css`
 2. Animated background: glowing blobs and a subtle star/grain layer
