@@ -60,7 +60,9 @@ export default function PrivacyPage() {
       <p>
         We use Vercel Web Analytics to count page views. It doesn&apos;t use
         cookies and doesn&apos;t identify you; we only see totals such as how
-        many people visited a lesson.
+        many people visited a lesson. Vercel Speed Insights measures how fast
+        pages load (for example, time until the main content appears), also
+        without cookies, so we can keep the site quick.
       </p>
 
       <h2>Who processes the data</h2>
