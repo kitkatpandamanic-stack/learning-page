@@ -102,6 +102,25 @@ The lesson URL is `/learn/<language>/<slug>` (the file name without its number).
 duplicate slugs fail the build with a clear message. New languages must also be added to
 `src/lib/languages.ts`.
 
+## Deployment
+
+The site is hosted on [Vercel](https://vercel.com) and connected to this GitHub repo:
+every push to `main` deploys to production, and other branches get preview deployments.
+Vercel runs `npm run build` (Velite, then Next.js) on Node 24.
+
+Production environment variables (Vercel → Project → Settings → Environment Variables):
+
+| Variable                                    | Value                                                                          |
+| ------------------------------------------- | ------------------------------------------------------------------------------ |
+| `DATABASE_URL`                              | Neon connection string                                                         |
+| `BETTER_AUTH_SECRET`                        | Its own random secret (`openssl rand -base64 32`), not the local one           |
+| `BETTER_AUTH_URL`                           | The production URL, e.g. `https://pandadev.vercel.app`                         |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | A separate GitHub OAuth app whose callback is `<url>/api/auth/callback/github` |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Optional, same idea with callback `<url>/api/auth/callback/google`             |
+
+Without the database or auth variables the site still works, just without sign-in and
+saved progress.
+
 ## Scripts
 
 | Command                | What it does                           |
