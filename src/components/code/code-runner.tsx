@@ -358,7 +358,7 @@ export function CodeRunner({
               </pre>
             ))
           ) : (
-            <p className="text-white/35">
+            <p className="text-white/55">
               {result
                 ? "(no output)"
                 : "Press Run, or Ctrl/⌘ + Enter, to see what your code prints."}

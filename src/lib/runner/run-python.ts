@@ -11,7 +11,8 @@ type PythonMessage =
   | { type: "done"; id: number; raw: string };
 
 export const PYTHON_RUN_TIMEOUT_MS = 5000;
-const LOAD_TIMEOUT_MS = 60_000;
+// Pyodide is about 10 MB; give slow mobile connections time to download it.
+const LOAD_TIMEOUT_MS = 120_000;
 
 /**
  * One long-lived Python worker for the whole page, because loading Pyodide

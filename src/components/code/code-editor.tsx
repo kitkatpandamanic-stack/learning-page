@@ -4,6 +4,7 @@ import * as React from "react";
 import CodeMirror, { type ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
+import { indentUnit } from "@codemirror/language";
 import { setDiagnostics } from "@codemirror/lint";
 import { EditorView } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
@@ -29,7 +30,7 @@ const glassTheme = EditorView.theme({
   ".cm-gutters": {
     backgroundColor: "transparent",
     border: "none",
-    color: "rgb(255 255 255 / 0.25)",
+    color: "rgb(255 255 255 / 0.45)",
   },
   ".cm-activeLine": { backgroundColor: "rgb(139 92 246 / 0.1)" },
   ".cm-activeLineGutter": {
@@ -99,7 +100,8 @@ export function CodeEditor({
   const extensions = React.useMemo(
     () => [
       language === "python"
-        ? python()
+        ? // Python style (PEP 8) and all our lessons use 4-space indents.
+          [python(), indentUnit.of("    ")]
         : javascript({ typescript: language === "typescript" }),
       glassTheme,
       EditorView.contentAttributes.of({ "aria-label": label }),

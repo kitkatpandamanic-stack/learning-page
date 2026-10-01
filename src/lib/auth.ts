@@ -27,6 +27,22 @@ export const auth = betterAuth({
     // Avoid a database round-trip on every request; re-validated every 5 minutes.
     cookieCache: { enabled: true, maxAge: 5 * 60 },
   },
+  rateLimit: {
+    // Every page checks the session (mostly answered from the cookie cache),
+    // so normal browsing must never hit the limit. Sign-in stays limited.
+    customRules: { "/get-session": false },
+  },
+  advanced: {
+    // Vercel puts the visitor's real IP here, so each visitor gets their own
+    // rate-limit counter instead of everyone sharing one.
+    ipAddress: {
+      ipAddressHeaders: [
+        "x-vercel-forwarded-for",
+        "x-real-ip",
+        "x-forwarded-for",
+      ],
+    },
+  },
   plugins: [nextCookies()], // must stay last
 });
 

@@ -3,7 +3,6 @@ import Link from "next/link";
 
 import { Logo } from "@/components/brand/logo";
 import { Container } from "@/components/ui/container";
-import { NewsletterForm } from "@/components/layout/newsletter-form";
 import { footerNav, siteConfig } from "@/lib/site";
 
 function GitHubIcon(props: ComponentProps<"svg">) {
@@ -52,9 +51,17 @@ export function Footer() {
               Stay in the loop
             </h2>
             <p className="text-sm text-muted-foreground">
-              New lessons, languages and tips, once a month.
+              New lessons and languages land on GitHub first. Star or watch the
+              project to follow along.
             </p>
-            <NewsletterForm />
+            <a
+              href={siteConfig.githubUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex w-fit items-center gap-2 rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/12 transition hover:bg-white/12"
+            >
+              <GitHubIcon className="size-4" /> Follow on GitHub
+            </a>
           </div>
         </div>
 

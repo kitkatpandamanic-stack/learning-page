@@ -88,7 +88,7 @@ export function LessonSidebar({
                         })}
                       </ul>
                     ) : (
-                      <p className="px-2 text-xs text-white/35 italic">
+                      <p className="px-2 text-xs text-white/55 italic">
                         Coming soon
                       </p>
                     )}

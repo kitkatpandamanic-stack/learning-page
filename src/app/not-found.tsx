@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { ArrowLeft, Compass } from "lucide-react";
 
@@ -8,6 +9,8 @@ import { Button } from "@/components/ui/button";
 import { Container } from "@/components/ui/container";
 import { GlassCard } from "@/components/ui/glass-card";
 import { GradientText } from "@/components/ui/gradient-text";
+
+export const metadata: Metadata = { title: "Page not found" };
 
 export default function NotFound() {
   return (

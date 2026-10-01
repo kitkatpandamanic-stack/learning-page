@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { redirect } from "next/navigation";
 import { CheckCircle2, Wrench } from "lucide-react";
 
@@ -80,8 +81,16 @@ export default async function SignInPage({
           )}
         </div>
 
-        <p className="text-xs text-white/45">
-          By continuing you agree to our Terms and Privacy Policy.
+        <p className="text-xs text-white/55">
+          By continuing you agree to our{" "}
+          <Link href="/terms" className="underline hover:text-white">
+            Terms
+          </Link>{" "}
+          and{" "}
+          <Link href="/privacy" className="underline hover:text-white">
+            Privacy Policy
+          </Link>
+          .
         </p>
       </GlassCard>
     </Container>

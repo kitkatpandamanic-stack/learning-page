@@ -61,7 +61,7 @@ testimonials, CTA banner). It adds **glassmorphism** and a **brighter, neon-styl
 3. **Languages grid:** glass cards for JavaScript, Python, TypeScript, Java, Go, Rust…
 4. **Path preview:** the 4 levels (Beginner → Junior → Middle → Senior) as a glowing connected track.
 5. **Dashboard preview:** "Good morning, Alex 👋" with XP, lessons done, streak, hours, an activity chart, and per-language progress bars.
-6. **Testimonials:** "Loved by learners worldwide".
+6. **Who it's for:** beginners, students and working developers (real learner quotes later, with permission).
 7. **CTA banner:** "Ready to write your first line of code?"
 8. **Footer.**
 
