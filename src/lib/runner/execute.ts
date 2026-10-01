@@ -133,7 +133,13 @@ export async function execute(
     };
   const settle = () => {
     pending = Math.max(0, pending - 1);
-    if (pending === 0) notifyIdle?.();
+    // Promise callbacks that run after this timer may start new timers
+    // (e.g. a second `await wait(100)`), so give them a turn first.
+    if (pending === 0) {
+      setTimeout(() => {
+        if (pending === 0) notifyIdle?.();
+      }, 0);
+    }
   };
 
   const timers = {

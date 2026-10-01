@@ -6,6 +6,7 @@ import { CodeExample } from "@/components/mdx/code-example";
 import { Exercise, Hint, Solution } from "@/components/mdx/exercise";
 import { Pre } from "@/components/mdx/pre";
 import { Quiz } from "@/components/mdx/quiz";
+import { TryIt } from "@/components/mdx/try-it";
 
 /** Components available inside every lesson without importing them. */
 const components = {
@@ -16,6 +17,7 @@ const components = {
   Hint,
   Quiz,
   Solution,
+  TryIt,
 };
 
 type MDXComponent = (props: { components: typeof components }) => ReactElement;

@@ -4,33 +4,102 @@ import type {
   RunLanguage,
   TestSpec,
 } from "./execute";
-import { runPython, type PythonStatus } from "./run-python";
+import { runPython } from "./run-python";
+import { typecheck } from "./run-typecheck";
 import type { WorkerMessage, WorkerRequest } from "./runner.worker";
+import { typeErrorResult, type TypeDiagnostic } from "./typecheck";
 
 export type RunResult = ExecuteResult & {
   timedOut: boolean;
   durationMs: number;
+  /** TypeScript only: type errors, for underlining in the editor */
+  diagnostics?: TypeDiagnostic[];
 };
 
 export const RUN_TIMEOUT_MS = 3000;
 
-/**
- * Runs code in a fresh Web Worker so it can't freeze the page, and kills it if
- * it runs too long (e.g. an infinite loop).
- */
-export function runCode(
-  code: string,
-  options: {
-    language?: RunLanguage;
-    tests?: TestSpec[];
-    timeoutMs?: number;
-    onLine?: (line: OutputLine) => void;
-    /** Python only: reports "loading" while Pyodide downloads */
-    onStatus?: (status: PythonStatus) => void;
-  } = {},
-): { result: Promise<RunResult>; cancel: () => void } {
-  if (options.language === "python") return runPython(code, options);
+/** "loading" while Python or the TypeScript checker downloads the first time */
+export type RunStatus = "loading" | "running";
 
+type RunOptions = {
+  language?: RunLanguage;
+  tests?: TestSpec[];
+  timeoutMs?: number;
+  onLine?: (line: OutputLine) => void;
+  onStatus?: (status: RunStatus) => void;
+};
+
+type Run = { result: Promise<RunResult>; cancel: () => void };
+
+/**
+ * Runs learner code without freezing the page: JavaScript in a fresh Web
+ * Worker, TypeScript after a type check, Python with Pyodide.
+ */
+export function runCode(code: string, options: RunOptions = {}): Run {
+  if (options.language === "python") return runPython(code, options);
+  if (options.language === "typescript") return runTypeScript(code, options);
+  return runInWorker(code, options);
+}
+
+/**
+ * Type-checks first, like the TypeScript compiler would: code with type
+ * errors doesn't run. If the checker can't load, the code runs unchecked.
+ */
+function runTypeScript(code: string, options: RunOptions): Run {
+  const started = performance.now();
+  let inner: Run | null = null;
+  let cancelled = false;
+  let stop: () => void = () => {};
+  const cancelledResult = new Promise<RunResult>((resolve) => {
+    stop = () =>
+      resolve({
+        output: [{ level: "error", text: "Stopped." }],
+        error: { name: "TimeoutError", message: "Stopped." },
+        timedOut: true,
+        durationMs: performance.now() - started,
+      });
+  });
+
+  const checked = typecheck(code, () => options.onStatus?.("loading")).then(
+    (diagnostics: TypeDiagnostic[] | null): Promise<RunResult> => {
+      if (cancelled) return cancelledResult;
+      options.onStatus?.("running");
+      if (diagnostics?.length) {
+        return Promise.resolve({
+          ...typeErrorResult(diagnostics, options.tests),
+          diagnostics,
+          timedOut: false,
+          durationMs: performance.now() - started,
+        });
+      }
+      if (diagnostics === null) {
+        options.onLine?.(UNCHECKED_NOTICE);
+      }
+      inner = runInWorker(code, options);
+      return inner.result.then((r) =>
+        diagnostics === null
+          ? { ...r, output: [UNCHECKED_NOTICE, ...r.output] }
+          : r,
+      );
+    },
+  );
+
+  return {
+    result: Promise.race([checked, cancelledResult]),
+    cancel: () => {
+      cancelled = true;
+      if (inner) inner.cancel();
+      else stop();
+    },
+  };
+}
+
+const UNCHECKED_NOTICE: OutputLine = {
+  level: "info",
+  text: "(Couldn't load the TypeScript checker, so types weren't checked.)",
+};
+
+function runInWorker(code: string, options: RunOptions): Run {
   const {
     language = "javascript",
     tests,

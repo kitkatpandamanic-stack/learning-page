@@ -76,10 +76,10 @@ export default function PrivacyPage() {
           you choose them.
         </li>
         <li>
-          <strong>jsDelivr</strong> serves Pyodide, the program that runs Python
-          in your browser. Your browser downloads it from their network the
-          first time you run Python code; your code itself never leaves your
-          device.
+          <strong>jsDelivr</strong> serves Pyodide, which runs Python in your
+          browser, and the TypeScript compiler, which checks TypeScript code.
+          Your browser downloads them from their network the first time you run
+          Python or TypeScript code; your code itself never leaves your device.
         </li>
       </ul>
       <p>We never sell your data or share it for advertising.</p>

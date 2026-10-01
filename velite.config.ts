@@ -1,4 +1,5 @@
 import tokyoNight from "@shikijs/themes/tokyo-night";
+import { parse as parseJs } from "acorn";
 import rehypePrettyCode, { type Options, type Theme } from "rehype-pretty-code";
 import GithubSlugger from "github-slugger";
 import rehypeSlug from "rehype-slug";
@@ -52,6 +53,51 @@ function remarkActivityIds() {
           name: "activityId",
           value: `${el.name.toLowerCase()}-${n}`,
         });
+      }
+    });
+  };
+}
+
+/**
+ * MDX strips two spaces from every line of a multi-line attribute expression,
+ * which mangles code in `starter={`…`}` and `code={`…`}`. Re-read each
+ * multi-line expression from the original source so indentation survives.
+ */
+function remarkKeepAttributeIndentation() {
+  return (tree: Parameters<typeof visit>[0], file: { value: unknown }) => {
+    const source = String(file.value);
+    visit(tree, ["mdxJsxFlowElement", "mdxJsxTextElement"], (node) => {
+      const el = node as unknown as {
+        attributes: {
+          type: string;
+          position?: { start: { offset?: number }; end: { offset?: number } };
+          value?: { type?: string; value: string; data?: { estree?: unknown } };
+        }[];
+      };
+      for (const attr of el.attributes) {
+        const value = attr.value;
+        const start = attr.position?.start.offset;
+        const end = attr.position?.end.offset;
+        if (
+          attr.type !== "mdxJsxAttribute" ||
+          value?.type !== "mdxJsxAttributeValueExpression" ||
+          !value.value.includes("\n") ||
+          start === undefined ||
+          end === undefined
+        )
+          continue;
+        const raw = source.slice(start, end);
+        const open = raw.indexOf("={");
+        if (open === -1 || !raw.endsWith("}")) continue;
+        const expression = raw.slice(open + 2, -1);
+        value.value = expression;
+        value.data = {
+          ...value.data,
+          estree: parseJs(expression, {
+            ecmaVersion: "latest",
+            sourceType: "module",
+          }),
+        };
       }
     });
   };
@@ -179,7 +225,7 @@ export default defineConfig({
   },
   collections: { courses, lessons },
   mdx: {
-    remarkPlugins: [remarkActivityIds],
+    remarkPlugins: [remarkKeepAttributeIndentation, remarkActivityIds],
     rehypePlugins: [rehypeSlug, [rehypePrettyCode, prettyCode]],
   },
   // Cross-file checks that a single schema can't express. Any problem fails the build.

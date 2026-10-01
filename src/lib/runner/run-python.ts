@@ -1,7 +1,7 @@
 import type { OutputLine, TestSpec } from "./execute";
 import { parsePythonResult } from "./execute-python";
 import { pythonWorkerSource } from "./python-worker-source";
-import type { RunResult } from "./run-code";
+import type { RunResult, RunStatus } from "./run-code";
 
 type PythonMessage =
   | { type: "ready" }
@@ -12,8 +12,6 @@ type PythonMessage =
 
 export const PYTHON_RUN_TIMEOUT_MS = 5000;
 const LOAD_TIMEOUT_MS = 60_000;
-
-export type PythonStatus = "loading" | "running";
 
 /**
  * One long-lived Python worker for the whole page, because loading Pyodide
@@ -77,7 +75,7 @@ export function runPython(
     tests?: TestSpec[];
     timeoutMs?: number;
     onLine?: (line: OutputLine) => void;
-    onStatus?: (status: PythonStatus) => void;
+    onStatus?: (status: RunStatus) => void;
   } = {},
 ): { result: Promise<RunResult>; cancel: () => void } {
   const {

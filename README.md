@@ -70,6 +70,7 @@ Lessons can use these components without importing them:
 | `<CodeExample output="…">` + a code block                                                            | Code with the output it prints                         |
 | `<Quiz question="…" options={[…]} answer={1} explanation="…" />`                                     | Multiple-choice question (`answer` is 0-based)         |
 | `<Exercise title="…" starter={`…`} tests={[…]} expectedOutput={`…`}>` with `<Hint>` and `<Solution>` | Practice task with an in-browser editor, Run and Check |
+| `<TryIt html={`…`} code={`…`} />`                                                                    | Live HTML + JavaScript demo the learner can edit       |
 
 Code blocks support titles and highlighted lines: ` ```js title="app.js" {2} `.
 
@@ -82,6 +83,19 @@ learner's code in the same scope, e.g. `{ name: "adds", check: "add(2, 3) === 5"
 Python exercises add `language="python"` and write their `check`s in Python
 (e.g. `"add(2, 3) == 5"`); they run on [Pyodide](https://pyodide.org) (Python 3.14),
 loaded in the browser from jsDelivr and in tests from the `pyodide` package.
+
+TypeScript exercises add `language="typescript"`. Code is type-checked first (strict,
+ES2023 library, no DOM) with the real TypeScript compiler, loaded from jsDelivr in the
+browser and from `node_modules` in tests; code with type errors doesn't run, so a starter
+with deliberate type errors makes a good "fix the types" task. `npm test` fails if any
+TypeScript example or solution has a type error. To show an error in a lesson, use a plain
+code block with a `// ❌ Error: …` comment.
+
+DOM exercises add `html={`…`}`: the code runs against that page in a sandboxed iframe
+with a live preview, and each check is evaluated in the page afterwards, in order, so
+checks can click (`document.querySelector("#add").click()`) and then inspect the page.
+`<TryIt html={`…`} code={`…`} />` (closing `/>` on its own line) is an editable demo with
+the same preview and no checks; `npm test` runs each one in jsdom to make sure it works.
 
 The lesson URL is `/learn/<language>/<slug>` (the file name without its number).
 `npm run content` validates everything: unknown modules, missing number prefixes and

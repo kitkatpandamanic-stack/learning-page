@@ -3,6 +3,7 @@
 import * as React from "react";
 import { usePathname } from "next/navigation";
 import {
+  AppWindow,
   CheckCircle2,
   CircleCheckBig,
   Loader2,
@@ -23,12 +24,13 @@ import {
   type RunLanguage,
   type TestSpec,
 } from "@/lib/runner/execute";
-import { runCode, type RunResult } from "@/lib/runner/run-code";
+import { runCode, type RunResult, type RunStatus } from "@/lib/runner/run-code";
+import { runDom, type DomRun } from "@/lib/runner/run-dom";
+import { isPythonReady, preloadPython } from "@/lib/runner/run-python";
 import {
-  isPythonReady,
-  preloadPython,
-  type PythonStatus,
-} from "@/lib/runner/run-python";
+  isTypeScriptReady,
+  preloadTypeScript,
+} from "@/lib/runner/run-typecheck";
 
 const languageLabel: Record<RunLanguage, string> = {
   javascript: "JavaScript",
@@ -76,6 +78,8 @@ export function CodeRunner({
   storageId,
   minHeight,
   activityId,
+  html,
+  autoRun = false,
 }: {
   starter: string;
   language?: RunLanguage;
@@ -87,6 +91,10 @@ export function CodeRunner({
   minHeight?: string;
   /** Lesson activity to reward with XP when solved */
   activityId?: string;
+  /** Runs the code against this page and shows it in a live preview */
+  html?: string;
+  /** Preview only: run the code as soon as the editor appears (demos) */
+  autoRun?: boolean;
 }) {
   const pathname = usePathname();
   const award = useAward(languageFromPath(pathname));
@@ -101,15 +109,42 @@ export function CodeRunner({
   const [result, setResult] = React.useState<RunResult | null>(null);
   const [check, setCheck] = React.useState<Check | null>(null);
   const [running, setRunning] = React.useState(false);
-  const [status, setStatus] = React.useState<PythonStatus | null>(null);
+  const [status, setStatus] = React.useState<RunStatus | null>(null);
   const cancelRef = React.useRef<(() => void) | null>(null);
+  const previewRef = React.useRef<HTMLDivElement>(null);
+  const previewRun = React.useRef<DomRun | null>(null);
   const canCheck = Boolean(tests?.length || expectedOutput !== undefined);
+  const hasPreview = html !== undefined;
 
-  React.useEffect(() => () => cancelRef.current?.(), []);
+  React.useEffect(
+    () => () => {
+      cancelRef.current?.();
+      previewRun.current?.dispose();
+    },
+    [],
+  );
 
-  // Python needs a few seconds to download the first time; start early.
+  // Show the page straight away: demos with their code, exercises without.
+  React.useEffect(() => {
+    if (html === undefined || !previewRef.current) return;
+    const preview = runDom(autoRun ? code : "", {
+      html,
+      container: previewRef.current,
+      onLine: autoRun
+        ? (line) => setLines((prev) => [...prev, line])
+        : undefined,
+    });
+    previewRun.current = preview;
+    return () => preview.dispose();
+    // Only on mount: later runs replace the preview themselves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Python and the TypeScript checker take a few seconds to download the
+  // first time; start early.
   React.useEffect(() => {
     if (language === "python") preloadPython();
+    if (language === "typescript") preloadTypeScript();
   }, [language]);
 
   function updateCode(value: string) {
@@ -123,31 +158,31 @@ export function CodeRunner({
     setLines([]);
     setResult(null);
     setCheck(null);
-    setStatus(language === "python" && !isPythonReady() ? "loading" : null);
-    const { result: pending, cancel } = runCode(code, {
-      language,
-      tests: withChecks ? tests : undefined,
-      onLine: (line) => setLines((prev) => [...prev, line]),
-      onStatus: setStatus,
-    });
-    cancelRef.current = cancel;
-    const res = await pending;
-    cancelRef.current = null;
+    setStatus(
+      (language === "python" && !isPythonReady()) ||
+        (language === "typescript" && !isTypeScriptReady())
+        ? "loading"
+        : null,
+    );
+    const { res, checked } = await (html !== undefined
+      ? runPreview(html, withChecks)
+      : runPlain(withChecks));
     setLines(res.output);
     setResult(res);
     setRunning(false);
     setStatus(null);
 
     if (withChecks) {
+      // Code with type errors never ran, so there's no output to compare.
       const output =
-        expectedOutput !== undefined
-          ? compareOutput(res.output, expectedOutput)
+        expectedOutput !== undefined && !checked.diagnostics?.length
+          ? compareOutput(checked.output, expectedOutput)
           : undefined;
       const solved =
-        !res.error &&
-        (res.tests ?? []).every((t) => t.passed) &&
+        !checked.error &&
+        (checked.tests ?? []).every((t) => t.passed) &&
         (output?.passed ?? true);
-      setCheck({ tests: res.tests, output, solved });
+      setCheck({ tests: checked.tests, output, solved });
       setReward(null);
       if (solved && activityId) {
         const result = await award.recordActivity(pathname, activityId);
@@ -162,6 +197,42 @@ export function CodeRunner({
         );
       }
     }
+  }
+
+  async function runPlain(withChecks: boolean) {
+    const { result: pending, cancel } = runCode(code, {
+      language,
+      tests: withChecks ? tests : undefined,
+      onLine: (line) => setLines((prev) => [...prev, line]),
+      onStatus: setStatus,
+    });
+    cancelRef.current = cancel;
+    const res = await pending;
+    cancelRef.current = null;
+    return { res, checked: res };
+  }
+
+  /**
+   * Runs the code in the visible preview. Checks run in a separate hidden
+   * copy of the page, so they can click around without changing the preview.
+   */
+  async function runPreview(page: string, withChecks: boolean) {
+    previewRun.current?.dispose();
+    const visible = runDom(code, {
+      html: page,
+      container: previewRef.current ?? undefined,
+      onLine: (line) => setLines((prev) => [...prev, line]),
+    });
+    previewRun.current = visible;
+    const hidden =
+      withChecks && canCheck ? runDom(code, { html: page, tests }) : null;
+    cancelRef.current = () => {
+      visible.cancel();
+      hidden?.cancel();
+    };
+    const [res, checked] = await Promise.all([visible.result, hidden?.result]);
+    cancelRef.current = null;
+    return { res, checked: checked ?? res };
   }
 
   function reset() {
@@ -236,7 +307,20 @@ export function CodeRunner({
         language={language}
         onRun={() => run(canCheck)}
         minHeight={minHeight}
+        diagnostics={result?.diagnostics}
       />
+
+      {hasPreview && (
+        <div className="border-t border-white/10">
+          <p className="flex items-center gap-1.5 bg-white/3 px-4 py-1.5 font-mono text-[11px] tracking-wider text-white/65 uppercase">
+            <AppWindow className="size-3.5" /> Preview
+          </p>
+          <div
+            ref={previewRef}
+            className="h-56 resize-y overflow-hidden bg-[#0b0d1f]"
+          />
+        </div>
+      )}
 
       {/* Output */}
       <div className="border-t border-white/10 bg-black/35 px-4 py-3">
@@ -248,7 +332,7 @@ export function CodeRunner({
             <span className="flex items-center gap-1.5 normal-case">
               <Loader2 className="size-3 animate-spin" />{" "}
               {status === "loading"
-                ? "Loading Python… (first time takes a few seconds)"
+                ? `Loading ${languageLabel[language]}… (first time takes a few seconds)`
                 : "Running…"}
             </span>
           ) : (

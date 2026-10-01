@@ -14,6 +14,7 @@ export function Exercise({
   language = "javascript",
   tests,
   expectedOutput,
+  html,
   activityId,
   children,
 }: {
@@ -23,6 +24,8 @@ export function Exercise({
   language?: RunLanguage;
   tests?: TestSpec[];
   expectedOutput?: string;
+  /** JavaScript exercises: the page the code runs against, shown in a preview */
+  html?: string;
   /** Added at build time ("exercise-1", …); used to award XP once */
   activityId?: string;
   children: ReactNode;
@@ -51,6 +54,7 @@ export function Exercise({
               language={language}
               tests={tests}
               expectedOutput={expectedOutput}
+              html={html}
               storageId={title}
               activityId={activityId}
             />

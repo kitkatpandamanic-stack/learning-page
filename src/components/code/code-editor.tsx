@@ -1,9 +1,10 @@
 "use client";
 
 import * as React from "react";
-import CodeMirror from "@uiw/react-codemirror";
+import CodeMirror, { type ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
+import { setDiagnostics } from "@codemirror/lint";
 import { EditorView } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
 import { tokyoNightInit } from "@uiw/codemirror-theme-tokyo-night";
@@ -37,7 +38,22 @@ const glassTheme = EditorView.theme({
   },
   ".cm-content": { padding: "12px 0" },
   ".cm-cursor": { borderLeftColor: "#22d3ee" },
+  ".cm-tooltip": {
+    backgroundColor: "#0d0f22",
+    border: "1px solid rgb(255 255 255 / 0.12)",
+    borderRadius: "10px",
+    overflow: "hidden",
+  },
+  ".cm-diagnostic": { fontFamily: "var(--font-jetbrains), ui-monospace" },
+  ".cm-diagnostic-error": { borderLeftColor: "#fb7185", color: "#fecdd3" },
 });
+
+/** A problem to underline, e.g. a TypeScript type error. */
+export type EditorDiagnostic = {
+  start: number;
+  length: number;
+  message: string;
+};
 
 export function CodeEditor({
   value,
@@ -46,6 +62,7 @@ export function CodeEditor({
   onRun,
   minHeight = "160px",
   label = "Code editor",
+  diagnostics,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -54,7 +71,31 @@ export function CodeEditor({
   onRun?: () => void;
   minHeight?: string;
   label?: string;
+  /** Underlined in the editor, with the message on hover */
+  diagnostics?: EditorDiagnostic[];
 }) {
+  const editor = React.useRef<ReactCodeMirrorRef>(null);
+
+  React.useEffect(() => {
+    const view = editor.current?.view;
+    if (!view) return;
+    const size = view.state.doc.length;
+    view.dispatch(
+      setDiagnostics(
+        view.state,
+        (diagnostics ?? []).map((d) => {
+          const from = Math.min(d.start, size);
+          return {
+            from,
+            to: Math.min(from + Math.max(d.length, 1), size),
+            severity: "error",
+            message: d.message,
+          };
+        }),
+      ),
+    );
+  }, [diagnostics]);
+
   const extensions = React.useMemo(
     () => [
       language === "python"
@@ -83,6 +124,7 @@ export function CodeEditor({
       }}
     >
       <CodeMirror
+        ref={editor}
         value={value}
         onChange={onChange}
         theme={theme}

@@ -79,8 +79,8 @@ export function Playground() {
         minHeight="360px"
       />
       <p className="text-sm text-white/45">
-        Your code is saved in this browser. Python runs on Pyodide and loads the
-        first time you run it.
+        Your code is saved in this browser. Python (Pyodide) and the TypeScript
+        type checker load the first time you run them.
       </p>
     </div>
   );

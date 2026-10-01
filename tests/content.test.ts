@@ -15,17 +15,27 @@ import {
   type TestSpec,
 } from "@/lib/runner/execute";
 import { executePython } from "@/lib/runner/execute-python";
+import { typeErrorResult } from "@/lib/runner/typecheck";
+
+import { runDomInNode } from "./node-dom";
+import { checkTypes } from "./node-typecheck";
 
 let pyodide: PyodideInterface;
 beforeAll(async () => {
   pyodide = await loadPyodide();
 }, 60_000);
 
-/** Runs lesson code the same way the browser does, in the right language. */
-function run(code: string, language: RunLanguage, tests?: TestSpec[]) {
-  return language === "python"
-    ? executePython(pyodide, code, { tests })
-    : execute(code, { language, tests });
+/**
+ * Runs lesson code the same way the browser does, in the right language.
+ * TypeScript with type errors doesn't run, just like in the browser.
+ */
+async function run(code: string, language: RunLanguage, tests?: TestSpec[]) {
+  if (language === "python") return executePython(pyodide, code, { tests });
+  if (language === "typescript") {
+    const diagnostics = checkTypes(code);
+    if (diagnostics.length) return typeErrorResult(diagnostics, tests);
+  }
+  return execute(code, { language, tests });
 }
 
 const ROOT = join(__dirname, "..", "content", "courses");
@@ -81,6 +91,8 @@ type Exercise = {
   language: RunLanguage;
   tests?: TestSpec[];
   expectedOutput?: string;
+  /** DOM exercises: the page the code runs against */
+  html?: string;
   solution?: string;
 };
 
@@ -106,6 +118,7 @@ function exercisesIn(file: string): Exercise[] {
         language: (attrs.language as RunLanguage) ?? "javascript",
         tests: attrs.tests as TestSpec[] | undefined,
         expectedOutput: attrs.expectedOutput as string | undefined,
+        html: attrs.html as string | undefined,
         solution,
       },
     ];
@@ -113,7 +126,10 @@ function exercisesIn(file: string): Exercise[] {
 }
 
 async function solves(code: string, ex: Exercise) {
-  const result = await run(code, ex.language, ex.tests);
+  const result =
+    ex.html !== undefined
+      ? await runDomInNode(code, ex.html, ex.tests)
+      : await run(code, ex.language, ex.tests);
   const output =
     ex.expectedOutput !== undefined
       ? compareOutput(result.output, ex.expectedOutput)
@@ -186,6 +202,33 @@ describe("Code + Output examples", () => {
         .join("\n")
         .trim();
       expect(got).toBe(ex.expected);
+    },
+  );
+});
+
+describe("TryIt live previews", () => {
+  const blocks = files.flatMap((file) => {
+    const source = readFileSync(file, "utf8");
+    return source
+      .split(/^<TryIt\b/m)
+      .slice(1)
+      .map((block, i) => {
+        const attrs = parseAttributes(block.slice(0, block.search(/^\/>$/m)));
+        return {
+          name: `${file.slice(ROOT.length + 1)} #${i + 1}`,
+          html: attrs.html as string,
+          code: attrs.code as string,
+        };
+      });
+  });
+
+  it.each(blocks.map((b) => [b.name, b] as const))(
+    "%s runs without errors",
+    async (_name, b) => {
+      expect(typeof b.html, "TryIt needs html").toBe("string");
+      expect(typeof b.code, "TryIt needs code").toBe("string");
+      const result = await runDomInNode(b.code, b.html);
+      expect(result.error, JSON.stringify(result.output)).toBeUndefined();
     },
   );
 });

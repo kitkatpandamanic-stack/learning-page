@@ -72,6 +72,20 @@ describe("execute", () => {
     expect(texts(r)).toEqual(["first", "later"]);
   });
 
+  it("waits for timers started after earlier timers resolve", async () => {
+    const r = await execute(
+      [
+        "const wait = (ms) => new Promise((r) => setTimeout(r, ms));",
+        "async function steps() {",
+        '  await wait(10); console.log("one");',
+        '  await wait(10); console.log("two");',
+        "}",
+        "steps();",
+      ].join("\n"),
+    );
+    expect(r.output.map((l) => l.text)).toEqual(["one", "two"]);
+  });
+
   it("runs tests in the learner's scope", async () => {
     const r = await execute("function add(a, b) { return a + b; }", {
       tests: [

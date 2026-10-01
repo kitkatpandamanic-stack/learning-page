@@ -19,7 +19,9 @@ testimonials, CTA banner). It adds **glassmorphism** and a **brighter, neon-styl
 | Lesson content            | **MDX + Velite**                                        | Lessons as Markdown files, validated and typed at build time                                 |
 | Syntax highlighting       | **Shiki** (via `rehype-pretty-code`)                    | VS Code-quality highlighting, rendered on the server                                         |
 | Code editor               | **CodeMirror 6** (`@uiw/react-codemirror`, Tokyo Night) | Lightweight, works well on mobile                                                            |
-| Run code: JS/TS           | **Web Worker runner** (+ sucrase for TS)                | Instant, offline, stops infinite loops; Sandpack added later for DOM/React lessons           |
+| Run code: JS/TS           | **Web Worker runner** (+ sucrase for TS)                | Instant, offline, stops infinite loops                                                       |
+| Type checking (TS)        | **TypeScript compiler** in a Web Worker (from jsDelivr) | Real type errors, underlined in the editor; code with type errors doesn't run                |
+| Run code: DOM lessons     | **Sandboxed iframe preview** (+ acorn loop guards)      | Live, clickable page for HTML + JavaScript; checks run in a hidden copy                      |
 | Run code: Python          | **Pyodide** (Python 3.14 in a Web Worker)               | Real Python in the browser, no server or API key                                             |
 | Run code: other languages | **Judge0** (through our own `/api/run` route)           | Java, C#, Go, Rust, C++… executed on a server (later)                                        |
 | Database                  | **PostgreSQL on Neon** + **Drizzle ORM**                | Serverless Postgres with type-safe queries                                                   |
@@ -187,9 +189,9 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 3. `/dashboard` with Recharts charts (activity, per-language progress)
 4. `/profile` page
 
-### Phase 8: Content & launch 🚧 (launch prep + Python Beginner done; deploy next)
+### Phase 8: Content & launch 🚧 (launch prep, Python + TypeScript Beginner and JavaScript Junior done; deploy next)
 
-1. Python and TypeScript Level 0–1 content
+1. Python and TypeScript Level 0–1 content (✅ Level 0 for all three; ✅ JavaScript Level 1)
 2. Junior → Middle → Senior content for the MVP languages
 3. `/playground` page
 4. Accessibility pass, performance (lazy-load the 3D and editor bundles), Open Graph images, Vercel Analytics
