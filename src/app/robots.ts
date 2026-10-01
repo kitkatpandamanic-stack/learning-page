@@ -4,7 +4,11 @@ import { siteUrl } from "@/lib/site";
 
 export default function robots(): MetadataRoute.Robots {
   return {
-    rules: { userAgent: "*", allow: "/", disallow: ["/design"] },
+    rules: {
+      userAgent: "*",
+      allow: "/",
+      disallow: ["/design", "/dashboard", "/profile", "/sign-in", "/api/"],
+    },
     sitemap: `${siteUrl}/sitemap.xml`,
   };
 }

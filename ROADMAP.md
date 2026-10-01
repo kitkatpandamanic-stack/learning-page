@@ -22,7 +22,7 @@ testimonials, CTA banner). It adds **glassmorphism** and a **brighter, neon-styl
 | Run code: JS/TS               | **Sandpack**                                        | In-browser bundler, instant feedback                                                         |
 | Run code: all other languages | **Judge0** (through our own `/api/run` route)       | Python, Java, C#, Go, Rust, C++… executed on a server                                        |
 | Database                      | **PostgreSQL on Neon** + **Drizzle ORM**            | Serverless Postgres with type-safe queries                                                   |
-| Auth                          | **Auth.js** (NextAuth v5)                           | Sign in with GitHub or Google                                                                |
+| Auth                          | **Better Auth**                                     | Sign in with GitHub or Google (Auth.js now recommends Better Auth for new projects)          |
 | Server data                   | **TanStack Query** + Server Actions                 | Fetching, caching and saving progress                                                        |
 | Client state                  | **Zustand**                                         | Small UI state (editor, panels, quiz)                                                        |
 | Charts                        | **Recharts**                                        | Dashboard charts (Tremor does not support React 19 yet)                                      |
@@ -75,7 +75,7 @@ testimonials, CTA banner). It adds **glassmorphism** and a **brighter, neon-styl
 | `/profile`               | Settings, achievements (signed in)                 |
 | `/sign-in`               | GitHub / Google sign-in                            |
 | `/api/run`               | Server route that sends code to Judge0             |
-| `/api/auth/*`            | Auth.js                                            |
+| `/api/auth/*`            | Better Auth                                        |
 
 ### Folder structure
 
@@ -164,12 +164,12 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 3. MDX components: `Callout`, `Quiz`, `CodeExample`, `Exercise`
 4. Write JavaScript Level 0 (about 10 lessons)
 
-### Phase 5: Database & accounts
+### Phase 5: Database & accounts ✅ (code done; waiting for Neon + OAuth keys)
 
 1. 👤 Create a free Neon database and give me the `DATABASE_URL`
-2. Drizzle schema: `users`, `accounts`, `sessions`, `lesson_progress`, `xp_events`, `achievements`, then run the migrations
+2. Drizzle schema: `user`, `account`, `session`, `verification`, `lesson_progress`, `xp_event`, `user_achievement`, then run the migrations
 3. 👤 Create GitHub and Google OAuth apps for login
-4. Auth.js setup, `/sign-in` page, user menu, protected routes
+4. Better Auth setup, `/sign-in` page, user menu, protected routes
 
 ### Phase 6: Interactive coding
 

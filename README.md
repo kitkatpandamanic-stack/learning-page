@@ -6,7 +6,7 @@ See [ROADMAP.md](ROADMAP.md) for the full plan, stack and development phases.
 
 ## Tech
 
-Next.js 16 (App Router) · React 19 · TypeScript · Tailwind CSS v4 · shadcn/ui
+Next.js 16 (App Router) · React 19 · TypeScript · Tailwind CSS v4 · shadcn/ui · Better Auth · Drizzle · Neon Postgres
 
 ## Getting started
 
@@ -19,6 +19,21 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000).
+
+## Accounts & database
+
+Sign-in uses [Better Auth](https://better-auth.com) with GitHub and Google, and data lives in
+[Neon](https://neon.tech) Postgres via Drizzle ORM. Until `DATABASE_URL` and
+`BETTER_AUTH_SECRET` are set, the site works normally and the sign-in page says
+sign-in isn't switched on yet.
+
+1. Copy `.env.example` to `.env.local` and fill it in (see the comments in the file).
+2. Create the tables: `npm run db:migrate`
+3. For production, add the same variables in Vercel → Project → Settings →
+   Environment Variables, with `BETTER_AUTH_URL` set to the live domain and
+   production OAuth callback URLs (`https://<domain>/api/auth/callback/github` and `/google`).
+
+Schema changes: edit `src/db/schema.ts`, then `npm run db:generate` and `npm run db:migrate`.
 
 ## Writing content
 
@@ -61,13 +76,16 @@ duplicate slugs fail the build with a clear message. New languages must also be 
 
 ## Scripts
 
-| Command                | What it does                      |
-| ---------------------- | --------------------------------- |
-| `npm run dev`          | Start the dev server              |
-| `npm run build`        | Production build                  |
-| `npm run start`        | Serve the production build        |
-| `npm run lint`         | ESLint                            |
-| `npm run typecheck`    | TypeScript type check             |
-| `npm run format`       | Format all files with Prettier    |
-| `npm run format:check` | Check formatting                  |
-| `npm run content`      | Build and validate course content |
+| Command                | What it does                           |
+| ---------------------- | -------------------------------------- |
+| `npm run dev`          | Start the dev server                   |
+| `npm run build`        | Production build                       |
+| `npm run start`        | Serve the production build             |
+| `npm run lint`         | ESLint                                 |
+| `npm run typecheck`    | TypeScript type check                  |
+| `npm run format`       | Format all files with Prettier         |
+| `npm run format:check` | Check formatting                       |
+| `npm run content`      | Build and validate course content      |
+| `npm run db:generate`  | Create a migration from schema changes |
+| `npm run db:migrate`   | Apply migrations to the database       |
+| `npm run db:studio`    | Browse the database in Drizzle Studio  |

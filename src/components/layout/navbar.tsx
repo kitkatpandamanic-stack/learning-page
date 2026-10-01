@@ -4,9 +4,20 @@ import * as React from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "cn";
-import { ArrowRight, Menu } from "lucide-react";
+import {
+  ArrowRight,
+  LayoutDashboard,
+  LogOut,
+  Menu,
+  UserRound,
+} from "lucide-react";
 
 import { Logo } from "@/components/brand/logo";
+import {
+  UserAvatar,
+  UserMenu,
+  useSignOut,
+} from "@/components/layout/user-menu";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -15,10 +26,14 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet";
+import { useSession } from "@/lib/auth-client";
 import { mainNav } from "@/lib/site";
 
 export function Navbar() {
   const pathname = usePathname();
+  const { data: session, isPending } = useSession();
+  const user = session?.user;
+  const handleSignOut = useSignOut();
   const [scrolled, setScrolled] = React.useState(false);
 
   React.useEffect(() => {
@@ -66,19 +81,37 @@ export function Navbar() {
           ))}
         </ul>
 
-        <div className="hidden items-center gap-2 md:flex">
-          <Button
-            asChild
-            variant="ghost"
-            className="rounded-full px-4 text-white/80"
-          >
-            <Link href="/sign-in">Sign in</Link>
-          </Button>
-          <Button asChild variant="gradient" size="lg" className="px-5">
-            <Link href="/languages">
-              Start learning <ArrowRight />
-            </Link>
-          </Button>
+        <div className="hidden items-center gap-3 md:flex">
+          {isPending ? (
+            <span
+              aria-hidden
+              className="size-9 animate-pulse rounded-full bg-white/10"
+            />
+          ) : user ? (
+            <>
+              <Button asChild variant="gradient" size="lg" className="px-5">
+                <Link href="/dashboard">
+                  Continue learning <ArrowRight />
+                </Link>
+              </Button>
+              <UserMenu user={user} />
+            </>
+          ) : (
+            <>
+              <Button
+                asChild
+                variant="ghost"
+                className="rounded-full px-4 text-white/80"
+              >
+                <Link href="/sign-in">Sign in</Link>
+              </Button>
+              <Button asChild variant="gradient" size="lg" className="px-5">
+                <Link href="/languages">
+                  Start learning <ArrowRight />
+                </Link>
+              </Button>
+            </>
+          )}
         </div>
 
         <Sheet>
@@ -117,18 +150,62 @@ export function Navbar() {
               ))}
             </ul>
             <div className="mt-auto flex flex-col gap-3">
-              <SheetClose asChild>
-                <Button asChild variant="glass" size="xl">
-                  <Link href="/sign-in">Sign in</Link>
-                </Button>
-              </SheetClose>
-              <SheetClose asChild>
-                <Button asChild variant="gradient" size="xl">
-                  <Link href="/languages">
-                    Start learning <ArrowRight />
-                  </Link>
-                </Button>
-              </SheetClose>
+              {user ? (
+                <>
+                  <div className="flex items-center gap-3 rounded-xl bg-white/5 p-3">
+                    <UserAvatar user={user} className="size-10" />
+                    <div className="min-w-0">
+                      <p className="truncate font-semibold text-white">
+                        {user.name}
+                      </p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {user.email}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <SheetClose asChild>
+                      <Button asChild variant="glass" size="xl">
+                        <Link href="/dashboard">
+                          <LayoutDashboard /> Dashboard
+                        </Link>
+                      </Button>
+                    </SheetClose>
+                    <SheetClose asChild>
+                      <Button asChild variant="glass" size="xl">
+                        <Link href="/profile">
+                          <UserRound /> Profile
+                        </Link>
+                      </Button>
+                    </SheetClose>
+                  </div>
+                  <SheetClose asChild>
+                    <Button
+                      variant="ghost"
+                      size="xl"
+                      className="rounded-full text-rose-300"
+                      onClick={handleSignOut}
+                    >
+                      <LogOut /> Sign out
+                    </Button>
+                  </SheetClose>
+                </>
+              ) : (
+                <>
+                  <SheetClose asChild>
+                    <Button asChild variant="glass" size="xl">
+                      <Link href="/sign-in">Sign in</Link>
+                    </Button>
+                  </SheetClose>
+                  <SheetClose asChild>
+                    <Button asChild variant="gradient" size="xl">
+                      <Link href="/languages">
+                        Start learning <ArrowRight />
+                      </Link>
+                    </Button>
+                  </SheetClose>
+                </>
+              )}
             </div>
           </SheetContent>
         </Sheet>
