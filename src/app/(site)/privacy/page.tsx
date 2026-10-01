@@ -75,6 +75,12 @@ export default function PrivacyPage() {
           <strong>GitHub</strong> and <strong>Google</strong> handle sign-in if
           you choose them.
         </li>
+        <li>
+          <strong>jsDelivr</strong> serves Pyodide, the program that runs Python
+          in your browser. Your browser downloads it from their network the
+          first time you run Python code; your code itself never leaves your
+          device.
+        </li>
       </ul>
       <p>We never sell your data or share it for advertising.</p>
 

@@ -1,5 +1,6 @@
 import tokyoNight from "@shikijs/themes/tokyo-night";
 import rehypePrettyCode, { type Options, type Theme } from "rehype-pretty-code";
+import GithubSlugger from "github-slugger";
 import rehypeSlug from "rehype-slug";
 import { visit } from "unist-util-visit";
 import { defineCollection, defineConfig, s } from "velite";
@@ -61,6 +62,44 @@ function countTags(raw: string, tag: string) {
   return raw.match(new RegExp(`^<${tag}\\b`, "gm"))?.length ?? 0;
 }
 
+type TocEntry = { title: string; url: string; items: TocEntry[] };
+
+/**
+ * Builds "On this page" from the lesson's ## and ### headings. Skips code
+ * fences and multi-line component tags, so a Python "# comment" inside an
+ * exercise's starter code is never mistaken for a heading. Slugs match
+ * rehype-slug, which adds the ids to the rendered headings.
+ */
+function buildToc(raw: string): TocEntry[] {
+  const slugger = new GithubSlugger();
+  const toc: TocEntry[] = [];
+  let inFence = false;
+  let inTag = false;
+  for (const line of raw.split("\n")) {
+    if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
+    if (inFence) continue;
+    if (inTag) {
+      if (/^\s*\/?>\s*$/.test(line)) inTag = false;
+      continue;
+    }
+    if (/^<[A-Z][A-Za-z]*\s*$/.test(line)) {
+      inTag = true; // e.g. "<Exercise" whose attributes span several lines
+      continue;
+    }
+    const match = /^(#{2,3})\s+(.+?)\s*#*$/.exec(line);
+    if (!match) continue;
+    const title = match[2]
+      .replace(/`([^`]*)`/g, "$1")
+      .replace(/\*\*([^*]*)\*\*/g, "$1")
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+    const entry = { title, url: `#${slugger.slug(title)}`, items: [] };
+    if (match[1] === "###" && toc.length > 0)
+      toc[toc.length - 1].items.push(entry);
+    else toc.push(entry);
+  }
+  return toc;
+}
+
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 const courses = defineCollection({
@@ -107,7 +146,6 @@ const lessons = defineCollection({
       duration: s.number().int().positive(),
       xp: s.number().int().positive().default(10),
       path: s.path(),
-      toc: s.toc(),
       body: s.mdx(),
       raw: s.raw(),
     })
@@ -122,6 +160,7 @@ const lessons = defineCollection({
         order: match ? Number(match[1]) : -1,
         slug: match ? match[2] : file,
         permalink: `/learn/${language}/${match ? match[2] : file}`,
+        toc: buildToc(raw),
         exerciseCount: countTags(raw, "Exercise"),
         quizCount: countTags(raw, "Quiz"),
       };

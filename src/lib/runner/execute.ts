@@ -2,7 +2,7 @@ import { transform } from "sucrase";
 
 import { formatArgs } from "./format";
 
-export type RunLanguage = "javascript" | "typescript";
+export type RunLanguage = "javascript" | "typescript" | "python";
 export type LogLevel = "log" | "info" | "warn" | "error";
 export type OutputLine = { level: LogLevel; text: string };
 

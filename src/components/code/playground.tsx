@@ -16,6 +16,13 @@ for (const language of languages) {
   console.log(\`I'm learning \${language}!\`);
 }
 `,
+  python: `# Python playground: real Python 3, running in your browser. 🐍
+
+languages = ["JavaScript", "Python", "TypeScript"]
+
+for language in languages:
+    print(f"I'm learning {language}!")
+`,
   typescript: `// TypeScript playground: type annotations are removed, then the code runs.
 // (Type errors are not reported yet.)
 
@@ -41,7 +48,7 @@ export function Playground() {
         aria-label="Language"
         className="inline-flex self-start rounded-full p-1 glass"
       >
-        {(["javascript", "typescript"] as const).map((lang) => (
+        {(["javascript", "python", "typescript"] as const).map((lang) => (
           <button
             key={lang}
             type="button"
@@ -53,7 +60,13 @@ export function Playground() {
                 "bg-gradient-brand text-white shadow-glow-violet",
             )}
           >
-            {lang === "javascript" ? "JavaScript" : "TypeScript"}
+            {
+              {
+                javascript: "JavaScript",
+                python: "Python",
+                typescript: "TypeScript",
+              }[lang]
+            }
           </button>
         ))}
       </div>
@@ -66,8 +79,8 @@ export function Playground() {
         minHeight="360px"
       />
       <p className="text-sm text-white/45">
-        Your code is saved in this browser. Python and more languages are coming
-        soon.
+        Your code is saved in this browser. Python runs on Pyodide and loads the
+        first time you run it.
       </p>
     </div>
   );

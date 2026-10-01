@@ -24,10 +24,16 @@ import {
   type TestSpec,
 } from "@/lib/runner/execute";
 import { runCode, type RunResult } from "@/lib/runner/run-code";
+import {
+  isPythonReady,
+  preloadPython,
+  type PythonStatus,
+} from "@/lib/runner/run-python";
 
 const languageLabel: Record<RunLanguage, string> = {
   javascript: "JavaScript",
   typescript: "TypeScript",
+  python: "Python",
 };
 
 const lineStyle: Record<OutputLine["level"], string> = {
@@ -95,10 +101,16 @@ export function CodeRunner({
   const [result, setResult] = React.useState<RunResult | null>(null);
   const [check, setCheck] = React.useState<Check | null>(null);
   const [running, setRunning] = React.useState(false);
+  const [status, setStatus] = React.useState<PythonStatus | null>(null);
   const cancelRef = React.useRef<(() => void) | null>(null);
   const canCheck = Boolean(tests?.length || expectedOutput !== undefined);
 
   React.useEffect(() => () => cancelRef.current?.(), []);
+
+  // Python needs a few seconds to download the first time; start early.
+  React.useEffect(() => {
+    if (language === "python") preloadPython();
+  }, [language]);
 
   function updateCode(value: string) {
     setCode(value);
@@ -111,10 +123,12 @@ export function CodeRunner({
     setLines([]);
     setResult(null);
     setCheck(null);
+    setStatus(language === "python" && !isPythonReady() ? "loading" : null);
     const { result: pending, cancel } = runCode(code, {
       language,
       tests: withChecks ? tests : undefined,
       onLine: (line) => setLines((prev) => [...prev, line]),
+      onStatus: setStatus,
     });
     cancelRef.current = cancel;
     const res = await pending;
@@ -122,6 +136,7 @@ export function CodeRunner({
     setLines(res.output);
     setResult(res);
     setRunning(false);
+    setStatus(null);
 
     if (withChecks) {
       const output =
@@ -231,7 +246,10 @@ export function CodeRunner({
           </span>
           {running ? (
             <span className="flex items-center gap-1.5 normal-case">
-              <Loader2 className="size-3 animate-spin" /> Running…
+              <Loader2 className="size-3 animate-spin" />{" "}
+              {status === "loading"
+                ? "Loading Python… (first time takes a few seconds)"
+                : "Running…"}
             </span>
           ) : (
             result && (

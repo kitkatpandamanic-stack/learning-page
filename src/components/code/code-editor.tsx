@@ -3,6 +3,7 @@
 import * as React from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { javascript } from "@codemirror/lang-javascript";
+import { python } from "@codemirror/lang-python";
 import { EditorView } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
 import { tokyoNightInit } from "@uiw/codemirror-theme-tokyo-night";
@@ -56,7 +57,9 @@ export function CodeEditor({
 }) {
   const extensions = React.useMemo(
     () => [
-      javascript({ typescript: language === "typescript" }),
+      language === "python"
+        ? python()
+        : javascript({ typescript: language === "typescript" }),
       glassTheme,
       EditorView.contentAttributes.of({ "aria-label": label }),
     ],

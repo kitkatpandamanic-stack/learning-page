@@ -8,27 +8,28 @@ testimonials, CTA banner). It adds **glassmorphism** and a **brighter, neon-styl
 
 ## 1. Tech stack (Option B: Next.js full-stack)
 
-| Area                          | Choice                                                  | Why                                                                                          |
-| ----------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Framework                     | **Next.js 16 (App Router) + React 19 + TypeScript**     | Frontend and backend in one project, server rendering for SEO                                |
-| Styling                       | **Tailwind CSS v4**                                     | Utility classes, `backdrop-blur` for glass, design tokens via `@theme`                       |
-| Components                    | **shadcn/ui** (Radix UI underneath)                     | Accessible components copied into the repo and restyled to glass                             |
-| Animation                     | **Motion** (Framer Motion)                              | Entrance, scroll-reveal and hover animations (GSAP only if a heavier scroll effect needs it) |
-| 3D hero                       | **React Three Fiber** (three.js)                        | Glowing particle orb written in code with custom shaders                                     |
-| Icons                         | **Lucide React**                                        | Line icons that match the design                                                             |
-| Lesson content                | **MDX + Velite**                                        | Lessons as Markdown files, validated and typed at build time                                 |
-| Syntax highlighting           | **Shiki** (via `rehype-pretty-code`)                    | VS Code-quality highlighting, rendered on the server                                         |
-| Code editor                   | **CodeMirror 6** (`@uiw/react-codemirror`, Tokyo Night) | Lightweight, works well on mobile                                                            |
-| Run code: JS/TS               | **Web Worker runner** (+ sucrase for TS)                | Instant, offline, stops infinite loops; Sandpack added later for DOM/React lessons           |
-| Run code: all other languages | **Judge0** (through our own `/api/run` route)           | Python, Java, C#, Go, Rust, C++… executed on a server                                        |
-| Database                      | **PostgreSQL on Neon** + **Drizzle ORM**                | Serverless Postgres with type-safe queries                                                   |
-| Auth                          | **Better Auth**                                         | Sign in with GitHub or Google (Auth.js now recommends Better Auth for new projects)          |
-| Server data                   | **TanStack Query** + Server Actions                     | Fetching, caching and saving progress                                                        |
-| Client state                  | **Zustand**                                             | Small UI state (editor, panels, quiz)                                                        |
-| Charts                        | **Recharts**                                            | Dashboard charts (Tremor does not support React 19 yet)                                      |
-| Validation                    | **Zod**                                                 | Shared schemas for forms, API and content                                                    |
-| Quality                       | **ESLint, Prettier, Vitest, Playwright**                | Linting, formatting, unit and end-to-end tests                                               |
-| Hosting                       | **Vercel** (+ Vercel Analytics)                         | Auto-deploys on every push to `main`                                                         |
+| Area                      | Choice                                                  | Why                                                                                          |
+| ------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Framework                 | **Next.js 16 (App Router) + React 19 + TypeScript**     | Frontend and backend in one project, server rendering for SEO                                |
+| Styling                   | **Tailwind CSS v4**                                     | Utility classes, `backdrop-blur` for glass, design tokens via `@theme`                       |
+| Components                | **shadcn/ui** (Radix UI underneath)                     | Accessible components copied into the repo and restyled to glass                             |
+| Animation                 | **Motion** (Framer Motion)                              | Entrance, scroll-reveal and hover animations (GSAP only if a heavier scroll effect needs it) |
+| 3D hero                   | **React Three Fiber** (three.js)                        | Glowing particle orb written in code with custom shaders                                     |
+| Icons                     | **Lucide React**                                        | Line icons that match the design                                                             |
+| Lesson content            | **MDX + Velite**                                        | Lessons as Markdown files, validated and typed at build time                                 |
+| Syntax highlighting       | **Shiki** (via `rehype-pretty-code`)                    | VS Code-quality highlighting, rendered on the server                                         |
+| Code editor               | **CodeMirror 6** (`@uiw/react-codemirror`, Tokyo Night) | Lightweight, works well on mobile                                                            |
+| Run code: JS/TS           | **Web Worker runner** (+ sucrase for TS)                | Instant, offline, stops infinite loops; Sandpack added later for DOM/React lessons           |
+| Run code: Python          | **Pyodide** (Python 3.14 in a Web Worker)               | Real Python in the browser, no server or API key                                             |
+| Run code: other languages | **Judge0** (through our own `/api/run` route)           | Java, C#, Go, Rust, C++… executed on a server (later)                                        |
+| Database                  | **PostgreSQL on Neon** + **Drizzle ORM**                | Serverless Postgres with type-safe queries                                                   |
+| Auth                      | **Better Auth**                                         | Sign in with GitHub or Google (Auth.js now recommends Better Auth for new projects)          |
+| Server data               | **TanStack Query** + Server Actions                     | Fetching, caching and saving progress                                                        |
+| Client state              | **Zustand**                                             | Small UI state (editor, panels, quiz)                                                        |
+| Charts                    | **Recharts**                                            | Dashboard charts (Tremor does not support React 19 yet)                                      |
+| Validation                | **Zod**                                                 | Shared schemas for forms, API and content                                                    |
+| Quality                   | **ESLint, Prettier, Vitest, Playwright**                | Linting, formatting, unit and end-to-end tests                                               |
+| Hosting                   | **Vercel** (+ Vercel Analytics)                         | Auto-deploys on every push to `main`                                                         |
 
 ---
 
@@ -186,7 +187,7 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 3. `/dashboard` with Recharts charts (activity, per-language progress)
 4. `/profile` page
 
-### Phase 8: Content & launch 🚧 (launch prep done; deploy + new content next)
+### Phase 8: Content & launch 🚧 (launch prep + Python Beginner done; deploy next)
 
 1. Python and TypeScript Level 0–1 content
 2. Junior → Middle → Senior content for the MVP languages

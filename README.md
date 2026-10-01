@@ -79,6 +79,10 @@ learner's code in the same scope, e.g. `{ name: "adds", check: "add(2, 3) === 5"
 `__output` holds the printed lines. Every exercise needs a `<Solution>` code block:
 `npm test` verifies each solution passes and each starter doesn't.
 
+Python exercises add `language="python"` and write their `check`s in Python
+(e.g. `"add(2, 3) == 5"`); they run on [Pyodide](https://pyodide.org) (Python 3.14),
+loaded in the browser from jsDelivr and in tests from the `pyodide` package.
+
 The lesson URL is `/learn/<language>/<slug>` (the file name without its number).
 `npm run content` validates everything: unknown modules, missing number prefixes and
 duplicate slugs fail the build with a clear message. New languages must also be added to

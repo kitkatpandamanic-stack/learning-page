@@ -5,7 +5,8 @@
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { loadPyodide, type PyodideInterface } from "pyodide";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import {
   compareOutput,
@@ -13,6 +14,19 @@ import {
   type RunLanguage,
   type TestSpec,
 } from "@/lib/runner/execute";
+import { executePython } from "@/lib/runner/execute-python";
+
+let pyodide: PyodideInterface;
+beforeAll(async () => {
+  pyodide = await loadPyodide();
+}, 60_000);
+
+/** Runs lesson code the same way the browser does, in the right language. */
+function run(code: string, language: RunLanguage, tests?: TestSpec[]) {
+  return language === "python"
+    ? executePython(pyodide, code, { tests })
+    : execute(code, { language, tests });
+}
 
 const ROOT = join(__dirname, "..", "content", "courses");
 
@@ -82,9 +96,8 @@ function exercisesIn(file: string): Exercise[] {
     const attrs = parseAttributes(tag);
     if (typeof attrs.starter !== "string") return [];
     const body = block.slice(0, block.indexOf("</Exercise>"));
-    const solution = /<Solution>\s*```(?:js|ts)[^\n]*\n([\s\S]*?)```/.exec(
-      body,
-    )?.[1];
+    const solution =
+      /<Solution>\s*```(?:js|ts|python)[^\n]*\n([\s\S]*?)```/.exec(body)?.[1];
     return [
       {
         file: file.slice(ROOT.length + 1),
@@ -100,10 +113,7 @@ function exercisesIn(file: string): Exercise[] {
 }
 
 async function solves(code: string, ex: Exercise) {
-  const result = await execute(code, {
-    language: ex.language,
-    tests: ex.tests,
-  });
+  const result = await run(code, ex.language, ex.tests);
   const output =
     ex.expectedOutput !== undefined
       ? compareOutput(result.output, ex.expectedOutput)
@@ -156,11 +166,13 @@ describe("Code + Output examples", () => {
   const examples = files.flatMap((file) => {
     const source = readFileSync(file, "utf8");
     const pattern =
-      /<CodeExample output=(?:"([^"]*)"|\{`([\s\S]*?)`\})>\s*```(js|ts)[^\n]*\n([\s\S]*?)```\s*<\/CodeExample>/g;
+      /<CodeExample output=(?:"([^"]*)"|\{`([\s\S]*?)`\})>\s*```(js|ts|python)[^\n]*\n([\s\S]*?)```\s*<\/CodeExample>/g;
     return [...source.matchAll(pattern)].map((m, i) => ({
       name: `${file.slice(ROOT.length + 1)} #${i + 1}`,
       expected: (m[1] ?? m[2]).trim(),
-      language: (m[3] === "ts" ? "typescript" : "javascript") as RunLanguage,
+      language: ({ js: "javascript", ts: "typescript", python: "python" }[
+        m[3]
+      ] ?? "javascript") as RunLanguage,
       code: m[4],
     }));
   });
@@ -168,7 +180,7 @@ describe("Code + Output examples", () => {
   it.each(examples.map((ex) => [ex.name, ex] as const))(
     "%s",
     async (_name, ex) => {
-      const result = await execute(ex.code, { language: ex.language });
+      const result = await run(ex.code, ex.language);
       const got = result.output
         .map((l) => l.text)
         .join("\n")

@@ -4,6 +4,7 @@ import type {
   RunLanguage,
   TestSpec,
 } from "./execute";
+import { runPython, type PythonStatus } from "./run-python";
 import type { WorkerMessage, WorkerRequest } from "./runner.worker";
 
 export type RunResult = ExecuteResult & {
@@ -24,8 +25,12 @@ export function runCode(
     tests?: TestSpec[];
     timeoutMs?: number;
     onLine?: (line: OutputLine) => void;
+    /** Python only: reports "loading" while Pyodide downloads */
+    onStatus?: (status: PythonStatus) => void;
   } = {},
 ): { result: Promise<RunResult>; cancel: () => void } {
+  if (options.language === "python") return runPython(code, options);
+
   const {
     language = "javascript",
     tests,
