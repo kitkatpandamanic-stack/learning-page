@@ -164,7 +164,7 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 3. MDX components: `Callout`, `Quiz`, `CodeExample`, `Exercise`
 4. Write JavaScript Level 0 (about 10 lessons)
 
-### Phase 5: Database & accounts ✅ (code done; waiting for Neon + OAuth keys)
+### Phase 5: Database & accounts ✅
 
 1. 👤 Create a free Neon database and give me the `DATABASE_URL`
 2. Drizzle schema: `user`, `account`, `session`, `verification`, `lesson_progress`, `xp_event`, `user_achievement`, then run the migrations
