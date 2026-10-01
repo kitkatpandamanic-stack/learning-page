@@ -1,4 +1,5 @@
-import rehypePrettyCode, { type Options } from "rehype-pretty-code";
+import tokyoNight from "@shikijs/themes/tokyo-night";
+import rehypePrettyCode, { type Options, type Theme } from "rehype-pretty-code";
 import rehypeSlug from "rehype-slug";
 import { visit } from "unist-util-visit";
 import { defineCollection, defineConfig, s } from "velite";
@@ -12,8 +13,20 @@ import { languages } from "./src/lib/languages";
  *   content/courses/<language>/<module>/<NN-slug>.mdx lessons, ordered by NN
  */
 
+// Tokyo Night with brighter comments: its default #51597d is too faint to read
+// on our dark background, and lessons explain a lot in code comments.
+const readableTokyoNight = {
+  ...tokyoNight,
+  name: "tokyo-night-readable",
+  tokenColors: (tokyoNight.tokenColors ?? []).map((rule) =>
+    rule.settings.foreground === "#51597d"
+      ? { ...rule, settings: { ...rule.settings, foreground: "#9aa5ce" } }
+      : rule,
+  ),
+} as Theme;
+
 const prettyCode: Options = {
-  theme: "tokyo-night",
+  theme: readableTokyoNight,
   // Background comes from our glass code block styles
   keepBackground: false,
   defaultLang: { block: "text", inline: "text" },

@@ -4,9 +4,16 @@ import * as React from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { javascript } from "@codemirror/lang-javascript";
 import { EditorView } from "@codemirror/view";
-import { tokyoNight } from "@uiw/codemirror-theme-tokyo-night";
+import { tags } from "@lezer/highlight";
+import { tokyoNightInit } from "@uiw/codemirror-theme-tokyo-night";
 
 import type { RunLanguage } from "@/lib/runner/execute";
+
+// Tokyo Night, but with readable comments: exercise instructions live in comments.
+const theme = tokyoNightInit({
+  settings: { background: "transparent", gutterBackground: "transparent" },
+  styles: [{ tag: [tags.comment, tags.meta], color: "#9aa5ce" }],
+});
 
 // Blend the editor into our glass panels and use the site's code font.
 const glassTheme = EditorView.theme({
@@ -75,7 +82,7 @@ export function CodeEditor({
       <CodeMirror
         value={value}
         onChange={onChange}
-        theme={tokyoNight}
+        theme={theme}
         extensions={extensions}
         minHeight={minHeight}
         basicSetup={{

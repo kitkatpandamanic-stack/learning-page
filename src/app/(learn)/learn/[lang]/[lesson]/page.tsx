@@ -67,7 +67,10 @@ export default async function LessonPage({
 
   return (
     <div className="mx-auto grid w-full max-w-[90rem] gap-8 px-4 py-8 sm:px-6 lg:grid-cols-[17rem_minmax(0,1fr)] lg:px-8 xl:grid-cols-[17rem_minmax(0,1fr)_14rem]">
-      <aside className="sticky top-24 hidden max-h-[calc(100vh-7rem)] self-start overflow-y-auto rounded-2xl p-4 glass lg:block">
+      <aside
+        aria-label="Course contents"
+        className="sticky top-24 hidden max-h-[calc(100vh-7rem)] self-start overflow-y-auto rounded-2xl p-4 glass lg:block"
+      >
         {sidebar}
       </aside>
 
@@ -150,7 +153,10 @@ export default async function LessonPage({
         </div>
       </article>
 
-      <aside className="sticky top-24 hidden self-start xl:block">
+      <aside
+        aria-label="On this page"
+        className="sticky top-24 hidden self-start xl:block"
+      >
         <TableOfContents toc={lesson.toc} />
       </aside>
     </div>

@@ -186,7 +186,7 @@ Steps marked 👤 need you (creating an account or a key). I'll guide you throug
 3. `/dashboard` with Recharts charts (activity, per-language progress)
 4. `/profile` page
 
-### Phase 8: Content & launch
+### Phase 8: Content & launch 🚧 (launch prep done; deploy + new content next)
 
 1. Python and TypeScript Level 0–1 content
 2. Junior → Middle → Senior content for the MVP languages

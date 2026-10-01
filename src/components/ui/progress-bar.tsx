@@ -17,6 +17,7 @@ function ProgressBar({
   size = "md",
   label,
   showValue = false,
+  "aria-label": ariaLabel,
   ...props
 }: Omit<React.ComponentProps<"div">, "children"> & {
   value: number;
@@ -50,7 +51,9 @@ function ProgressBar({
         aria-valuemin={0}
         aria-valuemax={max}
         aria-valuenow={value}
-        aria-label={typeof label === "string" ? label : undefined}
+        aria-label={
+          ariaLabel ?? (typeof label === "string" ? label : "Progress")
+        }
         className={cn(
           "w-full overflow-hidden rounded-full bg-white/8 ring-1 ring-white/5 ring-inset",
           sizes[size],

@@ -84,6 +84,7 @@ export function LanguageCatalog({
               key={language.slug}
               language={language}
               stats={stats}
+              headingLevel={2}
             />
           ))}
         </div>

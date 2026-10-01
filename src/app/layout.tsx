@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Analytics } from "@vercel/analytics/next";
 import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import { SpaceBackground } from "@/components/layout/space-background";
 import { MotionProvider } from "@/components/motion/motion-provider";
@@ -34,10 +35,17 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${jakarta.variable} ${jetbrainsMono.variable} dark h-full antialiased`}
     >
       <body className="flex min-h-full flex-col">
+        <a
+          href="#main"
+          className="sr-only z-50 rounded-full bg-gradient-brand px-5 py-2.5 font-semibold text-white focus:not-sr-only focus:fixed focus:top-4 focus:left-4"
+        >
+          Skip to content
+        </a>
         <SpaceBackground />
         <MotionProvider>
           <Providers>{children}</Providers>
         </MotionProvider>
+        <Analytics />
       </body>
     </html>
   );

@@ -29,9 +29,9 @@ export function Footer() {
 
           {footerNav.map((group) => (
             <div key={group.title}>
-              <h3 className="mb-4 text-sm font-semibold text-white">
+              <h2 className="mb-4 text-sm font-semibold text-white">
                 {group.title}
-              </h3>
+              </h2>
               <ul className="flex flex-col gap-2.5">
                 {group.links.map((link) => (
                   <li key={link.href}>
@@ -48,9 +48,9 @@ export function Footer() {
           ))}
 
           <div className="flex flex-col gap-3">
-            <h3 className="text-sm font-semibold text-white">
+            <h2 className="text-sm font-semibold text-white">
               Stay in the loop
-            </h3>
+            </h2>
             <p className="text-sm text-muted-foreground">
               New lessons, languages and tips, once a month.
             </p>

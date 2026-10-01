@@ -31,12 +31,16 @@ export function LanguageMonogram({
 export function LanguageCard({
   language,
   stats,
+  headingLevel = 3,
 }: {
   language: Language;
+  /** h2 on the catalog page, h3 inside landing sections */
+  headingLevel?: 2 | 3;
   /** Shown on the catalog page when the course outline exists */
   stats?: CourseStats;
 }) {
   const available = language.status === "available";
+  const Heading = headingLevel === 2 ? "h2" : "h3";
 
   return (
     <GlassCard
@@ -57,10 +61,10 @@ export function LanguageCard({
         </div>
 
         <div className="flex flex-col gap-1.5">
-          <h3 className="flex items-center gap-1.5 text-lg font-semibold text-white">
+          <Heading className="flex items-center gap-1.5 text-lg font-semibold text-white">
             {language.name}
             <ArrowUpRight className="size-4 text-white/40 transition group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:text-white" />
-          </h3>
+          </Heading>
           <p className="text-sm text-muted-foreground">
             {language.description}
           </p>

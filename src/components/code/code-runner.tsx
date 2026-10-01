@@ -225,7 +225,7 @@ export function CodeRunner({
 
       {/* Output */}
       <div className="border-t border-white/10 bg-black/35 px-4 py-3">
-        <div className="mb-1.5 flex items-center justify-between font-mono text-[11px] tracking-wider text-white/45 uppercase">
+        <div className="mb-1.5 flex items-center justify-between font-mono text-[11px] tracking-wider text-white/65 uppercase">
           <span className="flex items-center gap-1.5">
             <Terminal className="size-3.5" /> Output
           </span>

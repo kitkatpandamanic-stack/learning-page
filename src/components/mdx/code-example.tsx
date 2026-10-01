@@ -14,7 +14,7 @@ export function CodeExample({
     <div className="code-example my-6">
       {children}
       <div className="not-prose -mt-2 rounded-b-2xl border border-t-0 border-white/10 bg-black/40 px-4 pt-4 pb-3">
-        <p className="mb-1.5 flex items-center gap-1.5 font-mono text-[11px] tracking-wider text-white/45 uppercase">
+        <p className="mb-1.5 flex items-center gap-1.5 font-mono text-[11px] tracking-wider text-white/65 uppercase">
           <Terminal className="size-3.5" /> Output
         </p>
         <pre className="font-mono text-sm whitespace-pre-wrap text-amber-200">

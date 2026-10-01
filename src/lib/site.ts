@@ -9,6 +9,8 @@ export const siteConfig = {
   name: "PandaDev",
   tagline: "Learn programming from Zero to Senior.",
   githubUrl: "https://github.com/kitkatpandamanic-stack/learning-page",
+  /** Where people can reach us: GitHub Issues on the public repo */
+  contactUrl: "https://github.com/kitkatpandamanic-stack/learning-page/issues",
 };
 
 export type NavLink = { label: string; href: string };
@@ -43,8 +45,10 @@ export const footerNav: { title: string; links: NavLink[] }[] = [
     title: "Company",
     links: [
       { label: "About", href: "/about" },
-      { label: "Blog", href: "/blog" },
-      { label: "Contact", href: "/contact" },
+      {
+        label: "Contact",
+        href: "https://github.com/kitkatpandamanic-stack/learning-page/issues",
+      },
     ],
   },
 ];
