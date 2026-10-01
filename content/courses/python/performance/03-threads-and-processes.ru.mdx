@@ -1,0 +1,463 @@
+---
+title: Потоки и процессы
+description: Конкурентность и параллелизм, потоки для ввода-вывода, состояния гонки и блокировки, процессы для вычислений, API concurrent.futures и выбор между потоками, процессами и asyncio.
+duration: 25
+xp: 30
+---
+
+Две реальные истории. API-клиент одной команды по очереди обращался к 200 эндпоинтам партнёров и работал 40 секунд; десять потоков сократили это время до 2 секунд. Другая команда добавила потоки в ночную задачу обработки изображений, и она **ничуть не ускорилась**: работа была чистыми вычислениями, а GIL позволял считать только одному потоку за раз. Переход на процессы ускорил её в 7 раз на 8-ядерном сервере. Инструмент один, результаты противоположные. Этот урок о том, как понять, какой инструмент подходит для какой задачи. 🧵
+
+<Callout type="note" title="Потоки из этого урока запускаются на вашем компьютере">
+
+В браузерном запускальщике нет потоков и процессов, поэтому код, который их запускает, показан в обычных блоках — попробуйте его у себя на компьютере. Запускаемые примеры используют приём из настоящих наборов тестов: исполнитель (executor), который выполняет задачи сразу же. Так как API `concurrent.futures` у всех исполнителей одинаковый, код, который вы проверяете здесь, без изменений работает с настоящими потоками и процессами.
+
+</Callout>
+
+## Конкурентность и параллелизм
+
+Два слова, которые постоянно путают:
+
+- **Конкурентность (concurrency)** — это *работа* со многими делами сразу: несколько задач находятся в процессе, и вы переключаетесь между ними, пока каждая чего-то ждёт. Один повар с тремя кастрюлями на плите работает конкурентно.
+- **Параллелизм (parallelism)** — это *выполнение* многих дел в один и тот же момент, для чего нужно несколько ядер процессора. Три повара, каждый из которых помешивает свою кастрюлю, работают параллельно.
+
+Что именно вам нужно, зависит от того, на что ваш код тратит время:
+
+- Работа, **ограниченная вводом-выводом (I/O-bound)**, в основном **ждёт**: сеть, базу данных, диск. Процессор простаивает. Помогает конкурентность: пока один запрос ждёт, можно запускать другие.
+- Работа, **ограниченная процессором (CPU-bound)**, держит процессор занятым: изменение размера изображений, разбор данных, математика, сжатие. Помогает только параллелизм, потому что ожидания, которые можно было бы совместить, нет.
+
+А ещё есть **GIL** из [урока о памяти и GIL](/learn/python/memory-and-the-gil): в стандартном CPython байт-код Python одновременно выполняет только **один поток**. Но поток **отпускает** GIL, пока ждёт ввода-вывода (и внутри многих библиотек на C, например numpy). Поэтому потоки отлично подходят для работы с вводом-выводом и почти бесполезны для вычислений на чистом Python. Для вычислений используют несколько **процессов (processes)**, у каждого из которых свой интерпретатор и свой GIL.
+
+## Потоки для ввода-вывода
+
+Современный способ работать с **потоками (threads)** — **`concurrent.futures.ThreadPoolExecutor`**: пул рабочих потоков, которые выполняют переданные им задачи. На вашем компьютере:
+
+```python
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
+
+URLS = [f"https://httpbin.org/delay/1?page={i}" for i in range(10)]
+
+def fetch(url):
+    response = httpx.get(url, timeout=10)
+    return url, response.status_code
+
+start = time.perf_counter()
+with ThreadPoolExecutor(max_workers=10) as pool:
+    for url, status in pool.map(fetch, URLS):
+        print(status, url)
+print(f"{time.perf_counter() - start:.1f}s")  # ~1 с, а не ~10 с
+```
+
+Каждый запрос примерно секунду ждёт ответа сервера. По очереди это 10 секунд. С 10 потоками все десять ждут **одновременно**, и вся пачка занимает около секунды. `pool.map` возвращает результаты **в порядке входных данных**, как и `asyncio.gather`. Блок `with` дожидается завершения всех задач, а потом закрывает пул.
+
+Внутри пул использует `threading.Thread`. Низкоуровневый API до сих пор встречается в старом коде:
+
+```python
+import threading
+
+def greet(name):
+    print(f"привет из {name}")
+
+worker = threading.Thread(target=greet, args=("worker 1",))
+worker.start()   # запускает greet в новом потоке
+worker.join()    # ждёт его завершения
+```
+
+Предпочитайте исполнитель: он переиспользует потоки, ограничивает, сколько их работает одновременно, и отдаёт вам возвращаемые значения и исключения, которые голый `Thread` просто теряет.
+
+## Состояния гонки и блокировки
+
+Потоки разделяют общую память — в этом их сила и их опасность. Операционная система может приостановить поток **между любыми двумя инструкциями байт-кода** и запустить другой. Строка вроде `balance = balance - amount` на самом деле состоит из трёх шагов: прочитать, вычесть, записать. Если между ними вклинится другой поток, одно обновление потеряется. Давайте сыграем роль операционной системы с двумя генераторами и будем приостанавливать каждый «поток» после чтения:
+
+<CodeExample output={`A читает 100
+B читает 100
+A записывает 70
+B записывает 50
+баланс: 50 (должно быть 20)`}>
+
+```python
+balance = 100
+
+def withdraw(name, amount):
+    global balance
+    seen = balance                 # 1. чтение
+    yield f"{name} читает {seen}"
+    balance = seen - amount        # 2. запись
+    yield f"{name} записывает {balance}"
+
+# Играем роль операционной системы и переключаем «потоки»
+# после каждого шага: A, B, A, B.
+a = withdraw("A", 30)
+b = withdraw("B", 50)
+for thread in [a, b, a, b]:
+    print(next(thread))
+print("баланс:", balance, "(должно быть 20)")
+```
+
+</CodeExample>
+
+Оба снятия прочитали 100, поэтому снятие A на 30 просто исчезает. Это **состояние гонки (race condition)**: результат зависит от того, как совпало время. С настоящими потоками оно случается лишь изредка, может быть, раз на 10 000 запусков, и отлаживать его — кошмар: тесты проходят, а продакшн теряет деньги в загруженную пятницу. (Поменяйте порядок на `[a, a, b, b]` — и получите правильный ответ, 20.)
+
+Исправление — **блокировка (lock)**, она же «мьютекс» (mutex): держать её может только один поток за раз, поэтому чтение и запись происходят вместе. На вашем компьютере:
+
+```python
+import threading
+
+balance = 100
+lock = threading.Lock()
+
+def withdraw(amount):
+    global balance
+    with lock:                 # остальные ждут здесь
+        if balance < amount:
+            return False
+        balance -= amount      # чтение + запись без перерыва
+        return True
+```
+
+<Callout type="warning" title="GIL не защищает ваши данные">
+
+GIL оберегает *собственные* внутренности Python, но может переключить потоки между любыми двумя инструкциями *вашего* кода, поэтому `counter += 1` из нескольких потоков может терять обновления. А в **free-threaded**-сборке Python 3.14 (`python3.14t`) потоки действительно работают параллельно, так что гонки случаются гораздо чаще. Любым общим данным, которые **меняет** больше одного потока, нужна блокировка.
+
+</Callout>
+
+У блокировок свои ошибки: забудете одну — получите гонку; возьмёте две блокировки в разном порядке в двух потоках — и они могут вечно ждать друг друга (**взаимная блокировка, deadlock**). Поэтому лучший дизайн — **ничего не разделять**: каждая задача получает свои входные данные, **возвращает** результат, и только главный поток объединяет результаты. Когда потоки должны передавать работу друг другу, используйте **`queue.Queue`** — она берёт блокировки на себя.
+
+## Процессы для вычислений
+
+Для вычислений на чистом Python используйте **`ProcessPoolExecutor`**: он запускает рабочие **процессы**, каждый из которых — отдельный Python со своим GIL, поэтому они действительно работают параллельно на разных ядрах. На вашем компьютере:
+
+```python
+import math
+from concurrent.futures import ProcessPoolExecutor
+
+def count_primes(start, stop):
+    return sum(
+        1 for n in range(max(start, 2), stop)
+        if all(n % d for d in range(2, math.isqrt(n) + 1))
+    )
+
+if __name__ == "__main__":
+    step = 250_000
+    starts = range(0, 2_000_000, step)
+    stops = range(step, 2_000_000 + step, step)
+    with ProcessPoolExecutor() as pool:     # по одному на ядро процессора
+        print(sum(pool.map(count_primes, starts, stops)))
+```
+
+У процессов есть правила, которых нет у потоков:
+
+- **Проверка `if __name__ == "__main__":` обязательна.** В macOS и Windows (а начиная с Python 3.14 по умолчанию и в Linux) каждый рабочий процесс начинает с импорта вашего модуля. Без этой проверки каждый рабочий процесс пытался бы запустить свой собственный пул.
+- **Всё, что передаётся в рабочий процесс или из него, сериализуется pickle** (превращается в байты и копируется). Функции должны быть определены на уровне модуля (никаких лямбд и вложенных функций), а аргументы и результаты должны поддерживать pickle: никаких открытых файлов, подключений к базе данных или блокировок.
+- **Накладные расходы реальны.** Запуск процесса занимает десятки миллисекунд, копирование данных тоже требует времени. Отправляйте несколько **больших порций** работы, а не миллион крошечных задач: `pool.map(func, items, chunksize=1_000)` нарежет порции за вас. Если каждая задача занимает микросекунды, пул сделает всё *медленнее*.
+- **По умолчанию общей памяти нет.** Глобальная переменная, изменённая в рабочем процессе, меняется только в его копии. Возвращайте результаты.
+
+Стоит знать ещё два новых варианта. В Python 3.14 появился **`InterpreterPoolExecutor`**, который запускает рабочих как **субинтерпретаторы (sub-interpreters)**, каждый со своим GIL, внутри одного процесса: параллельно, как процессы, но дешевле при запуске (пока его поддерживают не все расширения на C). А необязательная **free-threaded-сборка** полностью убирает GIL, так что обычные потоки могут выполнять вычисления параллельно. Оба варианта многообещающие, но безопасный выбор по умолчанию сегодня — по-прежнему процессы.
+
+## API concurrent.futures
+
+У всех исполнителей один небольшой API, и выучить его один раз выгодно везде:
+
+- **`executor.submit(fn, *args, **kwargs)`** планирует вызов `fn(*args, **kwargs)` и сразу возвращает **`Future`** — заглушку для результата, который появится позже.
+- **`future.result(timeout=None)`** ждёт результат и возвращает его или **заново выбрасывает** исключение, которое выбросила задача. `future.exception()` возвращает исключение, а не выбрасывает его, `future.done()` сообщает, завершилась ли задача, а `future.cancel()` отменяет задачу, которая ещё не началась.
+- **`executor.map(fn, items)`** — это `submit` для каждого элемента плюс результаты в порядке входных данных.
+- **`as_completed(futures)`** выдаёт future в порядке их **завершения**.
+
+`Executor` — абстрактный базовый класс: достаточно написать `submit`, а `map` и инструкцию `with` вы получаете бесплатно. Вот полноценный исполнитель, который выполняет каждую задачу сразу, в текущем потоке. Тот же API, только без потоков:
+
+<CodeExample output={`True 49
+сохранено: ValueError("invalid literal for int() with base 10: 'panda'")
+result() выбросил ValueError
+[1, 4, 9, 16]`}>
+
+```python
+from concurrent.futures import Executor, Future
+
+class InlineExecutor(Executor):
+    """Выполняет каждую задачу сразу, в вызывающем потоке."""
+
+    def submit(self, fn, /, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as error:
+            future.set_exception(error)
+        return future
+
+def square(n):
+    return n * n
+
+with InlineExecutor() as pool:
+    job = pool.submit(square, 7)
+    print(job.done(), job.result())
+
+    bad = pool.submit(int, "panda")
+    print("сохранено:", repr(bad.exception()))
+    try:
+        bad.result()               # заново выбрасывает ошибку
+    except ValueError:
+        print("result() выбросил ValueError")
+
+    print(list(pool.map(square, [1, 2, 3, 4])))
+```
+
+</CodeExample>
+
+Обратите внимание: упавшая задача не роняет `submit`. Исключение **сохраняется в future** и выбрасывается только при вызове `result()`. Пулы потоков и процессов ведут себя точно так же, и это классический источник ошибок: если никогда не вызывать `result()`, ошибки в фоновых задачах бесследно исчезают.
+
+### Внедряйте исполнитель
+
+Вот приём уровня senior: пишите конкурентный код так, чтобы он **получал** исполнитель как параметр, а не создавал его сам. В продакшне передаётся настоящий пул, в тестах — `InlineExecutor`, поэтому тесты быстрые, детерминированные и никогда не «мигают»:
+
+<CodeExample output={`{'panda.dev': 9000, 'zoo.com': 7000}
+не удалось: ['broken.io']`}>
+
+```python
+from concurrent.futures import (Executor, Future,
+                                as_completed)
+
+class InlineExecutor(Executor):
+    def submit(self, fn, /, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as error:
+            future.set_exception(error)
+        return future
+
+def fetch_size(url):
+    """Притворная загрузка: на вашем компьютере — настоящий ввод-вывод."""
+    if "broken" in url:
+        raise ConnectionError(f"{url} недоступен")
+    return len(url) * 1_000
+
+def fetch_all(urls, executor):
+    futures = {executor.submit(fetch_size, url): url
+               for url in urls}
+    sizes, failed = {}, []
+    for future in as_completed(futures):
+        url = futures[future]
+        try:
+            sizes[url] = future.result()
+        except ConnectionError:
+            failed.append(url)
+    return sizes, failed
+
+urls = ["panda.dev", "broken.io", "zoo.com"]
+sizes, failed = fetch_all(urls, InlineExecutor())
+print(dict(sorted(sizes.items())))
+print("не удалось:", failed)
+```
+
+</CodeExample>
+
+Словарь `{future: url}` — стандартная идиома: `as_completed` отдаёт future в порядке завершения, а словарь подсказывает, к каким входным данным относится каждый. Одна упавшая ссылка не останавливает остальные. А в продакшне меняется только аргумент:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor(max_workers=20) as pool:
+    sizes, failed = fetch_all(urls, pool)   # настоящие потоки
+```
+
+<Callout type="tip" title="Никогда не проверяйте порядок завершения">
+
+`as_completed` выдаёт future в том порядке, в котором они завершаются, а с настоящими потоками этот порядок меняется от запуска к запуску. Даже с `InlineExecutor`, где все future уже готовы, порядок не гарантирован. Собирайте результаты в **словарь с ключами по входным данным** (или сортируйте их), чтобы ни код, ни тесты не зависели от времени. Поэтому пример и печатает `dict(sorted(...))`.
+
+</Callout>
+
+Исполнители связаны и с asyncio. Внутри `async`-кода **`await asyncio.to_thread(blocking_func, arg)`** выполняет блокирующий вызов в потоке, чтобы цикл событий оставался отзывчивым, а **`await loop.run_in_executor(process_pool, cpu_func, arg)`** отправляет вычисления в пул процессов.
+
+## Потоки, процессы или asyncio?
+
+| Ваша ситуация | Что взять | Почему |
+| --- | --- | --- |
+| Ожидание сети/диска, до нескольких сотен задач, блокирующие библиотеки (requests, boto3, драйверы БД) | `ThreadPoolExecutor` | Потоки отпускают GIL во время ожидания; легко добавить в существующий код |
+| Тысячи соединений, есть асинхронные библиотеки (httpx, asyncpg, FastAPI) | `asyncio` | Один поток, задачи очень дёшевы, явные точки `await` означают меньше гонок |
+| Тяжёлые вычисления на чистом Python | `ProcessPoolExecutor` (или `InterpreterPoolExecutor` в 3.14) | У каждого рабочего свой GIL, поэтому работают все ядра |
+| Вычисления над массивами чисел | Сначала numpy / pandas | Векторизованный код на C быстрее любого пула циклов на Python |
+| Асинхронному приложению нужно вызвать блокирующий код | `asyncio.to_thread` / `run_in_executor` | Цикл событий остаётся свободным |
+| Задачи должны переживать перезапуски или выполняться на других машинах | Очередь задач (Celery, RQ, Arq) | Исполнители живут и умирают вместе с вашим процессом |
+
+И правило важнее таблицы: **начните с последовательного кода, измерьте, а затем добавляйте конкурентность там, где профиль показывает ожидание или вычисления**. Конкурентный код труднее читать, тестировать и отлаживать, так что своё место он должен заслужить.
+
+<Quiz
+  question="Скрипт изменяет размер 10 000 фотографий алгоритмом на чистом Python. Он загружает одно ядро процессора на 100% на 8-ядерном ноутбуке. Что, скорее всего, его ускорит?"
+  options={[
+    "ThreadPoolExecutor с 8 потоками",
+    "ProcessPoolExecutor с отправкой фотографий порциями",
+    "Переписать его на asyncio и await",
+    "Добавить блокировку вокруг функции изменения размера",
+  ]}
+  answer={1}
+  explanation="Работа — вычисления на чистом Python, поэтому GIL позволяет считать только одному потоку за раз, и asyncio тоже не поможет (нет ожидания, которое можно совместить). У отдельных процессов свой GIL у каждого, и они могут задействовать все 8 ядер. Отправка порциями снижает накладные расходы на pickle."
+/>
+
+<Quiz
+  question="Четыре потока каждый миллион раз выполняют count += 1 для общей глобальной переменной без блокировки. Каким может оказаться итоговое значение count?"
+  options={[
+    "Всегда ровно 4 000 000, потому что GIL делает это безопасным",
+    "4 000 000 или иногда меньше, потому что обновления могут теряться",
+    "Всегда ровно 1 000 000",
+    "Будет выброшено RuntimeError",
+  ]}
+  answer={1}
+  explanation="count += 1 — это чтение, сложение и запись. Поток может быть приостановлен между чтением и записью, и тогда обновление другого потока перезаписывается. GIL защищает внутренности Python, а не ваше «прочитать-изменить-записать». Используйте блокировку или, ещё лучше, пусть каждый поток возвращает свой счётчик, а в конце их сложите."
+/>
+
+<Exercise
+  language="python"
+  title="Тестируемый запуск пакета задач"
+  starter={`from concurrent.futures import Executor, Future, as_completed
+
+class InlineExecutor(Executor):
+    """Выполняет каждую задачу сразу. Идеально для тестов."""
+
+    def __init__(self):
+        self.submitted = 0
+
+    def submit(self, fn, /, *args, **kwargs):
+        self.submitted += 1
+        # TODO: создайте Future, вызовите fn(*args, **kwargs),
+        # сохраните результат ИЛИ исключение, верните future.
+        pass
+
+def chunk_sum_squares(chunk):
+    """Тяжёлые вычисления для одной порции (не меняйте)."""
+    return sum(n * n for n in chunk)
+
+def sum_squares(numbers, executor, chunk_size):
+    """Разбейте numbers на порции по chunk_size, отправьте
+    по одной задаче chunk_sum_squares на порцию, сложите результаты."""
+    pass
+
+def run_batch(jobs, work, executor):
+    """Выполните work(job) для каждой задачи на исполнителе.
+    Верните (results, errors) — два словаря с ключами-задачами:
+    results[job] = возвращённое значение, errors[job] = str(error)."""
+    pass
+
+if __name__ == "__main__":
+    with InlineExecutor() as pool:
+        print(sum_squares(list(range(1, 6)), pool, 2))
+        results, errors = run_batch(["7", "x", "42"], int, pool)
+        print(sorted(results.items()))
+        print(errors)
+        print("отправлено задач:", pool.submitted)
+`}
+  tests={[
+    { name: "submit возвращает Future с результатом", check: "InlineExecutor().submit(pow, 2, 10).result() == 1024" },
+    { name: "submit передаёт именованные аргументы", check: "InlineExecutor().submit(int, '101', base=2).result() == 5" },
+    { name: "Ошибки сохраняются в Future, а не выбрасываются", check: "[f := InlineExecutor().submit(int, 'panda'), f.done(), isinstance(f.exception(), ValueError)][1:] == [True, True]" },
+    { name: "map работает через ваш submit", check: "list(InlineExecutor().map(abs, [-1, 2, -3])) == [1, 2, 3]" },
+    { name: "sum_squares складывает все порции", check: "sum_squares(list(range(10)), InlineExecutor(), 3) == 285" },
+    { name: "sum_squares отправляет одну задачу на порцию", check: "[ex := InlineExecutor(), sum_squares(list(range(10)), ex, 3), ex.submitted][2] == 4" },
+    { name: "sum_squares с порциями побольше", check: "[ex := InlineExecutor(), sum_squares(list(range(1, 101)), ex, 50), ex.submitted][1:] == [338350, 2]" },
+    { name: "sum_squares от пустого списка равна 0", check: "sum_squares([], InlineExecutor(), 5) == 0" },
+    { name: "run_batch разделяет результаты и ошибки", check: `run_batch(['1', 'x', '3'], int, InlineExecutor()) == ({'1': 1, '3': 3}, {'x': "invalid literal for int() with base 10: 'x'"})` },
+    { name: "run_batch отправляет каждую задачу исполнителю", check: "[ex := InlineExecutor(), run_batch(['a', 'b'], str.upper, ex), ex.submitted][1:] == [({'a': 'A', 'b': 'B'}, {}), 2]" },
+    { name: "run_batch без задач", check: "run_batch([], len, InlineExecutor()) == ({}, {})" },
+    { name: "Демо печатает ожидаемые строки", check: `__output[:2] == ['55', "[('42', 42), ('7', 7)]"] and __output[-1] == 'отправлено задач: 6'` },
+  ]}
+>
+
+Напишите небольшой запуск пакета задач, который здесь проверяется с `InlineExecutor`, а в продакшне работает на настоящих потоках или процессах.
+
+1. **`InlineExecutor.submit`**: создайте `Future`, вызовите `fn(*args, **kwargs)` и сохраните либо **результат** (`set_result`), либо выброшенное **исключение** (`set_exception`). Верните future. Оставьте строку `self.submitted += 1`: по ней проверки убеждаются, что ваши функции действительно идут через исполнитель. (`map` и `with` после этого заработают автоматически.)
+2. **`sum_squares(numbers, executor, chunk_size)`**: разбейте `numbers` (список) на порции по `chunk_size`, **отправьте по одной задаче `chunk_sum_squares` на каждую порцию** и верните сумму всех результатов. Именно так стоит кормить `ProcessPoolExecutor`: несколько больших задач вместо задачи на каждое число.
+3. **`run_batch(jobs, work, executor)`**: отправьте `work(job)` для каждой задачи и соберите результаты с помощью `as_completed`. Верните `(results, errors)`: `results[job]` — возвращённое значение успешной задачи, `errors[job]` — `str(exception)` для задачи, которая выбросила исключение. Одна упавшая задача не должна останавливать остальные.
+
+Когда всё заработает, демо напечатает `55`, `[('42', 42), ('7', 7)]`, ошибку для `'x'` и `отправлено задач: 6`.
+
+<Hint>
+
+`submit`: `future = Future()`, затем `try: future.set_result(fn(*args, **kwargs))` / `except Exception as error: future.set_exception(error)` и `return future`.
+
+`sum_squares`: порции — это `numbers[i:i + chunk_size]` для `i in range(0, len(numbers), chunk_size)`. Отправьте каждую через `executor.submit(chunk_sum_squares, chunk)`, сохраните future в список и сделайте `return sum(f.result() for f in futures)`.
+
+`run_batch`: `futures = {executor.submit(work, job): job for job in jobs}`. Пройдите циклом `for future in as_completed(futures):`, найдите `job = futures[future]` и внутри `try` положите `future.result()` в `results[job]` или в ветке `except Exception as error:` положите `str(error)` в `errors[job]`.
+
+</Hint>
+
+<Solution>
+
+```python
+from concurrent.futures import Executor, Future, as_completed
+
+class InlineExecutor(Executor):
+    """Выполняет каждую задачу сразу. Идеально для тестов."""
+
+    def __init__(self):
+        self.submitted = 0
+
+    def submit(self, fn, /, *args, **kwargs):
+        self.submitted += 1
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as error:
+            future.set_exception(error)
+        return future
+
+def chunk_sum_squares(chunk):
+    """Тяжёлые вычисления для одной порции (не меняйте)."""
+    return sum(n * n for n in chunk)
+
+def sum_squares(numbers, executor, chunk_size):
+    """Разбейте numbers на порции по chunk_size, отправьте
+    по одной задаче chunk_sum_squares на порцию, сложите результаты."""
+    chunks = [numbers[i:i + chunk_size]
+              for i in range(0, len(numbers), chunk_size)]
+    futures = [executor.submit(chunk_sum_squares, chunk)
+               for chunk in chunks]
+    return sum(future.result() for future in futures)
+
+def run_batch(jobs, work, executor):
+    """Выполните work(job) для каждой задачи на исполнителе.
+    Верните (results, errors) — два словаря с ключами-задачами:
+    results[job] = возвращённое значение, errors[job] = str(error)."""
+    futures = {executor.submit(work, job): job for job in jobs}
+    results, errors = {}, {}
+    for future in as_completed(futures):
+        job = futures[future]
+        try:
+            results[job] = future.result()
+        except Exception as error:
+            errors[job] = str(error)
+    return results, errors
+
+if __name__ == "__main__":
+    with InlineExecutor() as pool:
+        print(sum_squares(list(range(1, 6)), pool, 2))
+        results, errors = run_batch(["7", "x", "42"], int, pool)
+        print(sorted(results.items()))
+        print(errors)
+        print("отправлено задач:", pool.submitted)
+```
+
+</Solution>
+
+</Exercise>
+
+На вашем компьютере те же функции работают параллельно — достаточно подменить исполнитель, больше ничего менять не нужно:
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+
+if __name__ == "__main__":
+    with ProcessPoolExecutor() as pool:
+        numbers = list(range(10_000_000))
+        print(sum_squares(numbers, pool, 1_000_000))
+```
+
+## Итоги
+
+- **Конкурентность** совмещает ожидания; **параллелизм** выполняет вычисления на нескольких ядрах одновременно. Сначала определите, ограничена ваша работа **вводом-выводом (I/O-bound)** или **процессором (CPU-bound)**.
+- **Потоки** (`ThreadPoolExecutor`) подходят для ввода-вывода: во время ожидания они отпускают GIL. Вычисления на чистом Python они не ускоряют.
+- Общим данным, которые меняют потоки, нужна **`threading.Lock`**; ещё лучше ничего не разделять: возвращайте результаты и объединяйте их в одном месте или используйте `queue.Queue`. GIL не предотвращает состояния гонки.
+- **Процессы** (`ProcessPoolExecutor`) подходят для вычислений: у каждого свой GIL. Им нужны проверка `__main__`, функции уровня модуля и данные, поддерживающие pickle, и большие порции, чтобы окупить накладные расходы. В Python 3.14 появились `InterpreterPoolExecutor` и необязательная free-threaded-сборка.
+- **`concurrent.futures`**: `submit` → `Future` (`result()`, `exception()`, `done()`), `map` сохраняет порядок входных данных, `as_completed` выдаёт порядок завершения; ошибки остаются в future, пока вы не вызовете `result()`.
+- **Внедряйте исполнитель**: настоящие пулы в продакшне, `InlineExecutor` в тестах — для быстрых детерминированных проверок.
+- Выбирайте по таблице: потоки для блокирующего ввода-вывода, asyncio для множества соединений, процессы для вычислений, numpy для массивов, очередь задач для надёжных долгоживущих задач.

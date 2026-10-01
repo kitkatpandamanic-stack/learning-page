@@ -1,0 +1,729 @@
+---
+title: Containers and Deployment
+description: Ship a Python service the professional way - validated config from the environment, structured logs, health checks, Docker, workers behind a proxy, CI, zero-downtime deploys and monitoring.
+duration: 25
+xp: 30
+---
+
+"It works on my machine" is where most projects stop, and where the real work begins. A production service has to start the same way on every server, tell you when it's unhealthy, survive deploys without dropping requests, and leave enough clues behind that you can debug it at 3 a.m. In this lesson you'll build the pieces that live in your Python code (settings, logs, health checks), then see how containers, CI and monitoring fit around them. 🚀
+
+## Config from the environment (the 12-factor way)
+
+The **Twelve-Factor App** is a set of rules for services that are easy to deploy, written by engineers at Heroku. Rule number three is: **store config in the environment**. The same build (the same Docker image) runs in development, staging and production, and only environment variables differ: database URLs, secret keys, log levels, feature flags.
+
+Reading `os.environ["WORKERS"]` all over the code has two problems: values are always **strings**, and a typo or missing value only blows up when that line finally runs, maybe days later. The fix is a **settings object** that is loaded and **validated once, at startup**. Pydantic does the hard work:
+
+<CodeExample output={`5 dev
+**********
+40
+database_url -> missing
+secret_key -> too_short
+workres -> extra_forbidden`}>
+
+```python
+from collections.abc import Mapping
+from typing import Literal
+
+from pydantic import (
+    BaseModel, ConfigDict, Field, SecretStr, ValidationError,
+)
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    database_url: str
+    secret_key: SecretStr = Field(min_length=32)
+    workers: int = Field(default=2, ge=1, le=32)
+
+def load_settings(env: Mapping[str, str]) -> Settings:
+    values = {
+        name.removeprefix("APP_").lower(): value
+        for name, value in env.items()
+        if name.startswith("APP_")
+    }
+    return Settings.model_validate(values)
+
+env = {
+    "APP_DATABASE_URL": "postgresql://db/shop",
+    "APP_SECRET_KEY": "x" * 40,
+    "APP_WORKERS": "4",
+    "HOME": "/home/mei",            # not ours: ignored
+}
+settings = load_settings(env)
+print(settings.workers + 1, settings.environment)
+print(settings.secret_key)
+print(len(settings.secret_key.get_secret_value()))
+
+bad = {"APP_SECRET_KEY": "short", "APP_WORKRES": "4"}
+try:
+    load_settings(bad)
+except ValidationError as e:
+    for error in e.errors():
+        print(error["loc"][0], "->", error["type"])
+```
+
+</CodeExample>
+
+A lot of good things happen in a few lines:
+
+- `"4"` became the integer `4`, and `ge=1, le=32` rejects silly values.
+- **`SecretStr`** prints as `**********`, so the key can't leak into logs or error pages by accident; you have to ask for it with `get_secret_value()`.
+- The **`APP_` prefix** keeps our variables apart from everything else in the environment, and `extra="forbid"` turns the typo `APP_WORKRES` into an error instead of a silently ignored setting.
+- `load_settings` takes the environment **as a parameter**. In the app you call `load_settings(os.environ)`; in tests you pass a plain dict. No monkeypatching needed.
+
+On your machine, the **`pydantic-settings`** package does the same thing with less code, and can also read a local `.env` file:
+
+```python
+# pip install pydantic-settings
+from pydantic import Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="APP_", env_file=".env"
+    )
+    database_url: str
+    secret_key: SecretStr = Field(min_length=32)
+    workers: int = 2
+
+settings = Settings()   # reads APP_* from the environment
+```
+
+<Callout type="tip" title="Fail fast, fail loudly">
+
+A service with broken config should **refuse to start**, with a clear message naming the bad variable. During a deploy, that means the new version never becomes healthy, so the old version keeps serving traffic while you fix the typo. A service that starts anyway and fails on the first real request is much worse.
+
+</Callout>
+
+## Structured logging
+
+In production, nobody reads logs line by line: they're collected from every server into a tool like Grafana Loki, Datadog or CloudWatch and **searched**. A free-text line like `Order 42 placed, total 19.99` is hard to filter. A **structured** log line is a small JSON object with named fields, so "show me every warning for order 42" is a simple query:
+
+<CodeExample output={`{"level": "INFO", "logger": "shop.orders", "msg": "order placed", "order_id": 42, "total": 19.99}
+{"level": "WARNING", "logger": "shop.orders", "msg": "payment slow", "order_id": 42, "ms": 2300}`}>
+
+```python
+import json
+import logging
+import sys
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        entry.update(getattr(record, "fields", {}))
+        return json.dumps(entry)
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(
+    level=logging.INFO, handlers=[handler], force=True
+)
+
+log = logging.getLogger("shop.orders")
+log.info("order placed",
+         extra={"fields": {"order_id": 42, "total": 19.99}})
+log.debug("cart details")     # below INFO: not shown
+log.warning("payment slow",
+            extra={"fields": {"order_id": 42, "ms": 2300}})
+```
+
+</CodeExample>
+
+A real formatter also adds a timestamp (`"time": self.formatTime(record)`); we left it out here so the output stays the same every run. Some habits that make logs useful:
+
+- **Log to stdout**, not to files. The container platform collects stdout; that's another twelve-factor rule.
+- Add a **request id** to every line of a request (a middleware creates it and passes it on, often via `contextvars`), so you can follow one request through all its log lines and across services.
+- Choose levels deliberately: `INFO` for business events, `WARNING` for "odd but handled", `ERROR` for "someone should look at this".
+- **Never log secrets or personal data**: passwords, tokens, full card numbers. Log ids instead.
+
+The `structlog` and `python-json-logger` packages give you all of this ready-made.
+
+## Health checks
+
+Load balancers and container platforms constantly ask your service *"are you OK?"* by calling an HTTP endpoint. There are two different questions, and mixing them up causes outages:
+
+- **Liveness** (`/health/live`): *is the process working at all?* If not, the platform **restarts** it. Keep this check trivial.
+- **Readiness** (`/health/ready`): *can you handle requests right now?* If not, the load balancer **stops sending traffic** to this instance until it recovers. This is where you check the database.
+
+<CodeExample output={`{'status': 'ok'}
+{'status': 'ok', 'database': 'ok'}
+503 {'status': 'unavailable', 'database': 'down'}
+200`}>
+
+```python
+import sqlite3
+from collections.abc import Callable
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+
+def create_app(check_db: Callable[[], bool]) -> FastAPI:
+    app = FastAPI()
+
+    @app.get("/health/live")
+    def live():
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def ready():
+        try:
+            db_ok = check_db()
+        except Exception:
+            db_ok = False
+        if not db_ok:
+            return JSONResponse(
+                {"status": "unavailable", "database": "down"},
+                status_code=503,
+            )
+        return {"status": "ok", "database": "ok"}
+
+    return app
+
+conn = sqlite3.connect(":memory:")
+
+def check_sqlite() -> bool:
+    return conn.execute("SELECT 1").fetchone() == (1,)
+
+client = TestClient(create_app(check_sqlite))
+print(client.get("/health/live").json())
+print(client.get("/health/ready").json())
+
+conn.close()                          # the database "goes down"
+response = client.get("/health/ready")
+print(response.status_code, response.json())
+print(client.get("/health/live").status_code)
+```
+
+</CodeExample>
+
+When the database goes down, readiness answers **503 Service Unavailable** while liveness stays happy. That's exactly right: restarting the app wouldn't fix the database. Notice the **app factory** `create_app(...)`: instead of a global `app`, a function builds the app from its dependencies, so tests can build one with a fake database check.
+
+<Callout type="warning" title="Don't let the database restart your whole fleet">
+
+A classic outage: someone checks the database in the **liveness** probe. The database has a 30-second hiccup, every instance fails liveness, the platform restarts all of them at once, and they all reconnect at the same moment, which knocks the database over again. Keep liveness trivial, keep health endpoints fast and unauthenticated, and don't let them leak details like versions of internal systems.
+
+</Callout>
+
+## Packaging the app in a container
+
+A **container image** bundles your code, its dependencies and a Python interpreter into one artifact that runs the same on your laptop, in CI and in production. A good Dockerfile for a Python service uses two tricks: a **multi-stage build** (install dependencies in one stage, copy only the result into a small final image without compilers and caches) and a **non-root user** (if someone breaks into the app, they aren't root inside the container):
+
+```dockerfile
+# ---- stage 1: build the dependencies ----
+FROM python:3.14-slim AS build
+RUN python -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---- stage 2: the small runtime image ----
+FROM python:3.14-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/venv/bin:$PATH"
+RUN useradd --create-home --uid 10001 app
+WORKDIR /app
+COPY --from=build /venv /venv
+COPY src/ ./src/
+USER app
+EXPOSE 8000
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", \
+     "--port", "8000", "--proxy-headers"]
+```
+
+Line by line, the important parts:
+
+- `requirements.txt` is copied and installed **before** the source code. Docker caches each step, so changing your code doesn't reinstall every package.
+- `PYTHONUNBUFFERED=1` makes logs appear immediately instead of sitting in a buffer.
+- The code stays owned by root and only readable for the `app` user, so a compromised process can't rewrite it.
+- `CMD` uses the **list form**, so uvicorn is the main process and receives the `SIGTERM` signal on shutdown (more on that below).
+
+Add a `.dockerignore` so secrets and junk never end up in the image:
+
+```text
+# .dockerignore
+.env
+.git
+.venv
+__pycache__
+tests
+```
+
+For local development, **Docker Compose** starts the app together with its database, with one command (`docker compose up --build`):
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENVIRONMENT: dev
+      APP_DATABASE_URL: postgresql+psycopg://app:app@db:5432/app
+    env_file: .env          # APP_SECRET_KEY lives here, not in git
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+```
+
+Services reach each other by name (`db:5432`), the named volume keeps the database between restarts, and `condition: service_healthy` waits for Postgres to accept connections before starting the API. The dev password `app` is fine here; production secrets come from the platform's secret store, never from a compose file in git.
+
+## Workers behind a reverse proxy
+
+In production you don't expose uvicorn directly to the internet. A **reverse proxy** (nginx, Caddy, Traefik, or a cloud load balancer) sits in front and handles HTTPS certificates, compression, slow clients, request size limits and often rate limiting, then forwards requests to your app:
+
+```bash
+# one container, several worker processes
+uvicorn src.main:app --host 0.0.0.0 --port 8000 \
+  --workers 4 --proxy-headers --forwarded-allow-ips "10.0.0.0/8"
+
+# or with FastAPI's own CLI
+fastapi run src/main.py --workers 4
+```
+
+A few rules of thumb:
+
+- One Python process uses **one CPU core** for Python code (the GIL from the internals module), so you run several **worker processes**, roughly one per core for async apps.
+- On **Kubernetes** or similar platforms, the usual choice is **one worker per container** and more container replicas: the platform does the process management and restarts.
+- `--proxy-headers` makes uvicorn trust `X-Forwarded-For` and `X-Forwarded-Proto` from the proxy, so the app sees the real client IP and `https`. Only trust them from your proxy's addresses (`--forwarded-allow-ips`), or clients could fake their IP to dodge your rate limits.
+- Workers are separate processes: anything kept in memory (a rate-limit counter, a cache) is **per worker**. Shared state belongs in Redis or the database.
+
+## Continuous integration
+
+**CI** runs your checks automatically on every push and pull request, so broken code never reaches `main`. With GitHub Actions, it's a YAML file in `.github/workflows/`:
+
+```yaml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest
+      - run: pip-audit -r requirements.txt
+
+  image:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+```
+
+The `test` job lints, tests and audits dependencies on every pull request. Only when that passes on `main` does the `image` job build the Docker image and push it to a registry, **tagged with the commit hash**, so you always know exactly which code is running and can roll back to any earlier tag. Secrets come from GitHub's encrypted secrets (`secrets.GITHUB_TOKEN`), never from the YAML, and `permissions` gives the job only what it needs. From there, a deploy step (or a tool like Argo CD) rolls out the new image.
+
+## Deploying without downtime
+
+Users shouldn't notice a deploy. The common strategies:
+
+| Strategy | How it works | Trade-off |
+| --- | --- | --- |
+| **Rolling** | replace instances a few at a time; each new one must pass readiness first | simple; old and new versions run side by side for a while |
+| **Blue-green** | start a full new set ("green"), then switch all traffic at once | instant rollback by switching back; needs double capacity briefly |
+| **Canary** | send 1–5% of traffic to the new version, watch the metrics, then increase | catches problems early with few users affected; needs good monitoring |
+
+All of them depend on the pieces from this lesson. **Readiness checks** keep traffic away from instances that aren't ready. **Graceful shutdown** matters too: when the platform stops an old instance it sends `SIGTERM`, and uvicorn stops accepting new connections and finishes the requests in progress before exiting, so give it enough time (`--timeout-graceful-shutdown`).
+
+The hardest part is usually the **database**. During a rolling deploy, old and new code run against the **same** schema, so changes go in backwards-compatible steps, a pattern called **expand and contract**: first add the new column (old code ignores it), deploy code that writes both, backfill, switch reads, and only in a later release drop the old column. Renaming a column in one go is the classic way to break a "zero-downtime" deploy.
+
+## Monitoring and alerts
+
+Once it's live, you need to know it's working **before** your users tell you. Observability has three pillars:
+
+- **Metrics**: numbers over time, cheap to store and great for dashboards and alerts. For every service, track the **RED** metrics: **R**ate (requests per second), **E**rrors (failed requests) and **D**uration (latency, as percentiles like p50 and p99, since averages hide the slow requests). Add saturation: CPU, memory, database connections. Prometheus and Grafana are the classic open-source pair.
+- **Logs**: the structured events from earlier, for the details of what happened.
+- **Traces**: one request's journey through every service and database call, with timings, so you can see *where* the slow part is. **OpenTelemetry** is the standard, with automatic instrumentation for FastAPI, SQLAlchemy and httpx.
+
+Plus **error tracking** (Sentry and similar) that groups exceptions with their stack traces.
+
+For **alerts**, page a human only for **symptoms users feel**: "error rate above 2% for 5 minutes" or "p99 latency above 1 second", not "CPU at 80%". Teams often define **SLOs** (service level objectives, like "99.9% of requests succeed each month") and alert when they're burning through the allowed failures too fast. Every alert should be actionable and link to a **runbook** saying what to check first; an alert that fires daily and gets ignored is worse than none, because it trains people to ignore the real one.
+
+<Quiz
+  question="During a deploy, the new version has a typo in an environment variable name (APP_WORKRES). Its settings use extra='forbid' and are validated at startup, and the platform does rolling updates with readiness checks. What happens?"
+  options={[
+    "The new instances start, ignore the setting and use the default number of workers",
+    "The new instances refuse to start, never become ready, and the old version keeps serving traffic",
+    "All instances crash, including the old ones",
+    "The typo is fixed automatically by pydantic",
+  ]}
+  answer={1}
+  explanation="Validation fails at startup, so the new instances never pass readiness and the rolling update stops there. The old instances keep handling requests until someone fixes the variable. That's exactly why config should fail fast."
+/>
+
+<Quiz
+  question="The database is briefly unreachable. Which health check should fail?"
+  options={[
+    "Liveness, so the platform restarts every instance",
+    "Readiness, so the load balancer stops sending traffic until the database is back",
+    "Both, to be safe",
+    "Neither: health checks should never look at the database",
+  ]}
+  answer={1}
+  explanation="Readiness answers whether the instance can serve requests right now, so it should fail and traffic is held back. Failing liveness would restart every instance, which can't fix the database and often makes the outage worse."
+/>
+
+<Exercise
+  language="python"
+  title="Settings loader and health checks"
+  starter={`from collections.abc import Callable, Mapping
+from typing import Literal
+
+import pytest
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from pydantic import (
+    BaseModel, ConfigDict, Field, SecretStr, ValidationError,
+    model_validator,
+)
+
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    app_name: str = "panda-api"
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    database_url: str
+    secret_key: SecretStr
+    debug: bool = False
+    workers: int = 2
+
+    # TODO 1: secret_key needs at least 32 characters and
+    #         workers must be between 1 and 32 (use Field)
+
+    # TODO 2: a model_validator(mode="after") that raises
+    #         ValueError when debug is on in "prod"
+
+
+def load_settings(env: Mapping[str, str]) -> Settings:
+    # TODO 3: build Settings from the APP_* variables in env:
+    #         APP_DATABASE_URL -> database_url, and so on.
+    #         Ignore every variable without the APP_ prefix.
+    raise NotImplementedError
+
+
+def create_app(
+    settings: Settings, check_db: Callable[[], bool]
+) -> FastAPI:
+    app = FastAPI(title=settings.app_name, debug=settings.debug)
+
+    @app.get("/health/live")
+    def live():
+        return {"status": "ok"}
+
+    # TODO 4: GET /health/ready
+    #   check_db() returns True -> 200 {"status": "ok",
+    #       "environment": settings.environment}
+    #   returns False or raises -> 503 {"status": "unavailable"}
+
+    return app
+
+
+# ---------- tests (don't change them) ----------
+
+GOOD_ENV = {
+    "APP_DATABASE_URL": "postgresql://db:5432/pandas",
+    "APP_SECRET_KEY": "k" * 40,
+    "APP_ENVIRONMENT": "staging",
+    "APP_WORKERS": "4",
+    "PATH": "/usr/bin",
+}
+
+
+def env_with(**changes):
+    env = dict(GOOD_ENV)
+    for name, value in changes.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
+def test_loads_and_converts_values():
+    settings = load_settings(GOOD_ENV)
+    assert settings.workers == 4
+    assert settings.environment == "staging"
+    assert settings.debug is False
+    assert settings.app_name == "panda-api"
+
+
+def test_secret_is_hidden():
+    settings = load_settings(GOOD_ENV)
+    assert "kkkk" not in repr(settings)
+    assert settings.secret_key.get_secret_value() == "k" * 40
+
+
+@pytest.mark.parametrize("changes", [
+    {"APP_DATABASE_URL": None},
+    {"APP_SECRET_KEY": "too-short"},
+    {"APP_WORKERS": "0"},
+    {"APP_WORKERS": "lots"},
+    {"APP_ENVIRONMENT": "production"},
+    {"APP_WORKRES": "4"},
+])
+def test_bad_config_fails_fast(changes):
+    with pytest.raises(ValidationError):
+        load_settings(env_with(**changes))
+
+
+def test_no_debug_in_prod():
+    env = env_with(APP_ENVIRONMENT="prod", APP_DEBUG="true")
+    with pytest.raises(ValidationError):
+        load_settings(env)
+    assert load_settings(env_with(APP_DEBUG="true")).debug
+
+
+def test_ready_when_database_is_up():
+    app = create_app(load_settings(GOOD_ENV), lambda: True)
+    response = TestClient(app).get("/health/ready")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok", "environment": "staging"
+    }
+
+
+def broken_db():
+    raise ConnectionError("database unreachable")
+
+
+@pytest.mark.parametrize("check_db", [lambda: False, broken_db])
+def test_not_ready_when_database_is_down(check_db):
+    app = create_app(load_settings(GOOD_ENV), check_db)
+    client = TestClient(app)
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+    assert client.get("/health/live").status_code == 200
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "All the tests in the editor pass", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 12" },
+    { name: "load_settings reads APP_* variables and converts their types", check: "(s := load_settings({'APP_DATABASE_URL': 'sqlite://', 'APP_SECRET_KEY': 'z' * 32, 'APP_WORKERS': '7', 'APP_DEBUG': '1', 'APP_APP_NAME': 'bamboo', 'USER': 'mei'})) and s.workers == 7 and s.debug is True and s.app_name == 'bamboo' and s.environment == 'dev' and s.database_url == 'sqlite://'" },
+    { name: "Short secrets, out-of-range workers and debug in prod are rejected", check: "all([pytest.raises(ValidationError, load_settings, {'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 31}), pytest.raises(ValidationError, load_settings, {'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32, 'APP_WORKERS': '33'}), pytest.raises(ValidationError, load_settings, {'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32, 'APP_ENVIRONMENT': 'prod', 'APP_DEBUG': 'yes'})]) and load_settings({'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32, 'APP_ENVIRONMENT': 'prod', 'APP_WORKERS': '32'}).workers == 32" },
+    { name: "/health/ready answers 200 with the environment when the database is up", check: "(c := TestClient(create_app(load_settings({'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32, 'APP_ENVIRONMENT': 'prod'}), lambda: True))) and (r := c.get('/health/ready')).status_code == 200 and r.json() == {'status': 'ok', 'environment': 'prod'}" },
+    { name: "/health/ready answers 503 when the check fails or raises, liveness stays OK", check: "(c := TestClient(create_app(load_settings({'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32}), lambda: 1 / 0))) and (r := c.get('/health/ready')).status_code == 503 and r.json() == {'status': 'unavailable'} and c.get('/health/live').json() == {'status': 'ok'}" },
+  ]}
+>
+
+Build the production-readiness core of a service: a validated settings loader and the health endpoints. Make all twelve tests pass:
+
+1. In `Settings`, use `Field` so that `secret_key` has **at least 32 characters** and `workers` is **between 1 and 32**.
+2. Add a `@model_validator(mode="after")` that raises `ValueError` when `debug` is on and `environment` is `"prod"`.
+3. Write `load_settings(env)`: take every variable that starts with `APP_`, remove the prefix, lower-case the rest (`APP_DATABASE_URL` → `database_url`), ignore everything else and validate with `Settings.model_validate`.
+4. In `create_app`, add `GET /health/ready`: call `check_db()`. If it returns `True`, answer `{"status": "ok", "environment": ...}`; if it returns `False` **or raises**, answer **503** with `{"status": "unavailable"}`.
+
+<Hint>
+
+`secret_key: SecretStr = Field(min_length=32)` and `workers: int = Field(default=2, ge=1, le=32)`. The validator is a method decorated with `@model_validator(mode="after")` that checks `self.environment == "prod" and self.debug` and must `return self` at the end. For the loader, a dict comprehension with `name.removeprefix("APP_").lower()` and `if name.startswith("APP_")` does it all. For the 503, wrap `check_db()` in `try` / `except Exception` and return `JSONResponse({"status": "unavailable"}, status_code=503)`.
+
+</Hint>
+
+<Solution>
+
+```python
+from collections.abc import Callable, Mapping
+from typing import Literal
+
+import pytest
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from pydantic import (
+    BaseModel, ConfigDict, Field, SecretStr, ValidationError,
+    model_validator,
+)
+
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    app_name: str = "panda-api"
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    database_url: str
+    secret_key: SecretStr = Field(min_length=32)
+    debug: bool = False
+    workers: int = Field(default=2, ge=1, le=32)
+
+    @model_validator(mode="after")
+    def no_debug_in_prod(self):
+        if self.environment == "prod" and self.debug:
+            raise ValueError("debug must be off in prod")
+        return self
+
+
+def load_settings(env: Mapping[str, str]) -> Settings:
+    values = {
+        name.removeprefix("APP_").lower(): value
+        for name, value in env.items()
+        if name.startswith("APP_")
+    }
+    return Settings.model_validate(values)
+
+
+def create_app(
+    settings: Settings, check_db: Callable[[], bool]
+) -> FastAPI:
+    app = FastAPI(title=settings.app_name, debug=settings.debug)
+
+    @app.get("/health/live")
+    def live():
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def ready():
+        try:
+            db_ok = check_db()
+        except Exception:
+            db_ok = False
+        if not db_ok:
+            return JSONResponse(
+                {"status": "unavailable"}, status_code=503
+            )
+        return {"status": "ok", "environment": settings.environment}
+
+    return app
+
+
+# ---------- tests (don't change them) ----------
+
+GOOD_ENV = {
+    "APP_DATABASE_URL": "postgresql://db:5432/pandas",
+    "APP_SECRET_KEY": "k" * 40,
+    "APP_ENVIRONMENT": "staging",
+    "APP_WORKERS": "4",
+    "PATH": "/usr/bin",
+}
+
+
+def env_with(**changes):
+    env = dict(GOOD_ENV)
+    for name, value in changes.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
+def test_loads_and_converts_values():
+    settings = load_settings(GOOD_ENV)
+    assert settings.workers == 4
+    assert settings.environment == "staging"
+    assert settings.debug is False
+    assert settings.app_name == "panda-api"
+
+
+def test_secret_is_hidden():
+    settings = load_settings(GOOD_ENV)
+    assert "kkkk" not in repr(settings)
+    assert settings.secret_key.get_secret_value() == "k" * 40
+
+
+@pytest.mark.parametrize("changes", [
+    {"APP_DATABASE_URL": None},
+    {"APP_SECRET_KEY": "too-short"},
+    {"APP_WORKERS": "0"},
+    {"APP_WORKERS": "lots"},
+    {"APP_ENVIRONMENT": "production"},
+    {"APP_WORKRES": "4"},
+])
+def test_bad_config_fails_fast(changes):
+    with pytest.raises(ValidationError):
+        load_settings(env_with(**changes))
+
+
+def test_no_debug_in_prod():
+    env = env_with(APP_ENVIRONMENT="prod", APP_DEBUG="true")
+    with pytest.raises(ValidationError):
+        load_settings(env)
+    assert load_settings(env_with(APP_DEBUG="true")).debug
+
+
+def test_ready_when_database_is_up():
+    app = create_app(load_settings(GOOD_ENV), lambda: True)
+    response = TestClient(app).get("/health/ready")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok", "environment": "staging"
+    }
+
+
+def broken_db():
+    raise ConnectionError("database unreachable")
+
+
+@pytest.mark.parametrize("check_db", [lambda: False, broken_db])
+def test_not_ready_when_database_is_down(check_db):
+    app = create_app(load_settings(GOOD_ENV), check_db)
+    client = TestClient(app)
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+    assert client.get("/health/live").status_code == 200
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Twelve-factor config**: one build for every environment, settings from **environment variables**, loaded into a validated, frozen settings object at startup (`APP_` prefix, `extra="forbid"`, `SecretStr`), and **fail fast** when something is wrong.
+- **Structured logs** are JSON lines to stdout with named fields and request ids, and never contain secrets.
+- **Liveness** says "restart me if this fails" and stays trivial; **readiness** says "don't send me traffic" and checks dependencies like the database (503 when down). An **app factory** makes both easy to test.
+- A good **Dockerfile** is multi-stage, installs dependencies before copying code, runs as a **non-root user** and uses the list form of `CMD`; **Compose** runs the app with its database locally.
+- Run several **uvicorn workers** (or one per container on Kubernetes) behind a **reverse proxy** that handles HTTPS; trust forwarded headers only from the proxy.
+- **CI** lints, tests and audits every change, then builds an image tagged with the commit hash.
+- **Zero-downtime deploys** (rolling, blue-green, canary) rely on readiness checks, graceful shutdown and expand-and-contract database migrations.
+- **Monitor** with metrics (RED), logs and traces (OpenTelemetry), and alert on symptoms users feel, with a runbook for every alert.

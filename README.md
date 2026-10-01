@@ -71,6 +71,7 @@ Lessons can use these components without importing them:
 | `<Quiz question="…" options={[…]} answer={1} explanation="…" />`                                     | Multiple-choice question (`answer` is 0-based)         |
 | `<Exercise title="…" starter={`…`} tests={[…]} expectedOutput={`…`}>` with `<Hint>` and `<Solution>` | Practice task with an in-browser editor, Run and Check |
 | `<TryIt html={`…`} code={`…`} />`                                                                    | Live HTML + JavaScript demo the learner can edit       |
+| `<TryIt language="python" code={`…`} />`                                                             | Editable code to run, e.g. Python that draws a chart   |
 
 Code blocks support titles and highlighted lines: ` ```js title="app.js" {2} `.
 
@@ -83,6 +84,12 @@ learner's code in the same scope, e.g. `{ name: "adds", check: "add(2, 3) === 5"
 Python exercises add `language="python"` and write their `check`s in Python
 (e.g. `"add(2, 3) == 5"`); they run on [Pyodide](https://pyodide.org) (Python 3.14),
 loaded in the browser from jsDelivr and in tests from the `pyodide` package.
+Packages the code imports (pandas, FastAPI, SQLAlchemy, pytest, matplotlib…) are
+installed on first use. The browser has no threads, so the runner gives `asyncio.run`
+a simple event loop and runs FastAPI's `TestClient` on it; `plt.show()` prints the chart
+as an image. The code is saved as `lesson.py`, so `pytest.main([__file__])` runs its
+tests, and checks can call `_panda_pytest()` (counts of passed/failed tests) or
+`_panda_pytest(patch={"add": buggy})` to make sure the learner's tests catch a bug.
 
 TypeScript exercises add `language="typescript"`. Code is type-checked first (strict,
 ES2023 library, no DOM) with the real TypeScript compiler, loaded from jsDelivr in the

@@ -1,0 +1,542 @@
+---
+title: Шаблоны отказоустойчивости
+description: Сохраняйте работоспособность сервисов, когда отказывают их зависимости, с помощью тайм-аутов, повторных попыток с backoff и джиттером, ключей идемпотентности, circuit breaker и rate limiter.
+duration: 25
+xp: 25
+---
+
+В системе из многих сервисов где-нибудь **всегда** что-то сломано: база данных перезапускается, сетевое соединение тормозит, API партнёра возвращает ошибки. Предотвратить это невозможно. Зато можно контролировать, останется ли маленький сбой маленьким или он будет расползаться, пока не ляжет весь сайт. Этот урок — набор **шаблонов отказоустойчивости (resilience patterns)**, к которым senior-инженеры обращаются каждую неделю. 🛡️
+
+Одно правило на весь урок: все эти шаблоны связаны со **временем** (ожидание, истечение срока, пополнение). Код, который напрямую вызывает `time.time()` и `time.sleep()`, тестировать медленно, и тесты получаются нестабильными. Поэтому каждый пример здесь принимает часы или функцию сна как параметр. Тесты передают поддельные, продакшен — настоящие.
+
+## Как всё ломается
+
+| Сбой | Что вы видите | Типичная причина |
+| --- | --- | --- |
+| Падение (crash) | Connection refused, ошибка сразу | Сервер лежит, идёт деплой |
+| Ответ с ошибкой | HTTP 500/502/503 | Баг, перегрузка, зависимость зависимости |
+| Медленная работа | Вызов просто... висит | Перегрузка, борьба за блокировки, медленный запрос, потерянный пакет |
+| Неверный ответ | 200 OK с плохими данными | Баги, устаревшие кэши |
+
+Самый коварный сбой — **медленная работа**. Упавший сервис отказывает быстро, и вы идёте дальше. А зависший вызов держит воркер, соединение с базой данных и терпение пользователя. Когда все воркеры застряли в ожидании одной медленной зависимости, ваш здоровый сервис тоже перестаёт отвечать. Так сбои распространяются **каскадом (cascade)**.
+
+## Тайм-ауты: никогда не ждите вечно
+
+Каждому вызову по сети нужен **тайм-аут (timeout)**: максимальное время, которое вы готовы ждать, прежде чем сдаться. Выбирайте его исходя из того, что может позволить себе вызывающая сторона, а не из того, сколько обычно отвечает зависимость.
+
+<CodeExample output={`рекомендации не уложились в тайм-аут
+{'user': 'mei', 'picks': ['хиты продаж']}`}>
+
+```python
+import asyncio
+
+async def personal_picks(user):
+    await asyncio.sleep(0.3)       # у сервиса сегодня плохой день
+    return ["пельмени", "лапша"]
+
+async def homepage(user):
+    try:
+        async with asyncio.timeout(0.05):
+            picks = await personal_picks(user)
+    except TimeoutError:
+        print("рекомендации не уложились в тайм-аут")
+        picks = ["хиты продаж"]     # запасной вариант, а не страница с ошибкой
+    return {"user": user, "picks": picks}
+
+print(asyncio.run(homepage("mei")))
+```
+
+</CodeExample>
+
+С `asyncio.timeout` вы познакомились в [уроке о тайм-аутах и отмене](/learn/python/timeouts-and-cancellation). У HTTP-клиентов и драйверов баз данных есть свои настройки тайм-аутов. На своём компьютере вы задаёте их так:
+
+```python
+import httpx
+
+# подключиться за 2 с, весь запрос — за 5 с
+client = httpx.Client(timeout=httpx.Timeout(5.0, connect=2.0))
+
+import requests
+requests.get(url, timeout=(2, 5))   # (подключение, чтение)
+
+from sqlalchemy import create_engine
+engine = create_engine(db_url, pool_timeout=3)
+```
+
+<Callout type="warning" title="Проверяйте значения по умолчанию">
+
+У популярной библиотеки `requests` по умолчанию **вообще нет тайм-аута**: вызов может висеть вечно. С такой строчки начинаются многие аварии. Сделайте «у каждого сетевого вызова есть тайм-аут» правилом код-ревью.
+
+</Callout>
+
+## Повторные попытки с экспоненциальной задержкой
+
+Многие сбои **временные (transient)**: кратковременный сбой сети, перезапуск сервера. Попробовать ещё раз часто помогает. Но очень важно, *как* именно вы повторяете. Если сервису, который и так еле справляется, мгновенно повторяют каждый неудачный запрос, его нагрузка удваивается ровно тогда, когда он меньше всего способен её выдержать.
+
+**Экспоненциальная задержка (backoff)** после каждой неудачи ждёт дольше: 0,1 с, 0,2 с, 0,4 с, 0,8 с... до **верхнего предела (cap)**. **Джиттер (jitter)** добавляет случайность, чтобы тысяча клиентов, у которых сбой случился в один момент, не повторяли запрос тоже в один момент. Популярный вариант «полный джиттер» (full jitter) ждёт случайное время от 0 до значения задержки:
+
+<CodeExample output={`[0.1, 0.2, 0.4, 0.8, 1.6, 2.0]
+[0.064, 0.005, 0.11, 0.179, 1.178, 1.353]`}>
+
+```python
+import random
+
+def backoff(attempt, base=0.1, cap=2.0):
+    return min(cap, base * 2 ** attempt)
+
+def full_jitter(attempt, rand, base=0.1, cap=2.0):
+    return rand() * backoff(attempt, base, cap)
+
+print([backoff(n) for n in range(6)])
+
+rng = random.Random(42)    # с зерном: каждый запуск одни и те же числа
+print([round(full_jitter(n, rng.random), 3) for n in range(6)])
+```
+
+</CodeExample>
+
+Обратите внимание: `full_jitter` принимает `rand` как параметр — так же, как часы. Тесты могут передать `lambda: 0.5` и точно знать, чего ожидать.
+
+Теперь вспомогательная функция для **повторных попыток (retry)**. Параметр `sleep` по умолчанию — настоящая `time.sleep`, но здесь мы передаём `waited.append`, поэтому вместо сна функция просто записывает, сколько она *проспала бы*:
+
+<CodeExample output={`попытка 1 не удалась (503), ждём 0.1 с
+попытка 2 не удалась (timeout), ждём 0.2 с
+вот ваши данные
+всего ожидания: 0.3 с`}>
+
+```python
+import time
+
+class TemporaryError(Exception):
+    pass
+
+def retry(fn, attempts=4, base=0.1, sleep=time.sleep,
+          retry_on=(TemporaryError,)):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except retry_on as error:
+            if attempt == attempts - 1:
+                raise                      # попытки закончились
+            delay = base * 2 ** attempt
+            print(f"попытка {attempt + 1} не удалась ({error}),"
+                  f" ждём {delay:.1f} с")
+            sleep(delay)
+
+answers = iter([TemporaryError("503"), TemporaryError("timeout"),
+                "вот ваши данные"])
+
+def flaky_service():
+    answer = next(answers)
+    if isinstance(answer, Exception):
+        raise answer
+    return answer
+
+waited = []
+print(retry(flaky_service, sleep=waited.append))
+print("всего ожидания:", round(sum(waited), 2), "с")
+```
+
+</CodeExample>
+
+Повторяйте только те ошибки, которые могут пройти сами. Повторить некорректный запрос — значит просто ещё раз отправить тот же некорректный запрос:
+
+| Повторять | Не повторять |
+| --- | --- |
+| Тайм-ауты, ошибки соединения | 400 Bad Request, 422 (ошибки валидации) |
+| 502, 503, 504 | 401/403 (от повтора вы не авторизуетесь) |
+| 429 Too Many Requests (дождитесь времени из заголовка `Retry-After`) | 404 Not Found |
+
+В реальных проектах вместо собственной функции используют библиотеку вроде **tenacity** (`@retry(stop=stop_after_attempt(4), wait=wait_random_exponential(max=2))`), но делает она ровно это.
+
+<Callout type="danger" title="Повторы перемножаются">
+
+Если веб-приложение повторяет запрос 3 раза, API, которое оно вызывает, — тоже 3 раза, и клиент базы данных этого API — ещё 3 раза, то один клик пользователя может превратиться в 27 обращений к базе данных, и всё это во время аварии. Такой **шторм повторов (retry storm)** уже не раз ронял крупные сайты. Повторяйте на **одном** уровне (обычно самом внешнем, который знает, безопасен ли повтор), делайте мало попыток и всегда используйте backoff с джиттером.
+
+</Callout>
+
+## Ключи идемпотентности: повторять безопасно
+
+Повторные попытки скрывают неприятную проблему. Ваше приложение просит платёжный сервис списать 25 фунтов, и запрос не укладывается в тайм-аут. Прошло ли списание? Возможно, платёж прошёл, а потерялся только **ответ**. Если повторить запрос, можно списать деньги с клиента дважды.
+
+Операция **идемпотентна (idempotent)**, если двукратное выполнение даёт тот же результат, что и однократное. `GET`, `PUT` и `DELETE` задуманы идемпотентными, а `POST` обычно нет. Решение — **ключ идемпотентности (idempotency key)**: клиент создаёт уникальный id **один раз на операцию** (а не на каждую попытку) и отправляет его с каждым повтором. Сервер запоминает ключи, которые уже обработал, и возвращает сохранённый ответ:
+
+<CodeExample output={`{'charge': 1, 'amount': 25}
+{'charge': 1, 'amount': 25}
+списаний денег: 1`}>
+
+```python
+class PaymentService:
+    def __init__(self):
+        self.charges = []
+        self._done = {}      # ключ идемпотентности -> ответ
+
+    def charge(self, key, customer, amount):
+        if key in self._done:
+            return self._done[key]     # уже видели: повторяем ответ
+        self.charges.append((customer, amount))
+        response = {"charge": len(self.charges), "amount": amount}
+        self._done[key] = response
+        return response
+
+payments = PaymentService()
+key = "a3f9-order-1042"   # клиент создаёт его ОДИН раз, например uuid4()
+
+print(payments.charge(key, "mei", 25))
+# ...ответ потерялся, поэтому клиент повторяет запрос:
+print(payments.charge(key, "mei", 25))
+print("списаний денег:", len(payments.charges))
+```
+
+</CodeExample>
+
+Платёжные API вроде Stripe работают именно так — с HTTP-заголовком `Idempotency-Key`. В продакшене ключи хранятся в базе данных с **ограничением уникальности (unique constraint)**, чтобы два повтора, пришедшие одновременно, не проскочили оба, и истекают примерно через сутки. Та же идея делает безопасными воркеры очередей: если задача может выполниться дважды, дайте ей id и пропускайте id, которые уже обработаны.
+
+## Circuit breaker: перестаньте вызывать мёртвый сервис
+
+Повторные попытки помогают при коротких сбоях. Но если сервис лежит уже пять минут, каждый запрос по-прежнему ждёт тайм-аута, повторяется и падает, сжигая ваши воркеры и добивая сервис, который пытается подняться. **Автоматический выключатель (circuit breaker)** замечает повторяющиеся сбои и на время перестаёт вызывать сервис — вместо этого он сразу возвращает ошибку, то есть отказывает **быстро**. Название взято у электрического автомата, который отключает ток раньше, чем расплавятся провода.
+
+```text
+          N ошибок подряд
+ CLOSED ───────────────────────▶ OPEN
+   ▲                              │  (вызовы сразу падают,
+   │                              │   запрос не отправляется)
+   │ пробный                      │ прошёл reset_timeout
+   │ успешен                      ▼
+   └─────────────────────── HALF-OPEN
+                                  │
+               OPEN ◀─────────────┘ проба не удалась
+```
+
+| Состояние | Что происходит с вызовом |
+| --- | --- |
+| **Closed** (замкнут, обычный режим) | Проходит. Сбои подряд подсчитываются; успех сбрасывает счётчик. |
+| **Open** (разомкнут) | Сразу отклоняется с ошибкой, сервис не вызывается. |
+| **Half-open** (полуоткрыт, после паузы) | Пропускается один пробный вызов. Успех замыкает цепь, сбой снова размыкает её ещё на одну паузу. |
+
+Пока цепь разомкнута, вызывающий код мгновенно получает ошибку, которую может превратить в запасной вариант (см. плавную деградацию ниже), а сломанный сервис получает передышку, чтобы восстановиться. Вы напишете такой выключатель в упражнении. В реальных проектах это делают библиотеки вроде **pybreaker** или **purgatory**, а service mesh (Istio, Envoy) умеют делать это и вне вашего кода.
+
+## Ограничение частоты запросов с token bucket
+
+Отказоустойчивость — это ещё и защита **самого себя** от слишком большого трафика: от клиента с багом, который шлёт запросы в цикле, от парсера, от всплеска. **Ограничитель частоты запросов (rate limiter)** ограничивает, сколько запросов может сделать каждый клиент. Самый популярный алгоритм — **token bucket** («ведро с токенами»):
+
+- У каждого клиента есть ведро, в котором помещается до `capacity` токенов.
+- Токены понемногу возвращаются с постоянной скоростью (скажем, 1 в секунду).
+- Каждый запрос забирает один токен. Нет токена — нет запроса: отвечаем **429 Too Many Requests**.
+
+Ёмкость допускает короткие **всплески (bursts)**, а скорость пополнения задаёт среднюю частоту на длинном отрезке:
+
+<CodeExample output={`[True, True, True, False, False]
+[True, True, False]
+[True, True, True, False]`}>
+
+```python
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TokenBucket:
+    def __init__(self, capacity, per_second, clock):
+        self.capacity = capacity
+        self.per_second = per_second
+        self.clock = clock
+        self.tokens = capacity
+        self.updated = clock()
+
+    def allow(self):
+        now = self.clock()
+        earned = (now - self.updated) * self.per_second
+        self.tokens = min(self.capacity, self.tokens + earned)
+        self.updated = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+clock = FakeClock()
+bucket = TokenBucket(capacity=3, per_second=1, clock=clock.time)
+
+print([bucket.allow() for _ in range(5)])   # всплеск
+clock.advance(2)
+print([bucket.allow() for _ in range(3)])   # накопилось 2 токена
+clock.advance(60)
+print([bucket.allow() for _ in range(4)])   # никогда больше 3
+```
+
+</CodeExample>
+
+Никакого фонового таймера, пополняющего ведро, нет: каждый вызов вычисляет, сколько токенов **накопилось** с прошлого вызова. Поэтому это достаточно дёшево, чтобы держать отдельное ведро на каждого пользователя или каждый API-ключ. Если API-серверов несколько, вёдра должны быть общими, поэтому в продакшене они обычно живут в Redis.
+
+## Плавная деградация
+
+Когда зависимость отказывает, спросите себя: «Что **наименее плохое** мы можем показать?» Очень часто это не страница с ошибкой. Магазин, у которого упал сервис рекомендаций, всё равно может продавать:
+
+<CodeExample output={`(['любимое карри mei'], 'live')
+(['любимое карри mei'], 'stale')
+(['пельмени', 'лапша', 'баоцзы'], 'popular')`}>
+
+```python
+class ServiceDown(Exception):
+    pass
+
+POPULAR = ["пельмени", "лапша", "баоцзы"]
+last_good = {}
+
+def recommendations(user, fetch_live):
+    try:
+        picks = fetch_live(user)
+        last_good[user] = picks
+        return picks, "live"
+    except ServiceDown:
+        if user in last_good:
+            return last_good[user], "stale"
+        return POPULAR, "popular"
+
+def healthy(user):
+    return [f"любимое карри {user}"]
+
+def broken(user):
+    raise ServiceDown("сервис рекомендаций недоступен")
+
+print(recommendations("mei", healthy))
+print(recommendations("mei", broken))
+print(recommendations("kai", broken))
+```
+
+</CodeExample>
+
+Сначала живые данные (`live`), потом устаревшие (`stale`), потом разумное значение по умолчанию (`popular`). Другие формы **плавной деградации (graceful degradation)**: отключение дорогих функций с помощью **флага функциональности (feature flag)** во время инцидента, **сброс нагрузки (load shedding)** — заранее отклонять часть низкоприоритетных запросов, чтобы важные всё-таки выполнились, — и **переборки (bulkheads)**: отдельные пулы воркеров для каждой зависимости, чтобы одна медленная зависимость не заняла все воркеры. Договоритесь об этих запасных вариантах с продуктовой командой **до** инцидента, а не во время него.
+
+<Callout type="tip" title="Как шаблоны сочетаются друг с другом">
+
+Типичный исходящий вызов оборачивается изнутри наружу: **тайм-аут** на каждую попытку, **circuit breaker** вокруг вызова, небольшое число **повторных попыток** с backoff и джиттером вокруг этого (только для безопасных, идемпотентных запросов) и **запасной вариант (fallback)**, когда не помогло ничего. Входящий трафик сначала проходит через **rate limiter**.
+
+</Callout>
+
+<Quiz
+  question="Клиент отправляет заказ через POST, запрос не укладывается в тайм-аут, и клиент повторяет его. Заказ создаётся дважды. Что исправит это правильно?"
+  options={[
+    "Более длинный тайм-аут",
+    "Больше повторных попыток с экспоненциальной задержкой",
+    "Ключ идемпотентности, созданный один раз на заказ и отправляемый с каждой попыткой",
+    "Circuit breaker перед сервисом заказов",
+  ]}
+  answer={2}
+  explanation="Первый запрос мог выполниться успешно, хотя ответ потерялся. С ключом идемпотентности сервер узнаёт повтор и возвращает сохранённый ответ, а не создаёт второй заказ. Более длинный тайм-аут лишь делает проблему реже."
+/>
+
+<Quiz
+  question="У token bucket ёмкость 10, и он пополняется на 2 токена в секунду. Клиент минуту ничего не отправлял, а затем разом шлёт 15 запросов. Сколько из них будет разрешено?"
+  options={["2", "10", "15", "120"]}
+  answer={1}
+  explanation="В ведре никогда не бывает больше токенов, чем его ёмкость, поэтому после минуты простоя в нём 10 токенов, а не 120. Первые 10 запросов разрешены, а остальные 5 получают 429 Too Many Requests."
+/>
+
+<Exercise
+  language="python"
+  title="Повторные попытки и circuit breaker"
+  starter={`import time
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class CircuitOpenError(Exception):
+    """Выбрасывается вместо вызова сервиса, который, как мы знаем, лежит."""
+
+
+def retry(fn, attempts=3, base_delay=0.1, sleep=time.sleep):
+    # TODO: вызвать fn(); при исключении подождать base_delay * 2 ** n
+    # и попробовать снова, всего не больше \`attempts\` вызовов.
+    # Последнюю ошибку выбросить заново. CircuitOpenError не повторять.
+    return fn()
+
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold, reset_timeout, clock):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.clock = clock
+        self.failures = 0
+        self.opened_at = None    # None значит, что цепь замкнута
+
+    @property
+    def state(self):
+        # TODO: "closed", "open" или "half-open"
+        return "closed"
+
+    def call(self, fn):
+        # TODO: отклонять вызовы, пока цепь разомкнута, считать сбои,
+        # размыкать после failure_threshold сбоев подряд,
+        # пропускать один пробный вызов в состоянии half-open
+        return fn()
+
+
+clock = FakeClock()
+breaker = CircuitBreaker(failure_threshold=3, reset_timeout=30,
+                         clock=clock.time)
+
+def broken_service():
+    raise ConnectionError("no answer")
+
+for _ in range(2):
+    try:
+        retry(lambda: breaker.call(broken_service),
+              sleep=clock.sleep)
+    except Exception as error:
+        print(type(error).__name__, "|", breaker.state)
+
+clock.sleep(30)
+print(breaker.state)
+print(breaker.call(lambda: "pong"), "|", breaker.state)
+`}
+  tests={[
+    { name: "Демо печатает ожидаемые строки", check: "__output == ['ConnectionError | open', 'CircuitOpenError | open', 'half-open', 'pong | closed']" },
+    { name: "retry() возвращает результат, как только вызов удался", check: "[n := [], retry(lambda: 1 / 0 if n.append(1) or len(n) < 3 else 'ok', attempts=5, sleep=lambda s: None)][-1] == 'ok' and len(n) == 3" },
+    { name: "Никакого ожидания, если первый вызов сработал", check: "[w := [], retry(lambda: 7, sleep=w.append)][-1] == 7 and w == []" },
+    { name: "Ждёт base_delay * 2 ** n, затем выбрасывает последнюю ошибку", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [n := [], w := [], _try(lambda: retry(lambda: n.append(1) or 1 / 0, attempts=4, base_delay=0.5, sleep=w.append))][-1] == 'ZeroDivisionError' and len(n) == 4 and w == [0.5, 1.0, 2.0]" },
+    { name: "Никогда не повторяет CircuitOpenError", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [n := [], _try(lambda: retry(lambda: n.append(1) or (_ for _ in ()).throw(CircuitOpenError()), sleep=lambda s: None))][-1] == 'CircuitOpenError' and len(n) == 1" },
+    { name: "Замкнутый выключатель пропускает результаты", check: "[c := FakeClock(), b := CircuitBreaker(3, 10, c.time)][-1].call(lambda: 42) == 42 and b.state == 'closed'" },
+    { name: "Размыкается после failure_threshold сбоев подряд", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), b := CircuitBreaker(3, 10, c.time), [_try(lambda: b.call(lambda: 1 / 0)) for _ in range(2)], b.state, _try(lambda: b.call(lambda: 1 / 0)), b.state][3:] == ['closed', 'ZeroDivisionError', 'open']" },
+    { name: "В состоянии open отклоняет вызовы, не вызывая fn", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), n := [], b := CircuitBreaker(1, 10, c.time), _try(lambda: b.call(lambda: 1 / 0)), c.sleep(9.9), _try(lambda: b.call(lambda: n.append(1)))][-1] == 'CircuitOpenError' and n == []" },
+    { name: "Успех сбрасывает счётчик сбоев", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), b := CircuitBreaker(3, 10, c.time), _try(lambda: b.call(lambda: 1 / 0)), _try(lambda: b.call(lambda: 1 / 0)), b.call(lambda: 'ok'), _try(lambda: b.call(lambda: 1 / 0)), _try(lambda: b.call(lambda: 1 / 0)), b.state][-1] == 'closed'" },
+    { name: "Half-open после reset_timeout; удачная проба замыкает цепь", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), b := CircuitBreaker(2, 10, c.time), _try(lambda: b.call(lambda: 1 / 0)), _try(lambda: b.call(lambda: 1 / 0)), c.sleep(10), b.state, b.call(lambda: 'hi'), b.state, _try(lambda: b.call(lambda: 1 / 0)), b.state][-5:] == ['half-open', 'hi', 'closed', 'ZeroDivisionError', 'closed']" },
+    { name: "Неудачная проба снова размыкает цепь и перезапускает таймер", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), b := CircuitBreaker(5, 10, c.time), [_try(lambda: b.call(lambda: 1 / 0)) for _ in range(5)], c.sleep(15), b.state, _try(lambda: b.call(lambda: 1 / 0)), b.state, c.sleep(9), b.state, c.sleep(1), b.state][4::2] == ['half-open', 'open', 'open', 'half-open']" },
+  ]}>
+
+Соберите два шаблона, которые защищают исходящий вызов. Оба получают время снаружи: `sleep` и `clock` — параметры, а тесты передают `FakeClock`.
+
+**`retry(fn, attempts=3, base_delay=0.1, sleep=time.sleep)`**
+
+1. Вызовите `fn()` и верните результат, как только вызов удался.
+2. Если вызов выбросил исключение, подождите `base_delay * 2 ** n` (0.1, 0.2, 0.4...) с помощью `sleep(...)` и попробуйте снова — всего не больше `attempts` вызовов. После последней попытки не ждите: выбросьте её ошибку заново.
+3. Никогда не повторяйте `CircuitOpenError`: сразу выбрасывайте его дальше (выключатель уже знает, что сервис лежит).
+
+**`CircuitBreaker(failure_threshold, reset_timeout, clock)`**
+
+1. `state` равно `"closed"`, когда `opened_at` равно `None`; `"half-open"`, когда с момента `opened_at` прошло не меньше `reset_timeout` секунд; и `"open"` в остальных случаях.
+2. `call(fn)`: в состоянии open выбросьте `CircuitOpenError`, **не** вызывая `fn`. Иначе вызовите `fn()`.
+3. При сбое посчитайте его и выбросьте исходную ошибку заново. Разомкните цепь (запишите в `opened_at` текущее время), когда случилось `failure_threshold` сбоев подряд или когда упал пробный вызов в состоянии half-open.
+4. При успехе сбросьте счётчик сбоев, замкните цепь и верните результат.
+
+<Hint>
+
+Для `retry` сделайте цикл `for attempt in range(attempts):` с `try`/`return fn()`. Поставьте `except CircuitOpenError: raise` **перед** `except Exception:`, потому что Python выбирает первый подходящий `except`. В общем обработчике сделайте `raise`, если `attempt == attempts - 1`, а иначе — `sleep(base_delay * 2 ** attempt)`.
+
+Для выключателя `state` сравнивает `self.clock() - self.opened_at` с `self.reset_timeout`. В `call` сначала проверьте `if self.state == "open": raise CircuitOpenError(...)`, затем оберните `fn()` в `try`. В блоке `except Exception:` прибавьте 1 к `self.failures`; если состояние `"half-open"` или сбоев набралось столько, сколько задаёт порог, запишите `self.opened_at = self.clock()`; затем `raise`.
+
+</Hint>
+
+<Solution>
+
+```python
+import time
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class CircuitOpenError(Exception):
+    """Выбрасывается вместо вызова сервиса, который, как мы знаем, лежит."""
+
+
+def retry(fn, attempts=3, base_delay=0.1, sleep=time.sleep):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except CircuitOpenError:
+            raise
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            sleep(base_delay * 2 ** attempt)
+
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold, reset_timeout, clock):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.clock = clock
+        self.failures = 0
+        self.opened_at = None    # None значит, что цепь замкнута
+
+    @property
+    def state(self):
+        if self.opened_at is None:
+            return "closed"
+        if self.clock() - self.opened_at >= self.reset_timeout:
+            return "half-open"
+        return "open"
+
+    def call(self, fn):
+        if self.state == "open":
+            raise CircuitOpenError("сервис недоступен, не вызываем")
+        try:
+            result = fn()
+        except Exception:
+            self.failures += 1
+            if (self.state == "half-open"
+                    or self.failures >= self.failure_threshold):
+                self.opened_at = self.clock()
+            raise
+        self.failures = 0
+        self.opened_at = None
+        return result
+
+
+clock = FakeClock()
+breaker = CircuitBreaker(failure_threshold=3, reset_timeout=30,
+                         clock=clock.time)
+
+def broken_service():
+    raise ConnectionError("no answer")
+
+for _ in range(2):
+    try:
+        retry(lambda: breaker.call(broken_service),
+              sleep=clock.sleep)
+    except Exception as error:
+        print(type(error).__name__, "|", breaker.state)
+
+clock.sleep(30)
+print(breaker.state)
+print(breaker.call(lambda: "pong"), "|", breaker.state)
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Сбои распространяются **каскадом**, когда медленные вызовы занимают воркеры; медленная работа опаснее, чем чистое падение.
+- Дайте каждому сетевому вызову **тайм-аут**, исходя из того, что может себе позволить вызывающая сторона.
+- **Повторяйте** только временные ошибки, с **экспоненциальной задержкой** и **джиттером** и только на одном уровне, чтобы избежать штормов повторов.
+- **Ключи идемпотентности** (один на операцию, хранятся с ограничением уникальности) делают безопасными повторы `POST`-запросов и повторное выполнение задач.
+- **Circuit breaker** быстро отказывает, пока зависимость лежит (closed → open → half-open), и даёт ей восстановиться.
+- **Token bucket** допускает короткие всплески, но ограничивает среднюю частоту; когда ведро пустое, отвечайте 429.
+- **Плавная деградация**: живые данные, потом устаревшие, потом разумное значение по умолчанию — вместо страницы с ошибкой.
+- Внедряйте **часы, sleep и случайность** как зависимости, чтобы всё это можно было тестировать быстро и детерминированно.

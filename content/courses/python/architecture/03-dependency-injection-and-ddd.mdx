@@ -1,0 +1,830 @@
+---
+title: Dependency Injection and Domain-Driven Design
+description: Inject collaborators through constructors, wire them in a composition root and with FastAPI's Depends, and model the domain with entities, value objects, aggregates and domain events.
+duration: 25
+xp: 30
+---
+
+You now have layers, repositories and units of work. Two questions are left. First: **who creates all these objects and plugs them together?** That's **dependency injection**, and in Python it needs no framework. Second: **what should the domain objects in the middle look like?** That's where a light version of **domain-driven design** (DDD) helps. By the end of this lesson you'll refactor a tangled piece of code into small, injected parts that are a pleasure to test. 🧩
+
+## Hard-wired dependencies
+
+Here's a function you'll find in plenty of real codebases:
+
+```python
+SUBSCRIPTIONS = {}                      # global "database"
+
+def start_trial(email):
+    if email in SUBSCRIPTIONS:
+        raise KeyError("already subscribed")
+    ends = datetime.now() + timedelta(days=14)   # real clock
+    SUBSCRIPTIONS[email] = {"email": email, "trial_ends": ends}
+    smtp_send(email, "Welcome!")                 # real email
+    return SUBSCRIPTIONS[email]
+```
+
+It works. Now try to test it. The trial end date changes every time the test runs, so you can't assert on it. Every test run would send a real email (or you `patch` `smtp_send` by its import path, which breaks as soon as someone moves the function). And `SUBSCRIPTIONS` is shared by every test, so tests start depending on their order. The function **reaches out** and grabs its dependencies: the clock, the mail server, the storage.
+
+**Dependency injection** (DI) turns that around: a piece of code **receives** what it needs instead of creating or importing it.
+
+## Constructor injection
+
+The most common form is **constructor injection**: a class takes its collaborators as `__init__` parameters and keeps them. Even the clock is just a parameter, a function that returns the current time:
+
+<CodeExample output={`1
+[('sam@example.com', 'Invoice 2 is overdue')]
+2`}>
+
+```python
+from datetime import datetime, timedelta
+from typing import Callable, Protocol
+
+class Mailer(Protocol):
+    def send(self, to: str, subject: str) -> None: ...
+
+class ReminderService:
+    def __init__(self, mailer: Mailer,
+                 clock: Callable[[], datetime]):
+        self.mailer = mailer
+        self.clock = clock
+
+    def remind(self, invoices: list[dict]) -> int:
+        today = self.clock().date()
+        late = [i for i in invoices if i["due"] < today]
+        for invoice in late:
+            self.mailer.send(invoice["email"],
+                             f"Invoice {invoice['id']} is overdue")
+        return len(late)
+
+# --- in a test: fakes instead of SMTP and the real clock ---
+class FakeMailer:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, to, subject):
+        self.sent.append((to, subject))
+
+mailer = FakeMailer()
+now = datetime(2026, 3, 10, 9, 0)
+service = ReminderService(mailer, clock=lambda: now)
+invoices = [
+    {"id": 1, "email": "mei@example.com", "due": now.date()},
+    {"id": 2, "email": "sam@example.com",
+     "due": (now - timedelta(days=3)).date()},
+]
+print(service.remind(invoices))
+print(mailer.sent)
+now += timedelta(days=1)          # time travel, for free
+print(service.remind(invoices))
+```
+
+</CodeExample>
+
+The service never imports `smtplib` or calls `datetime.now()`. In production you pass `SmtpMailer(...)` and `datetime.now` (the function itself, without brackets); in tests, a `FakeMailer` and `lambda: now`. Because the lambda looks `now` up each time it's called, moving `now` forward a day makes invoice 1 overdue too: testing "what happens tomorrow" takes one line.
+
+Constructor injection also makes dependencies **honest**: you can see everything a class needs by reading its `__init__`. If that list grows past four or five, the class is probably doing too much (the single-responsibility smell from the first lesson).
+
+<Callout type="warning" title="Careful with default arguments">
+
+`def __init__(self, clock=datetime.now)` is a handy shortcut for a cheap default. But `def __init__(self, mailer=SmtpMailer("mail.example.com"))` creates **one** mailer when the class is defined, at import time, and shares it between every instance, connection and all. Defaults are evaluated once. Keep defaults to simple values and functions, and build real resources in the composition root.
+
+</Callout>
+
+## The composition root
+
+If every class receives its dependencies, *someone* still has to create them. That someone is the **composition root**: one place, usually a function in `main.py` or a `create_app()` factory, that reads the settings, picks the concrete classes and wires them together. It's the only place that knows about every concrete class:
+
+<CodeExample output={`ConsoleMailer SmtpMailer
+mail.example.com
+[mail] mei@example.com: Hello from dev`}>
+
+```python
+from dataclasses import dataclass
+from datetime import datetime
+
+class ConsoleMailer:
+    def send(self, to, subject):
+        print(f"[mail] {to}: {subject}")
+
+class SmtpMailer:
+    def __init__(self, host: str):
+        self.host = host
+
+    def send(self, to, subject):
+        ...  # smtplib.SMTP(self.host).sendmail(...)
+
+class ReminderService:
+    def __init__(self, mailer, clock):
+        self.mailer = mailer
+        self.clock = clock
+
+@dataclass
+class Settings:
+    env: str = "dev"
+    smtp_host: str = "localhost"
+
+def build_reminders(settings: Settings) -> ReminderService:
+    """The composition root: the ONE place that picks
+    concrete classes and wires them together."""
+    if settings.env == "prod":
+        mailer = SmtpMailer(settings.smtp_host)
+    else:
+        mailer = ConsoleMailer()
+    return ReminderService(mailer=mailer, clock=datetime.now)
+
+dev = build_reminders(Settings())
+prod = build_reminders(Settings("prod", "mail.example.com"))
+print(type(dev.mailer).__name__, type(prod.mailer).__name__)
+print(prod.mailer.host)
+dev.mailer.send("mei@example.com", "Hello from dev")
+```
+
+</CodeExample>
+
+Everything else in the codebase depends on Protocols and receives objects; only `build_reminders` says "in production, email goes through SMTP". Switching to a different email provider, or using a console mailer on a developer's laptop, is a change in one function.
+
+Java and C# developers often reach for a **DI container**, a library that builds the object graph automatically from type hints. Python has some (`dependency-injector`, `lagom`, `punq`), but most Python teams never need one: a plain function that calls constructors is easier to read and debug, and FastAPI already has a small DI system built in.
+
+## FastAPI's Depends is dependency injection
+
+You used `Depends` in Level 2 for a store and a session. Now you can see it for what it is: FastAPI acts as the composition root for each request. It calls your provider functions, passes the results into your endpoint, and lets tests swap any provider. The modern style puts the dependency into the type with `Annotated`, so you can reuse it across endpoints:
+
+<CodeExample output={`building the real Greeter
+{'message': 'Hello, Mei!'}
+{'message': 'Hello, Sam!'}
+{'message': 'Ahoy, Mei!'}
+{'message': 'Hello, Mei!'}`}>
+
+```python
+from functools import lru_cache
+from typing import Annotated
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+
+class Greeter:
+    def __init__(self, greeting: str):
+        self.greeting = greeting
+
+    def greet(self, name: str) -> str:
+        return f"{self.greeting}, {name}!"
+
+@lru_cache                      # build it once, reuse it
+def get_greeter() -> Greeter:
+    print("building the real Greeter")
+    return Greeter("Hello")
+
+GreeterDep = Annotated[Greeter, Depends(get_greeter)]
+
+app = FastAPI()
+
+@app.get("/greet/{name}")
+def greet(name: str, greeter: GreeterDep):
+    return {"message": greeter.greet(name)}
+
+client = TestClient(app)
+print(client.get("/greet/Mei").json())
+print(client.get("/greet/Sam").json())
+
+# in a test: swap the dependency, not the code
+app.dependency_overrides[get_greeter] = lambda: Greeter("Ahoy")
+print(client.get("/greet/Mei").json())
+app.dependency_overrides.clear()
+print(client.get("/greet/Mei").json())
+```
+
+</CodeExample>
+
+- `Annotated[Greeter, Depends(get_greeter)]` means "a `Greeter`, provided by `get_greeter`". Your editor sees a `Greeter`; FastAPI sees how to build one.
+- `@lru_cache` on a provider with no parameters makes it a lazy **singleton**: built on the first request, reused after ("building..." printed once). It's the usual way to load settings or create long-lived clients. Per-request things, like a database session or a unit of work, use a plain function (or a `yield` dependency) instead, so each request gets its own.
+- `app.dependency_overrides[provider] = replacement` is the test seam. The endpoint code never changes; only the wiring does.
+
+In a clean-architecture app, the providers form a chain from settings to services:
+
+```python
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()                     # reads env vars
+
+def get_uow(settings: SettingsDep) -> SqlUnitOfWork:
+    return SqlUnitOfWork(session_factory(settings.database_url))
+
+def get_orders(uow: UowDep) -> OrderService:
+    return OrderService(uow, mailer=SmtpMailer(...))
+
+@app.post("/orders")
+def create_order(body: OrderIn, orders: OrderServiceDep): ...
+```
+
+Tests override just one link, like `get_uow` with a `FakeUnitOfWork`, and everything above it still runs for real.
+
+## DDD-light: speak the business language
+
+**Domain-driven design** is a big topic (the original book is 500 pages), but a few of its ideas pay off in almost every project. The first is a **ubiquitous language**: the code uses the same words as the business. If the support team says "a member *borrows* a book", the method is `book.lend_to(member)`, not `book.update_status(2, user_id)`. When code and conversation use the same words, misunderstandings show up early.
+
+The next ideas are about the **kinds of objects** in your domain.
+
+### Value objects
+
+A **value object** is defined entirely by its values: two `Money(4.20, "EUR")` are interchangeable, like two 5-euro notes. Value objects are **immutable**, and they **validate themselves** when created, so an invalid one can't exist. In Python that's a frozen dataclass:
+
+<CodeExample output={`Money(amount=Decimal('5.00'), currency='EUR')
+True
+1
+value objects never change
+money can't be negative
+bad currency: 'euro'`}>
+
+```python
+from dataclasses import dataclass, FrozenInstanceError
+from decimal import Decimal
+
+@dataclass(frozen=True)
+class Money:
+    amount: Decimal
+    currency: str
+
+    def __post_init__(self):
+        if self.amount < 0:
+            raise ValueError("money can't be negative")
+        if len(self.currency) != 3:
+            raise ValueError(f"bad currency: {self.currency!r}")
+
+    def __add__(self, other: "Money") -> "Money":
+        if other.currency != self.currency:
+            raise ValueError("can't add EUR to GBP")
+        return Money(self.amount + other.amount, self.currency)
+
+price = Money(Decimal("4.20"), "EUR")
+print(price + Money(Decimal("0.80"), "EUR"))
+print(price == Money(Decimal("4.2"), "EUR"))
+print(len({price, Money(Decimal("4.20"), "EUR")}))
+try:
+    price.amount = Decimal("0")
+except FrozenInstanceError:
+    print("value objects never change")
+for bad in [(Decimal("-1"), "EUR"), (Decimal("1"), "euro")]:
+    try:
+        Money(*bad)
+    except ValueError as error:
+        print(error)
+```
+
+</CodeExample>
+
+- `frozen=True` blocks changes after creation and makes the object **hashable**, so it works in sets and as a dict key.
+- `__post_init__` runs right after the generated `__init__`: the perfect place for validation.
+- "Changing" a value object means creating a new one: `price + other` returns a fresh `Money`.
+- `Decimal`, not `float`, for money: `0.1 + 0.2` is not `0.3` in floats, and accountants notice.
+
+Replacing bare `str`s and `float`s with small value objects (`Email`, `Money`, `Sku`, `Quantity`) is one of the cheapest, highest-value refactors there is. A function that takes `Email` can't receive an unvalidated string by accident, and the validation lives in exactly one place. This anti-pattern even has a name: **primitive obsession**.
+
+### Entities
+
+An **entity** has an **identity** that stays the same while its data changes. A customer who changes their name and email is still the same customer. So entities compare by id, not by fields:
+
+<CodeExample output={`Email(value='mei@example.com')
+True
+False
+invalid email: 'not-an-email'`}>
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Email:
+    value: str
+
+    def __post_init__(self):
+        clean = self.value.strip().lower()
+        local, _, domain = clean.partition("@")
+        if not local or "." not in domain:
+            raise ValueError(f"invalid email: {self.value!r}")
+        # frozen, so normal assignment is blocked here too
+        object.__setattr__(self, "value", clean)
+
+@dataclass(eq=False)          # entities: equal by identity
+class Customer:
+    id: int
+    name: str
+    email: Email
+
+    def __eq__(self, other):
+        return isinstance(other, Customer) and other.id == self.id
+
+    def __hash__(self):
+        return hash(self.id)
+
+a = Customer(1, "Mei", Email("  Mei@Example.COM "))
+print(a.email)
+a.name = "Mei Lin"              # entities change over time...
+print(a == Customer(1, "Mei", Email("mei@example.com")))
+print(a == Customer(2, "Mei Lin", a.email))  # ...identity doesn't
+try:
+    Email("not-an-email")
+except ValueError as error:
+    print(error)
+```
+
+</CodeExample>
+
+The `Email` value object also **normalises** itself (trimmed, lower case), so `"Mei@Example.COM"` and `"mei@example.com"` are the same email everywhere. Because the dataclass is frozen, `__post_init__` has to use `object.__setattr__` to store the cleaned value: a well-known idiom, used only inside `__post_init__`.
+
+### Aggregates and invariants
+
+An **invariant** is a business rule that must *always* be true: "an order's total never exceeds 100.00", "a submitted order can't change". An **aggregate** is a cluster of objects that protect their invariants together, with one **aggregate root** as the only door in. You never append to `order.lines` directly; you call `order.add_line(...)`, which checks the rules first:
+
+<CodeExample output={`refused: order total would exceed 100.00
+refused: order is already submitted
+submitted 1420
+[OrderSubmitted(order_id=7, total_cents=1420)]`}>
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass(frozen=True)
+class OrderLine:                 # value object inside the aggregate
+    sku: str
+    qty: int
+    unit_cents: int
+
+@dataclass(frozen=True)
+class OrderSubmitted:            # a domain event: past tense!
+    order_id: int
+    total_cents: int
+
+class OrderError(Exception):
+    pass
+
+@dataclass
+class Order:                     # the aggregate root
+    id: int
+    lines: list[OrderLine] = field(default_factory=list)
+    status: str = "draft"
+    events: list = field(default_factory=list)
+    MAX_TOTAL = 100_00           # invariant: at most 100.00
+
+    @property
+    def total_cents(self) -> int:
+        return sum(ln.qty * ln.unit_cents for ln in self.lines)
+
+    def add_line(self, sku: str, qty: int, unit_cents: int):
+        if self.status != "draft":
+            raise OrderError("order is already submitted")
+        if self.total_cents + qty * unit_cents > self.MAX_TOTAL:
+            raise OrderError("order total would exceed 100.00")
+        self.lines.append(OrderLine(sku, qty, unit_cents))
+
+    def submit(self):
+        if not self.lines:
+            raise OrderError("can't submit an empty order")
+        self.status = "submitted"
+        self.events.append(OrderSubmitted(self.id, self.total_cents))
+
+order = Order(7)
+order.add_line("BMB-1", 3, 4_20)
+order.add_line("APL-7", 2, 80)
+for attempt in [lambda: order.add_line("TV", 1, 999_00),
+                order.submit,
+                lambda: order.add_line("NUT", 1, 10)]:
+    try:
+        attempt()
+    except OrderError as error:
+        print("refused:", error)
+print(order.status, order.total_cents)
+print(order.events)
+```
+
+</CodeExample>
+
+Some practical rules for aggregates:
+
+- **Load and save whole aggregates.** The repository has `get(order_id)` and `save(order)`, never `save_line(line)`. That's how the invariant stays protected.
+- **Keep them small.** An aggregate is also a transaction boundary. If `Customer` contains all their orders, two orders placed at once fight over one lock. Reference other aggregates by **id** (`order.customer_id`), not by holding the object.
+- **Store money in cents** (or `Decimal`), as here, never in floats.
+
+### Domain events
+
+Look at the last line of output: `submit()` didn't send an email or call the warehouse. It **recorded a domain event**, `OrderSubmitted`, named in the past tense because it's a fact that already happened. The service layer publishes the events **after** the unit of work commits, so nobody is told about an order that was then rolled back:
+
+<CodeExample output={`email: order 7 confirmed
+warehouse: pick order 7
+refund order 3
+[]`}>
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class OrderSubmitted:
+    order_id: int
+    total_cents: int
+
+@dataclass(frozen=True)
+class OrderCancelled:
+    order_id: int
+
+HANDLERS = {
+    OrderSubmitted: [
+        lambda e: print(f"email: order {e.order_id} confirmed"),
+        lambda e: print(f"warehouse: pick order {e.order_id}"),
+    ],
+    OrderCancelled: [
+        lambda e: print(f"refund order {e.order_id}"),
+    ],
+}
+
+def publish(events: list) -> None:
+    while events:
+        event = events.pop(0)
+        for handler in HANDLERS.get(type(event), []):
+            handler(event)
+
+# in the service, AFTER uow.commit():
+pending = [OrderSubmitted(7, 14_20), OrderCancelled(3)]
+publish(pending)
+print(pending)
+```
+
+</CodeExample>
+
+This is the observer pattern from the first lesson, with events as small frozen dataclasses and handlers looked up by the event's **type**. The domain stays pure (it only appends to a list), and side effects live in handlers that can be injected, faked in tests, or moved to a background queue later without touching `Order`. One trap: if the email fails after the commit, the order still exists. Real systems handle that with retries, or with an **outbox** table: the event is saved in the same transaction as the order and sent later by a background worker.
+
+<Callout type="note" title="How much DDD do you need?">
+
+Use the cheap parts everywhere: a ubiquitous language, value objects instead of primitives, rules inside the objects that own the data. Bring in aggregates and domain events when the domain is genuinely complex (pricing, bookings, inventory, payments). For a CRUD admin panel, full DDD is ceremony: plain Pydantic and SQLAlchemy models are fine there.
+
+</Callout>
+
+<Quiz
+  question="Which object should be a frozen dataclass value object rather than an entity?"
+  options={["A Customer whose name and email can change", "A ShippingAddress made of street, city and postcode", "An Order that moves from draft to submitted", "A BankAccount whose balance changes"]}
+  answer={1}
+  explanation="An address is defined only by its values: two identical addresses are interchangeable, and changing it means replacing it with a new one. Customers, orders and accounts have an identity that stays the same while their data changes, so they are entities."
+/>
+
+<Quiz
+  question="A FastAPI endpoint declares service: Annotated[TrialService, Depends(get_service)]. How does a test make it use a TrialService built with a fake mailer?"
+  options={["Patch TrialService.__init__ with unittest.mock", "Set app.dependency_overrides[get_service] to a function that returns the test service", "Pass the service as a query parameter in the request", "Edit get_service to check whether it is running in a test"]}
+  answer={1}
+  explanation="dependency_overrides replaces a provider for every endpoint that depends on it, without changing any endpoint code. That's dependency injection: the wiring changes, the code doesn't."
+/>
+
+<Exercise
+  language="python"
+  title="Untangle the trial sign-up"
+  starter={`from datetime import datetime, timedelta
+
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+WELCOME = "Welcome to your 14-day trial"
+
+# ---------- the tangled version: refactor me ----------
+
+SUBSCRIPTIONS = {}                  # global "database"
+
+
+def send_email(to, subject):        # pretend this is SMTP
+    print(f"SMTP -> {to}: {subject}")
+
+
+def start_trial(email):
+    email = email.strip().lower()
+    if "@" not in email:
+        raise ValueError("invalid email")
+    if email in SUBSCRIPTIONS:
+        raise KeyError("already subscribed")
+    ends = datetime.now() + timedelta(days=14)
+    SUBSCRIPTIONS[email] = {"email": email, "trial_ends": ends}
+    send_email(email, WELCOME)
+    return SUBSCRIPTIONS[email]
+
+
+app = FastAPI()
+
+
+class TrialIn(BaseModel):
+    email: str
+
+
+@app.post("/trials", status_code=201)
+def create_trial(body: TrialIn):
+    try:
+        sub = start_trial(body.email)
+    except ValueError:
+        raise HTTPException(422, "invalid email")
+    except KeyError:
+        raise HTTPException(409, "already subscribed")
+    return {
+        "email": sub["email"],
+        "trial_ends": sub["trial_ends"].isoformat(),
+    }
+
+
+# ---------- tests (don't change them) ----------
+
+NOW = datetime(2026, 1, 1, 9, 0)
+
+
+@pytest.fixture
+def mailer():
+    return FakeMailer()
+
+
+@pytest.fixture
+def trials(mailer):
+    return TrialService(
+        repo=InMemorySubscriptionRepository(),
+        mailer=mailer,
+        clock=lambda: NOW,
+    )
+
+
+@pytest.fixture
+def client(trials):
+    app.dependency_overrides[get_service] = lambda: trials
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def test_email_is_a_value_object():
+    assert Email(" Mei@Example.COM ") == Email("mei@example.com")
+    with pytest.raises(ValueError):
+        Email("nope")
+
+
+def test_trial_lasts_14_days(trials, mailer):
+    sub = trials.start_trial("mei@example.com")
+    assert sub.trial_ends == datetime(2026, 1, 15, 9, 0)
+    assert mailer.sent == [("mei@example.com", WELCOME)]
+
+
+def test_no_duplicates(trials, mailer):
+    trials.start_trial("mei@example.com")
+    with pytest.raises(AlreadySubscribed):
+        trials.start_trial("MEI@example.com")
+    assert len(mailer.sent) == 1
+
+
+def test_api_uses_the_injected_service(client, mailer):
+    r = client.post("/trials", json={"email": "Sam@Example.com"})
+    assert r.status_code == 201
+    assert r.json() == {
+        "email": "sam@example.com",
+        "trial_ends": "2026-01-15T09:00:00",
+    }
+    assert mailer.sent == [("sam@example.com", WELCOME)]
+
+
+def test_api_errors(client):
+    client.post("/trials", json={"email": "sam@example.com"})
+    r = client.post("/trials", json={"email": "sam@example.com"})
+    assert r.status_code == 409
+    r = client.post("/trials", json={"email": "sam"})
+    assert r.status_code == 422
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "All the tests in the editor pass", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 5" },
+    { name: "Email normalises itself and compares by value", check: "Email(' Kim@Mail.ORG') == Email('kim@mail.org') and Email('A@B.co').value == 'a@b.co' and len({Email('x@y.io'), Email('X@Y.IO')}) == 1" },
+    { name: "Email rejects invalid addresses and is frozen", check: "exec('_bad = []\\nfor _v in [\"kim\", \"@mail.org\", \"kim@mail\", \"\"]:\\n    try:\\n        Email(_v)\\n    except ValueError:\\n        _bad.append(_v)\\ntry:\\n    Email(\"a@b.co\").value = \"x\"\\n    _frozen = False\\nexcept Exception:\\n    _frozen = True') is None and len(_bad) == 4 and _frozen" },
+    { name: "TrialService uses the injected clock, mailer and repository", check: "[m := FakeMailer(), s := TrialService(repo=InMemorySubscriptionRepository(), mailer=m, clock=lambda: datetime(2030, 5, 20, 12, 30)), sub := s.start_trial(' Kim@Mail.org')] and sub.trial_ends == datetime(2030, 6, 3, 12, 30) and sub.email == Email('kim@mail.org') and m.sent == [('kim@mail.org', 'Welcome to your 14-day trial')] and s.repo.get(Email('kim@mail.org')) is not None" },
+    { name: "Duplicates raise AlreadySubscribed, invalid emails ValueError, no extra emails", check: "[m := FakeMailer(), s := TrialService(repo=InMemorySubscriptionRepository(), mailer=m, clock=lambda: datetime(2030, 1, 1)), s.start_trial('kim@mail.org')] and exec('_errs = []\\nfor _v in [\"KIM@mail.org\", \"kim\"]:\\n    try:\\n        s.start_trial(_v)\\n    except Exception as _e:\\n        _errs.append(type(_e).__name__)') is None and _errs == ['AlreadySubscribed', 'ValueError'] and len(m.sent) == 1" },
+    { name: "No global state: each service has its own repository", check: "[s1 := TrialService(repo=InMemorySubscriptionRepository(), mailer=FakeMailer(), clock=lambda: datetime(2030, 1, 1)), s2 := TrialService(repo=InMemorySubscriptionRepository(), mailer=FakeMailer(), clock=lambda: datetime(2030, 1, 1))] and s1.start_trial('zoe@mail.org') and s2.start_trial('zoe@mail.org') and s2.mailer.sent == [('zoe@mail.org', 'Welcome to your 14-day trial')]" },
+    { name: "POST /trials gets its service from Depends(get_service)", check: "[m := FakeMailer(), _r := InMemorySubscriptionRepository(), app.dependency_overrides.__setitem__(get_service, lambda: TrialService(repo=_r, mailer=m, clock=lambda: datetime(2031, 2, 1, 8, 15))), c := TestClient(app), a := c.post('/trials', json={'email': 'Ola@Mail.org'}), b := c.post('/trials', json={'email': 'ola@mail.org'}), d := c.post('/trials', json={'email': 'ola'}), app.dependency_overrides.clear()] and a.status_code == 201 and a.json() == {'email': 'ola@mail.org', 'trial_ends': '2031-02-15T08:15:00'} and b.status_code == 409 and d.status_code == 422 and m.sent == [('ola@mail.org', 'Welcome to your 14-day trial')]" },
+    { name: "build_service() is the composition root", check: "isinstance(build_service(), TrialService) and isinstance(build_service().mailer, ConsoleMailer) and build_service().repo is not build_service().repo" },
+  ]}
+>
+
+The trial sign-up above is tangled: a global dict, the real clock, a hard-wired "SMTP" call, and an endpoint glued to all of it. Refactor it into injected, testable pieces so that the tests at the bottom pass (they already describe the new design):
+
+1. **`Email`**: a frozen dataclass value object with a `value` field. It strips spaces and lower-cases the address, and raises `ValueError` unless there is text before the `@` and a `.` in the part after it.
+2. **`Subscription`**: a dataclass with `email` (an `Email`) and `trial_ends` (a `datetime`). Plus an exception **`AlreadySubscribed`**.
+3. **`InMemorySubscriptionRepository`** with `get(email)` (returns the subscription or `None`) and `add(subscription)`.
+4. **`ConsoleMailer`** (prints like the old `send_email`) and **`FakeMailer`** (records `(to, subject)` tuples in a `sent` list). Both have `send(to, subject)`.
+5. **`TrialService(repo, mailer, clock)`**, keeping them as attributes with those names, with `start_trial(raw_email)`: build the `Email`, raise `AlreadySubscribed` if it exists, set `trial_ends` to `clock()` plus 14 days, save it, send `WELCOME` to the address and return the subscription.
+6. A composition root **`build_service()`** that returns a new `TrialService` with an in-memory repository, a `ConsoleMailer` and `datetime.now`; a module-level `service = build_service()`; and a provider **`get_service()`** that returns it.
+7. `POST /trials` gets its service with `Depends(get_service)` (use `Annotated` if you like), and maps `ValueError` to 422 and `AlreadySubscribed` to 409, with the same JSON as before.
+
+<Hint>
+
+Start with `Email`: it's the `Email` class from the Entities section. `TrialService.__init__` just stores `repo`, `mailer` and `clock`; `start_trial` is the old function body, with `Email(raw_email)` instead of the manual cleaning, `self.repo.get(...)` instead of the dict, `self.clock()` instead of `datetime.now()` and `self.mailer.send(...)` instead of `send_email`. In the endpoint, add `service: Annotated[TrialService, Depends(get_service)]` and return `sub.email.value` and `sub.trial_ends.isoformat()`. Delete the old global `SUBSCRIPTIONS` and `start_trial` when you're done.
+
+</Hint>
+
+<Solution>
+
+```python
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Annotated, Callable, Protocol
+
+import pytest
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+TRIAL_DAYS = 14
+WELCOME = "Welcome to your 14-day trial"
+
+
+# ---------- domain ----------
+
+@dataclass(frozen=True)
+class Email:
+    value: str
+
+    def __post_init__(self):
+        clean = self.value.strip().lower()
+        local, _, domain = clean.partition("@")
+        if not local or "." not in domain:
+            raise ValueError(f"invalid email: {self.value!r}")
+        object.__setattr__(self, "value", clean)
+
+
+@dataclass
+class Subscription:
+    email: Email
+    trial_ends: datetime
+
+
+class AlreadySubscribed(Exception):
+    pass
+
+
+# ---------- ports ----------
+
+class Mailer(Protocol):
+    def send(self, to: str, subject: str) -> None: ...
+
+
+Clock = Callable[[], datetime]
+
+
+# ---------- adapters ----------
+
+class InMemorySubscriptionRepository:
+    def __init__(self):
+        self._items: dict[Email, Subscription] = {}
+
+    def get(self, email: Email) -> Subscription | None:
+        return self._items.get(email)
+
+    def add(self, subscription: Subscription) -> None:
+        self._items[subscription.email] = subscription
+
+
+class ConsoleMailer:
+    def send(self, to: str, subject: str) -> None:
+        print(f"SMTP -> {to}: {subject}")
+
+
+class FakeMailer:
+    def __init__(self):
+        self.sent: list[tuple[str, str]] = []
+
+    def send(self, to: str, subject: str) -> None:
+        self.sent.append((to, subject))
+
+
+# ---------- service ----------
+
+class TrialService:
+    def __init__(self, repo, mailer: Mailer, clock: Clock):
+        self.repo = repo
+        self.mailer = mailer
+        self.clock = clock
+
+    def start_trial(self, raw_email: str) -> Subscription:
+        email = Email(raw_email)
+        if self.repo.get(email) is not None:
+            raise AlreadySubscribed(email.value)
+        ends = self.clock() + timedelta(days=TRIAL_DAYS)
+        subscription = Subscription(email, ends)
+        self.repo.add(subscription)
+        self.mailer.send(email.value, WELCOME)
+        return subscription
+
+
+# ---------- composition root + web ----------
+
+def build_service() -> TrialService:
+    return TrialService(
+        repo=InMemorySubscriptionRepository(),
+        mailer=ConsoleMailer(),
+        clock=datetime.now,
+    )
+
+
+service = build_service()
+
+
+def get_service() -> TrialService:
+    return service
+
+
+ServiceDep = Annotated[TrialService, Depends(get_service)]
+
+app = FastAPI()
+
+
+class TrialIn(BaseModel):
+    email: str
+
+
+@app.post("/trials", status_code=201)
+def create_trial(body: TrialIn, service: ServiceDep):
+    try:
+        sub = service.start_trial(body.email)
+    except ValueError:
+        raise HTTPException(422, "invalid email")
+    except AlreadySubscribed:
+        raise HTTPException(409, "already subscribed")
+    return {
+        "email": sub.email.value,
+        "trial_ends": sub.trial_ends.isoformat(),
+    }
+
+
+# ---------- tests (don't change them) ----------
+
+NOW = datetime(2026, 1, 1, 9, 0)
+
+
+@pytest.fixture
+def mailer():
+    return FakeMailer()
+
+
+@pytest.fixture
+def trials(mailer):
+    return TrialService(
+        repo=InMemorySubscriptionRepository(),
+        mailer=mailer,
+        clock=lambda: NOW,
+    )
+
+
+@pytest.fixture
+def client(trials):
+    app.dependency_overrides[get_service] = lambda: trials
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def test_email_is_a_value_object():
+    assert Email(" Mei@Example.COM ") == Email("mei@example.com")
+    with pytest.raises(ValueError):
+        Email("nope")
+
+
+def test_trial_lasts_14_days(trials, mailer):
+    sub = trials.start_trial("mei@example.com")
+    assert sub.trial_ends == datetime(2026, 1, 15, 9, 0)
+    assert mailer.sent == [("mei@example.com", WELCOME)]
+
+
+def test_no_duplicates(trials, mailer):
+    trials.start_trial("mei@example.com")
+    with pytest.raises(AlreadySubscribed):
+        trials.start_trial("MEI@example.com")
+    assert len(mailer.sent) == 1
+
+
+def test_api_uses_the_injected_service(client, mailer):
+    r = client.post("/trials", json={"email": "Sam@Example.com"})
+    assert r.status_code == 201
+    assert r.json() == {
+        "email": "sam@example.com",
+        "trial_ends": "2026-01-15T09:00:00",
+    }
+    assert mailer.sent == [("sam@example.com", WELCOME)]
+
+
+def test_api_errors(client):
+    client.post("/trials", json={"email": "sam@example.com"})
+    r = client.post("/trials", json={"email": "sam@example.com"})
+    assert r.status_code == 409
+    r = client.post("/trials", json={"email": "sam"})
+    assert r.status_code == 422
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Dependency injection**: code receives its collaborators (storage, mailer, even the clock) instead of creating or importing them. That's what makes it testable without `patch`.
+- **Constructor injection** keeps dependencies visible in `__init__`; type them with Protocols and `Callable[[], datetime]`. Beware of default arguments that build real resources: they're created once, at import.
+- The **composition root** (`build_service()`, `create_app()`) is the one place that picks concrete classes from the settings. Most Python projects don't need a DI container.
+- **FastAPI's `Depends`** is DI per request: providers can chain (settings → unit of work → service), `@lru_cache` makes a lazy singleton, `Annotated[T, Depends(provider)]` keeps endpoints tidy, and `app.dependency_overrides` swaps any link in tests.
+- **DDD-light**: use the business's words; **value objects** are frozen, self-validating and equal by value (`Money`, `Email`); **entities** are equal by identity; **aggregates** guard their **invariants** behind one root and are loaded and saved whole.
+- Aggregates record **domain events** (past tense, frozen dataclasses); the service publishes them **after** commit to handlers that do the side effects.

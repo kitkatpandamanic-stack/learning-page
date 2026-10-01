@@ -1,0 +1,765 @@
+---
+title: Authentication and Authorisation for APIs
+description: Sessions vs tokens, how signed tokens and JWTs really work, protecting FastAPI routes with security dependencies, roles and permissions, and the idea behind rate limiting.
+duration: 24
+xp: 25
+---
+
+Almost every real API has to answer two questions on every single request: **who is calling?** and **are they allowed to do this?** Get the first wrong and strangers walk in; get the second wrong and every logged-in user can read everyone else's data, which is the single most common serious bug in real APIs. In this lesson you'll build a signed token by hand to see that there's no magic in it, then protect FastAPI routes with dependencies, roles and ownership checks. 🛡️
+
+## Authentication vs authorisation
+
+The two words sound alike, so people shorten them to **authn** and **authz**:
+
+- **Authentication** (authn): *who are you?* Proving identity with a password, a token, an API key or a login with Google.
+- **Authorisation** (authz): *what may you do?* Checking that this identity is allowed to perform this action on this particular thing.
+
+HTTP has a status code for each failure, and using the right one helps clients react correctly:
+
+| Status | Means | Client should |
+| --- | --- | --- |
+| **401** Unauthorized | "I don't know who you are": missing, invalid or expired credentials | log in (again) |
+| **403** Forbidden | "I know who you are, and you can't do this" | not retry; show "no access" |
+| **404** Not Found | also used to **hide** things that exist but aren't yours | treat it as missing |
+
+Yes, 401 is confusingly named "Unauthorized" although it's about authentication. A 401 response should also carry a `WWW-Authenticate` header telling the client *how* to authenticate, for example `WWW-Authenticate: Bearer`.
+
+## Sessions or tokens?
+
+After a successful login, the client needs something to send with every later request, so it doesn't have to send the password each time. There are two big families:
+
+| | Server-side sessions | Signed tokens (e.g. JWT) |
+| --- | --- | --- |
+| Client holds | a random session id (usually in a cookie) | a token containing the claims, plus a signature |
+| Server looks up | the session in a database or Redis | nothing: it checks the signature |
+| Logging out / banning | delete the session, done instantly | hard: the token stays valid until it expires |
+| Scaling | every server needs the session store | any server with the key can verify |
+| Good for | browser apps on your own domain | service-to-service calls, mobile apps, short-lived access |
+
+Neither is "the modern one". Sessions with a secure, `HttpOnly` cookie are still an excellent default for a website. Tokens shine when many services must verify identity without calling back to a central database. Many systems combine both: a **short-lived access token** (5–15 minutes) plus a long-lived **refresh token** that is stored server-side and can be revoked.
+
+## How a signed token works
+
+A signed token is just **data + a signature**. The server signs the data with a secret key using **HMAC**; anyone can read the data, but only someone with the key can produce a matching signature. Change one character and the signature no longer fits.
+
+The format everyone uses is the **JWT** (JSON Web Token): three base64url-encoded parts joined by dots, `header.payload.signature`. Here's a tiny version built from the standard library, so you can see every step:
+
+<CodeExample output={`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+{'sub': 'mei', 'role': 'user'}
+43`}>
+
+```python
+import base64
+import hashlib
+import hmac
+import json
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+def unb64(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+def sign(message: str, secret: bytes) -> str:
+    mac = hmac.new(secret, message.encode(), hashlib.sha256)
+    return b64(mac.digest())
+
+def make_token(claims: dict, secret: bytes) -> str:
+    header = b64(b'{"alg":"HS256","typ":"JWT"}')
+    body = b64(json.dumps(claims).encode())
+    return f"{header}.{body}.{sign(header + '.' + body, secret)}"
+
+SECRET = b"dev-only-secret"     # from the environment in real life
+token = make_token({"sub": "mei", "role": "user"}, SECRET)
+
+header, body, signature = token.split(".")
+print(header)
+print(json.loads(unb64(body)))
+print(len(signature))
+```
+
+</CodeExample>
+
+That first line, `eyJhbGciOi...`, is how almost every JWT you'll ever see begins: it's simply `{"alg":"HS256","typ":"JWT"}` in base64url. And look at the second line: **anyone can decode the payload** without the key. Base64 is an encoding, not encryption. A JWT is **signed, not secret**, so never put passwords, card numbers or other private data in it.
+
+The fields in the payload are called **claims**. The standard ones have short names: `sub` (subject: who the token is about), `exp` (expiry time, as a Unix timestamp), `iat` (issued at), `iss` (issuer) and `aud` (audience).
+
+### Verifying a token
+
+Verification is the important half. Recompute the signature, compare it **in constant time** (the `hmac.compare_digest` habit from the last lesson), and only then trust the payload and check the expiry. Notice that `now` is a parameter: injecting the time makes expiry easy to test.
+
+<CodeExample output={`{'sub': 'mei', 'role': 'user', 'exp': 1000900}
+tampered -> bad signature
+wrong key -> bad signature
+expired -> token expired
+garbage -> malformed token`}>
+
+```python
+import base64
+import hashlib
+import hmac
+import json
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+def unb64(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+def sign(message: str, secret: bytes) -> str:
+    mac = hmac.new(secret, message.encode(), hashlib.sha256)
+    return b64(mac.digest())
+
+def make_token(claims: dict, secret: bytes) -> str:
+    header = b64(b'{"alg":"HS256","typ":"JWT"}')
+    body = b64(json.dumps(claims).encode())
+    return f"{header}.{body}.{sign(header + '.' + body, secret)}"
+
+class InvalidToken(Exception):
+    pass
+
+def read_token(token: str, secret: bytes, now: float) -> dict:
+    try:
+        header, body, signature = token.split(".")
+    except ValueError:
+        raise InvalidToken("malformed token") from None
+    expected = sign(header + "." + body, secret)
+    if not hmac.compare_digest(signature, expected):
+        raise InvalidToken("bad signature")
+    claims = json.loads(unb64(body))
+    if now >= claims["exp"]:
+        raise InvalidToken("token expired")
+    return claims
+
+SECRET = b"dev-only-secret"
+issued_at = 1_000_000
+token = make_token(
+    {"sub": "mei", "role": "user", "exp": issued_at + 900}, SECRET
+)
+
+print(read_token(token, SECRET, now=issued_at + 60))
+
+header, body, signature = token.split(".")
+evil = b64(json.dumps(
+    {"sub": "mei", "role": "admin", "exp": issued_at + 900}
+).encode())
+attempts = [
+    ("tampered", f"{header}.{evil}.{signature}", SECRET),
+    ("wrong key", token, b"guessed-secret"),
+    ("expired", token, SECRET),
+    ("garbage", "not-a-token", SECRET),
+]
+for name, candidate, key in attempts:
+    try:
+        read_token(candidate, key, now=issued_at + 901)
+    except InvalidToken as e:
+        print(name, "->", e)
+```
+
+</CodeExample>
+
+Mei tried to promote herself to `admin` by editing the payload, but she can't produce a valid signature without the server's secret, so the token is rejected. That's the whole security of a JWT: **the secret key**. Generate it with `secrets.token_urlsafe(32)`, load it from the environment, and anyone who has it can mint tokens for any user.
+
+Our `read_token` also quietly does something important: it **ignores the header's `alg`** and always checks HS256. Real JWT libraries have had famous bugs where an attacker set `"alg": "none"` and the server skipped the signature check.
+
+### In production: use a library
+
+Writing your own token code was for understanding. In a real project, use a well-tested library such as **PyJWT** (or `joserfc` / `authlib`), which handles all the standard claims, clock skew and key types:
+
+```python
+# on your machine: pip install pyjwt
+from datetime import datetime, timedelta, timezone
+import jwt
+
+SECRET_KEY = settings.jwt_secret          # from the environment
+
+def create_access_token(user_id: str) -> str:
+    now = datetime.now(timezone.utc)
+    claims = {"sub": user_id, "iat": now,
+              "exp": now + timedelta(minutes=15)}
+    return jwt.encode(claims, SECRET_KEY, algorithm="HS256")
+
+def decode_access_token(token: str) -> dict:
+    # always pin the algorithms you accept
+    return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    # raises jwt.ExpiredSignatureError, jwt.InvalidTokenError
+```
+
+<Callout type="warning" title="JWT pitfalls that bite real teams">
+
+- **Pin the algorithm**: always pass `algorithms=["HS256"]` (or `["RS256"]`) when decoding.
+- **Keep access tokens short-lived** (minutes, not months). You can't easily revoke a JWT, so expiry is your safety net.
+- **Don't store tokens in `localStorage`** in browser apps: any XSS bug can read it. An `HttpOnly`, `Secure`, `SameSite` cookie can't be read by JavaScript.
+- **Signed, not encrypted**: everything in the payload is readable by anyone who sees the token.
+- Use **asymmetric keys** (RS256/ES256) when other services verify your tokens, so they only need the public key and can't mint tokens themselves.
+
+</Callout>
+
+## Protecting routes in FastAPI
+
+In FastAPI, "who is calling?" is a **dependency**, just like the database session in earlier modules. FastAPI ships helpers in `fastapi.security` that read the standard `Authorization: Bearer <token>` header and also add an **Authorize** button to `/docs`. `HTTPBearer` gives you the token; you decide whether it's valid:
+
+<CodeExample output={`401
+401 Bearer
+{'name': 'mei', 'role': 'user'}`}>
+
+```python
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import (
+    HTTPAuthorizationCredentials, HTTPBearer,
+)
+from fastapi.testclient import TestClient
+
+# opaque tokens -> user (a real app keeps these in a database)
+SESSIONS = {
+    "tok-mei": {"name": "mei", "role": "user"},
+    "tok-boss": {"name": "boss", "role": "admin"},
+}
+
+bearer = HTTPBearer(auto_error=False)
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> dict:
+    user = SESSIONS.get(creds.credentials) if creds else None
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+app = FastAPI()
+
+@app.get("/me")
+def me(user: dict = Depends(get_current_user)):
+    return user
+
+client = TestClient(app)
+print(client.get("/me").status_code)
+wrong = {"Authorization": "Bearer tok-nope"}
+response = client.get("/me", headers=wrong)
+print(response.status_code, response.headers["WWW-Authenticate"])
+good = {"Authorization": "Bearer tok-mei"}
+print(client.get("/me", headers=good).json())
+```
+
+</CodeExample>
+
+With `auto_error=False`, `HTTPBearer` returns `None` instead of raising when the header is missing, so one place (`get_current_user`) decides every failure and always answers the same way. Any endpoint that adds `user: dict = Depends(get_current_user)` is now protected, and the endpoint itself never sees an unauthenticated request. Here the "tokens" are random **opaque** strings looked up in a store: that's the session approach. Swap the lookup for `read_token(...)` and you have the stateless JWT approach; the endpoints don't change at all.
+
+For a username-and-password login, FastAPI also has **`OAuth2PasswordBearer`**, which follows the OAuth2 "password flow" so the `/docs` Authorize button can log in with a form. On your machine it looks like this (form parsing needs the `python-multipart` package):
+
+```python
+from typing import Annotated
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import (
+    OAuth2PasswordBearer, OAuth2PasswordRequestForm,
+)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+app = FastAPI()
+
+@app.post("/token")
+def login(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    user = users.get(form.username)
+    if user is None or not verify_password(
+        form.password, user.password_hash
+    ):
+        # same message for both cases: don't reveal which was wrong
+        raise HTTPException(401, "Incorrect username or password")
+    token = create_access_token(user.id)
+    return {"access_token": token, "token_type": "bearer"}
+
+def get_current_user(
+    token: Annotated[str, Depends(oauth2_scheme)],
+):
+    ...  # decode_access_token(token), load the user, or 401
+```
+
+## Roles, permissions and ownership
+
+Authentication says *who*; now the endpoint must check *what*. The simplest model is **roles**: each user has one (`user`, `admin`), and some endpoints require a particular role. A neat FastAPI pattern is a **dependency factory**: a function that *returns* a dependency, so each route can say which roles it needs:
+
+<CodeExample output={`401
+403
+{'users': 2}
+{'owner': 'mei', 'text': 'buy bamboo'}
+404`}>
+
+```python
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import (
+    HTTPAuthorizationCredentials, HTTPBearer,
+)
+from fastapi.testclient import TestClient
+
+SESSIONS = {
+    "tok-mei": {"name": "mei", "role": "user"},
+    "tok-boss": {"name": "boss", "role": "admin"},
+}
+bearer = HTTPBearer(auto_error=False)
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> dict:
+    user = SESSIONS.get(creds.credentials) if creds else None
+    if user is None:
+        raise HTTPException(401, "Not authenticated",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return user
+
+def require_role(*roles: str):
+    def checker(user: dict = Depends(get_current_user)) -> dict:
+        if user["role"] not in roles:
+            raise HTTPException(403, "Not enough permissions")
+        return user
+    return checker
+
+NOTES = {1: {"owner": "mei", "text": "buy bamboo"},
+         2: {"owner": "boss", "text": "raise prices"}}
+
+app = FastAPI()
+
+@app.get("/admin/stats")
+def stats(user: dict = Depends(require_role("admin"))):
+    return {"users": len(SESSIONS)}
+
+@app.get("/notes/{note_id}")
+def get_note(note_id: int,
+             user: dict = Depends(get_current_user)):
+    note = NOTES.get(note_id)
+    if note is None or note["owner"] != user["name"]:
+        raise HTTPException(404, "Note not found")
+    return note
+
+client = TestClient(app)
+mei = {"Authorization": "Bearer tok-mei"}
+boss = {"Authorization": "Bearer tok-boss"}
+print(client.get("/admin/stats").status_code)
+print(client.get("/admin/stats", headers=mei).status_code)
+print(client.get("/admin/stats", headers=boss).json())
+print(client.get("/notes/1", headers=mei).json())
+print(client.get("/notes/2", headers=mei).status_code)
+```
+
+</CodeExample>
+
+The last two lines show the check that most often goes missing: **ownership**. Mei is logged in, and note 2 exists, but it isn't hers. Forgetting this check is called **IDOR** (Insecure Direct Object Reference) or, in OWASP's API list, **Broken Object Level Authorization**, and it's the number one API risk: change `/notes/1` to `/notes/2` in the URL and read someone else's data. Answering 404 instead of 403 also avoids telling Mei that note 2 exists.
+
+As apps grow, roles turn into **permissions** (`notes:read`, `billing:write`) that roles bundle together, and OAuth2 calls them **scopes**. The pattern stays the same: one dependency per check, declared on the route, so a code reviewer can see each endpoint's rules at a glance.
+
+<Callout type="tip" title="Deny by default">
+
+Make "protected" the default instead of something each endpoint must remember. In FastAPI you can put the dependency on a whole router, `APIRouter(dependencies=[Depends(get_current_user)])`, and keep the few public endpoints (login, `/health`) on a separate router. A test that calls every route without a token and expects 401 catches the endpoint someone forgot.
+
+</Callout>
+
+## Rate limiting
+
+Even perfect authentication has a weakness: an attacker can just **keep guessing**. Rate limiting caps how many requests a client (an IP address, a user, an API key) can make in a period, and answers **429 Too Many Requests** with a `Retry-After` header when they go over. The simplest version is a **fixed window** counter:
+
+<CodeExample output={`[True, True, True, False, False, True]
+True`}>
+
+```python
+class FixedWindowLimiter:
+    """Allow at most limit requests per key per window."""
+
+    def __init__(self, limit: int, window: float):
+        self.limit = limit
+        self.window = window
+        self.counts: dict[tuple[str, int], int] = {}
+
+    def allow(self, key: str, now: float) -> bool:
+        bucket = (key, int(now // self.window))
+        self.counts[bucket] = self.counts.get(bucket, 0) + 1
+        return self.counts[bucket] <= self.limit
+
+limiter = FixedWindowLimiter(limit=3, window=60)
+attempts = [0, 5, 10, 15, 20, 61]
+print([limiter.allow("login:mei", t) for t in attempts])
+print(limiter.allow("login:po", 20))
+```
+
+</CodeExample>
+
+Three login attempts for `mei` per minute are allowed, the fourth and fifth are refused, and a new minute starts fresh. Other users have their own counters. In production:
+
+- With several server processes, the counters must live in a **shared store** like Redis, or each process counts separately. Often the limiting happens even earlier, in the reverse proxy or API gateway (nginx, Cloudflare, AWS API Gateway).
+- Limit **login, sign-up and password-reset** endpoints much more strictly than ordinary reads.
+- Fixed windows allow bursts at the window edge; the **token bucket** algorithm smooths that out, and you'll build one in the resilience patterns lesson.
+
+<Quiz
+  question="Mei is logged in with a valid token and calls DELETE /projects/7, which belongs to another team. Your API checks the token but not who owns the project, and deletes it. Which kind of bug is this?"
+  options={[
+    "An authentication bug: the token should have been rejected",
+    "An authorisation bug: Mei is identified correctly but isn't allowed to act on that object",
+    "A rate-limiting bug: she sent too many requests",
+    "Not a bug: logged-in users may delete anything",
+  ]}
+  answer={1}
+  explanation="Authentication worked: the API knows it's Mei. What's missing is the authorisation check that this particular object belongs to her (Broken Object Level Authorization). The right answer is 403 or 404, not a deletion."
+/>
+
+<Quiz
+  question="Why can't a user change role from user to admin inside their HS256 JWT and use it?"
+  options={[
+    "Because the payload is encrypted and they can't read it",
+    "Because base64 can't encode the word admin",
+    "Because the signature was computed over the original payload with the server's secret, so the edited token no longer verifies",
+    "Because JWTs can only be used once",
+  ]}
+  answer={2}
+  explanation="The payload is readable by anyone, but the signature is an HMAC of header and payload with a key only the server has. Any change makes the recomputed signature differ, so the server rejects the token."
+/>
+
+<Exercise
+  language="python"
+  title="Protect the panda API"
+  starter={`import base64
+import hashlib
+import hmac
+import json
+import time
+
+import pytest
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import (
+    HTTPAuthorizationCredentials, HTTPBearer,
+)
+from fastapi.testclient import TestClient
+
+SECRET = b"test-secret-from-env"
+
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def unb64(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def sign(message: str, secret: bytes) -> str:
+    mac = hmac.new(secret, message.encode(), hashlib.sha256)
+    return b64(mac.digest())
+
+
+def make_token(claims: dict, secret: bytes) -> str:
+    header = b64(b'{"alg":"HS256","typ":"JWT"}')
+    body = b64(json.dumps(claims).encode())
+    return f"{header}.{body}.{sign(header + '.' + body, secret)}"
+
+
+class InvalidToken(Exception):
+    pass
+
+
+def read_token(token: str, secret: bytes, now: float) -> dict:
+    # TODO 1: raise InvalidToken if the token doesn't have three
+    #         parts, if the signature is wrong (compare with
+    #         hmac.compare_digest) or if now >= claims["exp"]
+    header, body, signature = token.split(".")
+    return json.loads(unb64(body))
+
+
+bearer = HTTPBearer(auto_error=False)
+
+
+def get_now() -> float:
+    return time.time()
+
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+    now: float = Depends(get_now),
+) -> dict:
+    # TODO 2: read the token with read_token(creds.credentials,
+    #         SECRET, now) and return its claims. Missing or
+    #         invalid tokens -> 401 with a WWW-Authenticate header
+    raise HTTPException(status_code=501, detail="Not implemented")
+
+
+def require_role(role: str):
+    # TODO 3: the checker must answer 403 unless
+    #         user["role"] == role
+    def checker(user: dict = Depends(get_current_user)) -> dict:
+        return user
+    return checker
+
+
+app = FastAPI()
+
+
+@app.get("/me")
+def me(user: dict = Depends(get_current_user)):
+    return {"name": user["sub"], "role": user["role"]}
+
+
+@app.get("/admin/stats")
+def admin_stats(user: dict = Depends(require_role("admin"))):
+    return {"pandas": 42}
+
+
+# ---------- tests (don't change them) ----------
+
+NOW = 1_000_000.0
+
+
+@pytest.fixture
+def client():
+    app.dependency_overrides[get_now] = lambda: NOW
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def auth(sub="mei", role="user", exp=NOW + 900, secret=SECRET):
+    claims = {"sub": sub, "role": role, "exp": exp}
+    token = make_token(claims, secret)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_valid_token(client):
+    response = client.get("/me", headers=auth())
+    assert response.status_code == 200
+    assert response.json() == {"name": "mei", "role": "user"}
+
+
+def test_missing_token_is_401(client):
+    response = client.get("/me")
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_wrong_secret_is_401(client):
+    headers = auth(secret=b"guessed")
+    assert client.get("/me", headers=headers).status_code == 401
+
+
+def test_expired_token_is_401(client):
+    headers = auth(exp=NOW - 1)
+    assert client.get("/me", headers=headers).status_code == 401
+
+
+def test_garbage_token_is_401(client):
+    headers = {"Authorization": "Bearer nonsense"}
+    assert client.get("/me", headers=headers).status_code == 401
+
+
+def test_user_cannot_see_admin_stats(client):
+    response = client.get("/admin/stats", headers=auth())
+    assert response.status_code == 403
+
+
+def test_admin_can_see_admin_stats(client):
+    headers = auth(sub="boss", role="admin")
+    response = client.get("/admin/stats", headers=headers)
+    assert response.json() == {"pandas": 42}
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "All the tests in the editor pass", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 7" },
+    { name: "read_token returns the claims of a valid token", check: "(t := make_token({'sub': 'po', 'role': 'chef', 'exp': 500}, b'k')) and read_token(t, b'k', now=499) == {'sub': 'po', 'role': 'chef', 'exp': 500}" },
+    { name: "read_token raises InvalidToken for wrong key, expiry, malformed and tampered tokens", check: "(t := make_token({'sub': 'po', 'role': 'chef', 'exp': 500}, b'k')) and all([pytest.raises(InvalidToken, read_token, t, b'other', 100), pytest.raises(InvalidToken, read_token, t, b'k', 500), pytest.raises(InvalidToken, read_token, 'a.b', b'k', 100), pytest.raises(InvalidToken, read_token, t.split('.')[0] + '.' + b64(b'{\"sub\": \"po\", \"role\": \"admin\", \"exp\": 500}') + '.' + t.split('.')[2], b'k', 100)])" },
+    { name: "Signatures are compared with hmac.compare_digest", check: "'compare_digest' in read_token.__code__.co_names" },
+    { name: "get_current_user accepts valid tokens and answers 401 + WWW-Authenticate otherwise", check: "(c := TestClient(app)) and (now := time.time()) and c.get('/me', headers={'Authorization': 'Bearer ' + make_token({'sub': 'zhu', 'role': 'user', 'exp': now + 60}, SECRET)}).json() == {'name': 'zhu', 'role': 'user'} and c.get('/me', headers={'Authorization': 'Bearer ' + make_token({'sub': 'zhu', 'role': 'user', 'exp': now - 5}, SECRET)}).status_code == 401 and (r := c.get('/me', headers={'Authorization': 'Bearer x.y.z'})).status_code == 401 and r.headers.get('WWW-Authenticate') == 'Bearer'" },
+    { name: "require_role works for any role and answers 403", check: "require_role('chef')({'sub': 'po', 'role': 'chef'}) == {'sub': 'po', 'role': 'chef'} and pytest.raises(HTTPException, require_role('chef'), {'sub': 'mei', 'role': 'admin'}).value.status_code == 403" },
+  ]}
+>
+
+The panda API has two protected endpoints, `/me` and `/admin/stats`, and a test suite. Make all seven tests pass:
+
+1. **`read_token(token, secret, now)`**: raise `InvalidToken` if the token doesn't have exactly three parts, if the signature doesn't match (recompute it with `sign` and compare with `hmac.compare_digest`), or if `now >= claims["exp"]`. Otherwise return the claims.
+2. **`get_current_user`**: if there's no `Authorization: Bearer` header, or `read_token` raises `InvalidToken`, answer **401** with the header `WWW-Authenticate: Bearer`. Otherwise return the claims.
+3. **`require_role(role)`**: the inner `checker` answers **403** unless `user["role"] == role`.
+
+Notice how the tests control time: `get_now` is a dependency, and the `client` fixture overrides it with a fixed `NOW`, so expiry is tested without waiting.
+
+<Hint>
+
+In `read_token`, split first and check `len(parts) != 3`, then `expected = sign(header + "." + body, secret)` and `if not hmac.compare_digest(signature, expected): raise InvalidToken(...)`. Decode the claims with `json.loads(unb64(body))` only after the signature check. In `get_current_user`, handle `creds is None` first, then wrap `read_token(creds.credentials, SECRET, now)` in `try` / `except InvalidToken` and raise `HTTPException(status_code=401, detail=..., headers={"WWW-Authenticate": "Bearer"})`.
+
+</Hint>
+
+<Solution>
+
+```python
+import base64
+import hashlib
+import hmac
+import json
+import time
+
+import pytest
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import (
+    HTTPAuthorizationCredentials, HTTPBearer,
+)
+from fastapi.testclient import TestClient
+
+SECRET = b"test-secret-from-env"
+
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def unb64(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def sign(message: str, secret: bytes) -> str:
+    mac = hmac.new(secret, message.encode(), hashlib.sha256)
+    return b64(mac.digest())
+
+
+def make_token(claims: dict, secret: bytes) -> str:
+    header = b64(b'{"alg":"HS256","typ":"JWT"}')
+    body = b64(json.dumps(claims).encode())
+    return f"{header}.{body}.{sign(header + '.' + body, secret)}"
+
+
+class InvalidToken(Exception):
+    pass
+
+
+def read_token(token: str, secret: bytes, now: float) -> dict:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise InvalidToken("malformed token")
+    header, body, signature = parts
+    expected = sign(header + "." + body, secret)
+    if not hmac.compare_digest(signature, expected):
+        raise InvalidToken("bad signature")
+    claims = json.loads(unb64(body))
+    if now >= claims["exp"]:
+        raise InvalidToken("token expired")
+    return claims
+
+
+bearer = HTTPBearer(auto_error=False)
+
+
+def get_now() -> float:
+    return time.time()
+
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+    now: float = Depends(get_now),
+) -> dict:
+    if creds is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        return read_token(creds.credentials, SECRET, now)
+    except InvalidToken:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+
+
+def require_role(role: str):
+    def checker(user: dict = Depends(get_current_user)) -> dict:
+        if user["role"] != role:
+            raise HTTPException(
+                status_code=403, detail="Not enough permissions"
+            )
+        return user
+    return checker
+
+
+app = FastAPI()
+
+
+@app.get("/me")
+def me(user: dict = Depends(get_current_user)):
+    return {"name": user["sub"], "role": user["role"]}
+
+
+@app.get("/admin/stats")
+def admin_stats(user: dict = Depends(require_role("admin"))):
+    return {"pandas": 42}
+
+
+# ---------- tests (don't change them) ----------
+
+NOW = 1_000_000.0
+
+
+@pytest.fixture
+def client():
+    app.dependency_overrides[get_now] = lambda: NOW
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def auth(sub="mei", role="user", exp=NOW + 900, secret=SECRET):
+    claims = {"sub": sub, "role": role, "exp": exp}
+    token = make_token(claims, secret)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_valid_token(client):
+    response = client.get("/me", headers=auth())
+    assert response.status_code == 200
+    assert response.json() == {"name": "mei", "role": "user"}
+
+
+def test_missing_token_is_401(client):
+    response = client.get("/me")
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_wrong_secret_is_401(client):
+    headers = auth(secret=b"guessed")
+    assert client.get("/me", headers=headers).status_code == 401
+
+
+def test_expired_token_is_401(client):
+    headers = auth(exp=NOW - 1)
+    assert client.get("/me", headers=headers).status_code == 401
+
+
+def test_garbage_token_is_401(client):
+    headers = {"Authorization": "Bearer nonsense"}
+    assert client.get("/me", headers=headers).status_code == 401
+
+
+def test_user_cannot_see_admin_stats(client):
+    response = client.get("/admin/stats", headers=auth())
+    assert response.status_code == 403
+
+
+def test_admin_can_see_admin_stats(client):
+    headers = auth(sub="boss", role="admin")
+    response = client.get("/admin/stats", headers=headers)
+    assert response.json() == {"pandas": 42}
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Authentication** is *who are you* (fail with **401** + `WWW-Authenticate`), **authorisation** is *what may you do* (fail with **403**, or **404** to hide what exists).
+- **Sessions** keep state on the server and are easy to revoke; **signed tokens** are verified with a key and are hard to revoke, so keep them short-lived.
+- A **JWT** is `header.payload.signature` in base64url: **signed, not encrypted**. Verify the signature with `hmac.compare_digest` before trusting anything, check `exp`, pin the algorithm, and use a library like PyJWT in production.
+- In FastAPI, authentication is a dependency (`HTTPBearer`, `OAuth2PasswordBearer`) that every protected route depends on; prefer **deny by default** at router level.
+- Check roles with a **dependency factory** like `require_role("admin")`, and always check **ownership** of the object being accessed.
+- **Rate limiting** answers 429 and protects logins from guessing; in production it lives in a shared store or the proxy.
+- Inject the clock (`get_now`) so expiry is easy to test.

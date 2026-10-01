@@ -1,0 +1,491 @@
+---
+title: Кеширование и оптимизация
+description: Кешируйте результаты с functools.cache и lru_cache, избегайте устаревших кешей, напишите свой LRU-кеш, экономьте память генераторами, векторизуйте с numpy и знайте, когда нужен нативный код.
+duration: 24
+xp: 25
+---
+
+Вы профилировали программу и нашли горячую точку. Что дальше? Способов ускорить код совсем немного: **делать меньше работы** (взять алгоритм получше или не повторять уже сделанное), **тратить меньше памяти** или **перенести работу в более быстрый код** (на C — через numpy или нативное расширение). В этом уроке мы пройдём по каждому из них примерно в том порядке, в котором их стоит пробовать. ⚡
+
+## Не повторяйте работу: functools.cache
+
+Если функция **чистая (pure)** (одни и те же аргументы → один и тот же результат, никаких побочных эффектов) и её снова и снова вызывают с одинаковыми аргументами, можно запоминать её результаты. Это называется **мемоизацией (memoisation)** — частный случай **кеширования (caching)**, — и `functools.cache` делает её одной строкой:
+
+<CodeExample output={`832040
+вызовов: 31
+832040 вызовов: 31
+CacheInfo(hits=29, misses=31, maxsize=None, currsize=31)`}>
+
+```python
+from functools import cache
+
+calls = 0
+
+@cache
+def fib(n):
+    global calls
+    calls += 1
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+print(fib(30))
+print("вызовов:", calls)
+print(fib(30), "вызовов:", calls)    # ответ из кеша
+print(fib.cache_info())
+```
+
+</CodeExample>
+
+Без `@cache` вызов `fib(30)` делает **2 692 537** вызовов, потому что снова и снова пересчитывает одни и те же маленькие значения. С **кешем (cache)** каждое `n` от 0 до 30 вычисляется ровно **один раз** (31 вызов), а каждый повтор — это поиск в словаре. Экспоненциальный алгоритм превращается в линейный.
+
+**`cache_info()`** — ваша панель приборов: **hits** (попадания — ответ взят из кеша), **misses** (промахи — пришлось вычислять), **maxsize** и **currsize** (сколько результатов хранится). В продакшне низкая доля попаданий значит, что кеш только тратит память.
+
+## lru_cache: кеш с ограничением размера
+
+`@cache` ничего не забывает, поэтому может расти бесконечно. Для `fib` это нормально, но не, скажем, для загрузки пользователей по id на нагруженном сервере. **`@lru_cache(maxsize=N)`** хранит не больше `N` результатов и, когда места нет, выбрасывает тот, который **дольше всего не использовался (least recently used)**:
+
+<CodeExample output={`нужен пользователь 1
+  загружаем пользователя 1 из базы данных
+нужен пользователь 2
+  загружаем пользователя 2 из базы данных
+нужен пользователь 1
+нужен пользователь 3
+  загружаем пользователя 3 из базы данных
+нужен пользователь 2
+  загружаем пользователя 2 из базы данных
+CacheInfo(hits=1, misses=4, maxsize=2, currsize=2)`}>
+
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=2)
+def load_user(user_id):
+    print(f"  загружаем пользователя {user_id} из базы данных")
+    return {"id": user_id}
+
+for user_id in [1, 2, 1, 3, 2]:
+    print("нужен пользователь", user_id)
+    load_user(user_id)
+
+print(load_user.cache_info())
+```
+
+</CodeExample>
+
+Пройдите по шагам: пользователи 1 и 2 заполняют кеш. Повторный запрос 1 — это **попадание**, и 1 становится самым недавно использованным. Пользователь 3 не помещается, поэтому дольше всех не использовавшийся, пользователь 2, **вытесняется (evicted)**. Вот почему в конце пользователя 2 приходится загружать снова.
+
+**LRU** («least recently used», «дольше всего не использовавшийся») — самая популярная политика **вытеснения (eviction)**, потому что она соответствует реальному трафику: то, что использовали недавно, скорее всего, скоро понадобится снова. (`@cache` — это просто `@lru_cache(maxsize=None)`.)
+
+## Ловушки инвалидации кеша
+
+Известная шутка Фила Карлтона гласит, что в программировании есть только две сложные вещи — инвалидация кеша и придумывание имён. Кеш — это **копия** данных, а копии устаревают. Вот основные ловушки:
+
+<CodeExample output={`TypeError: unhashable type: 'list'
+6.5
+True
+True
+False`}>
+
+```python
+from functools import cache
+
+@cache
+def total(prices):
+    return sum(prices)
+
+try:
+    total([2.5, 4.0])
+except TypeError as error:
+    print("TypeError:", error)
+
+print(total((2.5, 4.0)))     # кортежи хешируемы
+
+stock = {"tea": 10}
+
+@cache
+def in_stock(item):
+    return stock[item] > 0
+
+print(in_stock("tea"))
+stock["tea"] = 0             # всё распродано!
+print(in_stock("tea"))       # устаревший ответ
+in_stock.cache_clear()
+print(in_stock("tea"))
+```
+
+</CodeExample>
+
+1. **Аргументы должны быть хешируемыми.** Кеш — это словарь, ключами которого служат аргументы, поэтому списки и словари не подходят. Передавайте вместо них кортежи или frozenset.
+2. **Устаревшие данные.** `in_stock` читает глобальную переменную, которая изменилась, но кеш об этом не знает. Кешируйте только **чистые** функции или вызывайте **`cache_clear()`** каждый раз, когда меняются исходные данные. Никогда не кешируйте то, что зависит от времени, случайности или базы данных, в которую пишут другие (разве что слегка устаревший ответ допустим и вы добавите срок жизни — его вы напишете в модуле System Design).
+3. **Память.** Неограниченный `@cache` на функции, которую вызывают с миллионами разных аргументов, — это утечка памяти с благими намерениями. Используйте `lru_cache(maxsize=...)` и следите за `cache_info()`.
+
+<Callout type="warning" title="Не вешайте lru_cache на методы">
+
+`@lru_cache` на методе включает `self` в ключ, поэтому кеш держит **каждый экземпляр живым вечно**: сборщик мусора не может их удалить. Линтеры это ловят (правило B019 в ruff/flake8-bugbear). Для значения, которое вычисляется один раз на объект, используйте **`@functools.cached_property`** — он сохраняет результат в самом экземпляре:
+
+```python
+from functools import cached_property
+
+class Report:
+    def __init__(self, rows):
+        self.rows = rows
+
+    @cached_property
+    def total(self):          # вычисляется только при первом обращении
+        return sum(r["amount"] for r in self.rows)
+```
+
+</Callout>
+
+## Напишите свой: LRU-кеш на OrderedDict
+
+`lru_cache` умеет оборачивать только функции. Часто же нужен кеш-**объект**: кеш на время одного запроса, кеш отрисованных страниц, кеш, который можно проверить в тестах. Классический способ его построить — **`collections.OrderedDict`**, словарь, в котором можно переставлять ключи:
+
+<CodeExample output={`['blog', 'about', 'home']
+вытесняем: blog <blog.html>
+['about', 'home']`}>
+
+```python
+from collections import OrderedDict
+
+recent = OrderedDict()
+for page in ["home", "blog", "about"]:
+    recent[page] = f"<{page}.html>"
+
+recent.move_to_end("home")       # "home" только что использовали
+print(list(recent))
+
+oldest, html = recent.popitem(last=False)
+print("вытесняем:", oldest, html)
+print(list(recent))
+```
+
+</CodeExample>
+
+Две операции, из которых состоит LRU-кеш:
+
+- **`move_to_end(key)`** переносит ключ в конец, так что в конце всегда «самый недавно использованный».
+- **`popitem(last=False)`** удаляет элемент из **начала** — тот, что дольше всего не использовался.
+
+Обе работают за O(1), поэтому кеш остаётся быстрым при любом размере. Полный кеш вы напишете в упражнении ниже. (Кстати, это любимый вопрос на собеседованиях, так что его стоит знать назубок.)
+
+## Экономьте память генераторами
+
+Вы познакомились с генераторами на Уровне 2: они выдают значения **по одному**, а не строят весь список. Для памяти это огромная разница, и теперь её можно доказать с помощью `tracemalloc`:
+
+<CodeExample output={`ответ совпадает: True
+списку нужно в 100+ раз больше памяти: True`}>
+
+```python
+import tracemalloc
+
+def peak_bytes(func):
+    tracemalloc.start()
+    result = func()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return result, peak
+
+n = 100_000
+total1, list_peak = peak_bytes(lambda: sum([x * x for x in range(n)]))
+total2, gen_peak = peak_bytes(lambda: sum(x * x for x in range(n)))
+
+print("ответ совпадает:", total1 == total2)
+print("списку нужно в 100+ раз больше памяти:", list_peak > 100 * gen_peak)
+```
+
+</CodeExample>
+
+Единственная разница — `[...]` вместо `(...)`. Версия со списком держит в памяти сразу 100 000 чисел (несколько мегабайт); генератор — по одному. С файлом логов на 10 ГБ это разница между «работает» и «убит операционной системой».
+
+Простое правило: если вы **проходите** по значениям только один раз (`sum`, `max`, `for`, запись в файл), используйте генератор. Если нужны `len()`, индексы или несколько проходов, нужен список. Цепочки генераторов образуют **конвейеры (pipelines)**, которые обрабатывают файлы любого размера в постоянном объёме памяти:
+
+```python
+from collections import Counter
+
+lines = (line for line in open("access.log"))
+errors = (line for line in lines if " 500 " in line)
+paths = (line.split()[6] for line in errors)
+print(Counter(paths).most_common(5))   # файл никогда не загружается целиком
+```
+
+## Векторизация с numpy
+
+Цикл на Python платит небольшую цену за **каждый** элемент: найти переменные, проверить типы, создать новый объект-число. **numpy** хранит числа в компактных массивах и выполняет операции целиком на C, так что одна строка обрабатывает миллион чисел сразу. Это называется **векторизацией (vectorisation)**:
+
+<CodeExample output={`[10.0, 4.0, 16.0, 3.5]
+[10.   4.  16.   3.5]
+33.5
+[4.  3.2]`}>
+
+```python
+import numpy as np
+
+prices = [2.5, 4.0, 3.2, 1.75]
+quantities = [4, 1, 5, 2]
+
+# Цикл на Python: по одному умножению за раз
+totals = []
+for price, qty in zip(prices, quantities):
+    totals.append(price * qty)
+print(totals)
+
+# numpy: одна операция над целыми массивами
+p = np.array(prices)
+q = np.array(quantities)
+print(p * q)
+print((p * q).sum())
+print(p[p > 3])            # фильтр без цикла
+```
+
+</CodeExample>
+
+Результаты те же, но numpy умножил, сложил и отфильтровал без цикла на Python. На четырёх элементах вы этого не заметите. На миллионе это обычно **в 50–100 раз быстрее**. Запустите и убедитесь:
+
+<TryIt language="python" code={`import timeit
+import numpy as np
+
+n = 1_000_000
+values = list(range(n))
+array = np.arange(n, dtype=np.int64)
+
+def loop_sum_squares():
+    total = 0
+    for v in values:
+        total += v * v
+    return total
+
+def numpy_sum_squares():
+    return int((array * array).sum())
+
+print("ответ совпадает:", loop_sum_squares() == numpy_sum_squares())
+loop_t = min(timeit.repeat(loop_sum_squares, number=1, repeat=3))
+np_t = min(timeit.repeat(numpy_sum_squares, number=1, repeat=3))
+print(f"цикл:  {loop_t * 1000:.1f} мс")
+print(f"numpy: {np_t * 1000:.1f} мс")
+print(f"numpy быстрее в {loop_t / np_t:.0f} раз")
+`}
+/>
+
+<Callout type="note" title="У чисел numpy фиксированный размер">
+
+`int` в Python никогда не переполняется, а числа numpy — переполняются. `np.arange(n)` использует целый тип по умолчанию для платформы, а он может быть 32-битным (здесь, в браузере, так и есть), и тогда возведение в квадрат миллиона чисел молча «заворачивается» и даёт неверные ответы. Поэтому в демо указано `dtype=np.int64`. Если результаты выглядят странно, проверьте `array.dtype`. У pandas (он построен на numpy) то же поведение.
+
+</Callout>
+
+## Дешёвые победы
+
+Прежде чем хвататься за что-то экзотическое, вспомните несколько привычек, которые ускоряют обычный Python. Запустите код, чтобы увидеть, сколько даёт каждая:
+
+<TryIt language="python" code={`import math
+import timeit
+
+words = ["panda"] * 10_000
+numbers = range(10_000)
+
+def plus_equals():
+    text = ""
+    for w in words:
+        text += w + ","
+    return text
+
+def join():
+    return ",".join(words) + ","
+
+def append_loop():
+    out = []
+    for n in numbers:
+        out.append(n * 2)
+    return out
+
+def comprehension():
+    return [n * 2 for n in numbers]
+
+def global_lookup():
+    return [math.sqrt(n) for n in numbers]
+
+def local_lookup():
+    sqrt = math.sqrt          # ищем один раз
+    return [sqrt(n) for n in numbers]
+
+contests = [(plus_equals, join),
+            (append_loop, comprehension),
+            (global_lookup, local_lookup)]
+for slow, fast in contests:
+    assert slow() == fast()
+    t_slow = min(timeit.repeat(slow, number=50, repeat=3))
+    t_fast = min(timeit.repeat(fast, number=50, repeat=3))
+    print(f"{fast.__name__:>13} vs {slow.__name__:<13}"
+          f" быстрее в {t_slow / t_fast:.1f} раза")
+`}
+/>
+
+- **`"".join(parts)`** вместо `+=` для строк в цикле: строки неизменяемы, поэтому `+=` может каждый раз копировать весь текст (в худшем случае O(n²)). `join` вычисляет размер один раз. Это большой выигрыш.
+- **Списковые включения (comprehensions)** вместо циклов с `append`: немного быстрее и легче читаются.
+- **Локальные имена** вместо повторного поиска глобальных имён или атрибутов (`sqrt = math.sqrt`, `append = out.append`): небольшой выигрыш в горячих циклах.
+- **Встроенные функции** (`sum`, `max`, `sorted`, `any`, `collections.Counter`) работают на C; предпочитайте их самописным циклам.
+- **Правильная структура данных**: `set` для проверки принадлежности, `dict` как индекс, `deque` для очередей. Это снова урок про Big-O, и обычно это самый большой выигрыш из всех.
+
+Обратите внимание, какие маленькие разрывы в двух последних случаях. Начиная с Python 3.11 интерпретатор стал гораздо быстрее справляться с ними, так что старые статьи в блогах часто обещают больше, чем вы получите. Сначала читаемость; трюки — только в горячем цикле, на который указал профилировщик.
+
+## Когда переходить на нативный код
+
+Иногда горячий цикл остаётся слишком медленным даже после всего перечисленного: своя симуляция, разбор бинарного формата, алгоритм, который не выразить через numpy. Тогда вы переносите в компилируемый код **только эту функцию**, а остальное оставляете на Python:
+
+- **Numba**: добавьте `@numba.njit` к числовой функции с циклами и массивами numpy, и при первом вызове она скомпилируется в машинный код. Самый быстрый выигрыш для вычислений с числами.
+- **Cython**: код, похожий на Python, с объявлениями типов (`cdef int i`), который компилируется в расширение на C. Зрелый инструмент, его используют pandas и scikit-learn.
+- **mypyc**: компилирует обычные модули Python с аннотациями типов в расширения на C (сам mypy скомпилирован им).
+- **Rust с PyO3 + maturin**: напишите функцию на Rust и импортируйте её как любой модуль Python. Безопасно для памяти и очень быстро; так устроены pydantic-core, polars, ruff и orjson.
+
+```rust
+use pyo3::prelude::*;
+
+#[pyfunction]
+fn count_words(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+```
+
+```bash
+maturin develop      # собрать, затем в Python: from mylib import count_words
+```
+
+У этого есть реальная цена: шаг сборки, второй язык для команды, более сложная отладка. Senior-разработчики делают это в последнюю очередь, для измеренной горячей точки, и часто ответ звучит так: «библиотека уже это сделала» (numpy, polars, orjson, запрос к базе данных).
+
+<Quiz
+  question="Функция get_price(product_id) читает текущую цену из базы данных. Коллега добавляет к ней @functools.cache, чтобы ускорить магазин. Какой главный риск?"
+  options={[
+    "Это не сработает, потому что id товаров — целые числа",
+    "Покупатели могут видеть старые цены после изменения цены, потому что кеш никогда не устаревает",
+    "Каждый вызов станет медленнее из-за поиска в кеше",
+    "Кеш очищается при каждом вызове функции",
+  ]}
+  answer={1}
+  explanation="Функция не чистая: её результат зависит от данных, которые меняются. Неограниченный кеш навсегда запоминает первую цену (и растёт с каждым товаром). Понадобится инвалидация (cache_clear при изменении цен) или кеш со сроком жизни."
+/>
+
+<Quiz
+  question="Функцию с lru_cache(maxsize=2) вызывают с 'a', 'b', 'a', 'c', 'b' именно в таком порядке. Сколько из этих вызовов — попадания в кеш?"
+  options={["0", "1", "2", "3"]}
+  answer={1}
+  explanation="a — промах, b — промах, a — попадание (теперь a самый недавний), c — промах и вытесняет b (дольше всех не использовался), b — снова промах. Попадание только одно."
+/>
+
+<Exercise
+  language="python"
+  title="Напишите LRU-кеш"
+  starter={`from collections import OrderedDict
+
+class LRUCache:
+    """Хранит \`capacity\` самых недавно использованных элементов."""
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.hits = 0
+        self.misses = 0
+        self._data = OrderedDict()
+
+    def get(self, key, default=None):
+        # Верните значение (и отметьте его как недавно использованное)
+        # или default, если ключа нет в кеше.
+        pass
+
+    def put(self, key, value):
+        # Сохраните значение как самое недавно использованное.
+        # Превышена ёмкость? Вытесните самое давнее.
+        pass
+
+    def __len__(self):
+        return len(self._data)
+
+cache = LRUCache(2)
+cache.put("tea", 2.5)
+cache.put("cake", 4.0)
+cache.get("tea")
+cache.put("bun", 3.2)        # кеш полон: кто уйдёт?
+print(cache.get("cake"), cache.get("tea"), cache.get("bun"))
+print(f"hits={cache.hits} misses={cache.misses} size={len(cache)}")
+`}
+  tests={[
+    { name: "Печатает ожидаемый результат", check: "__output == ['None 2.5 3.2', 'hits=3 misses=1 size=2']" },
+    { name: "get возвращает сохранённое значение", check: "[c := LRUCache(3), c.put('a', 1), c.get('a')][-1] == 1" },
+    { name: "Для отсутствующих ключей возвращается default", check: "[c := LRUCache(3), c.get('nope'), c.get('nope', 'x')][1:] == [None, 'x']" },
+    { name: "Когда кеш полон, вытесняет самый старый элемент", check: "[c := LRUCache(2), c.put('a', 1), c.put('b', 2), c.put('c', 3), c.get('a'), c.get('b'), c.get('c')][-3:] == [None, 2, 3]" },
+    { name: "get отмечает элемент как недавно использованный", check: "[c := LRUCache(2), c.put('a', 1), c.put('b', 2), c.get('a'), c.put('c', 3), c.get('b'), c.get('a')][-2:] == [None, 1]" },
+    { name: "put для существующего ключа обновляет его и делает недавним", check: "[c := LRUCache(2), c.put('a', 1), c.put('b', 2), c.put('a', 10), c.put('c', 3), len(c), c.get('a'), c.get('b')][-3:] == [2, 10, None]" },
+    { name: "Считает попадания и промахи", check: "[c := LRUCache(1), c.put('x', 1), c.get('x'), c.get('y'), c.get('x'), c.hits, c.misses][-2:] == [2, 1]" },
+    { name: "Никогда не превышает ёмкость", check: "[c := LRUCache(3), [c.put(i, i * i) for i in range(10)], len(c), [c.get(i) for i in range(10)]][2:] == [3, [None] * 7 + [49, 64, 81]]" },
+    { name: "Закешированный None — тоже попадание", check: "[c := LRUCache(2), c.put('a', None), c.get('a', 'missing'), c.hits][-2:] == [None, 1]" },
+  ]}
+>
+
+Допишите класс `LRUCache`, чтобы он вёл себя как кеш внутри `lru_cache`:
+
+- **`get(key, default=None)`**: если ключ есть в кеше, засчитайте **попадание (hit)**, отметьте ключ как самый недавно использованный и верните его значение. Иначе засчитайте **промах (miss)** и верните `default`.
+- **`put(key, value)`**: сохраните значение как самый недавно использованный элемент (в том числе когда ключ уже существует). Если теперь в кеше больше `capacity` элементов, удалите тот, что **дольше всего не использовался**.
+- Обе операции должны работать за O(1): никаких циклов и сортировок.
+
+Осторожно, есть ловушка: закешированное значение может быть `None`, поэтому проверяйте, есть ли в кеше **ключ**, а не равно ли значение `None`. Когда всё заработает, внизу напечатается `None 2.5 3.2` и `hits=3 misses=1 size=2`. Бонус (не проверяется): выбрасывайте `ValueError` для ёмкости меньше 1.
+
+<Hint>
+
+В `get`: `if key not in self._data:` → `self.misses += 1` и `return default`. Иначе `self.hits += 1`, `self._data.move_to_end(key)` и верните `self._data[key]`.
+
+В `put`: `self._data[key] = value`, затем `self._data.move_to_end(key)` (присваивание существующему ключу не меняет его позицию). Затем `if len(self._data) > self.capacity:` вызовите `self._data.popitem(last=False)`.
+
+</Hint>
+
+<Solution>
+
+```python
+from collections import OrderedDict
+
+class LRUCache:
+    """Хранит `capacity` самых недавно использованных элементов."""
+
+    def __init__(self, capacity):
+        if capacity < 1:
+            raise ValueError("ёмкость должна быть не меньше 1")
+        self.capacity = capacity
+        self.hits = 0
+        self.misses = 0
+        self._data = OrderedDict()
+
+    def get(self, key, default=None):
+        if key not in self._data:
+            self.misses += 1
+            return default
+        self.hits += 1
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def put(self, key, value):
+        self._data[key] = value
+        self._data.move_to_end(key)
+        if len(self._data) > self.capacity:
+            self._data.popitem(last=False)
+
+    def __len__(self):
+        return len(self._data)
+
+cache = LRUCache(2)
+cache.put("tea", 2.5)
+cache.put("cake", 4.0)
+cache.get("tea")
+cache.put("bun", 3.2)        # кеш полон: кто уйдёт?
+print(cache.get("cake"), cache.get("tea"), cache.get("bun"))
+print(f"hits={cache.hits} misses={cache.misses} size={len(cache)}")
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Пробуйте оптимизации в таком порядке: **лучший алгоритм или структура данных**, **не повторять работу** (кеширование), **меньше памяти** (генераторы), **перенос работы в C** (numpy, встроенные функции) и только потом **нативный код**.
+- **`@functools.cache`** мемоизирует чистые функции; **`@lru_cache(maxsize=N)`** хранит только N самых недавно использованных результатов. Попадания и промахи смотрите в **`cache_info()`**.
+- Ловушки кеширования: аргументы должны быть хешируемыми, закешированные данные **устаревают** (`cache_clear()`), неограниченные кеши текут, а `lru_cache` на методах держит экземпляры живыми (используйте `cached_property`).
+- **LRU-кеш** = `OrderedDict` + `move_to_end(key)` при использовании + `popitem(last=False)` для вытеснения.
+- **Генераторы** обрабатывают по одному элементу: постоянный объём памяти при любом количестве данных.
+- Векторизация **numpy** выполняет операции над целыми массивами на C, часто в 50–100 раз быстрее циклов; следите за `dtype`.
+- Дешёвые победы: `"".join`, списковые включения, встроенные функции, локальные имена. Нативный код (Numba, Cython, mypyc, Rust/PyO3) — последнее средство для измеренной горячей точки.

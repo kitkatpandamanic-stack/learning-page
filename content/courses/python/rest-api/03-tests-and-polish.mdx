@@ -1,0 +1,1178 @@
+---
+title: "Part 3: Tests and polish"
+description: Write a full pytest suite for the Projects API with a fresh database per test, a client fixture, parametrized error tests, and run it all on your own computer.
+duration: 22
+xp: 30
+---
+
+The Projects API works. But "it worked when I tried it" isn't good enough for an API other apps depend on: the next change could quietly break an endpoint you didn't touch. In this final part you'll write a **full API test suite**, so every endpoint, every error and every save is checked automatically in under a second. 🧪
+
+You'll use everything from [Fixtures and Parametrize](/learn/python/fixtures-and-parametrize) and the `client` fixture with `dependency_overrides` from the [To-do API](/learn/python/todo-api), now with a real database underneath.
+
+## Two layers, two kinds of tests
+
+We already have **repository tests** from Part 1. They're fast and precise, but they can't see anything HTTP-related. **API tests** send real requests through `TestClient` and check what a client would see. Together they cover different bugs:
+
+| A bug in... | Caught by |
+| --- | --- |
+| a query, a filter, the cascade | repository tests (and API tests) |
+| a `Field` rule, a missing 404, a wrong status code | API tests |
+| the JSON shape (`response_model`, `from_attributes`) | API tests |
+| wiring: `Depends`, a forgotten `commit()` in an endpoint | API tests |
+
+Most of an API's behaviour is in the second group, so a good suite has **lots** of API tests. They're still fast, because the database is in memory.
+
+## A fresh database for every test
+
+API tests must never use the app's real database: they'd fill it with test data, and tests would see each other's leftovers and pass or fail depending on their order. The fix is the trick from the To-do API: a `client` fixture that **overrides `get_session`**, so that during the test every endpoint gets a session on a **brand-new, empty test database**. Here's the whole pattern on a small notes API:
+
+<CodeExample output={`...........                                          [100%]
+11 passed in 0.01s`}>
+
+```python
+import pytest
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column,
+)
+from sqlalchemy.pool import StaticPool
+
+class Base(DeclarativeBase):
+    pass
+
+class Note(Base):
+    __tablename__ = "notes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    text: Mapped[str]
+
+class NoteIn(BaseModel):
+    text: str = Field(min_length=1)
+
+class NoteOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    text: str
+
+engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+Base.metadata.create_all(engine)
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+def get_note_or_404(
+    note_id: int, session: Session = Depends(get_session)
+) -> Note:
+    note = session.get(Note, note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return note
+
+app = FastAPI()
+
+@app.post("/notes", status_code=201, response_model=NoteOut)
+def api_add_note(
+    data: NoteIn, session: Session = Depends(get_session)
+):
+    note = Note(text=data.text)
+    session.add(note)
+    session.commit()
+    return note
+
+@app.get("/notes/{note_id}", response_model=NoteOut)
+def api_get_note(note: Note = Depends(get_note_or_404)):
+    return note
+
+@app.delete("/notes/{note_id}", status_code=204)
+def api_delete_note(
+    note: Note = Depends(get_note_or_404),
+    session: Session = Depends(get_session),
+):
+    session.delete(note)
+    session.commit()
+
+# ---------- tests ----------
+
+@pytest.fixture
+def client():
+    test_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(test_engine)
+
+    def get_test_session():
+        with Session(test_engine) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = get_test_session
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+@pytest.fixture
+def note(client):
+    return client.post("/notes", json={"text": "Buy milk"}).json()
+
+def test_add_note(client):
+    response = client.post("/notes", json={"text": "Buy milk"})
+    assert response.status_code == 201
+    assert response.json() == {"id": 1, "text": "Buy milk"}
+
+def test_get_note(client, note):
+    assert client.get(f"/notes/{note['id']}").json() == note
+
+def test_every_test_has_its_own_database(client, note):
+    assert note["id"] == 1
+
+def test_the_app_database_is_never_touched(client, note):
+    with Session(engine) as session:
+        assert session.scalars(select(Note)).all() == []
+
+@pytest.mark.parametrize("method, url", [
+    ("GET", "/notes/99"),
+    ("DELETE", "/notes/99"),
+    ("GET", "/notes/0"),
+])
+def test_unknown_ids_give_404(client, method, url):
+    response = client.request(method, url)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Note not found"}
+
+@pytest.mark.parametrize("body", [
+    {},
+    {"text": ""},
+    {"text": None},
+    {"txt": "Buy milk"},
+])
+def test_bad_data_gives_422(client, body):
+    response = client.post("/notes", json=body)
+    assert response.status_code == 422
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+How the `client` fixture works, step by step:
+
+1. It creates a **new engine** for this one test: an empty in-memory database, with `StaticPool` and `check_same_thread=False` for the same reasons as in Part 2.
+2. `create_all` adds the tables.
+3. `get_test_session` is a dependency with `yield`, just like `get_session`, but on the test engine.
+4. `app.dependency_overrides[get_session] = get_test_session` makes **every** endpoint and dependency that asks for `get_session` (including `get_note_or_404`) get the test session instead.
+5. After `yield`, the overrides are cleared, so nothing leaks into the next test.
+
+The last two tests prove it: each test's first note gets id `1`, and the app's own database stays empty. In real projects you sometimes see a session-scoped engine with a transaction that's rolled back after each test, which is faster for big databases. For in-memory SQLite, a new engine per test is simple and quick.
+
+## Fixtures on fixtures
+
+`note` is a fixture that **asks for another fixture**, `client`. pytest sees that, creates the client (and its fresh database) first, then the note. Tests that need existing data just list both: `def test_get_note(client, note)`. Both get the **same** client, because pytest creates each fixture once per test.
+
+In the Projects API, a `project` fixture does the same job: it creates a project called `"Garden"` through the API and returns its JSON, so task tests can start with `def test_...(client, project)`.
+
+## Testing errors with parametrize
+
+Errors are behaviour too, and APIs have a lot of them: every endpoint with an id can answer 404, and every endpoint with a body can answer 422. `@pytest.mark.parametrize` turns that into a table of cases instead of a pile of copied tests:
+
+- `client.request(method, url)` sends any HTTP method, so one test can try `GET`, `DELETE` and more. You can also pass a body: `client.request("PATCH", url, json={...})`.
+- Each case shows up as its own test, so a failure names exactly which request broke, like `test_unknown_ids_give_404[DELETE-/notes/99]`.
+- The 422 cases list the classic mistakes: a missing field, an empty value, `None`, and a misspelt key.
+
+<Callout type="tip" title="What pros check in API tests">
+
+For every endpoint: the **status code**, the **whole JSON body** (comparing with `==` against a full dict catches extra or missing fields) and the **side effect** (is it really saved, really deleted?). Then the error cases. That checklist catches most real-world API bugs.
+
+</Callout>
+
+## Did it really save?
+
+Here's a bug the response alone can't reveal. This `PATCH` endpoint changes the note but forgets to commit:
+
+<CodeExample output={`PATCH says: {'id': 1, 'text': 'Buy oat milk'}
+GET says:   {'id': 1, 'text': 'Buy milk'}`}>
+
+```python
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import create_engine
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column,
+)
+from sqlalchemy.pool import StaticPool
+
+class Base(DeclarativeBase):
+    pass
+
+class Note(Base):
+    __tablename__ = "notes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    text: Mapped[str]
+
+class NoteIn(BaseModel):
+    text: str = Field(min_length=1)
+
+class NoteOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    text: str
+
+engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+Base.metadata.create_all(engine)
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+def get_note_or_404(
+    note_id: int, session: Session = Depends(get_session)
+) -> Note:
+    note = session.get(Note, note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    return note
+
+app = FastAPI()
+
+@app.post("/notes", status_code=201, response_model=NoteOut)
+def api_add_note(
+    data: NoteIn, session: Session = Depends(get_session)
+):
+    note = Note(text=data.text)
+    session.add(note)
+    session.commit()
+    return note
+
+@app.get("/notes/{note_id}", response_model=NoteOut)
+def api_get_note(note: Note = Depends(get_note_or_404)):
+    return note
+
+@app.patch("/notes/{note_id}", response_model=NoteOut)
+def api_update_note(
+    data: NoteIn, note: Note = Depends(get_note_or_404)
+):
+    note.text = data.text        # bug: no session.commit()
+    return note
+
+client = TestClient(app)
+client.post("/notes", json={"text": "Buy milk"})
+
+response = client.patch("/notes/1", json={"text": "Buy oat milk"})
+print("PATCH says:", response.json())
+print("GET says:  ", client.get("/notes/1").json())
+```
+
+</CodeExample>
+
+The `PATCH` response looks perfect, because it's built from the changed object while the session is still open. Then the request ends, the session closes, the change is rolled back, and the next request sees the old text. A test that only checks the `PATCH` response would pass. So after every write, **read it back in a new request**: `PATCH`, then `GET`; `DELETE`, then `GET` and expect 404.
+
+Our repository test from Part 1 can't catch this either: it checks the same `task` object in the same session. That's exactly why both kinds of tests are worth having.
+
+## Running it for real
+
+On your computer, the suite is split into files, and the `client` fixture goes in **`tests/conftest.py`** so every test file can use it:
+
+```python
+# tests/conftest.py
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
+from app.database import get_session
+from app.main import app
+from app.models import Base
+
+
+@pytest.fixture
+def client():
+    test_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(test_engine)
+
+    def get_test_session():
+        with Session(test_engine) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = get_test_session
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+```
+
+Then, from the project folder (with an empty `__init__.py` in `app/` and `tests/`):
+
+```bash
+pip install "fastapi[standard]" sqlalchemy pytest pytest-cov
+pytest
+pytest --cov=app --cov-report=term-missing
+fastapi dev app/main.py
+```
+
+`pytest` finds and runs every `test_*.py` file. The coverage report from [Mocks and Coverage](/learn/python/mocks-and-coverage) shows any lines your tests never reached: with the suite you're about to write, the endpoints and repository should be at or near **100%**. And `fastapi dev` starts the server so you can click through `/docs`.
+
+<Quiz
+  question="An endpoint changes a task but forgets session.commit(). Which test catches the bug?"
+  options={["A test that checks the PATCH response body", "A test that sends PATCH, then GETs the task in a second request and checks the change", "A repository test that calls update_task and checks the same task object", "A test that checks that PATCH answers 200"]}
+  answer={1}
+  explanation="Within the PATCH request the changed object looks right, so its response and status code are fine. The change is rolled back when the session closes, so only reading it back in a new request reveals it."
+/>
+
+<Exercise
+  language="python"
+  title="Build it: The finished REST API"
+  starter={`import pytest
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import ForeignKey, String, create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+from sqlalchemy.pool import StaticPool
+
+
+# ---------- models ----------
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+
+# ---------- repository ----------
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+
+def list_projects(session: Session) -> list[Project]:
+    return list(session.scalars(select(Project).order_by(Project.id)))
+
+
+def delete_project(session: Session, project: Project) -> None:
+    session.delete(project)
+    session.commit()
+
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+
+def get_task(session: Session, task_id: int) -> Task | None:
+    return session.get(Task, task_id)
+
+
+def list_tasks(
+    session: Session, project_id: int, done: bool | None = None
+) -> list[Task]:
+    stmt = select(Task).where(Task.project_id == project_id)
+    if done is not None:
+        stmt = stmt.where(Task.done == done)
+    return list(session.scalars(stmt.order_by(Task.id)))
+
+
+def update_task(session: Session, task: Task, changes: dict) -> Task:
+    for field, value in changes.items():
+        setattr(task, field, value)
+    session.commit()
+    return task
+
+
+def delete_task(session: Session, task: Task) -> None:
+    session.delete(task)
+    session.commit()
+
+
+# ---------- schemas ----------
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class ProjectOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+class TaskUpdate(BaseModel):
+    title: str | None = Field(
+        default=None, min_length=1, max_length=200
+    )
+    done: bool | None = None
+
+
+class TaskOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    done: bool
+    project_id: int
+
+
+class ProjectDetail(ProjectOut):
+    tasks: list[TaskOut]
+
+
+# ---------- database and dependencies ----------
+
+engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+Base.metadata.create_all(engine)
+
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+
+def get_project_or_404(
+    project_id: int, session: Session = Depends(get_session)
+) -> Project:
+    project = get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+def get_task_or_404(
+    task_id: int, session: Session = Depends(get_session)
+) -> Task:
+    task = get_task(session, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+# ---------- endpoints ----------
+
+app = FastAPI(title="Projects API")
+
+
+@app.post("/projects", status_code=201, response_model=ProjectOut)
+def api_create_project(
+    data: ProjectCreate, session: Session = Depends(get_session)
+):
+    return create_project(session, data.name)
+
+
+@app.get("/projects", response_model=list[ProjectOut])
+def api_list_projects(session: Session = Depends(get_session)):
+    return list_projects(session)
+
+
+@app.get("/projects/{project_id}", response_model=ProjectDetail)
+def api_get_project(project: Project = Depends(get_project_or_404)):
+    return project
+
+
+@app.delete("/projects/{project_id}", status_code=204)
+def api_delete_project(
+    project: Project = Depends(get_project_or_404),
+    session: Session = Depends(get_session),
+):
+    delete_project(session, project)
+
+
+@app.post(
+    "/projects/{project_id}/tasks",
+    status_code=201,
+    response_model=TaskOut,
+)
+def api_add_task(
+    data: TaskCreate,
+    project: Project = Depends(get_project_or_404),
+    session: Session = Depends(get_session),
+):
+    return add_task(session, project, data.title)
+
+
+@app.get("/projects/{project_id}/tasks", response_model=list[TaskOut])
+def api_list_tasks(
+    done: bool | None = None,
+    project: Project = Depends(get_project_or_404),
+    session: Session = Depends(get_session),
+):
+    return list_tasks(session, project.id, done)
+
+
+@app.get("/tasks/{task_id}", response_model=TaskOut)
+def api_get_task(task: Task = Depends(get_task_or_404)):
+    return task
+
+
+@app.patch("/tasks/{task_id}", response_model=TaskOut)
+def api_update_task(
+    data: TaskUpdate,
+    task: Task = Depends(get_task_or_404),
+    session: Session = Depends(get_session),
+):
+    changes = data.model_dump(exclude_unset=True)
+    return update_task(session, task, changes)
+
+
+@app.delete("/tasks/{task_id}", status_code=204)
+def api_delete_task(
+    task: Task = Depends(get_task_or_404),
+    session: Session = Depends(get_session),
+):
+    delete_task(session, task)
+
+
+# ---------- repository tests ----------
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+@pytest.fixture
+def session():
+    with new_session() as session:
+        yield session
+
+
+def test_create_and_get_project(session):
+    project = create_project(session, "Garden")
+    assert project.id == 1
+    assert get_project(session, 1).name == "Garden"
+    assert get_project(session, 99) is None
+
+
+def test_list_projects_in_order(session):
+    create_project(session, "Garden")
+    create_project(session, "Kitchen")
+    names = [p.name for p in list_projects(session)]
+    assert names == ["Garden", "Kitchen"]
+
+
+def test_add_task(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    assert task.done is False
+    assert task.project_id == project.id
+    assert project.tasks == [task]
+
+
+def test_update_task_changes_only_given_fields(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    update_task(session, task, {"done": True})
+    assert (task.title, task.done) == ("Dig", True)
+
+
+def test_list_tasks_filters_by_done(session):
+    garden = create_project(session, "Garden")
+    kitchen = create_project(session, "Kitchen")
+    dig = add_task(session, garden, "Dig")
+    add_task(session, garden, "Plant")
+    add_task(session, kitchen, "Bake")
+    update_task(session, dig, {"done": True})
+
+    def titles(tasks):
+        return [task.title for task in tasks]
+
+    assert titles(list_tasks(session, garden.id)) == ["Dig", "Plant"]
+    assert titles(list_tasks(session, garden.id, True)) == ["Dig"]
+    assert titles(list_tasks(session, garden.id, False)) == ["Plant"]
+
+
+def test_delete_project_deletes_its_tasks(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    project_id, task_id = project.id, task.id
+    delete_project(session, project)
+    assert get_project(session, project_id) is None
+    assert get_task(session, task_id) is None
+
+
+# ---------- API tests ----------
+
+# TODO 1: a client fixture: a fresh in-memory test database
+#         (StaticPool), get_session overridden to use it,
+#         and the overrides cleared after the test
+
+
+# TODO 2: a project fixture that creates a project called
+#         "Garden" through the API and returns its JSON
+
+
+def new_task(client, project, title):
+    url = f"/projects/{project['id']}/tasks"
+    return client.post(url, json={"title": title}).json()
+
+
+def test_api_create_project(client):
+    response = client.post("/projects", json={"name": "Garden"})
+    assert response.status_code == 201
+    assert response.json() == {"id": 1, "name": "Garden"}
+
+
+def test_api_list_projects(client):
+    client.post("/projects", json={"name": "Garden"})
+    client.post("/projects", json={"name": "Kitchen"})
+    names = [p["name"] for p in client.get("/projects").json()]
+    assert names == ["Garden", "Kitchen"]
+
+
+def test_api_add_task(client, project):
+    url = f"/projects/{project['id']}/tasks"
+    response = client.post(url, json={"title": "Dig"})
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": 1, "title": "Dig", "done": False,
+        "project_id": project["id"],
+    }
+
+
+def test_api_project_detail_lists_its_tasks(client, project):
+    dig = new_task(client, project, "Dig")
+    plant = new_task(client, project, "Plant")
+    response = client.get(f"/projects/{project['id']}")
+    assert response.json() == {**project, "tasks": [dig, plant]}
+
+
+# TODO 3: test_api_update_is_saved: PATCH a task, then GET it in a
+#         new request and check the change is really there
+
+
+# TODO 4: tests for DELETE /tasks/{task_id} and for
+#         DELETE /projects/{project_id} (its tasks must be gone)
+
+
+# TODO 5: test_api_unknown_ids_give_404, parametrized with at least
+#         5 (method, url, detail) cases for unknown ids
+
+
+# TODO 6: test_api_bad_data_gives_422, parametrized with at least
+#         3 cases of invalid JSON bodies
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "client and project are fixtures", check: "type(client).__name__ == 'FixtureFunctionDefinition' and type(project).__name__ == 'FixtureFunctionDefinition'" },
+    { name: "At least two parametrized tests", check: "sum(any(m.name == 'parametrize' for m in getattr(f, 'pytestmark', [])) for f in list(globals().values()) if callable(f)) >= 2" },
+    { name: "All tests pass (at least 20), each on its own test database", check: "(r := _panda_pytest(patch={'engine': create_engine('sqlite://')}))['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 20" },
+    { name: "Your tests catch a PATCH that is never saved", check: "_panda_pytest(patch={'update_task': lambda session, task, changes: ([setattr(task, k, v) for k, v in changes.items()], task)[1]})['failed'] > 0" },
+    { name: "Your tests catch missing things answering 400 instead of 404", check: "_panda_pytest(patch={'HTTPException': lambda status_code, detail: HTTPException(400, detail)})['failed'] > 0" },
+  ]}
+>
+
+This is the complete Projects API from Part 2, with the repository tests at the bottom and the start of an **API test suite** after them. Finish the suite:
+
+1. A **`client` fixture**: a fresh in-memory test database (`StaticPool`, `check_same_thread=False`), `get_session` overridden to use it, and `dependency_overrides` cleared after the test.
+2. A **`project` fixture** that uses `client` to create a project called `"Garden"` and returns its JSON. The four tests that are already written will then pass.
+3. `test_api_update_is_saved`: `PATCH` a task, then `GET` it in a new request and check the change is really there.
+4. Tests for `DELETE /tasks/{task_id}` and `DELETE /projects/{project_id}`: each answers **204**, and afterwards the task (or the project **and its tasks**) answers 404.
+5. `test_api_unknown_ids_give_404`, **parametrized** with at least 5 `(method, url, detail)` cases, covering both `"Project not found"` and `"Task not found"`.
+6. `test_api_bad_data_gives_422`, **parametrized** with at least 3 invalid bodies.
+
+The checks run your suite with the app's own database **switched off** (so it must use the test database), and against **broken versions** of the app: a `PATCH` that never commits, and missing things answering 400. Your tests should catch both.
+
+<Hint>
+
+Copy the `client` fixture from the lesson; only the names `Base`, `get_session` and `app` matter, and they're the same here. The `project` fixture is one line: `return client.post("/projects", json={"name": "Garden"}).json()`. Use `new_task(client, project, "Dig")` to create tasks. For the 404 test, start from `@pytest.mark.parametrize("method, url, detail", [("GET", "/projects/99", "Project not found"), ("GET", "/tasks/99", "Task not found"), ...])` and send `client.request(method, url, json={"title": "Dig"})`, so endpoints that need a body still get one. Test names must be unique in the file: a second `def test_add_task` would silently replace the first, which is why the API tests start with `test_api_`.
+
+</Hint>
+
+<Solution>
+
+```python
+import pytest
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import ForeignKey, String, create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+from sqlalchemy.pool import StaticPool
+
+
+# ---------- models ----------
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+
+# ---------- repository ----------
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+
+def list_projects(session: Session) -> list[Project]:
+    return list(session.scalars(select(Project).order_by(Project.id)))
+
+
+def delete_project(session: Session, project: Project) -> None:
+    session.delete(project)
+    session.commit()
+
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+
+def get_task(session: Session, task_id: int) -> Task | None:
+    return session.get(Task, task_id)
+
+
+def list_tasks(
+    session: Session, project_id: int, done: bool | None = None
+) -> list[Task]:
+    stmt = select(Task).where(Task.project_id == project_id)
+    if done is not None:
+        stmt = stmt.where(Task.done == done)
+    return list(session.scalars(stmt.order_by(Task.id)))
+
+
+def update_task(session: Session, task: Task, changes: dict) -> Task:
+    for field, value in changes.items():
+        setattr(task, field, value)
+    session.commit()
+    return task
+
+
+def delete_task(session: Session, task: Task) -> None:
+    session.delete(task)
+    session.commit()
+
+
+# ---------- schemas ----------
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class ProjectOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+class TaskUpdate(BaseModel):
+    title: str | None = Field(
+        default=None, min_length=1, max_length=200
+    )
+    done: bool | None = None
+
+
+class TaskOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    done: bool
+    project_id: int
+
+
+class ProjectDetail(ProjectOut):
+    tasks: list[TaskOut]
+
+
+# ---------- database and dependencies ----------
+
+engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+Base.metadata.create_all(engine)
+
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+
+def get_project_or_404(
+    project_id: int, session: Session = Depends(get_session)
+) -> Project:
+    project = get_project(session, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+def get_task_or_404(
+    task_id: int, session: Session = Depends(get_session)
+) -> Task:
+    task = get_task(session, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+# ---------- endpoints ----------
+
+app = FastAPI(title="Projects API")
+
+
+@app.post("/projects", status_code=201, response_model=ProjectOut)
+def api_create_project(
+    data: ProjectCreate, session: Session = Depends(get_session)
+):
+    return create_project(session, data.name)
+
+
+@app.get("/projects", response_model=list[ProjectOut])
+def api_list_projects(session: Session = Depends(get_session)):
+    return list_projects(session)
+
+
+@app.get("/projects/{project_id}", response_model=ProjectDetail)
+def api_get_project(project: Project = Depends(get_project_or_404)):
+    return project
+
+
+@app.delete("/projects/{project_id}", status_code=204)
+def api_delete_project(
+    project: Project = Depends(get_project_or_404),
+    session: Session = Depends(get_session),
+):
+    delete_project(session, project)
+
+
+@app.post(
+    "/projects/{project_id}/tasks",
+    status_code=201,
+    response_model=TaskOut,
+)
+def api_add_task(
+    data: TaskCreate,
+    project: Project = Depends(get_project_or_404),
+    session: Session = Depends(get_session),
+):
+    return add_task(session, project, data.title)
+
+
+@app.get("/projects/{project_id}/tasks", response_model=list[TaskOut])
+def api_list_tasks(
+    done: bool | None = None,
+    project: Project = Depends(get_project_or_404),
+    session: Session = Depends(get_session),
+):
+    return list_tasks(session, project.id, done)
+
+
+@app.get("/tasks/{task_id}", response_model=TaskOut)
+def api_get_task(task: Task = Depends(get_task_or_404)):
+    return task
+
+
+@app.patch("/tasks/{task_id}", response_model=TaskOut)
+def api_update_task(
+    data: TaskUpdate,
+    task: Task = Depends(get_task_or_404),
+    session: Session = Depends(get_session),
+):
+    changes = data.model_dump(exclude_unset=True)
+    return update_task(session, task, changes)
+
+
+@app.delete("/tasks/{task_id}", status_code=204)
+def api_delete_task(
+    task: Task = Depends(get_task_or_404),
+    session: Session = Depends(get_session),
+):
+    delete_task(session, task)
+
+
+# ---------- repository tests ----------
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+@pytest.fixture
+def session():
+    with new_session() as session:
+        yield session
+
+
+def test_create_and_get_project(session):
+    project = create_project(session, "Garden")
+    assert project.id == 1
+    assert get_project(session, 1).name == "Garden"
+    assert get_project(session, 99) is None
+
+
+def test_list_projects_in_order(session):
+    create_project(session, "Garden")
+    create_project(session, "Kitchen")
+    names = [p.name for p in list_projects(session)]
+    assert names == ["Garden", "Kitchen"]
+
+
+def test_add_task(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    assert task.done is False
+    assert task.project_id == project.id
+    assert project.tasks == [task]
+
+
+def test_update_task_changes_only_given_fields(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    update_task(session, task, {"done": True})
+    assert (task.title, task.done) == ("Dig", True)
+
+
+def test_list_tasks_filters_by_done(session):
+    garden = create_project(session, "Garden")
+    kitchen = create_project(session, "Kitchen")
+    dig = add_task(session, garden, "Dig")
+    add_task(session, garden, "Plant")
+    add_task(session, kitchen, "Bake")
+    update_task(session, dig, {"done": True})
+
+    def titles(tasks):
+        return [task.title for task in tasks]
+
+    assert titles(list_tasks(session, garden.id)) == ["Dig", "Plant"]
+    assert titles(list_tasks(session, garden.id, True)) == ["Dig"]
+    assert titles(list_tasks(session, garden.id, False)) == ["Plant"]
+
+
+def test_delete_project_deletes_its_tasks(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    project_id, task_id = project.id, task.id
+    delete_project(session, project)
+    assert get_project(session, project_id) is None
+    assert get_task(session, task_id) is None
+
+
+# ---------- API tests ----------
+
+@pytest.fixture
+def client():
+    test_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(test_engine)
+
+    def get_test_session():
+        with Session(test_engine) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = get_test_session
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def project(client):
+    return client.post("/projects", json={"name": "Garden"}).json()
+
+
+def new_task(client, project, title):
+    url = f"/projects/{project['id']}/tasks"
+    return client.post(url, json={"title": title}).json()
+
+
+def test_api_create_project(client):
+    response = client.post("/projects", json={"name": "Garden"})
+    assert response.status_code == 201
+    assert response.json() == {"id": 1, "name": "Garden"}
+
+
+def test_api_list_projects(client):
+    client.post("/projects", json={"name": "Garden"})
+    client.post("/projects", json={"name": "Kitchen"})
+    names = [p["name"] for p in client.get("/projects").json()]
+    assert names == ["Garden", "Kitchen"]
+
+
+def test_api_add_task(client, project):
+    url = f"/projects/{project['id']}/tasks"
+    response = client.post(url, json={"title": "Dig"})
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": 1, "title": "Dig", "done": False,
+        "project_id": project["id"],
+    }
+
+
+def test_api_project_detail_lists_its_tasks(client, project):
+    dig = new_task(client, project, "Dig")
+    plant = new_task(client, project, "Plant")
+    response = client.get(f"/projects/{project['id']}")
+    assert response.json() == {**project, "tasks": [dig, plant]}
+
+
+def test_api_update_is_saved(client, project):
+    task = new_task(client, project, "Dig")
+    url = f"/tasks/{task['id']}"
+    response = client.patch(url, json={"done": True})
+    assert response.status_code == 200
+    assert client.get(url).json() == {**task, "done": True}
+
+
+def test_api_delete_task(client, project):
+    task = new_task(client, project, "Dig")
+    url = f"/tasks/{task['id']}"
+    assert client.delete(url).status_code == 204
+    assert client.get(url).status_code == 404
+
+
+def test_api_delete_project_deletes_its_tasks(client, project):
+    task = new_task(client, project, "Dig")
+    response = client.delete(f"/projects/{project['id']}")
+    assert response.status_code == 204
+    assert client.get(f"/projects/{project['id']}").status_code == 404
+    assert client.get(f"/tasks/{task['id']}").status_code == 404
+
+
+@pytest.mark.parametrize("method, url, detail", [
+    ("GET", "/projects/99", "Project not found"),
+    ("DELETE", "/projects/99", "Project not found"),
+    ("GET", "/projects/99/tasks", "Project not found"),
+    ("POST", "/projects/99/tasks", "Project not found"),
+    ("GET", "/tasks/99", "Task not found"),
+    ("PATCH", "/tasks/99", "Task not found"),
+    ("DELETE", "/tasks/99", "Task not found"),
+])
+def test_api_unknown_ids_give_404(client, method, url, detail):
+    response = client.request(method, url, json={"title": "Dig"})
+    assert response.status_code == 404
+    assert response.json() == {"detail": detail}
+
+
+@pytest.mark.parametrize("method, url, body", [
+    ("POST", "/projects", {}),
+    ("POST", "/projects", {"name": ""}),
+    ("POST", "/projects", {"name": "x" * 101}),
+    ("POST", "/projects/1/tasks", {"title": ""}),
+    ("PATCH", "/tasks/1", {"title": ""}),
+    ("PATCH", "/tasks/1", {"done": "maybe"}),
+])
+def test_api_bad_data_gives_422(client, project, method, url, body):
+    new_task(client, project, "Dig")
+    response = client.request(method, url, json=body)
+    assert response.status_code == 422
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+Over three parts you built a complete, tested REST API:
+
+- **Part 1**: SQLAlchemy **models** with a relationship and cascade, a typed **repository layer**, and repository tests on a fresh in-memory database.
+- **Part 2**: **Pydantic schemas** with `from_attributes`, a **`get_session` dependency** with `yield`, nine thin **CRUD endpoints** and proper **404** and **422** answers.
+- **Part 3**: an **API test suite** with a `client` fixture that overrides `get_session`, fixtures built on fixtures, **parametrized** error tests and read-back checks that catch forgotten commits.
+
+That's the same structure professional FastAPI services use: models, repository, schemas, endpoints and two layers of tests.
+
+## Take it further
+
+Some ideas to grow the project on your own computer:
+
+- **Pagination and sorting**: add `?skip=0&limit=20` to the list endpoints with a shared `Depends(pagination)` like in the To-do API, and `?sort=title`.
+- **More fields and a migration**: give tasks a `due_date` and a `priority`, switch to a database file or PostgreSQL, and add the columns with an Alembic migration (`alembic revision --autogenerate`, then `alembic upgrade head`).
+- **Unique names**: make project names unique and answer **409 Conflict** for duplicates, with a test for it.
+- **Users and login**: add users, protect the endpoints with FastAPI's OAuth2 tools and a `get_current_user` dependency, and override that dependency in tests just like `get_session`.
+- **Continuous integration**: run `pytest --cov=app --cov-fail-under=90` on every push with GitHub Actions, so a pull request can't lower your coverage.
+
+🎉 **Congratulations, you've finished Level 2!** You can now write modern, typed Python with decorators and generators, test it properly with pytest, build web APIs with FastAPI, store data with SQLAlchemy, write async code and analyse data with pandas. And you've just combined the biggest of those into a real, fully tested backend service. That's the everyday toolkit of a professional Python developer. Be proud! 🐼

@@ -1,0 +1,722 @@
+---
+title: "Mini-project: To-do API"
+description: Build a full CRUD To-do API with FastAPI, using Depends for shared logic, APIRouter, query filters and an in-memory store, and test it with TestClient and pytest.
+duration: 20
+xp: 25
+---
+
+Time to put everything together. In this lesson you'll build a complete **To-do API**: clients can create to-dos, list and search them, tick them off, rename them and delete them. Along the way you'll meet two tools that keep bigger FastAPI apps tidy, **`Depends`** and **`APIRouter`**, and you'll test the whole thing with pytest, just like a real project. ✅
+
+## The plan
+
+Good APIs are designed before they're coded. Ours has one resource, `todos`, with the five classic **CRUD** operations (Create, Read, Update, Delete):
+
+| Request | Does | Success |
+| --- | --- | --- |
+| `POST /todos` | create a to-do from `{"title": ...}` | 201 + the new to-do |
+| `GET /todos` | list to-dos, filtered by `?done=true` and searched with `?q=milk` | 200 + a list |
+| `GET /todos/{todo_id}` | get one to-do | 200 + the to-do |
+| `PATCH /todos/{todo_id}` | change `title` and/or `done` | 200 + the updated to-do |
+| `DELETE /todos/{todo_id}` | delete it | 204, no body |
+
+Any unknown id gives **404** `{"detail": "Todo not found"}`, and invalid data gives **422**. Following the last lesson, we use one Pydantic model per job:
+
+```python
+class TodoCreate(BaseModel):      # what a client sends to create
+    title: str = Field(min_length=1, max_length=100)
+
+class TodoUpdate(BaseModel):      # PATCH: every field optional
+    title: str | None = Field(
+        default=None, min_length=1, max_length=100
+    )
+    done: bool | None = None
+
+class Todo(BaseModel):            # what the API sends back
+    id: int
+    title: str
+    done: bool = False
+```
+
+## An in-memory store
+
+Real apps keep data in a database (that's the next module). For now, a dict from id to to-do is perfect, wrapped in a small class so the rest of the app doesn't care how it's stored. One detail matters a lot: **how you pick new ids**.
+
+<CodeExample output={`3 already taken? True
+{'id': 3, 'title': 'Climb tree', 'done': False}`}>
+
+```python
+todos = {1: "Buy bamboo", 2: "Nap", 3: "Climb tree"}
+del todos[2]
+
+new_id = len(todos) + 1          # the mistake
+print(new_id, "already taken?", new_id in todos)
+
+class TodoStore:
+    def __init__(self):
+        self.todos = {}
+        self.next_id = 1
+
+    def add(self, title):
+        todo = {"id": self.next_id, "title": title, "done": False}
+        self.todos[self.next_id] = todo
+        self.next_id += 1
+        return todo
+
+store = TodoStore()
+store.add("Buy bamboo")
+store.add("Nap")
+del store.todos[2]
+print(store.add("Climb tree"))
+```
+
+</CodeExample>
+
+`len(todos) + 1` looks fine until something is deleted: then a new to-do gets an id that is **already in use** and silently overwrites it. A counter that only ever goes up (`next_id`) never reuses an id. Databases do the same thing with auto-increment ids.
+
+## Sharing logic with Depends
+
+Three of our endpoints (`GET`, `PATCH` and `DELETE` on `/todos/{todo_id}`) all start the same way: look up the to-do, or answer 404. Copying that `if` three times is asking for bugs. FastAPI's answer is **dependency injection** with `Depends`: you write the shared logic once as a function, and FastAPI calls it for you before your endpoint.
+
+Here's the idea on a small example, a pagination helper shared by two endpoints:
+
+<CodeExample output={`['bamboo', 'apple']
+['honey', 'carrot', 'pear']
+['pear']
+422`}>
+
+```python
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+SNACKS = ["bamboo", "apple", "honey", "carrot", "pear"]
+
+def pagination(skip: int = 0, limit: int = 2):
+    return {"skip": skip, "limit": limit}
+
+@app.get("/snacks")
+def list_snacks(page: dict = Depends(pagination)):
+    start = page["skip"]
+    return SNACKS[start:start + page["limit"]]
+
+@app.get("/snacks/reversed")
+def list_reversed(page: dict = Depends(pagination)):
+    start = page["skip"]
+    return SNACKS[::-1][start:start + page["limit"]]
+
+client = TestClient(app)
+print(client.get("/snacks").json())
+print(client.get("/snacks?skip=2&limit=3").json())
+print(client.get("/snacks/reversed?limit=1").json())
+print(client.get("/snacks?limit=lots").status_code)
+```
+
+</CodeExample>
+
+`page: dict = Depends(pagination)` means: *"before calling me, call `pagination` and give me its result"*. The dependency's own parameters (`skip`, `limit`) are read from the request like any endpoint's, validated (hence the 422) and shown in `/docs`. A dependency can also **raise** `HTTPException`, and dependencies can depend on other dependencies.
+
+<Callout type="tip" title="Why pros love Depends">
+
+Dependencies are how real FastAPI apps share things: the database session, the logged-in user, permission checks, settings. And because FastAPI calls them for you, **tests can swap them out** with `app.dependency_overrides`, for example to give each test a fresh, empty store. You'll do exactly that below.
+
+</Callout>
+
+## Organising with APIRouter
+
+In a real project you don't put every endpoint in `main.py`. An `APIRouter` is a mini-app for one part of the API; you give it a common `prefix` and plug it into the main app:
+
+```text
+todo_api/
+├── main.py          app = FastAPI(); app.include_router(todos.router)
+├── models.py        TodoCreate, TodoUpdate, Todo
+├── store.py         TodoStore, get_store
+└── routers/
+    └── todos.py     router = APIRouter(prefix="/todos")
+```
+
+Here are the store, the dependencies and the first two endpoints of our To-do API, organised that way (in one file, so it runs here):
+
+<CodeExample output={`201 {'id': 1, 'title': 'Buy bamboo', 'done': False}
+{'id': 1, 'title': 'Buy bamboo', 'done': False}
+{'detail': 'Todo not found'}
+422`}>
+
+```python
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+class TodoCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+class Todo(BaseModel):
+    id: int
+    title: str
+    done: bool = False
+
+class TodoStore:
+    def __init__(self):
+        self.todos: dict[int, Todo] = {}
+        self.next_id = 1
+
+    def add(self, title: str) -> Todo:
+        todo = Todo(id=self.next_id, title=title)
+        self.todos[todo.id] = todo
+        self.next_id += 1
+        return todo
+
+store = TodoStore()
+
+def get_store() -> TodoStore:
+    return store
+
+def get_todo_or_404(
+    todo_id: int, store: TodoStore = Depends(get_store)
+) -> Todo:
+    if todo_id not in store.todos:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return store.todos[todo_id]
+
+router = APIRouter(prefix="/todos", tags=["todos"])
+
+@router.post("", status_code=201, response_model=Todo)
+def create_todo(
+    data: TodoCreate, store: TodoStore = Depends(get_store)
+):
+    return store.add(data.title)
+
+@router.get("/{todo_id}", response_model=Todo)
+def get_todo(todo: Todo = Depends(get_todo_or_404)):
+    return todo
+
+app = FastAPI(title="To-do API")
+app.include_router(router)
+
+client = TestClient(app)
+response = client.post("/todos", json={"title": "Buy bamboo"})
+print(response.status_code, response.json())
+print(client.get("/todos/1").json())
+print(client.get("/todos/7").json())
+print(client.post("/todos", json={"title": ""}).status_code)
+```
+
+</CodeExample>
+
+Look how short `get_todo` is: by the time it runs, `get_todo_or_404` has already read `todo_id` from the path, asked `get_store` for the store, and either found the to-do or stopped with a 404. `PATCH` and `DELETE` can reuse the very same dependency.
+
+A few details:
+
+- With `prefix="/todos"`, the path `""` means `/todos` itself and `"/{todo_id}"` means `/todos/{todo_id}`.
+- `tags=["todos"]` groups these endpoints under a "todos" heading in `/docs`.
+- Endpoints get their store through `get_store` instead of using the global `store` directly. That one extra line is what makes testing easy.
+
+<Callout type="warning" title="include_router copies the routes">
+
+`app.include_router(router)` copies the router's endpoints **at that moment**. Endpoints you add to the router afterwards are silently missing (you get 404 or 405). Define all the endpoints first and include the router at the end.
+
+</Callout>
+
+## Testing the API with pytest
+
+In real projects, every endpoint has tests, and they look just like the ones from the testing module: a `client` **fixture**, and test functions that send requests and `assert` on the responses. The key trick is giving every test its **own fresh store**, so tests never depend on each other or on their order. Here it is on a tiny notes API:
+
+<CodeExample output={`....                                                 [100%]
+4 passed in 0.01s`}>
+
+```python
+import pytest
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+class Note(BaseModel):
+    text: str
+
+notes: list[str] = []
+
+def get_notes() -> list[str]:
+    return notes
+
+app = FastAPI()
+
+@app.post("/notes", status_code=201)
+def add_note(note: Note, notes: list = Depends(get_notes)):
+    notes.append(note.text)
+    return {"count": len(notes)}
+
+@app.get("/notes")
+def list_notes(notes: list = Depends(get_notes)):
+    return notes
+
+@pytest.fixture
+def client():
+    fresh: list[str] = []                       # arrange
+    app.dependency_overrides[get_notes] = lambda: fresh
+    yield TestClient(app)
+    app.dependency_overrides.clear()            # clean up
+
+def test_starts_empty(client):
+    assert client.get("/notes").json() == []
+
+def test_add_note(client):
+    response = client.post("/notes", json={"text": "Buy bamboo"})
+    assert response.status_code == 201
+    assert response.json() == {"count": 1}
+    assert client.get("/notes").json() == ["Buy bamboo"]
+
+def test_each_test_gets_a_fresh_list(client):
+    client.post("/notes", json={"text": "Nap"})
+    assert client.get("/notes").json() == ["Nap"]
+
+def test_text_is_required(client):
+    assert client.post("/notes", json={}).status_code == 422
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+`app.dependency_overrides[get_notes] = lambda: fresh` tells FastAPI: *"wherever an endpoint asks for `get_notes`, call this instead"*. After the test, `.clear()` puts everything back. Notice that `test_each_test_gets_a_fresh_list` only sees `"Nap"`, not the note from the test before it.
+
+<Callout type="warning" title="One store per test, not per request">
+
+It's tempting to write `app.dependency_overrides[get_store] = TodoStore`. But FastAPI calls the override on **every request**, so each request would get a brand new, empty store: you'd create a to-do and then get 404 when you ask for it! Create the store once in the fixture and return that same object: `lambda: fresh`.
+
+</Callout>
+
+## Running it for real
+
+Save the finished app as `main.py` and start it:
+
+```bash
+fastapi dev main.py
+```
+
+Open `http://127.0.0.1:8000/docs`, click **POST /todos**, then **Try it out**, and create a few to-dos from the browser. You can also call the API from another terminal with `curl`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/todos \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Buy bamboo"}'
+curl "http://127.0.0.1:8000/todos?done=false"
+```
+
+And run the test suite with `pytest` as usual. One thing you'll notice: restart the server and all your to-dos are gone, because they only lived in memory. Saving them in a real database is exactly what the next module, Databases & SQLAlchemy, is about.
+
+<Quiz
+  question="get_todo_or_404 is used as Depends(get_todo_or_404) by the GET, PATCH and DELETE endpoints. A client sends DELETE /todos/42 and there is no to-do 42. What happens?"
+  options={["The delete endpoint runs and deletes nothing", "get_todo_or_404 raises HTTPException, so the client gets 404 and the delete endpoint never runs", "FastAPI answers 422 because 42 is not valid", "The client gets 204 No Content"]}
+  answer={1}
+  explanation="FastAPI runs the dependency first. It raises HTTPException(404), which stops the request before the endpoint function is called. That's how one dependency protects all three endpoints."
+/>
+
+<Quiz
+  question="Why do the tests give each test its own fresh store through app.dependency_overrides?"
+  options={["Because TestClient can't use global variables", "So every test starts from the same known state and tests can't affect each other", "To make the tests run faster", "Because pytest deletes global variables between tests"]}
+  answer={1}
+  explanation="With a shared store, a to-do created in one test would show up in the next, so results would depend on which tests ran before. A fresh store per test makes every test independent and repeatable."
+/>
+
+<Exercise
+  language="python"
+  title="Mini-project: To-do API"
+  starter={`import pytest
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+
+class TodoCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+
+class TodoUpdate(BaseModel):
+    title: str | None = Field(
+        default=None, min_length=1, max_length=100
+    )
+    done: bool | None = None
+
+
+class Todo(BaseModel):
+    id: int
+    title: str
+    done: bool = False
+
+
+class TodoStore:
+    def __init__(self):
+        self.todos: dict[int, Todo] = {}
+        self.next_id = 1
+
+    def add(self, title: str) -> Todo:
+        todo = Todo(id=self.next_id, title=title)
+        self.todos[todo.id] = todo
+        self.next_id += 1
+        return todo
+
+
+store = TodoStore()
+
+
+def get_store() -> TodoStore:
+    return store
+
+
+router = APIRouter(prefix="/todos", tags=["todos"])
+
+
+@router.post("", status_code=201, response_model=Todo)
+def create_todo(
+    data: TodoCreate, store: TodoStore = Depends(get_store)
+):
+    return store.add(data.title)
+
+
+# TODO 1: a dependency get_todo_or_404(todo_id, store) that
+#         returns the Todo, or raises 404 "Todo not found"
+
+# TODO 2: GET /todos -> list of all to-dos, with optional
+#         query parameters done (bool) and q (text search,
+#         ignoring upper/lower case)
+
+# TODO 3: GET /todos/{todo_id} -> one to-do
+
+# TODO 4: PATCH /todos/{todo_id} -> change only the fields
+#         that were sent (body: TodoUpdate)
+
+# TODO 5: DELETE /todos/{todo_id} -> 204 No Content
+
+
+app = FastAPI(title="To-do API")
+app.include_router(router)   # keep this after the endpoints
+
+
+# ---------- tests (don't change them) ----------
+
+@pytest.fixture
+def client():
+    fresh = TodoStore()
+    app.dependency_overrides[get_store] = lambda: fresh
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def add(client, title):
+    return client.post("/todos", json={"title": title}).json()
+
+
+def test_create_todo(client):
+    response = client.post("/todos", json={"title": "Buy bamboo"})
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": 1, "title": "Buy bamboo", "done": False
+    }
+
+
+def test_empty_title_is_rejected(client):
+    response = client.post("/todos", json={"title": ""})
+    assert response.status_code == 422
+
+
+def test_list_todos(client):
+    add(client, "Buy bamboo")
+    add(client, "Nap")
+    titles = [t["title"] for t in client.get("/todos").json()]
+    assert titles == ["Buy bamboo", "Nap"]
+
+
+def test_get_todo(client):
+    todo = add(client, "Nap")
+    assert client.get(f"/todos/{todo['id']}").json() == todo
+
+
+def test_unknown_todo_is_404(client):
+    assert client.get("/todos/99").status_code == 404
+    response = client.patch("/todos/99", json={"done": True})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Todo not found"}
+    assert client.delete("/todos/99").status_code == 404
+
+
+def test_update_changes_only_sent_fields(client):
+    todo = add(client, "Nap")
+    url = f"/todos/{todo['id']}"
+    response = client.patch(url, json={"done": True})
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": todo["id"], "title": "Nap", "done": True
+    }
+    assert client.get(url).json()["done"] is True
+
+
+def test_delete_todo(client):
+    todo = add(client, "Nap")
+    url = f"/todos/{todo['id']}"
+    response = client.delete(url)
+    assert response.status_code == 204
+    assert client.get(url).status_code == 404
+
+
+def test_ids_are_never_reused(client):
+    first = add(client, "One")
+    add(client, "Two")
+    client.delete(f"/todos/{first['id']}")
+    assert add(client, "Three")["id"] == 3
+
+
+def test_filter_by_done(client):
+    add(client, "Nap")
+    todo = add(client, "Eat")
+    client.patch(f"/todos/{todo['id']}", json={"done": True})
+    done = client.get("/todos", params={"done": True}).json()
+    assert [t["title"] for t in done] == ["Eat"]
+    to_do = client.get("/todos", params={"done": False}).json()
+    assert [t["title"] for t in to_do] == ["Nap"]
+
+
+def test_search_ignores_case(client):
+    add(client, "Buy milk")
+    add(client, "Walk")
+    add(client, "Oat MILK")
+    found = client.get("/todos", params={"q": "Milk"}).json()
+    assert [t["title"] for t in found] == ["Buy milk", "Oat MILK"]
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "All the tests in the editor pass", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 10" },
+    { name: "GET /todos/{todo_id} returns one to-do, unknown ids give 404", check: "(c := TestClient(app)) and (t := c.post('/todos', json={'title': 'Feed Mei'}).json()) and c.get('/todos/' + str(t['id'])).json() == t and (r := c.get('/todos/9999')).status_code == 404 and r.json() == {'detail': 'Todo not found'}" },
+    { name: "GET /todos lists the to-dos", check: "(c := TestClient(app)) and (t := c.post('/todos', json={'title': 'Wash dishes'}).json()) and t in c.get('/todos').json() and all(set(x) == {'id', 'title', 'done'} for x in c.get('/todos').json())" },
+    { name: "?q= searches titles, ignoring case", check: "(c := TestClient(app)) and [c.post('/todos', json={'title': x}) for x in ['Buy ZEBRA food', 'zebra nap', 'Lion walk']] and [x['title'] for x in c.get('/todos?q=Zebra').json()] == ['Buy ZEBRA food', 'zebra nap']" },
+    { name: "?done= filters by status (and works together with q)", check: "(c := TestClient(app)) and (a := c.post('/todos', json={'title': 'koala one'}).json()) and (b := c.post('/todos', json={'title': 'koala two'}).json()) and c.patch('/todos/' + str(a['id']), json={'done': True}).status_code == 200 and [x['id'] for x in c.get('/todos?q=koala&done=true').json()] == [a['id']] and [x['id'] for x in c.get('/todos?q=koala&done=false').json()] == [b['id']]" },
+    { name: "PATCH changes only the fields sent", check: "(c := TestClient(app)) and (t := c.post('/todos', json={'title': 'Old title'}).json()) and c.patch('/todos/' + str(t['id']), json={'done': True}).json() == {**t, 'done': True} and c.patch('/todos/' + str(t['id']), json={'title': 'New title'}).json() == {'id': t['id'], 'title': 'New title', 'done': True} and c.patch('/todos/' + str(t['id']), json={'title': ''}).status_code == 422 and c.patch('/todos/9999', json={'done': True}).status_code == 404" },
+    { name: "DELETE answers 204, the to-do is gone and ids aren't reused", check: "(c := TestClient(app)) and (t := c.post('/todos', json={'title': 'Temp'}).json()) and c.delete('/todos/' + str(t['id'])).status_code == 204 and c.get('/todos/' + str(t['id'])).status_code == 404 and c.delete('/todos/' + str(t['id'])).status_code == 404 and c.post('/todos', json={'title': 'Next'}).json()['id'] > t['id']" },
+  ]}
+>
+
+Finish the To-do API so that **all ten tests pass**. The models, the store, `get_store`, the router, `POST /todos` and the test suite are ready. You write:
+
+1. The dependency `get_todo_or_404(todo_id, store)`: return the `Todo`, or raise **404** with `detail` `"Todo not found"`.
+2. `GET /todos`: all to-dos as a list, with two optional query parameters: `done` (`bool`) keeps only finished or unfinished ones, and `q` keeps only to-dos whose title contains that text, **ignoring upper/lower case**. Both can be used together.
+3. `GET /todos/{todo_id}`: one to-do.
+4. `PATCH /todos/{todo_id}`: body `TodoUpdate`; change only the fields that were sent and return the updated to-do.
+5. `DELETE /todos/{todo_id}`: remove it and answer **204**.
+
+Press Run to see pytest's report: the failures tell you what's still missing. Don't change the tests: the checks also call your API directly.
+
+<Hint>
+
+Copy `get_todo_or_404` from the lesson, and let `get_todo`, `update_todo` and `delete_todo` take `todo: Todo = Depends(get_todo_or_404)`. Put `response_model=list[Todo]` on the list endpoint, start from `list(store.todos.values())` and filter it with list comprehensions; compare `q.lower() in t.title.lower()`. For `PATCH`, loop over `data.model_dump(exclude_unset=True).items()` and use `setattr(todo, field, value)`. `DELETE` needs both the to-do and the store: `del store.todos[todo.id]`, with `status_code=204` on the decorator.
+
+</Hint>
+
+<Solution>
+
+```python
+import pytest
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+
+class TodoCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+
+class TodoUpdate(BaseModel):
+    title: str | None = Field(
+        default=None, min_length=1, max_length=100
+    )
+    done: bool | None = None
+
+
+class Todo(BaseModel):
+    id: int
+    title: str
+    done: bool = False
+
+
+class TodoStore:
+    def __init__(self):
+        self.todos: dict[int, Todo] = {}
+        self.next_id = 1
+
+    def add(self, title: str) -> Todo:
+        todo = Todo(id=self.next_id, title=title)
+        self.todos[todo.id] = todo
+        self.next_id += 1
+        return todo
+
+
+store = TodoStore()
+
+
+def get_store() -> TodoStore:
+    return store
+
+
+router = APIRouter(prefix="/todos", tags=["todos"])
+
+
+@router.post("", status_code=201, response_model=Todo)
+def create_todo(
+    data: TodoCreate, store: TodoStore = Depends(get_store)
+):
+    return store.add(data.title)
+
+
+def get_todo_or_404(
+    todo_id: int, store: TodoStore = Depends(get_store)
+) -> Todo:
+    if todo_id not in store.todos:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return store.todos[todo_id]
+
+
+@router.get("", response_model=list[Todo])
+def list_todos(
+    done: bool | None = None,
+    q: str | None = None,
+    store: TodoStore = Depends(get_store),
+):
+    todos = list(store.todos.values())
+    if done is not None:
+        todos = [t for t in todos if t.done == done]
+    if q:
+        todos = [t for t in todos if q.lower() in t.title.lower()]
+    return todos
+
+
+@router.get("/{todo_id}", response_model=Todo)
+def get_todo(todo: Todo = Depends(get_todo_or_404)):
+    return todo
+
+
+@router.patch("/{todo_id}", response_model=Todo)
+def update_todo(
+    data: TodoUpdate, todo: Todo = Depends(get_todo_or_404)
+):
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(todo, field, value)
+    return todo
+
+
+@router.delete("/{todo_id}", status_code=204)
+def delete_todo(
+    todo: Todo = Depends(get_todo_or_404),
+    store: TodoStore = Depends(get_store),
+):
+    del store.todos[todo.id]
+
+
+app = FastAPI(title="To-do API")
+app.include_router(router)   # keep this after the endpoints
+
+
+# ---------- tests (don't change them) ----------
+
+@pytest.fixture
+def client():
+    fresh = TodoStore()
+    app.dependency_overrides[get_store] = lambda: fresh
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def add(client, title):
+    return client.post("/todos", json={"title": title}).json()
+
+
+def test_create_todo(client):
+    response = client.post("/todos", json={"title": "Buy bamboo"})
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": 1, "title": "Buy bamboo", "done": False
+    }
+
+
+def test_empty_title_is_rejected(client):
+    response = client.post("/todos", json={"title": ""})
+    assert response.status_code == 422
+
+
+def test_list_todos(client):
+    add(client, "Buy bamboo")
+    add(client, "Nap")
+    titles = [t["title"] for t in client.get("/todos").json()]
+    assert titles == ["Buy bamboo", "Nap"]
+
+
+def test_get_todo(client):
+    todo = add(client, "Nap")
+    assert client.get(f"/todos/{todo['id']}").json() == todo
+
+
+def test_unknown_todo_is_404(client):
+    assert client.get("/todos/99").status_code == 404
+    response = client.patch("/todos/99", json={"done": True})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Todo not found"}
+    assert client.delete("/todos/99").status_code == 404
+
+
+def test_update_changes_only_sent_fields(client):
+    todo = add(client, "Nap")
+    url = f"/todos/{todo['id']}"
+    response = client.patch(url, json={"done": True})
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": todo["id"], "title": "Nap", "done": True
+    }
+    assert client.get(url).json()["done"] is True
+
+
+def test_delete_todo(client):
+    todo = add(client, "Nap")
+    url = f"/todos/{todo['id']}"
+    response = client.delete(url)
+    assert response.status_code == 204
+    assert client.get(url).status_code == 404
+
+
+def test_ids_are_never_reused(client):
+    first = add(client, "One")
+    add(client, "Two")
+    client.delete(f"/todos/{first['id']}")
+    assert add(client, "Three")["id"] == 3
+
+
+def test_filter_by_done(client):
+    add(client, "Nap")
+    todo = add(client, "Eat")
+    client.patch(f"/todos/{todo['id']}", json={"done": True})
+    done = client.get("/todos", params={"done": True}).json()
+    assert [t["title"] for t in done] == ["Eat"]
+    to_do = client.get("/todos", params={"done": False}).json()
+    assert [t["title"] for t in to_do] == ["Nap"]
+
+
+def test_search_ignores_case(client):
+    add(client, "Buy milk")
+    add(client, "Walk")
+    add(client, "Oat MILK")
+    found = client.get("/todos", params={"q": "Milk"}).json()
+    assert [t["title"] for t in found] == ["Buy milk", "Oat MILK"]
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Plan the API first: one resource, five **CRUD** endpoints, the status codes for success and failure, and separate models for create, update and output.
+- Pick ids with a counter that only goes up; `len(...) + 1` reuses ids after a delete.
+- `Depends(func)` runs shared logic before an endpoint: its parameters come from the request, it can raise `HTTPException`, and dependencies can depend on each other (`get_todo_or_404` → `get_store`).
+- `APIRouter(prefix=..., tags=[...])` groups endpoints; `app.include_router(router)` goes **after** the endpoints.
+- Filtering with optional query parameters: `done: bool | None = None`, `q: str | None = None`.
+- Test with a `client` fixture that sets `app.dependency_overrides` to a **fresh store per test**, and `.clear()` afterwards.

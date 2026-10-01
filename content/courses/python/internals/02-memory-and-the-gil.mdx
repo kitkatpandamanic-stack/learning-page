@@ -1,0 +1,530 @@
+---
+title: Memory Management and the GIL
+description: See how CPython frees memory with reference counting and the cycle collector, use weakref, __slots__ and tracemalloc, and understand the GIL and free-threaded Python.
+duration: 24
+xp: 25
+---
+
+Python manages memory for you: you never call `free()`. That's wonderful until a service slowly grows from 200 MB to 4 GB over a weekend and someone has to find out why. And then there's the famous **GIL**, blamed for every slow Python program on the internet, usually by people who can't say what it actually does. In this lesson you'll learn how CPython really frees memory, how to hunt down a leak, and what the GIL means for your threads in 3.14. 🧠
+
+## Reference counting
+
+Every CPython object carries a counter: **how many references point at me?** A reference is anything that refers to the object: a variable name, a slot in a list, a dict value, an attribute. `sys.getrefcount()` shows the counter:
+
+<CodeExample output={`2
+0`}>
+
+```python
+import sys
+
+data = [1, 2, 3]
+before = sys.getrefcount(data)
+
+alias = data
+box = {"items": data}
+print(sys.getrefcount(data) - before)
+
+del alias
+box.clear()
+print(sys.getrefcount(data) - before)
+```
+
+</CodeExample>
+
+Two new references (`alias` and the dict value) raise the count by 2; removing them brings it back. We print the **difference** on purpose: the absolute number includes temporary references (the function argument itself counts), and CPython 3.14 skips some counting with "borrowed" references (remember `LOAD_FAST_BORROW` from the last lesson), so the exact numbers vary between versions.
+
+The key rule: **when the count drops to zero, the object is freed immediately**. Note that `del alias` doesn't delete the list; it removes one name. You can watch the moment of death with `__del__`, a method CPython calls just before freeing an object:
+
+<CodeExample output={`open db-1
+working
+freed db-1
+request done`}>
+
+```python
+class Connection:
+    def __init__(self, name):
+        self.name = name
+        print(f"open {name}")
+
+    def __del__(self):
+        print(f"freed {self.name}")
+
+def handle_request():
+    conn = Connection("db-1")
+    print("working")
+
+handle_request()
+print("request done")
+```
+
+</CodeExample>
+
+When `handle_request` returns, its frame disappears, the local `conn` goes with it, the count hits zero, and the object is freed right there, **before** `request done`. That predictability is a CPython feature. But don't build on it:
+
+<Callout type="warning" title="Don't use __del__ to clean up resources">
+
+Other Pythons (like PyPy) free objects later, an exception traceback can keep objects alive longer than you expect, and `__del__` is not guaranteed to run at interpreter shutdown. Close files, connections and locks **explicitly** with `with` (context managers). Use `__del__` for debugging at most.
+
+</Callout>
+
+## Cycles and the garbage collector
+
+Reference counting has one blind spot: **cycles**. If `a` points to `b` and `b` points back to `a`, both counts stay at 1 forever, even when nothing else can reach them. That's what CPython's **cyclic garbage collector** (the `gc` module) is for:
+
+<CodeExample output={`names gone, objects still alive
+freed a
+freed b
+collector ran: True`}>
+
+```python
+import gc
+
+class Node:
+    def __init__(self, name):
+        self.name = name
+        self.partner = None
+
+    def __del__(self):
+        print(f"freed {self.name}")
+
+a = Node("a")
+b = Node("b")
+a.partner = b
+b.partner = a    # a cycle: a -> b -> a
+
+del a, b
+print("names gone, objects still alive")
+found = gc.collect()
+print("collector ran:", found > 0)
+```
+
+</CodeExample>
+
+The collector runs automatically every so often (based on how many objects were allocated since the last run), finds groups of container objects that are only reachable from each other, and frees them. We called `gc.collect()` by hand to make it happen right now. Cycles are common in real code: parent/child trees with back-links, objects that store a bound method of themselves as a callback, exceptions that keep a traceback that references the frame that holds the exception.
+
+The collector groups objects by age ("generations") because most objects die young; the exact scheme and thresholds have changed between Python versions, so don't tune them without measuring. War story: Instagram famously **disabled** the collector in their Django workers (and later used `gc.freeze()`, added in 3.7, for the same goal) because its passes were touching memory shared between forked processes and forcing it to be copied. That's an extreme, measured optimisation, not a default.
+
+## Weak references for caches
+
+Sometimes you want to **refer** to an object without **keeping it alive**. A **weak reference** doesn't increase the reference count. When the object dies, the weak reference returns `None`:
+
+<CodeExample output={`True
+Q3 sales
+None`}>
+
+```python
+import weakref
+
+class Report:
+    def __init__(self, title):
+        self.title = title
+
+report = Report("Q3 sales")
+ref = weakref.ref(report)
+
+print(ref() is report)
+print(ref().title)
+
+del report       # the only strong reference
+print(ref())
+```
+
+</CodeExample>
+
+The killer use case is a **cache** that shouldn't cause a leak. A normal dict cache holds every value forever. A **`WeakValueDictionary`** keeps an entry only while something else in the program still uses the value:
+
+<CodeExample output={`loading logo.png
+True 1
+0
+loading logo.png`}>
+
+```python
+import weakref
+
+class Image:
+    def __init__(self, name):
+        self.name = name
+
+cache = weakref.WeakValueDictionary()
+
+def load(name):
+    image = cache.get(name)
+    if image is None:
+        print(f"loading {name}")
+        image = Image(name)
+        cache[name] = image
+    return image
+
+logo = load("logo.png")
+again = load("logo.png")      # cached
+print(logo is again, len(cache))
+
+del logo, again               # nobody uses it now
+print(len(cache))
+load("logo.png")
+```
+
+</CodeExample>
+
+While anyone holds the image, every `load` returns the same object. Once the last user lets go, the entry disappears on its own. Not every object supports weak references: built-in `int`, `str`, `list` and `dict` don't, and neither do classes with `__slots__` unless you ask for it (you'll need that in the exercise).
+
+## __slots__ and object size
+
+A normal instance can get new attributes at any time because it has a **`__dict__`**. If you create millions of small objects, you can tell Python the exact attribute names with **`__slots__`**. Instances then get fixed storage and no `__dict__`:
+
+<CodeExample output={`True False
+AttributeError: 'SlimPoint' object has no attribute 'z' and no __dict__ for setting new attributes
+True
+True`}>
+
+```python
+import sys
+
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+class SlimPoint:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+p = Point(1, 2)
+s = SlimPoint(1, 2)
+p.z = 3                         # fine: p has a __dict__
+print(hasattr(p, "__dict__"), hasattr(s, "__dict__"))
+
+try:
+    s.z = 3
+except AttributeError as error:
+    print("AttributeError:", error)
+
+big = list(range(100_000))
+wrapper = [big]
+print(sys.getsizeof(wrapper) < 100)
+print(sys.getsizeof(big) > 100_000)
+```
+
+</CodeExample>
+
+Two lessons in one example:
+
+- `__slots__` saves memory and **catches typos** (`s.z = 3` fails instead of silently creating an attribute). The price: no ad-hoc attributes, and some tools that expect `__dict__` (or weak references) need extra slots. `@dataclass(slots=True)` generates them for you.
+- **`sys.getsizeof` is shallow**. It measures only the object itself, not what it refers to: the one-item `wrapper` list looks tiny, even though it holds a list of 100,000 numbers. Byte sizes also differ between platforms (this site runs 32-bit WebAssembly; your laptop is 64-bit).
+
+To measure what objects **really** cost, count actual allocations with `tracemalloc`:
+
+<CodeExample output={`True`}>
+
+```python
+import tracemalloc
+
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+class SlimPoint:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+def memory_used(cls, n=10_000):
+    tracemalloc.start()
+    points = [cls(i, i) for i in range(n)]
+    size, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return size
+
+print(memory_used(SlimPoint) < memory_used(Point))
+```
+
+</CodeExample>
+
+Slots win, but by less than old blog posts claim: modern CPython already stores instance attributes compactly and only builds a real `__dict__` when you ask for it. Reach for `__slots__` when you have **many** instances and a measurement that says memory matters.
+
+## Finding a leak with tracemalloc
+
+A "leak" in Python is almost never lost memory; it's memory that is **still referenced** by something you forgot: a module-level list, a cache without a limit, a list of callbacks that only grows. **`tracemalloc`** records where every allocation happened, and comparing two **snapshots** points straight at the guilty line:
+
+<CodeExample output={`line 6: +2 MB
+200 new blocks`}>
+
+```python
+import tracemalloc
+
+_seen = []
+
+def handle(request_id):
+    body = "x" * 10_000
+    _seen.append(body)     # oops: kept forever
+    return len(body)
+
+tracemalloc.start()
+before = tracemalloc.take_snapshot()
+
+for request_id in range(200):
+    handle(request_id)
+
+after = tracemalloc.take_snapshot()
+tracemalloc.stop()
+
+top = after.compare_to(before, "lineno")[0]
+frame = top.traceback[0]
+print(f"line {frame.lineno}: +{top.size_diff // 1_000_000} MB")
+print(f"{top.count_diff} new blocks")
+```
+
+</CodeExample>
+
+The biggest growth is allocated on line 6, the `"x" * 10_000`, and 200 of those blocks survived. The allocation line tells you **what** is piling up; then you look for **who** is holding it (here, `_seen`). In production, the same workflow is: take a snapshot, let the service handle traffic for a while, take another, compare. `tracemalloc` slows the program down, so enable it on one instance or behind a flag.
+
+<Callout type="tip" title="The usual suspects">
+
+When memory grows in a long-running service, check in this order: unbounded caches (use `functools.lru_cache(maxsize=...)` or a weak cache), module-level lists or dicts that collect per-request data, event listeners that are added but never removed, and large objects kept alive by a stored exception or traceback.
+
+</Callout>
+
+## The GIL: what it actually is
+
+CPython's **Global Interpreter Lock** is a lock that a thread must hold to run Python bytecode. So in a normal CPython process, **only one thread executes Python code at any moment**, even on a 16-core machine.
+
+Why does it exist? Remember the reference counts: every assignment changes them. Without the GIL, two threads updating the same counter at once could corrupt it and free an object that's still in use. One big lock made CPython's internals (and thousands of C extensions) simple and fast for single-threaded code, which is most code.
+
+What the GIL does **not** do is make **your** code thread-safe. It only guarantees that single bytecode instructions don't get torn. Look at `counter += 1`:
+
+<CodeExample output={`  5           RESUME                   0
+
+  7           LOAD_GLOBAL              0 (counter)
+              LOAD_SMALL_INT           1
+              BINARY_OP               13 (+=)
+              STORE_GLOBAL             0 (counter)
+              LOAD_CONST               1 (None)
+              RETURN_VALUE`}>
+
+```python
+import dis
+
+counter = 0
+
+def increment():
+    global counter
+    counter += 1
+
+dis.dis(increment)
+```
+
+</CodeExample>
+
+That's a load, an add, and a store. CPython can switch threads **between** any two instructions (by default it asks the running thread to let go every 5 milliseconds). If two threads both load `counter` as 41, both store 42, and one increment is lost. On your machine you protect shared state with a lock:
+
+```python
+import threading
+
+counter = 0
+lock = threading.Lock()
+
+def increment_many():
+    global counter
+    for _ in range(100_000):
+        with lock:            # only one thread at a time in here
+            counter += 1
+
+threads = [threading.Thread(target=increment_many) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print(counter)                # 400000, every time
+```
+
+(This site's runner has no threads, so this block is for your machine. The next module goes deep on threads, processes and locks.)
+
+## Threads for I/O, processes for CPU
+
+If only one thread runs Python at a time, why use threads at all? Because the GIL is **released while waiting**. Blocking I/O (reading a socket, waiting for a database, `time.sleep`) releases it, and so do many C extensions while they crunch numbers (NumPy, compression, hashing big buffers). So:
+
+- **I/O-bound work** (HTTP calls, database queries, file transfers): threads work well, because the threads spend their time waiting with the GIL released. `asyncio` is the other good option.
+- **CPU-bound pure-Python work** (parsing, number crunching in loops): threads give you **no speed-up** and often a small slowdown. Use **processes** (`multiprocessing`, `ProcessPoolExecutor`): each process has its own interpreter and its own GIL. The cost is start-up time and copying (pickling) data between processes.
+- **Vectorised work**: push the loop into NumPy or another C/Rust library, which may release the GIL and use several cores itself.
+
+## Free-threaded Python and sub-interpreters
+
+The GIL is finally becoming optional. [PEP 703](https://peps.python.org/pep-0703/) added a **free-threaded build** of CPython that runs without a GIL, so threads can run Python code on several cores truly in parallel:
+
+- In **3.13** it was **experimental**: a separate build (often installed as `python3.13t`).
+- In **3.14** it is **officially supported** (no longer experimental), but still an **optional, separate build** (`python3.14t`). The normal `python3.14` you download still has a GIL.
+- It costs some **single-threaded speed** (the 3.14 documentation estimates roughly 5–10%) and more memory, because reference counting needs extra care without a global lock.
+- C extensions must declare that they're safe without the GIL. Importing one that hasn't **re-enables the GIL** (with a warning), so check your dependencies before you celebrate.
+
+You can ask at runtime which kind you're on. This site runs the normal build:
+
+<CodeExample output={`0
+True`}>
+
+```python
+import sys
+import sysconfig
+
+print(sysconfig.get_config_var("Py_GIL_DISABLED"))
+print(sys._is_gil_enabled())
+```
+
+</CodeExample>
+
+The second route is **sub-interpreters**: several independent interpreters inside **one** process. Since 3.12 each one can have **its own GIL** ([PEP 684](https://peps.python.org/pep-0684/)), and 3.14 adds a standard-library API for them: the `concurrent.interpreters` module and `concurrent.futures.InterpreterPoolExecutor` ([PEP 734](https://peps.python.org/pep-0734/)). They give you process-like isolation (objects aren't shared; you pass data through queues) with less overhead than separate processes.
+
+So which should you use today? For most teams in 2026: `asyncio` or threads for I/O, processes for CPU-heavy pure Python, and keep an eye on free-threading as your libraries add support. "It depends" here has a concrete test: **profile first**, then pick the tool that matches where the time goes.
+
+<Quiz
+  question="def f(): x = [1, 2, 3]; return len(x). When is the list freed in CPython?"
+  options={[
+    "When the garbage collector next runs",
+    "Right when f returns, because its reference count drops to zero",
+    "When the program exits",
+    "Never, lists live forever",
+  ]}
+  answer={1}
+  explanation="The list is only referenced by the local x. When f returns, the frame and its locals go away, the count reaches zero and CPython frees it immediately. The cyclic collector is only needed for cycles."
+/>
+
+<Quiz
+  question="An API server spends most of its time waiting for database queries. On standard CPython 3.14 (with the GIL), will a thread pool help it handle more requests?"
+  options={[
+    "No, the GIL means threads never help",
+    "Yes, because the GIL is released while a thread waits for I/O",
+    "Only if you use the free-threaded build",
+    "Only with processes, never with threads",
+  ]}
+  answer={1}
+  explanation="Blocking I/O releases the GIL, so while one thread waits for the database, another can run. Threads (or asyncio) are a good fit for I/O-bound work; the GIL hurts CPU-bound pure-Python code."
+/>
+
+<Exercise
+  language="python"
+  title="A cache that doesn't leak"
+  starter={`class Thumbnail:
+    __slots__ = ("name", "pixels")
+
+    def __init__(self, name, pixels):
+        self.name = name
+        self.pixels = pixels
+
+
+class ThumbnailCache:
+    def __init__(self, render):
+        self.render = render       # function: name -> Thumbnail
+        self._items = {}
+
+    def get(self, name):
+        if name not in self._items:
+            self._items[name] = self.render(name)
+        return self._items[name]
+
+    def __len__(self):
+        return len(self._items)
+
+
+renders = []
+
+def render(name):
+    renders.append(name)
+    return Thumbnail(name, b"\\x00" * 1_000)
+
+cache = ThumbnailCache(render)
+a = cache.get("cat.png")
+b = cache.get("cat.png")
+print(a is b, renders)
+
+del a, b
+print(len(cache))
+`}
+  tests={[
+    { name: "Thumbnail still uses __slots__ (no __dict__)", check: "not hasattr(Thumbnail('a', b''), '__dict__')" },
+    { name: "get returns the same object while it's in use", check: "(c := ThumbnailCache(lambda n: Thumbnail(n, b''))) is not None and (t := c.get('dog.png')) is c.get('dog.png') and t.name == 'dog.png'" },
+    { name: "render runs once while the thumbnail is alive", check: "(calls := []) == [] and (c := ThumbnailCache(lambda n: calls.append(n) or Thumbnail(n, b''))) is not None and (k := c.get('a')) is c.get('a') and calls == ['a'] and len(c) == 1" },
+    { name: "Different names give different thumbnails", check: "(c := ThumbnailCache(lambda n: Thumbnail(n, b''))) is not None and (t1 := c.get('one')) is not None and (t2 := c.get('two')) is not t1 and len(c) == 2" },
+    { name: "The cache doesn't keep unused thumbnails alive", check: "(c := ThumbnailCache(lambda n: Thumbnail(n, b''))) is not None and c.get('x').name == 'x' and len(c) == 0" },
+    { name: "A thumbnail that was freed is rendered again", check: "(calls := []) == [] and (c := ThumbnailCache(lambda n: calls.append(n) or Thumbnail(n, b''))) is not None and c.get('a').name == c.get('a').name and calls == ['a', 'a']" },
+  ]}
+>
+
+A photo app renders thumbnails on demand. The cache works, but in production the process grew without limit: the plain dict keeps **every** thumbnail ever rendered alive. Run the code: after `del a, b` the cache still holds one item.
+
+Change the code so that:
+
+1. `ThumbnailCache` stores thumbnails in a `weakref.WeakValueDictionary`, so an entry disappears when nobody uses that thumbnail any more. `get` must still return the cached object while it's alive and call `render` only when needed. `len(cache)` counts the live entries.
+2. `Thumbnail` keeps its `__slots__` (there will be millions of them) but can be weakly referenced.
+
+When it works, the last line prints `0`.
+
+<Hint>
+
+`import weakref` and use `self._items = weakref.WeakValueDictionary()`. In `get`, read the value **once** into a local (`thumb = self._items.get(name)`) and check `if thumb is None`: with weak values an entry can vanish between an `in` check and the lookup. If you get `TypeError: cannot create weak reference to 'Thumbnail' object`, that's the slots: add `"__weakref__"` to the `__slots__` tuple.
+
+</Hint>
+
+<Solution>
+
+```python
+import weakref
+
+
+class Thumbnail:
+    __slots__ = ("name", "pixels", "__weakref__")
+
+    def __init__(self, name, pixels):
+        self.name = name
+        self.pixels = pixels
+
+
+class ThumbnailCache:
+    def __init__(self, render):
+        self.render = render       # function: name -> Thumbnail
+        self._items = weakref.WeakValueDictionary()
+
+    def get(self, name):
+        thumb = self._items.get(name)
+        if thumb is None:
+            thumb = self.render(name)
+            self._items[name] = thumb
+        return thumb
+
+    def __len__(self):
+        return len(self._items)
+
+
+renders = []
+
+def render(name):
+    renders.append(name)
+    return Thumbnail(name, b"\x00" * 1_000)
+
+cache = ThumbnailCache(render)
+a = cache.get("cat.png")
+b = cache.get("cat.png")
+print(a is b, renders)
+
+del a, b
+print(len(cache))
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- CPython frees most objects through **reference counting**: when the count reaches zero, the object is freed immediately. `del` removes a name, not an object.
+- The **cyclic garbage collector** (`gc`) frees groups of objects that only reference each other.
+- Don't rely on `__del__` for cleanup; use `with`.
+- **Weak references** (`weakref.ref`, `WeakValueDictionary`) point at objects without keeping them alive, which is perfect for caches.
+- **`__slots__`** removes the per-instance `__dict__`, saving memory and catching typos; add `"__weakref__"` if you need weak references. `sys.getsizeof` is **shallow**.
+- **`tracemalloc`** snapshots show which line allocated the memory that's piling up; then find who still holds it.
+- The **GIL** lets one thread run Python bytecode at a time. It protects the interpreter, not your data: use locks for shared state. Threads help for **I/O**, processes for **CPU-bound** pure Python.
+- **Free-threaded** CPython is officially supported in 3.14 as an optional separate build; **sub-interpreters** with their own GIL get a standard API (`concurrent.interpreters`) in 3.14.

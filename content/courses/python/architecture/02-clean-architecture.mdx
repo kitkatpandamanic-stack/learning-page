@@ -1,0 +1,923 @@
+---
+title: Clean Architecture in Python
+description: Split an app into domain, use cases and adapters, follow the dependency rule, and use the repository and unit of work patterns with SQLAlchemy and in-memory fakes.
+duration: 24
+xp: 25
+---
+
+Most apps start the same way: business rules inside FastAPI endpoints, SQL queries next to `if` statements about discounts, and an email sent from the middle of a database transaction. It's fast to write, and for a small app it's fine. Then the app grows. One team that needed to move from SQLite to PostgreSQL found database calls in 40 files, some of them inside Jinja templates. A migration planned for a week took three months. 🏗️
+
+**Clean architecture** is a way to organise code so that the important part, your **business rules**, doesn't depend on details like the web framework or the database. In this lesson you'll learn its three layers, the one rule that holds them together, and two patterns that make it practical in Python: the **repository** and the **unit of work**.
+
+## Three layers
+
+Think of the app as rings, with the most important and most stable code in the middle:
+
+| Layer | Contains | Knows about |
+| --- | --- | --- |
+| **Domain** (the core) | Entities and business rules: `Product`, `Order`, "you can't reserve more than is in stock" | Nothing but plain Python |
+| **Services** (use cases) | One function per thing a user can do: `place_order`, `cancel_order` | The domain, plus abstract interfaces for storage and messaging |
+| **Adapters** (the edge) | FastAPI routes, SQLAlchemy models and repositories, email senders, CLI commands | Everything: they plug the outside world into the services |
+
+In a project folder it often looks like this:
+
+```text
+shop/
+├── domain/        model.py: Product, OutOfStock     (pure Python)
+├── services/      orders.py: place_order(uow, ...)
+├── adapters/      orm.py, repository.py, unit_of_work.py
+└── entrypoints/   api.py: FastAPI routes (thin!)
+```
+
+You'll also hear this called **ports and adapters** or **hexagonal architecture**. The names differ in details, but the idea is the same: the inside defines **ports** (interfaces like "something that can store products"), and the outside provides **adapters** that implement them (a SQLAlchemy repository, an in-memory one for tests).
+
+## The dependency rule
+
+The one rule that makes this work: **source code dependencies point inwards**. The domain imports nothing from services or adapters; services import the domain but never `fastapi` or `sqlalchemy`; adapters may import anything.
+
+Here's what a domain model looks like. Notice the imports: just the standard library.
+
+<CodeExample output={`Product(sku='BMB-1', name='bamboo', stock=2)
+Sorry: only 2 bamboo left`}>
+
+```python
+from dataclasses import dataclass
+
+class OutOfStock(Exception):
+    pass
+
+@dataclass
+class Product:
+    sku: str
+    name: str
+    stock: int
+
+    def reserve(self, qty: int) -> None:
+        if qty <= 0:
+            raise ValueError("quantity must be positive")
+        if qty > self.stock:
+            raise OutOfStock(f"only {self.stock} {self.name} left")
+        self.stock -= qty
+
+bamboo = Product("BMB-1", "bamboo", stock=5)
+bamboo.reserve(3)
+print(bamboo)
+try:
+    bamboo.reserve(4)
+except OutOfStock as error:
+    print("Sorry:", error)
+```
+
+</CodeExample>
+
+The rule "you can't reserve more than is in stock" lives **in the domain**, not in an endpoint and not in a SQL `CHECK`. That means:
+
+- It's tested in microseconds, with no database and no HTTP.
+- The FastAPI endpoint, a CLI script and a nightly batch job all share the same rule.
+- You can read the business logic without wading through framework code.
+
+A quick way to check the dependency rule in a real project: `grep -r "import fastapi\|import sqlalchemy" shop/domain shop/services` should find nothing. Tools like `import-linter` can enforce it in CI.
+
+<Callout type="tip" title="Keep endpoints thin">
+
+In clean architecture, a FastAPI endpoint does three things: turn the request into plain values, call **one** service function, and turn the result (or a domain exception) into a response. If an endpoint has business `if`s in it, they probably belong in the domain or a service.
+
+</Callout>
+
+## The repository pattern
+
+The services need to load and save products, but they mustn't import SQLAlchemy. The answer is a **repository**: an object that looks like a collection of domain objects (`get`, `save`, `list_all`) and hides how they're stored. First the **port**, an abstract base class, then a simple in-memory **adapter**:
+
+<CodeExample output={`5
+None
+Can't instantiate abstract class HalfDoneRepository without an implementation for abstract methods 'list_all', 'save'`}>
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, replace
+
+@dataclass
+class Product:
+    sku: str
+    name: str
+    stock: int
+
+class ProductRepository(ABC):
+    @abstractmethod
+    def get(self, sku: str) -> Product | None: ...
+
+    @abstractmethod
+    def save(self, product: Product) -> None: ...
+
+    @abstractmethod
+    def list_all(self) -> list[Product]: ...
+
+class InMemoryProductRepository(ProductRepository):
+    def __init__(self):
+        self._items: dict[str, Product] = {}
+
+    def get(self, sku):
+        item = self._items.get(sku)
+        return replace(item) if item else None   # a copy
+
+    def save(self, product):
+        self._items[product.sku] = replace(product)
+
+    def list_all(self):
+        return [replace(p) for p in self._items.values()]
+
+repo = InMemoryProductRepository()
+repo.save(Product("BMB-1", "bamboo", 5))
+p = repo.get("BMB-1")
+p.stock = 0                  # changed, but not saved...
+print(repo.get("BMB-1").stock)
+print(repo.get("NOPE"))
+
+class HalfDoneRepository(ProductRepository):
+    def get(self, sku):
+        return None
+
+try:
+    HalfDoneRepository()
+except TypeError as error:
+    print(error)
+```
+
+</CodeExample>
+
+Two things to notice:
+
+- `abc.ABC` with `@abstractmethod` makes Python **refuse** to create a repository that forgets a method. Here we want that hard error, because we own every implementation. (A `Protocol` from the last lesson would work too; it just wouldn't complain until a type checker runs.)
+- The in-memory repository stores and returns **copies** (`dataclasses.replace(obj)` with no changes makes a copy). That's deliberate: a real database also gives you a fresh object each time, and changes are lost unless you save them. If the fake returned the same object, a service that **forgets** to call `save` would pass every test with the fake and silently lose data in production. A fake is only useful if it behaves like the real thing.
+
+## A SQLAlchemy repository
+
+Now the real adapter. The SQLAlchemy model (`ProductRow`) is a **database** concern and lives in the adapters layer; the repository translates between rows and domain objects, so nothing above it ever sees a `ProductRow`:
+
+<CodeExample output={`[Product(sku='APL-7', name='apple', stock=12), Product(sku='BMB-1', name='bamboo', stock=5)]
+Product`}>
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session,
+)
+
+# --- domain + port (no SQLAlchemy here) ---
+@dataclass
+class Product:
+    sku: str
+    name: str
+    stock: int
+
+class ProductRepository(ABC):
+    @abstractmethod
+    def get(self, sku: str) -> Product | None: ...
+    @abstractmethod
+    def save(self, product: Product) -> None: ...
+    @abstractmethod
+    def list_all(self) -> list[Product]: ...
+
+# --- adapter: SQLAlchemy ---
+class Base(DeclarativeBase):
+    pass
+
+class ProductRow(Base):
+    __tablename__ = "products"
+    sku: Mapped[str] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    stock: Mapped[int]
+
+def to_domain(row: ProductRow) -> Product:
+    return Product(sku=row.sku, name=row.name, stock=row.stock)
+
+class SqlProductRepository(ProductRepository):
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get(self, sku):
+        row = self.session.get(ProductRow, sku)
+        return to_domain(row) if row else None
+
+    def save(self, product):
+        row = self.session.get(ProductRow, product.sku)
+        if row is None:
+            row = ProductRow(sku=product.sku)
+            self.session.add(row)
+        row.name, row.stock = product.name, product.stock
+
+    def list_all(self):
+        rows = self.session.scalars(
+            select(ProductRow).order_by(ProductRow.sku))
+        return [to_domain(r) for r in rows]
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    repo = SqlProductRepository(session)
+    repo.save(Product("BMB-1", "bamboo", 5))
+    repo.save(Product("APL-7", "apple", 12))
+    session.commit()
+
+with Session(engine) as session:
+    repo = SqlProductRepository(session)
+    print(repo.list_all())
+    print(type(repo.get("BMB-1")).__name__)
+```
+
+</CodeExample>
+
+`save` works as an "upsert": it loads the row if it exists, creates it if not, and copies the fields across. Notice what the repository does **not** do: it never calls `session.commit()`. Deciding when a piece of work is finished is the job of the next pattern.
+
+Is the mapping code worth it? It's the main cost of this architecture: every field is written down twice. For a CRUD app where the database tables *are* the business, it often isn't, and using SQLAlchemy models directly is a perfectly good choice. The payoff comes when the domain has real rules, or when you need to test lots of business logic quickly. (SQLAlchemy also has "imperative mapping", which maps plain dataclasses to tables without a separate row class; it's powerful but more magical.)
+
+## The unit of work
+
+A **use case** often changes several objects, and they must all be saved together or not at all. Ordering one bamboo and three apples when only two apples are left must not leave the bamboo reserved. The **unit of work** pattern wraps one business operation in one transaction: it opens a session, gives you the repositories, and commits only when you say so. Python's `with` statement is a perfect fit:
+
+<CodeExample output={`[4, 1]
+Order failed: only 1 apple left
+[4, 1]`}>
+
+```python
+from dataclasses import dataclass
+from sqlalchemy import create_engine
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session, sessionmaker,
+)
+
+@dataclass
+class Product:
+    sku: str
+    name: str
+    stock: int
+
+    def reserve(self, qty: int) -> None:
+        if qty > self.stock:
+            raise ValueError(f"only {self.stock} {self.name} left")
+        self.stock -= qty
+
+class Base(DeclarativeBase):
+    pass
+
+class ProductRow(Base):
+    __tablename__ = "products"
+    sku: Mapped[str] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    stock: Mapped[int]
+
+class SqlProductRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get(self, sku):
+        row = self.session.get(ProductRow, sku)
+        return Product(row.sku, row.name, row.stock) if row else None
+
+    def save(self, product):
+        row = self.session.get(ProductRow, product.sku)
+        if row is None:
+            row = ProductRow(sku=product.sku)
+            self.session.add(row)
+        row.name, row.stock = product.name, product.stock
+
+class SqlUnitOfWork:
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    def __enter__(self):
+        self.session = self.session_factory()
+        self.products = SqlProductRepository(self.session)
+        return self
+
+    def __exit__(self, *exc_info):
+        self.rollback()          # no-op if commit() already ran
+        self.session.close()
+
+    def commit(self):
+        self.session.commit()
+
+    def rollback(self):
+        self.session.rollback()
+
+# --- the use case: all lines or nothing ---
+def place_order(uow, lines: dict[str, int]) -> None:
+    with uow:
+        for sku, qty in lines.items():
+            product = uow.products.get(sku)
+            product.reserve(qty)
+            uow.products.save(product)
+        uow.commit()
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+make_session = sessionmaker(engine)
+with SqlUnitOfWork(make_session) as uow:
+    uow.products.save(Product("BMB-1", "bamboo", 5))
+    uow.products.save(Product("APL-7", "apple", 2))
+    uow.commit()
+
+def stock():
+    with SqlUnitOfWork(make_session) as uow:
+        return [uow.products.get(s).stock for s in ("BMB-1", "APL-7")]
+
+place_order(SqlUnitOfWork(make_session), {"BMB-1": 1, "APL-7": 1})
+print(stock())
+try:
+    place_order(SqlUnitOfWork(make_session),
+                {"BMB-1": 3, "APL-7": 9})
+except ValueError as error:
+    print("Order failed:", error)
+print(stock())
+```
+
+</CodeExample>
+
+The second order reserved three bamboo, then failed on the apples. Because `commit()` was never reached, `__exit__` rolled the whole transaction back, and the bamboo stock is still 4. The service function reads like the business process ("for each line, reserve and save, then commit") and doesn't contain a single SQLAlchemy call.
+
+- `sessionmaker(engine)` is a **session factory**: calling it gives a new `Session`. The unit of work makes a fresh session for every `with` block.
+- **Commit explicitly.** The safe default is "roll back unless the use case says it's done". Auto-committing on success is tempting, but explicit commits make it obvious where the transaction ends.
+- In FastAPI, the endpoint would get a unit of work through `Depends`, call the service, and turn a domain error like `OutOfStock` into a 409 response. You'll wire that up in the next lesson.
+
+```python
+@app.post("/orders", status_code=201)
+def create_order(body: OrderIn, uow=Depends(get_uow)):
+    try:
+        place_order(uow, body.lines)
+    except OutOfStock as error:
+        raise HTTPException(409, str(error))
+    return {"status": "reserved"}
+```
+
+## Testing with fakes
+
+Now the payoff. Because the service only needs "something with `.products`, `.commit()` and `with` support", tests can give it a **fake unit of work** that keeps everything in memory and simply records whether `commit()` was called:
+
+<CodeExample output={`....                                                 [100%]
+4 passed in 0.01s`}>
+
+```python
+import pytest
+from dataclasses import dataclass, replace
+
+@dataclass
+class Product:
+    sku: str
+    name: str
+    stock: int
+
+    def reserve(self, qty: int) -> None:
+        if qty > self.stock:
+            raise ValueError(f"only {self.stock} {self.name} left")
+        self.stock -= qty
+
+class InMemoryProductRepository:
+    def __init__(self, *products):
+        self._items = {p.sku: replace(p) for p in products}
+
+    def get(self, sku):
+        item = self._items.get(sku)
+        return replace(item) if item else None
+
+    def save(self, product):
+        self._items[product.sku] = replace(product)
+
+class FakeUnitOfWork:
+    def __init__(self, *products):
+        self.products = InMemoryProductRepository(*products)
+        self.committed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        pass
+
+    def commit(self):
+        self.committed = True
+
+class UnknownProduct(Exception):
+    pass
+
+def reserve(uow, sku: str, qty: int) -> int:
+    with uow:
+        product = uow.products.get(sku)
+        if product is None:
+            raise UnknownProduct(sku)
+        product.reserve(qty)
+        uow.products.save(product)
+        uow.commit()
+        return product.stock
+
+@pytest.fixture
+def uow():
+    return FakeUnitOfWork(Product("BMB-1", "bamboo", 5))
+
+def test_reserve_lowers_stock_and_commits(uow):
+    assert reserve(uow, "BMB-1", 2) == 3
+    assert uow.products.get("BMB-1").stock == 3
+    assert uow.committed
+
+def test_unknown_product(uow):
+    with pytest.raises(UnknownProduct):
+        reserve(uow, "NOPE", 1)
+    assert not uow.committed
+
+def test_not_enough_stock_commits_nothing(uow):
+    with pytest.raises(ValueError, match="only 5 bamboo left"):
+        reserve(uow, "BMB-1", 6)
+    assert not uow.committed
+
+def test_can_reserve_everything(uow):
+    assert reserve(uow, "BMB-1", 5) == 0
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+These tests need no database, no `Mock` and no `patch`: just plain objects passed in. A project can have thousands of them and still run the whole suite in seconds. That's the testing strategy clean architecture gives you:
+
+- **Lots of fast unit tests** for the domain and the services, using fakes.
+- **A few integration tests** for each adapter against a real database (SQLite in memory, or a throwaway PostgreSQL in CI), to prove the SQL mapping works.
+- A handful of **end-to-end tests** through the API with `TestClient`.
+
+A neat trick for the middle layer is a **contract test**: one set of repository tests, run against *both* implementations with a parametrised fixture (`@pytest.fixture(params=["memory", "sql"])`). If the fake and the real repository pass the same tests, you can trust the fake in all your fast tests. You'll write exactly that in the exercise.
+
+<Callout type="warning" title="Don't architect a to-do app">
+
+Layers, repositories and units of work cost code: mapping functions, interfaces, extra files. For a small CRUD service, a prototype, or a script, FastAPI + SQLAlchemy models used directly (like in Level 2) is the right call. Reach for clean architecture when the **business rules** are complex, the app will live for years, or several teams work on it. You can also adopt it gradually: start by moving rules into the domain, add a repository when testing hurts.
+
+</Callout>
+
+<Quiz
+  question="In a clean architecture project, which import inside services/orders.py breaks the dependency rule?"
+  options={["from shop.domain.model import Product", "from dataclasses import dataclass", "from sqlalchemy.orm import Session", "from typing import Protocol"]}
+  answer={2}
+  explanation="Services may depend on the domain and on the standard library, but not on infrastructure like SQLAlchemy. Database code belongs in the adapters layer, behind a repository and a unit of work."
+/>
+
+<Quiz
+  question="An in-memory fake repository returns the very same object it stores, while the SQLAlchemy repository returns a fresh object each time. A service changes a product but forgets to call save(). What happens?"
+  options={["Both the tests with the fake and production lose the change", "Tests with the fake pass, but production silently loses the change", "Tests with the fake fail, production works", "Python raises an error because save was not called"]}
+  answer={1}
+  explanation="With the fake, the change is made to the stored object itself, so it looks saved. The real repository returns a copy, so without save() nothing reaches the database. Fakes must behave like the real thing, which is why the in-memory repository stores and returns copies."
+/>
+
+<Exercise
+  language="python"
+  title="A library with repositories and a unit of work"
+  starter={`import pytest
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, replace
+from sqlalchemy import create_engine
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session, sessionmaker,
+)
+
+
+# ---------- domain (done) ----------
+
+class BookNotFound(Exception):
+    pass
+
+
+class AlreadyBorrowed(Exception):
+    pass
+
+
+class NotBorrowed(Exception):
+    pass
+
+
+@dataclass
+class Book:
+    isbn: str
+    title: str
+    borrower: str | None = None
+
+    def lend_to(self, member: str) -> None:
+        if self.borrower is not None:
+            raise AlreadyBorrowed(self.title)
+        self.borrower = member
+
+    def give_back(self) -> None:
+        if self.borrower is None:
+            raise NotBorrowed(self.title)
+        self.borrower = None
+
+
+class BookRepository(ABC):
+    @abstractmethod
+    def get(self, isbn: str) -> Book | None: ...
+
+    @abstractmethod
+    def save(self, book: Book) -> None: ...
+
+
+# ---------- adapters ----------
+
+class Base(DeclarativeBase):
+    pass
+
+
+class BookRow(Base):
+    __tablename__ = "books"
+    isbn: Mapped[str] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    borrower: Mapped[str | None]
+
+
+# TODO 1: class InMemoryBookRepository(BookRepository)
+#         that stores and returns COPIES of books
+
+
+# TODO 2: class SqlBookRepository(BookRepository) with
+#         __init__(self, session); get() returns a Book
+#         (or None); save() inserts or updates a BookRow
+
+
+class FakeUnitOfWork:
+    def __init__(self):
+        self.books = InMemoryBookRepository()
+        self.committed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        pass
+
+    def commit(self):
+        self.committed = True
+
+
+class SqlUnitOfWork:
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    def __enter__(self):
+        self.session = self.session_factory()
+        self.books = SqlBookRepository(self.session)
+        return self
+
+    def __exit__(self, *exc_info):
+        self.session.rollback()
+        self.session.close()
+
+    def commit(self):
+        self.session.commit()
+
+
+# ---------- use cases ----------
+
+# TODO 3: borrow_book(uow, isbn, member) -> Book
+# TODO 4: return_book(uow, isbn) -> Book
+#   Both: raise BookNotFound for an unknown isbn, let the
+#   domain enforce the rules, save, commit, return the book.
+
+
+# ---------- tests (don't change them) ----------
+
+def sql_uow():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return SqlUnitOfWork(sessionmaker(engine))
+
+
+@pytest.fixture(params=["memory", "sql"])
+def uow(request):
+    uow = FakeUnitOfWork() if request.param == "memory" else sql_uow()
+    with uow:
+        uow.books.save(Book("111", "Dune"))
+        uow.books.save(Book("222", "Emma"))
+        uow.commit()
+    return uow
+
+
+def borrower_of(uow, isbn):
+    with uow:
+        return uow.books.get(isbn).borrower
+
+
+def test_repository_returns_copies(uow):
+    with uow:
+        book = uow.books.get("111")
+        book.borrower = "changed but not saved"
+        assert uow.books.get("111").borrower is None
+        assert uow.books.get("999") is None
+
+
+def test_borrow_book(uow):
+    book = borrow_book(uow, "111", "mei")
+    assert book == Book("111", "Dune", "mei")
+    assert borrower_of(uow, "111") == "mei"
+    assert borrower_of(uow, "222") is None
+
+
+def test_cannot_borrow_twice(uow):
+    borrow_book(uow, "111", "mei")
+    with pytest.raises(AlreadyBorrowed):
+        borrow_book(uow, "111", "sam")
+    assert borrower_of(uow, "111") == "mei"
+
+
+def test_return_book(uow):
+    borrow_book(uow, "222", "sam")
+    assert return_book(uow, "222").borrower is None
+    assert borrower_of(uow, "222") is None
+
+
+def test_unknown_book(uow):
+    with pytest.raises(BookNotFound):
+        borrow_book(uow, "999", "mei")
+    with pytest.raises(BookNotFound):
+        return_book(uow, "999")
+
+
+def test_returning_a_book_on_the_shelf(uow):
+    with pytest.raises(NotBorrowed):
+        return_book(uow, "111")
+
+
+def test_commits_only_when_it_works():
+    uow = FakeUnitOfWork()
+    uow.books.save(Book("111", "Dune"))
+    with pytest.raises(NotBorrowed):
+        return_book(uow, "111")
+    assert not uow.committed
+    borrow_book(uow, "111", "mei")
+    assert uow.committed
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "All the tests in the editor pass (with both repositories)", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 13" },
+    { name: "Both repositories implement BookRepository", check: "issubclass(InMemoryBookRepository, BookRepository) and issubclass(SqlBookRepository, BookRepository)" },
+    { name: "The in-memory repository stores and returns copies", check: "[r := InMemoryBookRepository(), r.save(b := Book('9', 'Up')), setattr(b, 'title', 'X')] and r.get('9') == Book('9', 'Up') and r.get('9') is not r.get('9') and r.get('0') is None" },
+    { name: "The SQL repository inserts, updates and maps rows to Books", check: "[e := create_engine('sqlite://'), Base.metadata.create_all(e), s := Session(e), r := SqlBookRepository(s), r.save(Book('9', 'Up')), s.commit(), r.save(Book('9', 'Up 2', 'kim')), s.commit()] and Session(e).get(BookRow, '9').borrower == 'kim' and Session(e).get(BookRow, '9').title == 'Up 2' and r.get('9') == Book('9', 'Up 2', 'kim') and type(r.get('9')) is Book and r.get('0') is None" },
+    { name: "borrow_book saves and commits", check: "[u := FakeUnitOfWork(), u.books.save(Book('5', 'Heidi'))] and borrow_book(u, '5', 'zoe') == Book('5', 'Heidi', 'zoe') and u.committed and u.books.get('5').borrower == 'zoe'" },
+    { name: "Broken rules raise and commit nothing", check: "[u := FakeUnitOfWork(), u.books.save(Book('5', 'Heidi', 'ann'))] and exec('_r = []\\nfor _f in (lambda: borrow_book(u, \"5\", \"zoe\"), lambda: borrow_book(u, \"6\", \"zoe\"), lambda: return_book(u, \"6\")):\\n    try:\\n        _f()\\n    except Exception as _e:\\n        _r.append(type(_e).__name__)') is None and _r == ['AlreadyBorrowed', 'BookNotFound', 'BookNotFound'] and not u.committed" },
+    { name: "Changes really reach the database", check: "[e := create_engine('sqlite://'), Base.metadata.create_all(e), u := SqlUnitOfWork(sessionmaker(e)), s := Session(e), s.add(BookRow(isbn='5', title='Heidi')), s.commit(), s.close()] and borrow_book(u, '5', 'zoe').borrower == 'zoe' and Session(e).get(BookRow, '5').borrower == 'zoe' and return_book(u, '5').borrower is None and Session(e).get(BookRow, '5').borrower is None" },
+  ]}
+>
+
+Finish a small **library** app in clean-architecture style. The domain (`Book` with its rules), the repository port, the ORM model, both units of work and the tests are ready. You write the adapters and the use cases:
+
+1. `InMemoryBookRepository(BookRepository)`: `get(isbn)` and `save(book)`, keeping books in a dict. It must store and return **copies**, like a real database.
+2. `SqlBookRepository(BookRepository)`: takes a `session`; `get` turns a `BookRow` into a `Book` (or returns `None`); `save` inserts a new row or updates the existing one. It must **not** commit.
+3. `borrow_book(uow, isbn, member)` and
+4. `return_book(uow, isbn)`: inside `with uow:`, load the book (raise `BookNotFound(isbn)` if it's missing), call the domain method (`lend_to` / `give_back`), save it, commit, and return the book.
+
+The tests run twice, once with each repository (`params=["memory", "sql"]`): if a test passes with the fake but fails with SQL, your fake isn't behaving like the real thing.
+
+<Hint>
+
+Copy the shape of `InMemoryProductRepository` and `SqlProductRepository` from the lesson: `replace(book)` makes a copy; `self.session.get(BookRow, isbn)` loads a row; in `save`, create and `session.add` a `BookRow(isbn=book.isbn)` if there isn't one, then copy `title` and `borrower` across. Each use case is the `reserve` function from "Testing with fakes" with `book.lend_to(member)` or `book.give_back()` in the middle.
+
+</Hint>
+
+<Solution>
+
+```python
+import pytest
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, replace
+from sqlalchemy import create_engine
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session, sessionmaker,
+)
+
+
+# ---------- domain (done) ----------
+
+class BookNotFound(Exception):
+    pass
+
+
+class AlreadyBorrowed(Exception):
+    pass
+
+
+class NotBorrowed(Exception):
+    pass
+
+
+@dataclass
+class Book:
+    isbn: str
+    title: str
+    borrower: str | None = None
+
+    def lend_to(self, member: str) -> None:
+        if self.borrower is not None:
+            raise AlreadyBorrowed(self.title)
+        self.borrower = member
+
+    def give_back(self) -> None:
+        if self.borrower is None:
+            raise NotBorrowed(self.title)
+        self.borrower = None
+
+
+class BookRepository(ABC):
+    @abstractmethod
+    def get(self, isbn: str) -> Book | None: ...
+
+    @abstractmethod
+    def save(self, book: Book) -> None: ...
+
+
+# ---------- adapters ----------
+
+class Base(DeclarativeBase):
+    pass
+
+
+class BookRow(Base):
+    __tablename__ = "books"
+    isbn: Mapped[str] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    borrower: Mapped[str | None]
+
+
+class InMemoryBookRepository(BookRepository):
+    def __init__(self):
+        self._books: dict[str, Book] = {}
+
+    def get(self, isbn):
+        book = self._books.get(isbn)
+        return replace(book) if book else None
+
+    def save(self, book):
+        self._books[book.isbn] = replace(book)
+
+
+class SqlBookRepository(BookRepository):
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get(self, isbn):
+        row = self.session.get(BookRow, isbn)
+        if row is None:
+            return None
+        return Book(row.isbn, row.title, row.borrower)
+
+    def save(self, book):
+        row = self.session.get(BookRow, book.isbn)
+        if row is None:
+            row = BookRow(isbn=book.isbn)
+            self.session.add(row)
+        row.title = book.title
+        row.borrower = book.borrower
+
+
+class FakeUnitOfWork:
+    def __init__(self):
+        self.books = InMemoryBookRepository()
+        self.committed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        pass
+
+    def commit(self):
+        self.committed = True
+
+
+class SqlUnitOfWork:
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    def __enter__(self):
+        self.session = self.session_factory()
+        self.books = SqlBookRepository(self.session)
+        return self
+
+    def __exit__(self, *exc_info):
+        self.session.rollback()
+        self.session.close()
+
+    def commit(self):
+        self.session.commit()
+
+
+# ---------- use cases ----------
+
+def borrow_book(uow, isbn: str, member: str) -> Book:
+    with uow:
+        book = uow.books.get(isbn)
+        if book is None:
+            raise BookNotFound(isbn)
+        book.lend_to(member)
+        uow.books.save(book)
+        uow.commit()
+        return book
+
+
+def return_book(uow, isbn: str) -> Book:
+    with uow:
+        book = uow.books.get(isbn)
+        if book is None:
+            raise BookNotFound(isbn)
+        book.give_back()
+        uow.books.save(book)
+        uow.commit()
+        return book
+
+
+# ---------- tests (don't change them) ----------
+
+def sql_uow():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return SqlUnitOfWork(sessionmaker(engine))
+
+
+@pytest.fixture(params=["memory", "sql"])
+def uow(request):
+    uow = FakeUnitOfWork() if request.param == "memory" else sql_uow()
+    with uow:
+        uow.books.save(Book("111", "Dune"))
+        uow.books.save(Book("222", "Emma"))
+        uow.commit()
+    return uow
+
+
+def borrower_of(uow, isbn):
+    with uow:
+        return uow.books.get(isbn).borrower
+
+
+def test_repository_returns_copies(uow):
+    with uow:
+        book = uow.books.get("111")
+        book.borrower = "changed but not saved"
+        assert uow.books.get("111").borrower is None
+        assert uow.books.get("999") is None
+
+
+def test_borrow_book(uow):
+    book = borrow_book(uow, "111", "mei")
+    assert book == Book("111", "Dune", "mei")
+    assert borrower_of(uow, "111") == "mei"
+    assert borrower_of(uow, "222") is None
+
+
+def test_cannot_borrow_twice(uow):
+    borrow_book(uow, "111", "mei")
+    with pytest.raises(AlreadyBorrowed):
+        borrow_book(uow, "111", "sam")
+    assert borrower_of(uow, "111") == "mei"
+
+
+def test_return_book(uow):
+    borrow_book(uow, "222", "sam")
+    assert return_book(uow, "222").borrower is None
+    assert borrower_of(uow, "222") is None
+
+
+def test_unknown_book(uow):
+    with pytest.raises(BookNotFound):
+        borrow_book(uow, "999", "mei")
+    with pytest.raises(BookNotFound):
+        return_book(uow, "999")
+
+
+def test_returning_a_book_on_the_shelf(uow):
+    with pytest.raises(NotBorrowed):
+        return_book(uow, "111")
+
+
+def test_commits_only_when_it_works():
+    uow = FakeUnitOfWork()
+    uow.books.save(Book("111", "Dune"))
+    with pytest.raises(NotBorrowed):
+        return_book(uow, "111")
+    assert not uow.committed
+    borrow_book(uow, "111", "mei")
+    assert uow.committed
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Clean architecture has three layers: the **domain** (entities and rules, plain Python), **services** (one function per use case) and **adapters** (FastAPI, SQLAlchemy, email...).
+- **The dependency rule**: imports point inwards. The domain knows nothing about frameworks; services know the domain and abstract ports.
+- A **repository** looks like a collection of domain objects (`get`, `save`) and hides storage. Define the port with `abc.ABC`, implement it with SQLAlchemy and in memory; map rows to domain objects at the edge.
+- Fakes must behave like the real thing: an in-memory repository should store and return **copies**. Contract tests (one test suite, both implementations) prove it.
+- A **unit of work** wraps one use case in one transaction: `with uow:`, change things through `uow.products`, `uow.commit()`; anything else rolls back.
+- Test services with a fake unit of work: thousands of fast tests, no database, no mocks. Keep a few integration tests for the real adapters.
+- It costs extra code, so use it where business rules are complex and the app will live long, not for every CRUD service.

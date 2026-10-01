@@ -52,7 +52,7 @@ function lessonFiles(dir = ROOT): string[] {
 }
 
 /** Reads `name="..."` and `name={expression}` attributes of a JSX opening tag. */
-function parseAttributes(tag: string): Record<string, unknown> {
+function parseAttributes(tag: string, file: string): Record<string, unknown> {
   const attrs: Record<string, unknown> = {};
   let i = 0;
   while (i < tag.length) {
@@ -80,7 +80,14 @@ function parseAttributes(tag: string): Record<string, unknown> {
         else if (ch === "{") depth++;
         else if (ch === "}" && --depth === 0) break;
       }
-      attrs[name[1]] = new Function(`return (${tag.slice(i + 1, j)});`)();
+      try {
+        attrs[name[1]] = new Function(`return (${tag.slice(i + 1, j)});`)();
+      } catch (error) {
+        // e.g. a closing `/>` that isn't on its own line
+        throw new Error(
+          `${file.slice(ROOT.length + 1)}: can't read the ${name[1]}={…} attribute (${error})`,
+        );
+      }
       i = j + 1;
     }
   }
@@ -108,7 +115,7 @@ function exercisesIn(file: string): Exercise[] {
       tagEnd === -1
         ? block.slice(0, block.indexOf(">"))
         : block.slice(0, tagEnd);
-    const attrs = parseAttributes(tag);
+    const attrs = parseAttributes(tag, file);
     if (typeof attrs.starter !== "string") return [];
     const body = block.slice(0, block.indexOf("</Exercise>"));
     const solution =
@@ -226,11 +233,15 @@ describe("TryIt live previews", () => {
       .split(/^<TryIt\b/m)
       .slice(1)
       .map((block, i) => {
-        const attrs = parseAttributes(block.slice(0, block.search(/^\/>$/m)));
+        const attrs = parseAttributes(
+          block.slice(0, block.search(/^\/>$/m)),
+          file,
+        );
         return {
           name: `${file.slice(ROOT.length + 1)} #${i + 1}`,
-          html: attrs.html as string,
+          html: attrs.html as string | undefined,
           code: attrs.code as string,
+          language: (attrs.language as RunLanguage) ?? "javascript",
         };
       });
   });
@@ -238,11 +249,14 @@ describe("TryIt live previews", () => {
   it.each(blocks.map((b) => [b.name, b] as const))(
     "%s runs without errors",
     async (_name, b) => {
-      expect(typeof b.html, "TryIt needs html").toBe("string");
       expect(typeof b.code, "TryIt needs code").toBe("string");
-      const result = await runDomInNode(b.code, b.html);
+      const result =
+        b.html !== undefined
+          ? await runDomInNode(b.code, b.html)
+          : await run(b.code, b.language);
       expect(result.error, JSON.stringify(result.output)).toBeUndefined();
     },
+    PACKAGE_TIMEOUT_MS,
   );
 });
 

@@ -1,0 +1,728 @@
+---
+title: "Part 1: Models and storage"
+description: Plan a projects-and-tasks REST API, model it with SQLAlchemy, write a small repository layer and test it with pytest fixtures.
+duration: 22
+xp: 30
+---
+
+Welcome to the **Level 2 capstone**! 🚀 Over three parts you'll build a real **REST API for projects and tasks**, the kind of backend that sits behind a to-do or project-planning app. Clients will create projects, add tasks to them, tick tasks off and delete things, and every request will be checked, stored in a **database** and covered by **tests**.
+
+This project uses almost everything from Level 2: **type hints** and **decorators**, **pytest** with fixtures and parametrize, **FastAPI** with Pydantic and `Depends`, and the **SQLAlchemy** ORM with relationships. In this first part we build the bottom layer: the **database models** and a set of small **repository functions** that read and write them, with tests. No HTTP yet.
+
+## The plan
+
+Here's the API we're aiming for. A project has many tasks, so task lists live **under** their project, while a single task can be reached directly by its id:
+
+| Request | Does | Success |
+| --- | --- | --- |
+| `POST /projects` | create a project from `{"name": ...}` | 201 + the project |
+| `GET /projects` | list all projects | 200 + a list |
+| `GET /projects/{project_id}` | one project, with its tasks | 200 + the project |
+| `DELETE /projects/{project_id}` | delete a project and its tasks | 204 |
+| `POST /projects/{project_id}/tasks` | add a task from `{"title": ...}` | 201 + the task |
+| `GET /projects/{project_id}/tasks` | the project's tasks, `?done=true` to filter | 200 + a list |
+| `GET /tasks/{task_id}` | one task | 200 + the task |
+| `PATCH /tasks/{task_id}` | change `title` and/or `done` | 200 + the task |
+| `DELETE /tasks/{task_id}` | delete a task | 204 |
+
+Unknown ids answer **404** and invalid data **422**, just like the To-do API. We'll build it in three layers, one per part:
+
+| Part | What it adds | Main tools |
+| --- | --- | --- |
+| 1 | Models, repository functions and their tests | SQLAlchemy, pytest fixtures |
+| 2 | Schemas, a session per request, the endpoints | FastAPI, Pydantic, `Depends` |
+| 3 | A full API test suite and running it for real | `TestClient`, `dependency_overrides`, parametrize |
+
+On your computer the project would be split into files like this. In the editor everything lives in **one file**, in the same order, with a comment header for each part:
+
+```text
+projects_api/
+├── app/
+│   ├── models.py        Base, Project, Task              (part 1)
+│   ├── repository.py    create_project, list_tasks, ...  (part 1)
+│   ├── schemas.py       Pydantic models                  (part 2)
+│   ├── database.py      engine, get_session              (part 2)
+│   └── main.py          the FastAPI app and endpoints    (part 2)
+└── tests/
+    ├── test_repository.py                                (part 1)
+    ├── conftest.py      shared fixtures                  (part 3)
+    └── test_api.py                                       (part 3)
+```
+
+<Callout type="tip" title="Why a repository layer?">
+
+We could put the SQLAlchemy code straight into the endpoints. Real projects usually don't: they keep database work in small functions like `create_project(session, name)`. The endpoints stay short and only deal with HTTP, the functions can be tested without any HTTP at all, and if the storage ever changes, only one file changes. You saw this idea in the [SQLAlchemy ORM lesson](/learn/python/sqlalchemy-orm): functions that take the **session as a parameter**.
+
+</Callout>
+
+## The models
+
+Two tables: `projects` and `tasks`, with a **one-to-many** relationship exactly like authors and books in [Relationships and Migrations](/learn/python/relationships-and-migrations):
+
+<CodeExample output={`None
+1 False 1
+['Dig', 'Plant']`}>
+
+```python
+from sqlalchemy import ForeignKey, String, create_engine
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    garden = Project(name="Garden")
+    dig = Task(title="Dig", project=garden)
+    Task(title="Plant", project=garden)
+    print(dig.done)
+    session.add(garden)
+    session.commit()
+    print(dig.id, dig.done, dig.project_id)
+    print([task.title for task in garden.tasks])
+```
+
+</CodeExample>
+
+What's new compared to the databases lessons:
+
+- **`String(100)`** and **`String(200)`** give the text columns a maximum length. SQLite doesn't enforce it, but PostgreSQL and MySQL do, so it's good practice to say what you expect. (Our API will check the length too.)
+- **`done: Mapped[bool] = mapped_column(default=False)`** gives new tasks a default. Notice the first line of output: the default is only applied when SQLAlchemy **inserts** the row, so `dig.done` is `None` until the commit. After the commit it's `False`.
+- **`cascade="all, delete-orphan"`** on `Project.tasks` says that tasks belong to their project. That's important for deleting, as you'll see next.
+
+## Why cascade matters
+
+What should happen to a project's tasks when the project is deleted? Here's the same pair of models **without** the cascade:
+
+<CodeExample output={`NOT NULL constraint failed: tasks.project_id`}>
+
+```python
+from sqlalchemy import ForeignKey, create_engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project"            # no cascade
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    garden = Project(name="Garden", tasks=[Task(title="Dig")])
+    session.add(garden)
+    session.commit()
+
+    session.delete(garden)
+    try:
+        session.commit()
+    except IntegrityError as error:
+        print(error.orig)
+```
+
+</CodeExample>
+
+Without a cascade, SQLAlchemy tries to keep the task and just unlink it by setting its `project_id` to `NULL`. But `project_id` is `Mapped[int]`, which means `NOT NULL`, so the database refuses and the commit fails. With `cascade="all, delete-orphan"`, deleting a project deletes its tasks in the same transaction, which is exactly what our `DELETE /projects/{project_id}` endpoint should do.
+
+## Repository functions
+
+Now the functions that do the database work. Each one takes the **session as its first parameter** and has type hints, so it's clear what goes in and what comes out. The ones that change data **commit**, so a caller can't forget to:
+
+<CodeExample output={`['Garden', 'Kitchen']
+Dig
+None`}>
+
+```python
+from sqlalchemy import ForeignKey, String, create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+def list_projects(session: Session) -> list[Project]:
+    return list(session.scalars(select(Project).order_by(Project.id)))
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+with new_session() as session:
+    garden = create_project(session, "Garden")
+    create_project(session, "Kitchen")
+    add_task(session, garden, "Dig")
+    print([project.name for project in list_projects(session)])
+    print(get_project(session, 1).tasks[0].title)
+    print(get_project(session, 99))
+```
+
+</CodeExample>
+
+A few details:
+
+- `get_project` returns **`Project | None`**: the caller (later, an endpoint) decides what "not found" means. In Part 2 that will be a 404.
+- `list_projects` sorts by id. Without `order_by`, the database may return rows in any order, and tests that compare lists would randomly fail.
+- `add_task` takes the **project object**, not an id, and sets `project=project`. SQLAlchemy fills in `project_id` on commit.
+- **`new_session()`** creates a brand-new in-memory database each time it's called. That's what our tests will use.
+
+## Optional filters
+
+`GET /projects/{project_id}/tasks?done=true` needs a query whose `WHERE` part depends on the arguments. SQLAlchemy statements make this easy: every `.where()` returns a **new** statement with one more condition, so you can add conditions step by step with plain `if`s:
+
+<CodeExample output={`tasks.project_id = :project_id_1
+tasks.project_id = :project_id_1 AND tasks.done = true
+tasks.project_id = :project_id_1 AND tasks.done = false`}>
+
+```python
+from sqlalchemy import ForeignKey, String, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+def tasks_query(project_id: int, done: bool | None = None):
+    stmt = select(Task).where(Task.project_id == project_id)
+    if done is not None:
+        stmt = stmt.where(Task.done == done)
+    return stmt
+
+print(tasks_query(1).whereclause)
+print(tasks_query(1, done=True).whereclause)
+print(tasks_query(1, done=False).whereclause)
+```
+
+</CodeExample>
+
+`.whereclause` shows the `WHERE` part SQLAlchemy built (the `:project_id_1` is a safe parameter, never pasted-in text). Two calls to `.where()` are joined with `AND`. Notice the check is `done is not None`, not `if done:`, because `done=False` is a real filter ("only unfinished tasks"), not "no filter".
+
+## Testing the repository
+
+The repository is plain Python, so pytest can test it directly. The trick from [Fixtures and Parametrize](/learn/python/fixtures-and-parametrize) is a `session` fixture with `yield`: each test gets a session on a **fresh, empty database**, and the session is closed after the test:
+
+<CodeExample output={`...                                                  [100%]
+3 passed in 0.01s`}>
+
+```python
+import pytest
+from sqlalchemy import ForeignKey, String, create_engine
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+@pytest.fixture
+def session():
+    with new_session() as session:
+        yield session
+
+def test_create_and_get_project(session):
+    project = create_project(session, "Garden")
+    assert project.id == 1
+    assert get_project(session, 1).name == "Garden"
+    assert get_project(session, 99) is None
+
+def test_each_test_gets_an_empty_database(session):
+    project = create_project(session, "Kitchen")
+    assert project.id == 1
+
+def test_add_task(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    assert task.done is False
+    assert task.project_id == project.id
+    assert project.tasks == [task]
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+`test_each_test_gets_an_empty_database` proves the isolation: the first test already created a project, but here the new project gets id `1` again. That works because `new_session()` makes a **new engine** for every test, and an in-memory SQLite database (`"sqlite://"`) lives only as long as its connection. A new engine means a new, empty database.
+
+<Callout type="warning" title="Test what a bug would break">
+
+`test_add_task` checks the default `done`, the foreign key **and** the relationship. A good test asks "what could be wrong here?" and checks that. For `list_tasks`, that means both projects' tasks are in the database, so a missing `WHERE project_id = ...` would be caught. For `delete_project`, it means checking that the **tasks** are gone too, not just the project.
+
+</Callout>
+
+<Quiz
+  question="Project.tasks is relationship(back_populates='project') with no cascade, and Task.project_id is Mapped[int]. You call session.delete(project) on a project that has 3 tasks, then session.commit(). What happens?"
+  options={["The project and its 3 tasks are deleted", "Only the project is deleted and the tasks keep pointing at it", "The commit fails with an IntegrityError, because SQLAlchemy tries to set the tasks' project_id to NULL", "SQLAlchemy asks which tasks to delete"]}
+  answer={2}
+  explanation="Without a cascade, SQLAlchemy keeps the tasks and unlinks them by setting project_id to NULL. Mapped[int] means NOT NULL, so the database refuses. cascade='all, delete-orphan' makes the tasks get deleted together with their project."
+/>
+
+<Exercise
+  language="python"
+  title="Build it: Models and repository"
+  starter={`import pytest
+from sqlalchemy import ForeignKey, String, create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+
+# ---------- models ----------
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    # TODO 1: deleting a project should delete its tasks too
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project"
+    )
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+
+# ---------- repository ----------
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+
+def list_projects(session: Session) -> list[Project]:
+    return list(session.scalars(select(Project).order_by(Project.id)))
+
+
+def delete_project(session: Session, project: Project) -> None:
+    # TODO 2: delete the project (and so its tasks) and save
+    pass
+
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+
+def get_task(session: Session, task_id: int) -> Task | None:
+    # TODO 3: the task with this id, or None
+    pass
+
+
+def list_tasks(
+    session: Session, project_id: int, done: bool | None = None
+) -> list[Task]:
+    # TODO 4: the project's tasks in id order; if done is True
+    #         or False, only the tasks with that done value
+    pass
+
+
+def update_task(session: Session, task: Task, changes: dict) -> Task:
+    # TODO 5: set each field in changes, e.g. {"done": True},
+    #         save, and return the task
+    pass
+
+
+def delete_task(session: Session, task: Task) -> None:
+    # TODO 6: delete the task and save
+    pass
+
+
+# ---------- repository tests ----------
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+@pytest.fixture
+def session():
+    with new_session() as session:
+        yield session
+
+
+def test_create_and_get_project(session):
+    project = create_project(session, "Garden")
+    assert project.id == 1
+    assert get_project(session, 1).name == "Garden"
+    assert get_project(session, 99) is None
+
+
+def test_list_projects_in_order(session):
+    create_project(session, "Garden")
+    create_project(session, "Kitchen")
+    names = [p.name for p in list_projects(session)]
+    assert names == ["Garden", "Kitchen"]
+
+
+def test_add_task(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    assert task.done is False
+    assert task.project_id == project.id
+    assert project.tasks == [task]
+
+
+def test_update_task_changes_only_given_fields(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    update_task(session, task, {"done": True})
+    assert (task.title, task.done) == ("Dig", True)
+
+
+# TODO 7: test_list_tasks_filters_by_done: list_tasks with
+#         done=None, True and False (use two projects)
+
+
+# TODO 8: test_delete_project_deletes_its_tasks
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "get_task finds a task by id, or returns None", check: "[s := new_session(), a := create_project(s, 'A'), t := add_task(s, a, 'Dig')] and get_task(s, t.id) is t and get_task(s, 99) is None" },
+    { name: "list_tasks returns one project's tasks in id order", check: "[s := new_session(), a := create_project(s, 'A'), b := create_project(s, 'B'), add_task(s, a, 'one'), add_task(s, b, 'other'), add_task(s, a, 'two')] and [t.title for t in list_tasks(s, a.id)] == ['one', 'two'] and [t.title for t in list_tasks(s, b.id)] == ['other'] and list_tasks(s, 99) == []" },
+    { name: "list_tasks filters by done (True, False or None)", check: "[s := new_session(), a := create_project(s, 'A'), t1 := add_task(s, a, 'one'), t2 := add_task(s, a, 'two'), t3 := add_task(s, a, 'three'), setattr(t2, 'done', True), s.commit()] and [t.id for t in list_tasks(s, a.id, True)] == [t2.id] and [t.id for t in list_tasks(s, a.id, False)] == [t1.id, t3.id] and len(list_tasks(s, a.id, None)) == 3" },
+    { name: "update_task changes only the given fields and saves them", check: "[s := new_session(), a := create_project(s, 'A'), t := add_task(s, a, 'Dig'), r := update_task(s, t, {'done': True}), s.rollback()] and r is t and (t.title, t.done) == ('Dig', True) and [update_task(s, t, {'title': 'Rake'}), s.rollback()] and (t.title, t.done) == ('Rake', True)" },
+    { name: "delete_task deletes the task and saves", check: "[s := new_session(), a := create_project(s, 'A'), t := add_task(s, a, 'Dig'), add_task(s, a, 'Keep'), tid := t.id, delete_task(s, t), s.rollback()] and s.get(Task, tid) is None and s.scalars(select(Task.title)).all() == ['Keep']" },
+    { name: "delete_project deletes the project and its tasks", check: "[s := new_session(), a := create_project(s, 'A'), b := create_project(s, 'B'), add_task(s, a, 'x'), add_task(s, a, 'y'), add_task(s, b, 'z'), delete_project(s, a), s.rollback()] and s.scalars(select(Project.name)).all() == ['B'] and s.scalars(select(Task.title)).all() == ['z']" },
+    { name: "All your tests pass (at least 6)", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 6" },
+    { name: "Your tests catch a list_tasks that ignores done", check: "_panda_pytest(patch={'list_tasks': lambda session, project_id, done=None: list_tasks(session, project_id)})['failed'] > 0" },
+    { name: "Your tests catch a delete_project that leaves the tasks behind", check: "_panda_pytest(patch={'delete_project': lambda session, project: [session.execute(__import__('sqlalchemy').delete(Project).where(Project.id == project.id)), session.commit()] and None})['failed'] > 0" },
+  ]}
+>
+
+Finish the storage layer of the Projects API. The models, `create_project`, `get_project`, `list_projects`, `add_task` and the first tests are ready. You write:
+
+1. **The cascade**: deleting a project must delete its tasks.
+2. `delete_project(session, project)`: delete it and commit.
+3. `get_task(session, task_id)`: the `Task`, or `None`.
+4. `list_tasks(session, project_id, done=None)`: the project's tasks sorted by id. If `done` is `True` or `False`, only tasks with that `done` value.
+5. `update_task(session, task, changes)`: `changes` is a dict like `{"done": True}` or `{"title": "Rake", "done": False}`. Set only those fields, commit and **return the task**.
+6. `delete_task(session, task)`: delete it and commit.
+7. A test `test_list_tasks_filters_by_done` that checks `list_tasks` with `done` left out, `True` and `False`. Use **two projects**.
+8. A test `test_delete_project_deletes_its_tasks` that checks the project **and** its tasks are gone.
+
+The checks call your functions directly, and also run **your tests against broken versions** of `list_tasks` and `delete_project`: your tests should fail for those.
+
+<Hint>
+
+Add `cascade="all, delete-orphan"` to `relationship(...)` in `Project`. `get_task` is one line with `session.get(Task, task_id)`. For `list_tasks`, build the statement like `tasks_query` in the lesson, then `return list(session.scalars(stmt.order_by(Task.id)))`. In `update_task`, loop over `changes.items()` and use `setattr(task, field, value)`, then commit. In the delete test, save `project.id` and `task.id` in variables **before** deleting, then check that `get_project(...)` and `get_task(...)` both return `None`.
+
+</Hint>
+
+<Solution>
+
+```python
+import pytest
+from sqlalchemy import ForeignKey, String, create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+
+# ---------- models ----------
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+
+# ---------- repository ----------
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+
+def list_projects(session: Session) -> list[Project]:
+    return list(session.scalars(select(Project).order_by(Project.id)))
+
+
+def delete_project(session: Session, project: Project) -> None:
+    session.delete(project)
+    session.commit()
+
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+
+def get_task(session: Session, task_id: int) -> Task | None:
+    return session.get(Task, task_id)
+
+
+def list_tasks(
+    session: Session, project_id: int, done: bool | None = None
+) -> list[Task]:
+    stmt = select(Task).where(Task.project_id == project_id)
+    if done is not None:
+        stmt = stmt.where(Task.done == done)
+    return list(session.scalars(stmt.order_by(Task.id)))
+
+
+def update_task(session: Session, task: Task, changes: dict) -> Task:
+    for field, value in changes.items():
+        setattr(task, field, value)
+    session.commit()
+    return task
+
+
+def delete_task(session: Session, task: Task) -> None:
+    session.delete(task)
+    session.commit()
+
+
+# ---------- repository tests ----------
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+@pytest.fixture
+def session():
+    with new_session() as session:
+        yield session
+
+
+def test_create_and_get_project(session):
+    project = create_project(session, "Garden")
+    assert project.id == 1
+    assert get_project(session, 1).name == "Garden"
+    assert get_project(session, 99) is None
+
+
+def test_list_projects_in_order(session):
+    create_project(session, "Garden")
+    create_project(session, "Kitchen")
+    names = [p.name for p in list_projects(session)]
+    assert names == ["Garden", "Kitchen"]
+
+
+def test_add_task(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    assert task.done is False
+    assert task.project_id == project.id
+    assert project.tasks == [task]
+
+
+def test_update_task_changes_only_given_fields(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    update_task(session, task, {"done": True})
+    assert (task.title, task.done) == ("Dig", True)
+
+
+def test_list_tasks_filters_by_done(session):
+    garden = create_project(session, "Garden")
+    kitchen = create_project(session, "Kitchen")
+    dig = add_task(session, garden, "Dig")
+    add_task(session, garden, "Plant")
+    add_task(session, kitchen, "Bake")
+    update_task(session, dig, {"done": True})
+
+    def titles(tasks):
+        return [task.title for task in tasks]
+
+    assert titles(list_tasks(session, garden.id)) == ["Dig", "Plant"]
+    assert titles(list_tasks(session, garden.id, True)) == ["Dig"]
+    assert titles(list_tasks(session, garden.id, False)) == ["Plant"]
+
+
+def test_delete_project_deletes_its_tasks(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    project_id, task_id = project.id, task.id
+    delete_project(session, project)
+    assert get_project(session, project_id) is None
+    assert get_task(session, task_id) is None
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- Two **SQLAlchemy models**, `Project` and `Task`, linked one-to-many, with a `done` default and a **cascade** so tasks are deleted with their project.
+- A **repository layer**: small typed functions that take a session, do one job and commit.
+- **Optional filters** built step by step with `.where()`.
+- **Repository tests** with a `session` fixture that gives every test a fresh in-memory database.
+
+Nothing can talk to it over HTTP yet. In **Part 2** we'll put FastAPI on top: Pydantic schemas, one database session per request and all nine endpoints. 🌐

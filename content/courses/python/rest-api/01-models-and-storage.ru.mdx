@@ -1,0 +1,728 @@
+---
+title: "Часть 1: Модели и хранилище"
+description: "Спланируйте REST API для проектов и задач, опишите данные моделями SQLAlchemy, напишите небольшой слой репозитория и протестируйте его с фикстурами pytest."
+duration: 22
+xp: 30
+---
+
+Добро пожаловать в **итоговый проект уровня 2**! 🚀 За три части вы создадите настоящий **REST API для проектов и задач** — такой бэкенд стоит за приложениями для списков дел и планирования проектов. Клиенты будут создавать проекты, добавлять в них задачи, отмечать задачи выполненными и удалять лишнее, а каждый запрос (request) будет проверяться, сохраняться в **базу данных (database)** и покрываться **тестами (tests)**.
+
+В этом проекте пригодится почти всё из уровня 2: **аннотации типов (type hints)** и **декораторы (decorators)**, **pytest** с фикстурами и parametrize, **FastAPI** с Pydantic и `Depends`, а также ORM **SQLAlchemy** со связями. В первой части мы построим нижний слой: **модели базы данных** и набор небольших **функций-репозиториев (repository functions)**, которые читают и записывают эти модели, — вместе с тестами. HTTP пока не будет.
+
+## План
+
+Вот к какому API мы стремимся. У проекта много задач, поэтому списки задач живут **внутри** своего проекта, а к отдельной задаче можно обратиться напрямую по её id:
+
+| Запрос | Что делает | Успех |
+| --- | --- | --- |
+| `POST /projects` | создаёт проект из `{"name": ...}` | 201 + проект |
+| `GET /projects` | возвращает все проекты | 200 + список |
+| `GET /projects/{project_id}` | один проект вместе с его задачами | 200 + проект |
+| `DELETE /projects/{project_id}` | удаляет проект и его задачи | 204 |
+| `POST /projects/{project_id}/tasks` | добавляет задачу из `{"title": ...}` | 201 + задача |
+| `GET /projects/{project_id}/tasks` | задачи проекта, `?done=true` для фильтра | 200 + список |
+| `GET /tasks/{task_id}` | одна задача | 200 + задача |
+| `PATCH /tasks/{task_id}` | меняет `title` и/или `done` | 200 + задача |
+| `DELETE /tasks/{task_id}` | удаляет задачу | 204 |
+
+На неизвестные id API отвечает **404**, на некорректные данные — **422**, совсем как API списка дел. Мы соберём его в три слоя — по одному на каждую часть:
+
+| Часть | Что добавляет | Основные инструменты |
+| --- | --- | --- |
+| 1 | Модели, функции-репозитории и их тесты | SQLAlchemy, фикстуры pytest |
+| 2 | Схемы, сессия на каждый запрос, эндпоинты | FastAPI, Pydantic, `Depends` |
+| 3 | Полный набор тестов API и запуск по-настоящему | `TestClient`, `dependency_overrides`, parametrize |
+
+На вашем компьютере проект был бы разбит на такие файлы. В редакторе всё живёт в **одном файле** в том же порядке, а каждый раздел начинается с комментария-заголовка:
+
+```text
+projects_api/
+├── app/
+│   ├── models.py        Base, Project, Task              (часть 1)
+│   ├── repository.py    create_project, list_tasks, ...  (часть 1)
+│   ├── schemas.py       модели Pydantic                  (часть 2)
+│   ├── database.py      engine, get_session              (часть 2)
+│   └── main.py          приложение FastAPI и эндпоинты   (часть 2)
+└── tests/
+    ├── test_repository.py                                (часть 1)
+    ├── conftest.py      общие фикстуры                   (часть 3)
+    └── test_api.py                                       (часть 3)
+```
+
+<Callout type="tip" title="Зачем нужен слой репозитория?">
+
+Код SQLAlchemy можно было бы писать прямо в эндпоинтах (endpoints). В настоящих проектах так обычно не делают: работу с базой данных держат в небольших функциях вроде `create_project(session, name)`. Эндпоинты остаются короткими и занимаются только HTTP, функции можно тестировать вообще без HTTP, а если способ хранения когда-нибудь поменяется, менять придётся только один файл. Вы уже видели эту идею в [уроке про ORM SQLAlchemy](/learn/python/sqlalchemy-orm): функции, которые принимают **сессию (session) как параметр**.
+
+</Callout>
+
+## Модели
+
+Две таблицы (tables), `projects` и `tasks`, со связью **один-ко-многим (one-to-many)** — в точности как авторы и книги в уроке [Связи и миграции](/learn/python/relationships-and-migrations):
+
+<CodeExample output={`None
+1 False 1
+['Dig', 'Plant']`}>
+
+```python
+from sqlalchemy import ForeignKey, String, create_engine
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    garden = Project(name="Garden")
+    dig = Task(title="Dig", project=garden)
+    Task(title="Plant", project=garden)
+    print(dig.done)
+    session.add(garden)
+    session.commit()
+    print(dig.id, dig.done, dig.project_id)
+    print([task.title for task in garden.tasks])
+```
+
+</CodeExample>
+
+Что нового по сравнению с уроками про базы данных:
+
+- **`String(100)`** и **`String(200)`** задают текстовым столбцам максимальную длину. SQLite её не проверяет, а PostgreSQL и MySQL проверяют, так что хорошая практика — явно указать, чего вы ждёте. (Наш API тоже будет проверять длину.)
+- **`done: Mapped[bool] = mapped_column(default=False)`** задаёт новым задачам значение по умолчанию. Посмотрите на первую строку вывода: значение по умолчанию подставляется, только когда SQLAlchemy **вставляет** строку в таблицу, поэтому до коммита `dig.done` равно `None`. После коммита — `False`.
+- **`cascade="all, delete-orphan"`** у `Project.tasks` говорит, что задачи принадлежат своему проекту. Это важно при удалении — сейчас увидите почему.
+
+## Зачем нужен каскад
+
+Что должно произойти с задачами проекта, когда удаляют сам проект? Вот та же пара моделей, но **без** каскада (cascade):
+
+<CodeExample output={`NOT NULL constraint failed: tasks.project_id`}>
+
+```python
+from sqlalchemy import ForeignKey, create_engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project"            # без каскада
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    garden = Project(name="Garden", tasks=[Task(title="Dig")])
+    session.add(garden)
+    session.commit()
+
+    session.delete(garden)
+    try:
+        session.commit()
+    except IntegrityError as error:
+        print(error.orig)
+```
+
+</CodeExample>
+
+Без каскада SQLAlchemy пытается сохранить задачу и просто отвязать её от проекта, записав `NULL` в её `project_id`. Но `project_id` объявлен как `Mapped[int]`, а это значит `NOT NULL`, поэтому база данных отказывается, и коммит падает. С `cascade="all, delete-orphan"` удаление проекта удаляет и его задачи в той же транзакции (transaction) — именно это и должен делать наш эндпоинт `DELETE /projects/{project_id}`.
+
+## Функции-репозитории
+
+Теперь функции, которые работают с базой данных. Каждая принимает **сессию первым параметром** и снабжена аннотациями типов, так что сразу видно, что она принимает и что возвращает. Функции, которые меняют данные, сами делают **коммит** — так вызывающий код не сможет про него забыть:
+
+<CodeExample output={`['Garden', 'Kitchen']
+Dig
+None`}>
+
+```python
+from sqlalchemy import ForeignKey, String, create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+def list_projects(session: Session) -> list[Project]:
+    return list(session.scalars(select(Project).order_by(Project.id)))
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+with new_session() as session:
+    garden = create_project(session, "Garden")
+    create_project(session, "Kitchen")
+    add_task(session, garden, "Dig")
+    print([project.name for project in list_projects(session)])
+    print(get_project(session, 1).tasks[0].title)
+    print(get_project(session, 99))
+```
+
+</CodeExample>
+
+Несколько деталей:
+
+- `get_project` возвращает **`Project | None`**: что значит «не найдено», решает вызывающий код (позже — эндпоинт). Во второй части это будет 404.
+- `list_projects` сортирует по id. Без `order_by` база данных может вернуть строки в любом порядке, и тесты, которые сравнивают списки, будут падать случайным образом.
+- `add_task` принимает **объект проекта**, а не id, и задаёт `project=project`. `project_id` SQLAlchemy заполнит сама при коммите.
+- **`new_session()`** при каждом вызове создаёт совершенно новую базу данных в памяти. Именно её будут использовать наши тесты.
+
+## Необязательные фильтры
+
+Для `GET /projects/{project_id}/tasks?done=true` нужен запрос (query), у которого часть `WHERE` зависит от аргументов. С запросами SQLAlchemy это просто: каждый `.where()` возвращает **новый** запрос с ещё одним условием, поэтому условия можно добавлять по шагам обычными `if`:
+
+<CodeExample output={`tasks.project_id = :project_id_1
+tasks.project_id = :project_id_1 AND tasks.done = true
+tasks.project_id = :project_id_1 AND tasks.done = false`}>
+
+```python
+from sqlalchemy import ForeignKey, String, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+def tasks_query(project_id: int, done: bool | None = None):
+    stmt = select(Task).where(Task.project_id == project_id)
+    if done is not None:
+        stmt = stmt.where(Task.done == done)
+    return stmt
+
+print(tasks_query(1).whereclause)
+print(tasks_query(1, done=True).whereclause)
+print(tasks_query(1, done=False).whereclause)
+```
+
+</CodeExample>
+
+`.whereclause` показывает часть `WHERE`, которую построила SQLAlchemy (`:project_id_1` — это безопасный параметр, а не текст, вставленный прямо в запрос). Два вызова `.where()` соединяются через `AND`. Обратите внимание: проверка — `done is not None`, а не `if done:`, потому что `done=False` — это настоящий фильтр («только невыполненные задачи»), а не «без фильтра».
+
+## Тестируем репозиторий
+
+Репозиторий — это обычный код на Python, поэтому pytest может тестировать его напрямую. Пригодится приём из урока [Фикстуры и параметризация](/learn/python/fixtures-and-parametrize) — фикстура (fixture) `session` с `yield`: каждый тест получает сессию на **свежей пустой базе данных**, а после теста сессия закрывается:
+
+<CodeExample output={`...                                                  [100%]
+3 passed in 0.01s`}>
+
+```python
+import pytest
+from sqlalchemy import ForeignKey, String, create_engine
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+@pytest.fixture
+def session():
+    with new_session() as session:
+        yield session
+
+def test_create_and_get_project(session):
+    project = create_project(session, "Garden")
+    assert project.id == 1
+    assert get_project(session, 1).name == "Garden"
+    assert get_project(session, 99) is None
+
+def test_each_test_gets_an_empty_database(session):
+    project = create_project(session, "Kitchen")
+    assert project.id == 1
+
+def test_add_task(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    assert task.done is False
+    assert task.project_id == project.id
+    assert project.tasks == [task]
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+`test_each_test_gets_an_empty_database` доказывает изоляцию: первый тест уже создал проект, но здесь новый проект снова получает id `1`. Так происходит потому, что `new_session()` создаёт **новый движок (engine)** для каждого теста, а база SQLite в памяти (`"sqlite://"`) живёт ровно столько, сколько её соединение. Новый движок — новая пустая база.
+
+<Callout type="warning" title="Проверяйте то, что сломала бы ошибка">
+
+`test_add_task` проверяет значение `done` по умолчанию, внешний ключ (foreign key) **и** связь (relationship). Хороший тест задаётся вопросом «что здесь может пойти не так?» и проверяет именно это. Для `list_tasks` это значит, что в базе должны лежать задачи обоих проектов — тогда забытый `WHERE project_id = ...` будет пойман. Для `delete_project` — что проверяется исчезновение и **задач**, а не только самого проекта.
+
+</Callout>
+
+<Quiz
+  question="Project.tasks — это relationship(back_populates='project') без каскада, а Task.project_id — Mapped[int]. Вы вызываете session.delete(project) для проекта с 3 задачами, а затем session.commit(). Что произойдёт?"
+  options={["Проект и его 3 задачи удалятся", "Удалится только проект, а задачи продолжат на него ссылаться", "Коммит упадёт с IntegrityError, потому что SQLAlchemy попытается записать NULL в project_id задач", "SQLAlchemy спросит, какие задачи удалить"]}
+  answer={2}
+  explanation="Без каскада SQLAlchemy оставляет задачи и отвязывает их, записывая NULL в project_id. Mapped[int] означает NOT NULL, поэтому база данных отказывается. С cascade='all, delete-orphan' задачи удаляются вместе со своим проектом."
+/>
+
+<Exercise
+  language="python"
+  title="Соберите: модели и репозиторий"
+  starter={`import pytest
+from sqlalchemy import ForeignKey, String, create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+
+# ---------- модели ----------
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    # TODO 1: при удалении проекта должны удаляться и его задачи
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project"
+    )
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+
+# ---------- репозиторий ----------
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+
+def list_projects(session: Session) -> list[Project]:
+    return list(session.scalars(select(Project).order_by(Project.id)))
+
+
+def delete_project(session: Session, project: Project) -> None:
+    # TODO 2: удалите проект (а с ним и его задачи) и сохраните
+    pass
+
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+
+def get_task(session: Session, task_id: int) -> Task | None:
+    # TODO 3: задача с этим id или None
+    pass
+
+
+def list_tasks(
+    session: Session, project_id: int, done: bool | None = None
+) -> list[Task]:
+    # TODO 4: задачи проекта по порядку id; если done равно True
+    #         или False, то только задачи с таким значением done
+    pass
+
+
+def update_task(session: Session, task: Task, changes: dict) -> Task:
+    # TODO 5: задайте каждое поле из changes, например {"done": True},
+    #         сохраните и верните задачу
+    pass
+
+
+def delete_task(session: Session, task: Task) -> None:
+    # TODO 6: удалите задачу и сохраните
+    pass
+
+
+# ---------- тесты репозитория ----------
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+@pytest.fixture
+def session():
+    with new_session() as session:
+        yield session
+
+
+def test_create_and_get_project(session):
+    project = create_project(session, "Garden")
+    assert project.id == 1
+    assert get_project(session, 1).name == "Garden"
+    assert get_project(session, 99) is None
+
+
+def test_list_projects_in_order(session):
+    create_project(session, "Garden")
+    create_project(session, "Kitchen")
+    names = [p.name for p in list_projects(session)]
+    assert names == ["Garden", "Kitchen"]
+
+
+def test_add_task(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    assert task.done is False
+    assert task.project_id == project.id
+    assert project.tasks == [task]
+
+
+def test_update_task_changes_only_given_fields(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    update_task(session, task, {"done": True})
+    assert (task.title, task.done) == ("Dig", True)
+
+
+# TODO 7: test_list_tasks_filters_by_done: list_tasks с
+#         done=None, True и False (возьмите два проекта)
+
+
+# TODO 8: test_delete_project_deletes_its_tasks
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "get_task находит задачу по id или возвращает None", check: "[s := new_session(), a := create_project(s, 'A'), t := add_task(s, a, 'Dig')] and get_task(s, t.id) is t and get_task(s, 99) is None" },
+    { name: "list_tasks возвращает задачи одного проекта по порядку id", check: "[s := new_session(), a := create_project(s, 'A'), b := create_project(s, 'B'), add_task(s, a, 'one'), add_task(s, b, 'other'), add_task(s, a, 'two')] and [t.title for t in list_tasks(s, a.id)] == ['one', 'two'] and [t.title for t in list_tasks(s, b.id)] == ['other'] and list_tasks(s, 99) == []" },
+    { name: "list_tasks фильтрует по done (True, False или None)", check: "[s := new_session(), a := create_project(s, 'A'), t1 := add_task(s, a, 'one'), t2 := add_task(s, a, 'two'), t3 := add_task(s, a, 'three'), setattr(t2, 'done', True), s.commit()] and [t.id for t in list_tasks(s, a.id, True)] == [t2.id] and [t.id for t in list_tasks(s, a.id, False)] == [t1.id, t3.id] and len(list_tasks(s, a.id, None)) == 3" },
+    { name: "update_task меняет только переданные поля и сохраняет их", check: "[s := new_session(), a := create_project(s, 'A'), t := add_task(s, a, 'Dig'), r := update_task(s, t, {'done': True}), s.rollback()] and r is t and (t.title, t.done) == ('Dig', True) and [update_task(s, t, {'title': 'Rake'}), s.rollback()] and (t.title, t.done) == ('Rake', True)" },
+    { name: "delete_task удаляет задачу и сохраняет изменения", check: "[s := new_session(), a := create_project(s, 'A'), t := add_task(s, a, 'Dig'), add_task(s, a, 'Keep'), tid := t.id, delete_task(s, t), s.rollback()] and s.get(Task, tid) is None and s.scalars(select(Task.title)).all() == ['Keep']" },
+    { name: "delete_project удаляет проект и его задачи", check: "[s := new_session(), a := create_project(s, 'A'), b := create_project(s, 'B'), add_task(s, a, 'x'), add_task(s, a, 'y'), add_task(s, b, 'z'), delete_project(s, a), s.rollback()] and s.scalars(select(Project.name)).all() == ['B'] and s.scalars(select(Task.title)).all() == ['z']" },
+    { name: "Все ваши тесты проходят (не меньше 6)", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 6" },
+    { name: "Ваши тесты ловят list_tasks, который игнорирует done", check: "_panda_pytest(patch={'list_tasks': lambda session, project_id, done=None: list_tasks(session, project_id)})['failed'] > 0" },
+    { name: "Ваши тесты ловят delete_project, который оставляет задачи", check: "_panda_pytest(patch={'delete_project': lambda session, project: [session.execute(__import__('sqlalchemy').delete(Project).where(Project.id == project.id)), session.commit()] and None})['failed'] > 0" },
+  ]}
+>
+
+Закончите слой хранения для Projects API. Модели, `create_project`, `get_project`, `list_projects`, `add_task` и первые тесты уже готовы. Вам нужно написать:
+
+1. **Каскад**: при удалении проекта должны удаляться его задачи.
+2. `delete_project(session, project)`: удалить проект и сделать коммит.
+3. `get_task(session, task_id)`: вернуть `Task` или `None`.
+4. `list_tasks(session, project_id, done=None)`: задачи проекта, отсортированные по id. Если `done` равно `True` или `False` — только задачи с таким значением `done`.
+5. `update_task(session, task, changes)`: `changes` — словарь вроде `{"done": True}` или `{"title": "Rake", "done": False}`. Задайте только эти поля, сделайте коммит и **верните задачу**.
+6. `delete_task(session, task)`: удалить задачу и сделать коммит.
+7. Тест `test_list_tasks_filters_by_done`, который проверяет `list_tasks` без `done`, с `True` и с `False`. Используйте **два проекта**.
+8. Тест `test_delete_project_deletes_its_tasks`, который проверяет, что исчезли и проект, **и** его задачи.
+
+Проверки вызывают ваши функции напрямую, а ещё запускают **ваши тесты на сломанных версиях** `list_tasks` и `delete_project`: на них ваши тесты должны падать.
+
+<Hint>
+
+Добавьте `cascade="all, delete-orphan"` в `relationship(...)` внутри `Project`. `get_task` — одна строка с `session.get(Task, task_id)`. Для `list_tasks` постройте запрос как `tasks_query` из урока, а затем `return list(session.scalars(stmt.order_by(Task.id)))`. В `update_task` пройдите циклом по `changes.items()`, используйте `setattr(task, field, value)` и сделайте коммит. В тесте на удаление сохраните `project.id` и `task.id` в переменные **до** удаления, а потом проверьте, что и `get_project(...)`, и `get_task(...)` возвращают `None`.
+
+</Hint>
+
+<Solution>
+
+```python
+import pytest
+from sqlalchemy import ForeignKey, String, create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, relationship,
+)
+
+
+# ---------- модели ----------
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    tasks: Mapped[list["Task"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    done: Mapped[bool] = mapped_column(default=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    project: Mapped["Project"] = relationship(back_populates="tasks")
+
+
+# ---------- репозиторий ----------
+
+def create_project(session: Session, name: str) -> Project:
+    project = Project(name=name)
+    session.add(project)
+    session.commit()
+    return project
+
+
+def get_project(session: Session, project_id: int) -> Project | None:
+    return session.get(Project, project_id)
+
+
+def list_projects(session: Session) -> list[Project]:
+    return list(session.scalars(select(Project).order_by(Project.id)))
+
+
+def delete_project(session: Session, project: Project) -> None:
+    session.delete(project)
+    session.commit()
+
+
+def add_task(session: Session, project: Project, title: str) -> Task:
+    task = Task(title=title, project=project)
+    session.add(task)
+    session.commit()
+    return task
+
+
+def get_task(session: Session, task_id: int) -> Task | None:
+    return session.get(Task, task_id)
+
+
+def list_tasks(
+    session: Session, project_id: int, done: bool | None = None
+) -> list[Task]:
+    stmt = select(Task).where(Task.project_id == project_id)
+    if done is not None:
+        stmt = stmt.where(Task.done == done)
+    return list(session.scalars(stmt.order_by(Task.id)))
+
+
+def update_task(session: Session, task: Task, changes: dict) -> Task:
+    for field, value in changes.items():
+        setattr(task, field, value)
+    session.commit()
+    return task
+
+
+def delete_task(session: Session, task: Task) -> None:
+    session.delete(task)
+    session.commit()
+
+
+# ---------- тесты репозитория ----------
+
+def new_session() -> Session:
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+@pytest.fixture
+def session():
+    with new_session() as session:
+        yield session
+
+
+def test_create_and_get_project(session):
+    project = create_project(session, "Garden")
+    assert project.id == 1
+    assert get_project(session, 1).name == "Garden"
+    assert get_project(session, 99) is None
+
+
+def test_list_projects_in_order(session):
+    create_project(session, "Garden")
+    create_project(session, "Kitchen")
+    names = [p.name for p in list_projects(session)]
+    assert names == ["Garden", "Kitchen"]
+
+
+def test_add_task(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    assert task.done is False
+    assert task.project_id == project.id
+    assert project.tasks == [task]
+
+
+def test_update_task_changes_only_given_fields(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    update_task(session, task, {"done": True})
+    assert (task.title, task.done) == ("Dig", True)
+
+
+def test_list_tasks_filters_by_done(session):
+    garden = create_project(session, "Garden")
+    kitchen = create_project(session, "Kitchen")
+    dig = add_task(session, garden, "Dig")
+    add_task(session, garden, "Plant")
+    add_task(session, kitchen, "Bake")
+    update_task(session, dig, {"done": True})
+
+    def titles(tasks):
+        return [task.title for task in tasks]
+
+    assert titles(list_tasks(session, garden.id)) == ["Dig", "Plant"]
+    assert titles(list_tasks(session, garden.id, True)) == ["Dig"]
+    assert titles(list_tasks(session, garden.id, False)) == ["Plant"]
+
+
+def test_delete_project_deletes_its_tasks(session):
+    project = create_project(session, "Garden")
+    task = add_task(session, project, "Dig")
+    project_id, task_id = project.id, task.id
+    delete_project(session, project)
+    assert get_project(session, project_id) is None
+    assert get_task(session, task_id) is None
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- Две **модели SQLAlchemy**, `Project` и `Task`, со связью один-ко-многим, значением `done` по умолчанию и **каскадом**, благодаря которому задачи удаляются вместе с проектом.
+- **Слой репозитория**: небольшие типизированные функции, которые принимают сессию, делают одно дело и сохраняют результат коммитом.
+- **Необязательные фильтры**, построенные по шагам через `.where()`.
+- **Тесты репозитория** с фикстурой `session`, которая даёт каждому тесту свежую базу данных в памяти.
+
+Поговорить с этим кодом по HTTP пока нельзя. Во **второй части** мы надстроим над ним FastAPI: схемы Pydantic, по одной сессии базы данных на запрос и все девять эндпоинтов. 🌐

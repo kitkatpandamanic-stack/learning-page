@@ -1,0 +1,436 @@
+---
+title: The SQLAlchemy ORM
+description: Map Python classes to database tables with SQLAlchemy 2.0 and create, query, update and delete rows without writing SQL by hand.
+duration: 18
+xp: 25
+---
+
+Raw SQL works, but in a big app it gets repetitive: you write the same `INSERT` strings again and again, rows come back as plain tuples, and a typo in a column name only shows up when that line runs. An **ORM** (Object-Relational Mapper) lets you work with **Python objects** instead, and writes the SQL for you. 🧩
+
+**SQLAlchemy** is the most popular database toolkit for Python. It's what FastAPI projects usually use, and it works with SQLite, PostgreSQL, MySQL and more. This lesson uses the modern **SQLAlchemy 2.0** style.
+
+## Why an ORM?
+
+With an ORM, a **class** describes a table, and each **object** of that class is one row:
+
+- `Book(title="Dune")` instead of `INSERT INTO books ...`
+- `book.title` instead of `row[1]`
+- `select(Book).where(Book.pages > 300)` instead of a hand-written string (still with safe parameters, so no SQL injection)
+- the same code works on SQLite in your tests and PostgreSQL in production
+
+You still need to understand SQL (it's what runs underneath, and you'll read it when debugging), but you write much less of it.
+
+## Defining a model
+
+A **model** is a class that inherits from your project's `DeclarativeBase`. Each attribute annotated with **`Mapped[...]`** becomes a column:
+
+<CodeExample output={`Book(id=None, title='Dune')
+Book(id=1, title='Dune')`}>
+
+```python
+from sqlalchemy import create_engine, String
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Book(Base):
+    __tablename__ = "books"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    author: Mapped[str]
+    year: Mapped[int | None]    # NULL allowed
+
+    def __repr__(self):
+        return f"Book(id={self.id}, title={self.title!r})"
+
+engine = create_engine("sqlite://")   # in-memory SQLite
+Base.metadata.create_all(engine)      # CREATE TABLE books ...
+
+with Session(engine) as session:
+    dune = Book(title="Dune", author="Frank Herbert", year=1965)
+    print(dune)
+    session.add(dune)
+    session.commit()
+    print(dune)
+```
+
+</CodeExample>
+
+Step by step:
+
+- **`class Base(DeclarativeBase)`**: every project makes one base class; all models inherit from it, and it keeps a list of their tables in `Base.metadata`.
+- **`__tablename__`** is the table's name in the database.
+- **`Mapped[int]`** uses the type hint to pick the column type. `Mapped[str]` is required (`NOT NULL`); `Mapped[int | None]` may be empty (`NULL`).
+- **`mapped_column(...)`** adds extra settings: `primary_key=True`, a maximum length with `String(200)`, `default=...`, `unique=True`, `index=True`. Leave it out when you don't need any.
+- **`create_engine("sqlite://")`**: the **engine** knows how to connect to the database. In a real app the URL would be a file or server, like `"sqlite:///library.db"` or `"postgresql+psycopg://user:pw@host/db"`.
+- **`Base.metadata.create_all(engine)`** creates every table that doesn't exist yet. SQLAlchemy writes SQL like this for you:
+
+```sql
+CREATE TABLE books (
+    id INTEGER NOT NULL,
+    title VARCHAR(200) NOT NULL,
+    author VARCHAR NOT NULL,
+    year INTEGER,
+    PRIMARY KEY (id)
+)
+```
+
+You also get a free `__init__` that takes the columns as keyword arguments. Writing a `__repr__` is optional, but it makes printing objects (and debugging) much nicer.
+
+## The Session: add and commit
+
+You talk to the database through a **`Session`**. Think of it as a shopping basket: `session.add(obj)` puts new or changed objects in the basket, and **`session.commit()`** sends everything to the database in one transaction. Notice above that `dune.id` was `None` until the commit; then the database gave it id `1` and SQLAlchemy filled it in.
+
+`with Session(engine) as session:` closes the session at the end of the block. Anything you didn't commit is **thrown away**:
+
+<CodeExample output={`[]
+['Emma']`}>
+
+```python
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    session.add(Book(title="Dune"))
+    # oops: no session.commit()
+
+with Session(engine) as session:
+    print(session.scalars(select(Book)).all())
+
+with Session(engine) as session:
+    session.add(Book(title="Emma"))
+    session.commit()
+
+with Session(engine) as session:
+    print(session.scalars(select(Book.title)).all())
+```
+
+</CodeExample>
+
+<Callout type="warning" title="Forgot to commit?">
+
+The most common ORM bug: your code runs without errors, but the data never shows up later. If you `add()` or change objects, you must `session.commit()`. If something goes wrong halfway, `session.rollback()` (or just leaving the `with` block with an exception) cancels the whole transaction, exactly like `with conn:` did in sqlite3.
+
+</Callout>
+
+## Querying with select()
+
+To read data, build a statement with **`select()`** and run it with **`session.scalars()`**. You chain `.where()`, `.order_by()` and `.limit()`, and use the model's attributes in normal Python comparisons:
+
+<CodeExample output={`[Book('The BFG', 208), Book('Matilda', 240), Book('Dune', 412)]
+Book('Matilda', 240)
+Book('Emma', 474)
+None
+['Dune', 'Emma', 'Matilda', 'The BFG']
+4`}>
+
+```python
+from sqlalchemy import create_engine, select, func
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    author: Mapped[str]
+    pages: Mapped[int]
+
+    def __repr__(self):
+        return f"Book({self.title!r}, {self.pages})"
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    session.add_all([
+        Book(title="Dune", author="Frank Herbert", pages=412),
+        Book(title="Emma", author="Jane Austen", pages=474),
+        Book(title="Matilda", author="Roald Dahl", pages=240),
+        Book(title="The BFG", author="Roald Dahl", pages=208),
+    ])
+    session.commit()
+
+    stmt = select(Book).where(Book.pages < 450).order_by(Book.pages)
+    print(session.scalars(stmt).all())
+
+    dahl = select(Book).where(Book.author == "Roald Dahl")
+    print(session.scalars(dahl.limit(1)).first())
+
+    print(session.get(Book, 2))
+    print(session.get(Book, 99))
+
+    titles = session.scalars(select(Book.title)).all()
+    print(titles)
+
+    count = session.scalar(select(func.count()).select_from(Book))
+    print(count)
+```
+
+</CodeExample>
+
+- **`session.scalars(stmt)`** runs the query and gives you the objects; `.all()` makes a list, `.first()` gives the first one (or `None`). You can also loop over it directly.
+- **`session.get(Book, 2)`** is the quick way to load one row **by primary key**. It returns `None` if it doesn't exist.
+- `select(Book.title)` selects just one column, so you get plain strings back.
+- **`func`** gives you SQL functions: `func.count()`, `func.sum(Book.pages)`, `func.avg(...)`. **`session.scalar()`** (no s) returns a single value.
+- More filters: `Book.title.like("D%")`, `Book.id.in_([1, 3])`, `Book.year.is_(None)`, several conditions with `.where(a, b)` (both must be true), and `.order_by(Book.pages.desc())` for largest first.
+
+## Updating and deleting
+
+To **update** a row, load the object, change its attributes and commit: SQLAlchemy notices what changed and writes the `UPDATE`. To **delete**, pass the object to **`session.delete()`**. For changes to many rows at once, run an `update()` or `delete()` statement with `session.execute()`:
+
+<CodeExample output={`updated: 2
+1 Dune (deluxe) 422
+2 Emma 484`}>
+
+```python
+from sqlalchemy import create_engine, select, update, delete
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    pages: Mapped[int]
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    session.add_all([Book(title="Dune", pages=412),
+                     Book(title="Emma", pages=474),
+                     Book(title="Up", pages=48)])
+    session.commit()
+
+    dune = session.get(Book, 1)
+    dune.title = "Dune (deluxe)"   # just change it
+    session.delete(session.get(Book, 3))
+    session.commit()
+
+    result = session.execute(
+        update(Book).values(pages=Book.pages + 10)
+    )
+    print("updated:", result.rowcount)
+    session.commit()
+
+    for book in session.scalars(select(Book)):
+        print(book.id, book.title, book.pages)
+```
+
+</CodeExample>
+
+`delete(Book).where(Book.pages < 100)` works the same way as the `update()` statement. As with raw SQL, an `update()` or `delete()` statement **without** `.where()` affects every row.
+
+<Callout type="tip" title="How real projects organise this">
+
+In a real app, the models live in `models.py`, the engine is created once in `database.py`, and you write small functions like `get_book(session, book_id)` that take a session as a parameter. Then a FastAPI endpoint can pass in a session for each request, and a test can pass in a session for a fresh in-memory database. You'll build exactly that in the capstone.
+
+</Callout>
+
+<Quiz
+  question="You run session.add(Book(title='Dune')) inside with Session(engine) as session:, but never call session.commit(). What happens to the book when the block ends?"
+  options={[
+    "It is saved automatically when the session closes",
+    "It is thrown away, because the transaction is rolled back",
+    "It stays in memory and is saved by the next session",
+    "SQLAlchemy raises an error about the missing commit",
+  ]}
+  answer={1}
+  explanation="Closing a session rolls back anything that wasn't committed, without an error. Always call session.commit() after adding or changing objects."
+/>
+
+<Quiz
+  question="Which call is the simplest way to load the book with primary key 5, returning None if it doesn't exist?"
+  options={[
+    "session.get(Book, 5)",
+    "session.scalars(select(Book)).all()[5]",
+    "Book.get(5)",
+    "session.execute('SELECT * FROM books WHERE id = 5')",
+  ]}
+  answer={0}
+  explanation="session.get(Model, primary_key) loads one object by its primary key or returns None. Indexing a list of all books would load every row and use the list position, not the id."
+/>
+
+<Exercise
+  language="python"
+  title="Movie watchlist"
+  starter={`from sqlalchemy import create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+
+# 1. Movie model: table "movies" with id (primary key),
+#    title (str), year (int) and rating (int or None)
+
+
+def new_session():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+def add_movie(session, title, year):
+    # create a Movie (no rating yet), commit, return it
+    pass
+
+
+def rate_movie(session, movie_id, rating):
+    # set the rating and commit; return False if no such movie
+    pass
+
+
+def top_rated(session, limit):
+    # titles of rated movies, best first (ties: A-Z by title)
+    pass
+
+
+def delete_movie(session, movie_id):
+    # delete and commit; return False if no such movie
+    pass
+
+
+# Once Movie exists, remove the # signs to try it:
+# with new_session() as session:
+#     up = add_movie(session, "Up", 2009)
+#     add_movie(session, "Coco", 2017)
+#     rate_movie(session, up.id, 8)
+#     print(top_rated(session, 5))
+`}
+  tests={[
+    { name: "Movie maps to a movies table with the right columns", check: "Movie.__tablename__ == 'movies' and {'id', 'title', 'year', 'rating'} <= set(Movie.__table__.columns.keys())" },
+    { name: "add_movie returns the saved movie with an id", check: "[s := new_session(), m := add_movie(s, 'Up', 2009)] and m.id == 1 and m.title == 'Up' and m.year == 2009 and m.rating is None and add_movie(s, 'Coco', 2017).id == 2" },
+    { name: "add_movie commits", check: "[s := new_session(), add_movie(s, 'Up', 2009), s.rollback()] and s.scalars(select(Movie.title)).all() == ['Up']" },
+    { name: "rate_movie saves the rating, or returns False", check: "[s := new_session(), add_movie(s, 'Up', 2009), add_movie(s, 'Coco', 2017), rate_movie(s, 2, 9), rate_movie(s, 42, 5), s.rollback()][3:5] == [True, False] and s.get(Movie, 2).rating == 9 and s.get(Movie, 1).rating is None" },
+    { name: "top_rated sorts, skips unrated movies and limits", check: "[s := new_session()] + [add_movie(s, t, 2000) for t in ['Up', 'Coco', 'Cars', 'Soul', 'Luca']] + [rate_movie(s, i, r) for i, r in [(1, 8), (2, 9), (4, 8), (5, 6)]] and top_rated(s, 3) == ['Coco', 'Soul', 'Up'] and top_rated(s, 10) == ['Coco', 'Soul', 'Up', 'Luca']" },
+    { name: "delete_movie deletes and commits", check: "[s := new_session(), add_movie(s, 'Up', 2009), add_movie(s, 'Coco', 2017), d1 := delete_movie(s, 1), d2 := delete_movie(s, 1), s.rollback()] and (d1, d2) == (True, False) and s.scalars(select(Movie.title)).all() == ['Coco']" },
+  ]}
+>
+
+Build the data layer for a **movie watchlist** with the ORM. Each function receives a `session` (the checks make a fresh one with `new_session()` every time).
+
+1. Write a `Movie` model for the table `"movies"`: `id` (primary key), `title` (`str`), `year` (`int`) and `rating` (`int | None`, empty until the movie is rated).
+2. `add_movie(session, title, year)`: create the movie, commit, and return the `Movie` object.
+3. `rate_movie(session, movie_id, rating)`: set its rating and commit. Return `True`, or `False` if there's no movie with that id.
+4. `top_rated(session, limit)`: return a list of up to `limit` **titles** of rated movies, highest rating first; equal ratings are sorted by title.
+5. `delete_movie(session, movie_id)`: delete the movie and commit. Return `True`, or `False` if it doesn't exist.
+
+<Hint>
+
+Copy the shape of the `Book` model: `rating: Mapped[int | None]`. Use `session.get(Movie, movie_id)` to load one movie and check for `None` first. For `top_rated`, build `select(Movie.title).where(Movie.rating.is_not(None)).order_by(Movie.rating.desc(), Movie.title).limit(limit)` and turn `session.scalars(...)` into a list.
+
+</Hint>
+
+<Solution>
+
+```python
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Movie(Base):
+    __tablename__ = "movies"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    year: Mapped[int]
+    rating: Mapped[int | None]
+
+    def __repr__(self):
+        return f"Movie({self.title!r}, rating={self.rating})"
+
+
+def new_session():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+def add_movie(session, title, year):
+    movie = Movie(title=title, year=year)
+    session.add(movie)
+    session.commit()
+    return movie
+
+
+def rate_movie(session, movie_id, rating):
+    movie = session.get(Movie, movie_id)
+    if movie is None:
+        return False
+    movie.rating = rating
+    session.commit()
+    return True
+
+
+def top_rated(session, limit):
+    stmt = (
+        select(Movie.title)
+        .where(Movie.rating.is_not(None))
+        .order_by(Movie.rating.desc(), Movie.title)
+        .limit(limit)
+    )
+    return list(session.scalars(stmt))
+
+
+def delete_movie(session, movie_id):
+    movie = session.get(Movie, movie_id)
+    if movie is None:
+        return False
+    session.delete(movie)
+    session.commit()
+    return True
+
+
+with new_session() as session:
+    up = add_movie(session, "Up", 2009)
+    add_movie(session, "Coco", 2017)
+    rate_movie(session, up.id, 8)
+    print(top_rated(session, 5))
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- An **ORM** maps classes to tables and objects to rows, writes the SQL for you and always uses safe parameters.
+- Models inherit from a `DeclarativeBase` subclass; columns are `Mapped[type]`, with `mapped_column()` for options like `primary_key=True`. `Mapped[int | None]` allows `NULL`.
+- `create_engine(url)` connects; `Base.metadata.create_all(engine)` creates the tables.
+- Work inside `with Session(engine) as session:`: `add()` / `add_all()`, then **`commit()`**. Uncommitted work is rolled back.
+- Read with `session.scalars(select(Model).where(...).order_by(...).limit(...))`, one row by key with `session.get(Model, id)`, single values with `session.scalar()`.
+- Update by changing attributes and committing; delete with `session.delete(obj)`; bulk changes with `update()` / `delete()` statements in `session.execute()`.

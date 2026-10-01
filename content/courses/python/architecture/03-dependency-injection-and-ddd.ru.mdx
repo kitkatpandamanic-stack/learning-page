@@ -1,0 +1,831 @@
+---
+title: Внедрение зависимостей и предметно-ориентированное проектирование
+description: Передавайте помощников через конструктор, связывайте их в корне композиции и через Depends в FastAPI, моделируйте домен сущностями, объектами-значениями, агрегатами и доменными событиями.
+duration: 25
+xp: 30
+---
+
+У вас уже есть слои, репозитории и единицы работы. Осталось два вопроса. Первый: **кто создаёт все эти объекты и соединяет их друг с другом?** Это **внедрение зависимостей (dependency injection)**, и в Python для него не нужен фреймворк. Второй: **как должны выглядеть объекты домена в центре?** Здесь помогает облегчённая версия **предметно-ориентированного проектирования (domain-driven design, DDD)**. К концу урока вы превратите запутанный кусок кода в маленькие внедряемые части, которые приятно тестировать. 🧩
+
+## Жёстко зашитые зависимости
+
+Вот функция, которую можно встретить во множестве настоящих проектов:
+
+```python
+SUBSCRIPTIONS = {}                      # глобальная «база данных»
+
+def start_trial(email):
+    if email in SUBSCRIPTIONS:
+        raise KeyError("уже есть подписка")
+    ends = datetime.now() + timedelta(days=14)   # настоящие часы
+    SUBSCRIPTIONS[email] = {"email": email, "trial_ends": ends}
+    smtp_send(email, "Добро пожаловать!")        # настоящее письмо
+    return SUBSCRIPTIONS[email]
+```
+
+Она работает. А теперь попробуйте её протестировать. Дата окончания пробного периода меняется при каждом запуске теста, так что проверить её нельзя. Каждый запуск тестов отправлял бы настоящее письмо (или вы подменяете `smtp_send` через `patch` по пути импорта, и это ломается, как только кто-то переносит функцию). А `SUBSCRIPTIONS` общий для всех тестов, поэтому тесты начинают зависеть от порядка запуска. Функция **сама тянется** за своими зависимостями: за часами, почтовым сервером, хранилищем.
+
+**Внедрение зависимостей** (DI) переворачивает это: код **получает** то, что ему нужно, вместо того чтобы создавать или импортировать это сам.
+
+## Внедрение через конструктор
+
+Самая распространённая форма — **внедрение через конструктор (constructor injection)**: класс принимает своих помощников как параметры `__init__` и сохраняет их. Даже часы — просто параметр, функция, которая возвращает текущее время:
+
+<CodeExample output={`1
+[('sam@example.com', 'Счёт 2 просрочен')]
+2`}>
+
+```python
+from datetime import datetime, timedelta
+from typing import Callable, Protocol
+
+class Mailer(Protocol):
+    def send(self, to: str, subject: str) -> None: ...
+
+class ReminderService:
+    def __init__(self, mailer: Mailer,
+                 clock: Callable[[], datetime]):
+        self.mailer = mailer
+        self.clock = clock
+
+    def remind(self, invoices: list[dict]) -> int:
+        today = self.clock().date()
+        late = [i for i in invoices if i["due"] < today]
+        for invoice in late:
+            self.mailer.send(invoice["email"],
+                             f"Счёт {invoice['id']} просрочен")
+        return len(late)
+
+# --- в тесте: фейки вместо SMTP и настоящих часов ---
+class FakeMailer:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, to, subject):
+        self.sent.append((to, subject))
+
+mailer = FakeMailer()
+now = datetime(2026, 3, 10, 9, 0)
+service = ReminderService(mailer, clock=lambda: now)
+invoices = [
+    {"id": 1, "email": "mei@example.com", "due": now.date()},
+    {"id": 2, "email": "sam@example.com",
+     "due": (now - timedelta(days=3)).date()},
+]
+print(service.remind(invoices))
+print(mailer.sent)
+now += timedelta(days=1)          # путешествие во времени, бесплатно
+print(service.remind(invoices))
+```
+
+</CodeExample>
+
+Сервис никогда не импортирует `smtplib` и не вызывает `datetime.now()`. В продакшене вы передаёте `SmtpMailer(...)` и `datetime.now` (саму функцию, без скобок), в тестах — `FakeMailer` и `lambda: now`. Лямбда ищет `now` при каждом вызове, поэтому если сдвинуть `now` на день вперёд, счёт 1 тоже становится просроченным: проверка «что будет завтра» занимает одну строку.
+
+Внедрение через конструктор ещё и делает зависимости **честными**: всё, что нужно классу, видно в его `__init__`. Если этот список разрастается больше чем до четырёх-пяти пунктов, класс, вероятно, делает слишком много (тот самый признак нарушения единственной ответственности из первого урока).
+
+<Callout type="warning" title="Осторожно с аргументами по умолчанию">
+
+`def __init__(self, clock=datetime.now)` — удобное сокращение для дешёвого значения по умолчанию. Но `def __init__(self, mailer=SmtpMailer("mail.example.com"))` создаёт **один** объект отправки писем в момент определения класса, при импорте, и делит его между всеми экземплярами вместе с соединением. Значения по умолчанию вычисляются один раз. Оставляйте в значениях по умолчанию простые значения и функции, а настоящие ресурсы создавайте в корне композиции.
+
+</Callout>
+
+## Корень композиции
+
+Если каждый класс получает свои зависимости, *кто-то* всё равно должен их создать. Этот кто-то — **корень композиции (composition root)**: одно место, обычно функция в `main.py` или фабрика `create_app()`, которое читает настройки, выбирает конкретные классы и соединяет их. Это единственное место, которое знает обо всех конкретных классах:
+
+<CodeExample output={`ConsoleMailer SmtpMailer
+mail.example.com
+[почта] mei@example.com: Привет из dev`}>
+
+```python
+from dataclasses import dataclass
+from datetime import datetime
+
+class ConsoleMailer:
+    def send(self, to, subject):
+        print(f"[почта] {to}: {subject}")
+
+class SmtpMailer:
+    def __init__(self, host: str):
+        self.host = host
+
+    def send(self, to, subject):
+        ...  # smtplib.SMTP(self.host).sendmail(...)
+
+class ReminderService:
+    def __init__(self, mailer, clock):
+        self.mailer = mailer
+        self.clock = clock
+
+@dataclass
+class Settings:
+    env: str = "dev"
+    smtp_host: str = "localhost"
+
+def build_reminders(settings: Settings) -> ReminderService:
+    """Корень композиции: ЕДИНСТВЕННОЕ место, которое выбирает
+    конкретные классы и соединяет их."""
+    if settings.env == "prod":
+        mailer = SmtpMailer(settings.smtp_host)
+    else:
+        mailer = ConsoleMailer()
+    return ReminderService(mailer=mailer, clock=datetime.now)
+
+dev = build_reminders(Settings())
+prod = build_reminders(Settings("prod", "mail.example.com"))
+print(type(dev.mailer).__name__, type(prod.mailer).__name__)
+print(prod.mailer.host)
+dev.mailer.send("mei@example.com", "Привет из dev")
+```
+
+</CodeExample>
+
+Весь остальной код зависит от протоколов и получает объекты; только `build_reminders` говорит: «в продакшене почта идёт через SMTP». Перейти на другой почтовый сервис или выводить письма в консоль на ноутбуке разработчика — это изменение в одной функции.
+
+Разработчики на Java и C# часто берут **DI-контейнер** — библиотеку, которая собирает граф объектов автоматически по аннотациям типов. В Python такие тоже есть (`dependency-injector`, `lagom`, `punq`), но большинству Python-команд они не нужны: обычную функцию, которая вызывает конструкторы, проще читать и отлаживать, а в FastAPI уже встроена небольшая система DI.
+
+## Depends в FastAPI — это внедрение зависимостей
+
+На Уровне 2 вы использовали `Depends` для хранилища и сессии. Теперь видно, что это такое на самом деле: FastAPI выступает корнем композиции для каждого запроса. Он вызывает ваши функции-провайдеры, передаёт результаты в эндпоинт и позволяет тестам подменить любой провайдер. Современный стиль кладёт зависимость прямо в тип с помощью `Annotated`, чтобы её можно было переиспользовать в разных эндпоинтах:
+
+<CodeExample output={`создаём настоящий Greeter
+{'message': 'Привет, Mei!'}
+{'message': 'Привет, Sam!'}
+{'message': 'Салют, Mei!'}
+{'message': 'Привет, Mei!'}`}>
+
+```python
+from functools import lru_cache
+from typing import Annotated
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+
+class Greeter:
+    def __init__(self, greeting: str):
+        self.greeting = greeting
+
+    def greet(self, name: str) -> str:
+        return f"{self.greeting}, {name}!"
+
+@lru_cache                      # создать один раз и переиспользовать
+def get_greeter() -> Greeter:
+    print("создаём настоящий Greeter")
+    return Greeter("Привет")
+
+GreeterDep = Annotated[Greeter, Depends(get_greeter)]
+
+app = FastAPI()
+
+@app.get("/greet/{name}")
+def greet(name: str, greeter: GreeterDep):
+    return {"message": greeter.greet(name)}
+
+client = TestClient(app)
+print(client.get("/greet/Mei").json())
+print(client.get("/greet/Sam").json())
+
+# в тесте: подменяем зависимость, а не код
+app.dependency_overrides[get_greeter] = lambda: Greeter("Салют")
+print(client.get("/greet/Mei").json())
+app.dependency_overrides.clear()
+print(client.get("/greet/Mei").json())
+```
+
+</CodeExample>
+
+- `Annotated[Greeter, Depends(get_greeter)]` означает «`Greeter`, который предоставляет `get_greeter`». Редактор видит `Greeter`, а FastAPI — как его создать.
+- `@lru_cache` на провайдере без параметров превращает его в ленивый **синглтон (singleton)**: объект создаётся при первом запросе и дальше переиспользуется («создаём...» печатается один раз). Это обычный способ загружать настройки или создавать долгоживущие клиенты. Для того, что относится к одному запросу, например сессии базы данных или единицы работы, используют обычную функцию (или зависимость с `yield`), чтобы каждый запрос получал свой экземпляр.
+- `app.dependency_overrides[provider] = replacement` — это точка подмены для тестов. Код эндпоинта никогда не меняется, меняется только связывание.
+
+В приложении с чистой архитектурой провайдеры образуют цепочку от настроек до сервисов:
+
+```python
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()                     # читает переменные окружения
+
+def get_uow(settings: SettingsDep) -> SqlUnitOfWork:
+    return SqlUnitOfWork(session_factory(settings.database_url))
+
+def get_orders(uow: UowDep) -> OrderService:
+    return OrderService(uow, mailer=SmtpMailer(...))
+
+@app.post("/orders")
+def create_order(body: OrderIn, orders: OrderServiceDep): ...
+```
+
+Тесты подменяют только одно звено, например `get_uow` на `FakeUnitOfWork`, а всё, что выше, по-прежнему работает по-настоящему.
+
+## Облегчённый DDD: говорите на языке бизнеса
+
+**Предметно-ориентированное проектирование** — большая тема (оригинальная книга занимает 500 страниц), но несколько его идей окупаются почти в любом проекте. Первая — **единый язык (ubiquitous language)**: в коде используются те же слова, что и в бизнесе. Если служба поддержки говорит «читатель *берёт* книгу», метод называется `book.lend_to(member)`, а не `book.update_status(2, user_id)`. Когда код и разговоры используют одни и те же слова, недопонимания всплывают рано.
+
+Следующие идеи касаются **видов объектов** в вашем домене.
+
+### Объекты-значения
+
+**Объект-значение (value object)** полностью определяется своими значениями: два `Money(4.20, "EUR")` взаимозаменяемы, как две купюры по 5 евро. Объекты-значения **неизменяемы** и **проверяют себя сами** при создании, поэтому некорректный объект просто не может существовать. В Python это замороженный dataclass:
+
+<CodeExample output={`Money(amount=Decimal('5.00'), currency='EUR')
+True
+1
+объекты-значения не меняются
+сумма не может быть отрицательной
+неверная валюта: 'euro'`}>
+
+```python
+from dataclasses import dataclass, FrozenInstanceError
+from decimal import Decimal
+
+@dataclass(frozen=True)
+class Money:
+    amount: Decimal
+    currency: str
+
+    def __post_init__(self):
+        if self.amount < 0:
+            raise ValueError("сумма не может быть отрицательной")
+        if len(self.currency) != 3:
+            raise ValueError(f"неверная валюта: {self.currency!r}")
+
+    def __add__(self, other: "Money") -> "Money":
+        if other.currency != self.currency:
+            raise ValueError("нельзя сложить EUR и GBP")
+        return Money(self.amount + other.amount, self.currency)
+
+price = Money(Decimal("4.20"), "EUR")
+print(price + Money(Decimal("0.80"), "EUR"))
+print(price == Money(Decimal("4.2"), "EUR"))
+print(len({price, Money(Decimal("4.20"), "EUR")}))
+try:
+    price.amount = Decimal("0")
+except FrozenInstanceError:
+    print("объекты-значения не меняются")
+for bad in [(Decimal("-1"), "EUR"), (Decimal("1"), "euro")]:
+    try:
+        Money(*bad)
+    except ValueError as error:
+        print(error)
+```
+
+</CodeExample>
+
+- `frozen=True` запрещает изменения после создания и делает объект **хешируемым**, поэтому он работает в множествах и как ключ словаря.
+- `__post_init__` выполняется сразу после сгенерированного `__init__`: идеальное место для валидации.
+- «Изменить» объект-значение — значит создать новый: `price + other` возвращает свежий `Money`.
+- Для денег — `Decimal`, а не `float`: в числах с плавающей точкой `0.1 + 0.2` не равно `0.3`, и бухгалтеры это заметят.
+
+Замена голых `str` и `float` на маленькие объекты-значения (`Email`, `Money`, `Sku`, `Quantity`) — один из самых дешёвых и самых полезных рефакторингов. Функция, которая принимает `Email`, не может случайно получить непроверенную строку, а валидация живёт ровно в одном месте. У этого антипаттерна даже есть название: **одержимость примитивами (primitive obsession)**.
+
+### Сущности
+
+У **сущности (entity)** есть **идентичность (identity)**, которая остаётся прежней, пока её данные меняются. Клиент, сменивший имя и email, — всё тот же клиент. Поэтому сущности сравнивают по id, а не по полям:
+
+<CodeExample output={`Email(value='mei@example.com')
+True
+False
+некорректный email: 'not-an-email'`}>
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Email:
+    value: str
+
+    def __post_init__(self):
+        clean = self.value.strip().lower()
+        local, _, domain = clean.partition("@")
+        if not local or "." not in domain:
+            raise ValueError(f"некорректный email: {self.value!r}")
+        # объект заморожен, поэтому обычное присваивание здесь тоже
+        # запрещено
+        object.__setattr__(self, "value", clean)
+
+@dataclass(eq=False)          # сущности: равны по идентичности
+class Customer:
+    id: int
+    name: str
+    email: Email
+
+    def __eq__(self, other):
+        return isinstance(other, Customer) and other.id == self.id
+
+    def __hash__(self):
+        return hash(self.id)
+
+a = Customer(1, "Mei", Email("  Mei@Example.COM "))
+print(a.email)
+a.name = "Mei Lin"              # сущности со временем меняются...
+print(a == Customer(1, "Mei", Email("mei@example.com")))
+print(a == Customer(2, "Mei Lin", a.email))  # ...а идентичность нет
+try:
+    Email("not-an-email")
+except ValueError as error:
+    print(error)
+```
+
+</CodeExample>
+
+Объект-значение `Email` ещё и **нормализует** себя (обрезает пробелы, приводит к нижнему регистру), поэтому `"Mei@Example.COM"` и `"mei@example.com"` везде считаются одним и тем же адресом. Поскольку dataclass заморожен, в `__post_init__` приходится использовать `object.__setattr__`, чтобы сохранить очищенное значение: это известная идиома, и применяют её только внутри `__post_init__`.
+
+### Агрегаты и инварианты
+
+**Инвариант (invariant)** — это бизнес-правило, которое должно быть истинным *всегда*: «сумма заказа никогда не превышает 100.00», «оформленный заказ нельзя изменить». **Агрегат (aggregate)** — это группа объектов, которые вместе защищают свои инварианты, с одним **корнем агрегата (aggregate root)** в качестве единственной двери внутрь. Вы никогда не добавляете элементы в `order.lines` напрямую; вы вызываете `order.add_line(...)`, который сначала проверяет правила:
+
+<CodeExample output={`отказ: сумма заказа превысит 100.00
+отказ: заказ уже оформлен
+submitted 1420
+[OrderSubmitted(order_id=7, total_cents=1420)]`}>
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass(frozen=True)
+class OrderLine:                 # объект-значение внутри агрегата
+    sku: str
+    qty: int
+    unit_cents: int
+
+@dataclass(frozen=True)
+class OrderSubmitted:            # доменное событие: прошедшее время!
+    order_id: int
+    total_cents: int
+
+class OrderError(Exception):
+    pass
+
+@dataclass
+class Order:                     # корень агрегата
+    id: int
+    lines: list[OrderLine] = field(default_factory=list)
+    status: str = "draft"
+    events: list = field(default_factory=list)
+    MAX_TOTAL = 100_00           # инвариант: не больше 100.00
+
+    @property
+    def total_cents(self) -> int:
+        return sum(ln.qty * ln.unit_cents for ln in self.lines)
+
+    def add_line(self, sku: str, qty: int, unit_cents: int):
+        if self.status != "draft":
+            raise OrderError("заказ уже оформлен")
+        if self.total_cents + qty * unit_cents > self.MAX_TOTAL:
+            raise OrderError("сумма заказа превысит 100.00")
+        self.lines.append(OrderLine(sku, qty, unit_cents))
+
+    def submit(self):
+        if not self.lines:
+            raise OrderError("нельзя оформить пустой заказ")
+        self.status = "submitted"
+        self.events.append(OrderSubmitted(self.id, self.total_cents))
+
+order = Order(7)
+order.add_line("BMB-1", 3, 4_20)
+order.add_line("APL-7", 2, 80)
+for attempt in [lambda: order.add_line("TV", 1, 999_00),
+                order.submit,
+                lambda: order.add_line("NUT", 1, 10)]:
+    try:
+        attempt()
+    except OrderError as error:
+        print("отказ:", error)
+print(order.status, order.total_cents)
+print(order.events)
+```
+
+</CodeExample>
+
+Несколько практических правил для агрегатов:
+
+- **Загружайте и сохраняйте агрегаты целиком.** У репозитория есть `get(order_id)` и `save(order)`, но никогда — `save_line(line)`. Только так инвариант остаётся под защитой.
+- **Делайте их маленькими.** Агрегат — это ещё и граница транзакции. Если `Customer` содержит все свои заказы, два заказа, оформленные одновременно, будут бороться за одну блокировку. Ссылайтесь на другие агрегаты по **id** (`order.customer_id`), а не храните сам объект.
+- **Храните деньги в центах** (или в `Decimal`), как здесь, и никогда — во float.
+
+### Доменные события
+
+Посмотрите на последнюю строку вывода: `submit()` не отправил письмо и не обратился к складу. Он **записал доменное событие (domain event)** `OrderSubmitted`, названное в прошедшем времени, потому что это факт, который уже случился. Слой сервисов публикует события **после** того, как единица работы зафиксировала изменения, поэтому никто не узнает о заказе, который потом откатили:
+
+<CodeExample output={`письмо: заказ 7 подтверждён
+склад: собрать заказ 7
+возврат денег за заказ 3
+[]`}>
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class OrderSubmitted:
+    order_id: int
+    total_cents: int
+
+@dataclass(frozen=True)
+class OrderCancelled:
+    order_id: int
+
+HANDLERS = {
+    OrderSubmitted: [
+        lambda e: print(f"письмо: заказ {e.order_id} подтверждён"),
+        lambda e: print(f"склад: собрать заказ {e.order_id}"),
+    ],
+    OrderCancelled: [
+        lambda e: print(f"возврат денег за заказ {e.order_id}"),
+    ],
+}
+
+def publish(events: list) -> None:
+    while events:
+        event = events.pop(0)
+        for handler in HANDLERS.get(type(event), []):
+            handler(event)
+
+# в сервисе, ПОСЛЕ uow.commit():
+pending = [OrderSubmitted(7, 14_20), OrderCancelled(3)]
+publish(pending)
+print(pending)
+```
+
+</CodeExample>
+
+Это паттерн «наблюдатель» из первого урока: события — маленькие замороженные dataclass-объекты, а обработчики ищутся по **типу** события. Домен остаётся чистым (он только добавляет элементы в список), а побочные эффекты живут в обработчиках, которые можно внедрить, подменить фейками в тестах или позже перенести в фоновую очередь, не трогая `Order`. Одна ловушка: если письмо не ушло после commit, заказ всё равно существует. Настоящие системы решают это повторными попытками или таблицей **outbox**: событие сохраняется в той же транзакции, что и заказ, а позже его отправляет фоновый обработчик.
+
+<Callout type="note" title="Сколько DDD вам нужно?">
+
+Дешёвые части используйте везде: единый язык, объекты-значения вместо примитивов, правила внутри объектов, которым принадлежат данные. Агрегаты и доменные события подключайте, когда домен действительно сложный (ценообразование, бронирования, складской учёт, платежи). Для CRUD-админки полный DDD — пустая церемония: там вполне хватит обычных моделей Pydantic и SQLAlchemy.
+
+</Callout>
+
+<Quiz
+  question="Какой объект должен быть объектом-значением (замороженным dataclass), а не сущностью?"
+  options={["Customer, у которого могут меняться имя и email", "ShippingAddress из улицы, города и почтового индекса", "Order, который переходит из черновика в оформленный", "BankAccount, у которого меняется баланс"]}
+  answer={1}
+  explanation="Адрес определяется только своими значениями: два одинаковых адреса взаимозаменяемы, а изменить адрес — значит заменить его новым. У клиентов, заказов и счетов есть идентичность, которая остаётся прежней, пока меняются их данные, поэтому это сущности."
+/>
+
+<Quiz
+  question="Эндпоинт FastAPI объявляет service: Annotated[TrialService, Depends(get_service)]. Как тесту заставить его использовать TrialService с фейковым отправителем писем?"
+  options={["Подменить TrialService.__init__ через unittest.mock", "Записать в app.dependency_overrides[get_service] функцию, которая возвращает тестовый сервис", "Передать сервис в запросе как query-параметр", "Изменить get_service, чтобы она проверяла, запущена ли она в тесте"]}
+  answer={1}
+  explanation="dependency_overrides подменяет провайдер для всех эндпоинтов, которые от него зависят, без изменения кода эндпоинтов. Это и есть внедрение зависимостей: меняется связывание, а не код."
+/>
+
+<Exercise
+  language="python"
+  title="Распутайте регистрацию на пробный период"
+  starter={`from datetime import datetime, timedelta
+
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+WELCOME = "Ваш 14-дневный пробный период начался"
+
+# ---------- запутанная версия: отрефакторьте меня ----------
+
+SUBSCRIPTIONS = {}                  # глобальная «база данных»
+
+
+def send_email(to, subject):        # представим, что это SMTP
+    print(f"SMTP -> {to}: {subject}")
+
+
+def start_trial(email):
+    email = email.strip().lower()
+    if "@" not in email:
+        raise ValueError("некорректный email")
+    if email in SUBSCRIPTIONS:
+        raise KeyError("уже есть подписка")
+    ends = datetime.now() + timedelta(days=14)
+    SUBSCRIPTIONS[email] = {"email": email, "trial_ends": ends}
+    send_email(email, WELCOME)
+    return SUBSCRIPTIONS[email]
+
+
+app = FastAPI()
+
+
+class TrialIn(BaseModel):
+    email: str
+
+
+@app.post("/trials", status_code=201)
+def create_trial(body: TrialIn):
+    try:
+        sub = start_trial(body.email)
+    except ValueError:
+        raise HTTPException(422, "invalid email")
+    except KeyError:
+        raise HTTPException(409, "already subscribed")
+    return {
+        "email": sub["email"],
+        "trial_ends": sub["trial_ends"].isoformat(),
+    }
+
+
+# ---------- тесты (не меняйте их) ----------
+
+NOW = datetime(2026, 1, 1, 9, 0)
+
+
+@pytest.fixture
+def mailer():
+    return FakeMailer()
+
+
+@pytest.fixture
+def trials(mailer):
+    return TrialService(
+        repo=InMemorySubscriptionRepository(),
+        mailer=mailer,
+        clock=lambda: NOW,
+    )
+
+
+@pytest.fixture
+def client(trials):
+    app.dependency_overrides[get_service] = lambda: trials
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def test_email_is_a_value_object():
+    assert Email(" Mei@Example.COM ") == Email("mei@example.com")
+    with pytest.raises(ValueError):
+        Email("nope")
+
+
+def test_trial_lasts_14_days(trials, mailer):
+    sub = trials.start_trial("mei@example.com")
+    assert sub.trial_ends == datetime(2026, 1, 15, 9, 0)
+    assert mailer.sent == [("mei@example.com", WELCOME)]
+
+
+def test_no_duplicates(trials, mailer):
+    trials.start_trial("mei@example.com")
+    with pytest.raises(AlreadySubscribed):
+        trials.start_trial("MEI@example.com")
+    assert len(mailer.sent) == 1
+
+
+def test_api_uses_the_injected_service(client, mailer):
+    r = client.post("/trials", json={"email": "Sam@Example.com"})
+    assert r.status_code == 201
+    assert r.json() == {
+        "email": "sam@example.com",
+        "trial_ends": "2026-01-15T09:00:00",
+    }
+    assert mailer.sent == [("sam@example.com", WELCOME)]
+
+
+def test_api_errors(client):
+    client.post("/trials", json={"email": "sam@example.com"})
+    r = client.post("/trials", json={"email": "sam@example.com"})
+    assert r.status_code == 409
+    r = client.post("/trials", json={"email": "sam"})
+    assert r.status_code == 422
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "Все тесты в редакторе проходят", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 5" },
+    { name: "Email нормализует себя и сравнивается по значению", check: "Email(' Kim@Mail.ORG') == Email('kim@mail.org') and Email('A@B.co').value == 'a@b.co' and len({Email('x@y.io'), Email('X@Y.IO')}) == 1" },
+    { name: "Email отклоняет некорректные адреса и заморожен", check: "exec('_bad = []\\nfor _v in [\"kim\", \"@mail.org\", \"kim@mail\", \"\"]:\\n    try:\\n        Email(_v)\\n    except ValueError:\\n        _bad.append(_v)\\ntry:\\n    Email(\"a@b.co\").value = \"x\"\\n    _frozen = False\\nexcept Exception:\\n    _frozen = True') is None and len(_bad) == 4 and _frozen" },
+    { name: "TrialService использует внедрённые часы, отправителя писем и репозиторий", check: "[m := FakeMailer(), s := TrialService(repo=InMemorySubscriptionRepository(), mailer=m, clock=lambda: datetime(2030, 5, 20, 12, 30)), sub := s.start_trial(' Kim@Mail.org')] and sub.trial_ends == datetime(2030, 6, 3, 12, 30) and sub.email == Email('kim@mail.org') and m.sent == [('kim@mail.org', 'Ваш 14-дневный пробный период начался')] and s.repo.get(Email('kim@mail.org')) is not None" },
+    { name: "Повторы выбрасывают AlreadySubscribed, некорректные адреса — ValueError, лишних писем нет", check: "[m := FakeMailer(), s := TrialService(repo=InMemorySubscriptionRepository(), mailer=m, clock=lambda: datetime(2030, 1, 1)), s.start_trial('kim@mail.org')] and exec('_errs = []\\nfor _v in [\"KIM@mail.org\", \"kim\"]:\\n    try:\\n        s.start_trial(_v)\\n    except Exception as _e:\\n        _errs.append(type(_e).__name__)') is None and _errs == ['AlreadySubscribed', 'ValueError'] and len(m.sent) == 1" },
+    { name: "Никакого глобального состояния: у каждого сервиса свой репозиторий", check: "[s1 := TrialService(repo=InMemorySubscriptionRepository(), mailer=FakeMailer(), clock=lambda: datetime(2030, 1, 1)), s2 := TrialService(repo=InMemorySubscriptionRepository(), mailer=FakeMailer(), clock=lambda: datetime(2030, 1, 1))] and s1.start_trial('zoe@mail.org') and s2.start_trial('zoe@mail.org') and s2.mailer.sent == [('zoe@mail.org', 'Ваш 14-дневный пробный период начался')]" },
+    { name: "POST /trials получает сервис из Depends(get_service)", check: "[m := FakeMailer(), _r := InMemorySubscriptionRepository(), app.dependency_overrides.__setitem__(get_service, lambda: TrialService(repo=_r, mailer=m, clock=lambda: datetime(2031, 2, 1, 8, 15))), c := TestClient(app), a := c.post('/trials', json={'email': 'Ola@Mail.org'}), b := c.post('/trials', json={'email': 'ola@mail.org'}), d := c.post('/trials', json={'email': 'ola'}), app.dependency_overrides.clear()] and a.status_code == 201 and a.json() == {'email': 'ola@mail.org', 'trial_ends': '2031-02-15T08:15:00'} and b.status_code == 409 and d.status_code == 422 and m.sent == [('ola@mail.org', 'Ваш 14-дневный пробный период начался')]" },
+    { name: "build_service() — корень композиции", check: "isinstance(build_service(), TrialService) and isinstance(build_service().mailer, ConsoleMailer) and build_service().repo is not build_service().repo" },
+  ]}
+>
+
+Регистрация на пробный период выше запутана: глобальный словарь, настоящие часы, жёстко зашитый вызов «SMTP» и эндпоинт, приклеенный ко всему этому. Отрефакторьте её во внедряемые, тестируемые части так, чтобы тесты внизу проходили (они уже описывают новую архитектуру):
+
+1. **`Email`**: объект-значение — замороженный dataclass с полем `value`. Он обрезает пробелы, приводит адрес к нижнему регистру и выбрасывает `ValueError`, если перед `@` нет текста или в части после неё нет `.`.
+2. **`Subscription`**: dataclass с полями `email` (типа `Email`) и `trial_ends` (типа `datetime`). Плюс исключение **`AlreadySubscribed`**.
+3. **`InMemorySubscriptionRepository`** с методами `get(email)` (возвращает подписку или `None`) и `add(subscription)`.
+4. **`ConsoleMailer`** (печатает так же, как старая `send_email`) и **`FakeMailer`** (запоминает кортежи `(to, subject)` в списке `sent`). У обоих есть `send(to, subject)`.
+5. **`TrialService(repo, mailer, clock)`**, который хранит их в атрибутах с этими же именами, с методом `start_trial(raw_email)`: создайте `Email`, выбросьте `AlreadySubscribed`, если такой адрес уже есть, задайте `trial_ends` как `clock()` плюс 14 дней, сохраните подписку, отправьте `WELCOME` на этот адрес и верните подписку.
+6. Корень композиции **`build_service()`**, который возвращает новый `TrialService` с репозиторием в памяти, `ConsoleMailer` и `datetime.now`; переменная уровня модуля `service = build_service()`; и провайдер **`get_service()`**, который её возвращает.
+7. `POST /trials` получает сервис через `Depends(get_service)` (если хотите, используйте `Annotated`) и превращает `ValueError` в 422, а `AlreadySubscribed` — в 409, с тем же JSON, что и раньше.
+
+<Hint>
+
+Начните с `Email`: это класс `Email` из раздела «Сущности». `TrialService.__init__` просто сохраняет `repo`, `mailer` и `clock`; `start_trial` — это тело старой функции, где вместо ручной очистки стоит `Email(raw_email)`, вместо словаря — `self.repo.get(...)`, вместо `datetime.now()` — `self.clock()`, а вместо `send_email` — `self.mailer.send(...)`. В эндпоинт добавьте `service: Annotated[TrialService, Depends(get_service)]` и возвращайте `sub.email.value` и `sub.trial_ends.isoformat()`. Когда закончите, удалите старые глобальные `SUBSCRIPTIONS` и `start_trial`.
+
+</Hint>
+
+<Solution>
+
+```python
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Annotated, Callable, Protocol
+
+import pytest
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+TRIAL_DAYS = 14
+WELCOME = "Ваш 14-дневный пробный период начался"
+
+
+# ---------- домен ----------
+
+@dataclass(frozen=True)
+class Email:
+    value: str
+
+    def __post_init__(self):
+        clean = self.value.strip().lower()
+        local, _, domain = clean.partition("@")
+        if not local or "." not in domain:
+            raise ValueError(f"некорректный email: {self.value!r}")
+        object.__setattr__(self, "value", clean)
+
+
+@dataclass
+class Subscription:
+    email: Email
+    trial_ends: datetime
+
+
+class AlreadySubscribed(Exception):
+    pass
+
+
+# ---------- порты ----------
+
+class Mailer(Protocol):
+    def send(self, to: str, subject: str) -> None: ...
+
+
+Clock = Callable[[], datetime]
+
+
+# ---------- адаптеры ----------
+
+class InMemorySubscriptionRepository:
+    def __init__(self):
+        self._items: dict[Email, Subscription] = {}
+
+    def get(self, email: Email) -> Subscription | None:
+        return self._items.get(email)
+
+    def add(self, subscription: Subscription) -> None:
+        self._items[subscription.email] = subscription
+
+
+class ConsoleMailer:
+    def send(self, to: str, subject: str) -> None:
+        print(f"SMTP -> {to}: {subject}")
+
+
+class FakeMailer:
+    def __init__(self):
+        self.sent: list[tuple[str, str]] = []
+
+    def send(self, to: str, subject: str) -> None:
+        self.sent.append((to, subject))
+
+
+# ---------- сервис ----------
+
+class TrialService:
+    def __init__(self, repo, mailer: Mailer, clock: Clock):
+        self.repo = repo
+        self.mailer = mailer
+        self.clock = clock
+
+    def start_trial(self, raw_email: str) -> Subscription:
+        email = Email(raw_email)
+        if self.repo.get(email) is not None:
+            raise AlreadySubscribed(email.value)
+        ends = self.clock() + timedelta(days=TRIAL_DAYS)
+        subscription = Subscription(email, ends)
+        self.repo.add(subscription)
+        self.mailer.send(email.value, WELCOME)
+        return subscription
+
+
+# ---------- корень композиции + веб ----------
+
+def build_service() -> TrialService:
+    return TrialService(
+        repo=InMemorySubscriptionRepository(),
+        mailer=ConsoleMailer(),
+        clock=datetime.now,
+    )
+
+
+service = build_service()
+
+
+def get_service() -> TrialService:
+    return service
+
+
+ServiceDep = Annotated[TrialService, Depends(get_service)]
+
+app = FastAPI()
+
+
+class TrialIn(BaseModel):
+    email: str
+
+
+@app.post("/trials", status_code=201)
+def create_trial(body: TrialIn, service: ServiceDep):
+    try:
+        sub = service.start_trial(body.email)
+    except ValueError:
+        raise HTTPException(422, "invalid email")
+    except AlreadySubscribed:
+        raise HTTPException(409, "already subscribed")
+    return {
+        "email": sub.email.value,
+        "trial_ends": sub.trial_ends.isoformat(),
+    }
+
+
+# ---------- тесты (не меняйте их) ----------
+
+NOW = datetime(2026, 1, 1, 9, 0)
+
+
+@pytest.fixture
+def mailer():
+    return FakeMailer()
+
+
+@pytest.fixture
+def trials(mailer):
+    return TrialService(
+        repo=InMemorySubscriptionRepository(),
+        mailer=mailer,
+        clock=lambda: NOW,
+    )
+
+
+@pytest.fixture
+def client(trials):
+    app.dependency_overrides[get_service] = lambda: trials
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def test_email_is_a_value_object():
+    assert Email(" Mei@Example.COM ") == Email("mei@example.com")
+    with pytest.raises(ValueError):
+        Email("nope")
+
+
+def test_trial_lasts_14_days(trials, mailer):
+    sub = trials.start_trial("mei@example.com")
+    assert sub.trial_ends == datetime(2026, 1, 15, 9, 0)
+    assert mailer.sent == [("mei@example.com", WELCOME)]
+
+
+def test_no_duplicates(trials, mailer):
+    trials.start_trial("mei@example.com")
+    with pytest.raises(AlreadySubscribed):
+        trials.start_trial("MEI@example.com")
+    assert len(mailer.sent) == 1
+
+
+def test_api_uses_the_injected_service(client, mailer):
+    r = client.post("/trials", json={"email": "Sam@Example.com"})
+    assert r.status_code == 201
+    assert r.json() == {
+        "email": "sam@example.com",
+        "trial_ends": "2026-01-15T09:00:00",
+    }
+    assert mailer.sent == [("sam@example.com", WELCOME)]
+
+
+def test_api_errors(client):
+    client.post("/trials", json={"email": "sam@example.com"})
+    r = client.post("/trials", json={"email": "sam@example.com"})
+    assert r.status_code == 409
+    r = client.post("/trials", json={"email": "sam"})
+    assert r.status_code == 422
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Внедрение зависимостей**: код получает своих помощников (хранилище, отправителя писем, даже часы), а не создаёт и не импортирует их сам. Именно это позволяет тестировать его без `patch`.
+- **Внедрение через конструктор** держит зависимости на виду в `__init__`; описывайте их типы протоколами и `Callable[[], datetime]`. Остерегайтесь аргументов по умолчанию, которые создают настоящие ресурсы: они создаются один раз, при импорте.
+- **Корень композиции** (`build_service()`, `create_app()`) — единственное место, которое выбирает конкретные классы по настройкам. Большинству Python-проектов DI-контейнер не нужен.
+- **`Depends` в FastAPI** — это DI для каждого запроса: провайдеры могут образовывать цепочку (настройки → единица работы → сервис), `@lru_cache` делает ленивый синглтон, `Annotated[T, Depends(provider)]` сохраняет эндпоинты аккуратными, а `app.dependency_overrides` подменяет любое звено в тестах.
+- **Облегчённый DDD**: используйте слова бизнеса; **объекты-значения** заморожены, сами себя проверяют и равны по значению (`Money`, `Email`); **сущности** равны по идентичности; **агрегаты** охраняют свои **инварианты** за единственным корнем, а загружают и сохраняют их целиком.
+- Агрегаты записывают **доменные события** (прошедшее время, замороженные dataclass); сервис публикует их **после** commit, передавая обработчикам, которые выполняют побочные эффекты.

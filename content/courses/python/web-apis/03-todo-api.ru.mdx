@@ -1,0 +1,722 @@
+---
+title: "Мини-проект: API списка дел"
+description: Создайте полноценный CRUD API списка дел на FastAPI с Depends для общей логики, APIRouter, фильтрами в запросе и хранилищем в памяти и протестируйте его через TestClient и pytest.
+duration: 20
+xp: 25
+---
+
+Пора собрать всё вместе. В этом уроке вы создадите полноценный **API списка дел (To-do API)**: клиенты смогут создавать задачи, получать их список и искать по нему, отмечать выполненные, переименовывать и удалять. По пути вы познакомитесь с двумя инструментами, которые помогают держать большие приложения на FastAPI в порядке, — **`Depends`** и **`APIRouter`**, — и протестируете всё это с pytest, как в настоящем проекте. ✅
+
+## План
+
+Хорошие API сначала проектируют, а потом пишут. У нашего API один ресурс, `todos`, и пять классических операций **CRUD** (Create, Read, Update, Delete — создать, прочитать, изменить, удалить):
+
+| Запрос | Что делает | Успех |
+| --- | --- | --- |
+| `POST /todos` | создаёт задачу из `{"title": ...}` | 201 + новая задача |
+| `GET /todos` | возвращает список задач, с фильтром `?done=true` и поиском `?q=milk` | 200 + список |
+| `GET /todos/{todo_id}` | возвращает одну задачу | 200 + задача |
+| `PATCH /todos/{todo_id}` | меняет `title` и/или `done` | 200 + обновлённая задача |
+| `DELETE /todos/{todo_id}` | удаляет задачу | 204, без тела |
+
+На любой неизвестный id приходит **404** `{"detail": "Todo not found"}`, а на некорректные данные — **422**. Как и в прошлом уроке, мы заводим отдельную модель Pydantic для каждой роли:
+
+```python
+class TodoCreate(BaseModel):      # что клиент присылает для создания
+    title: str = Field(min_length=1, max_length=100)
+
+class TodoUpdate(BaseModel):      # PATCH: все поля необязательны
+    title: str | None = Field(
+        default=None, min_length=1, max_length=100
+    )
+    done: bool | None = None
+
+class Todo(BaseModel):            # что API отправляет обратно
+    id: int
+    title: str
+    done: bool = False
+```
+
+## Хранилище в памяти
+
+Настоящие приложения хранят данные в базе данных (database) — этому посвящён следующий модуль. А пока отлично подойдёт словарь «id → задача», обёрнутый в небольшой класс, чтобы остальному приложению было всё равно, как именно устроено хранение. Одна деталь здесь очень важна: **как выбирать новые id**.
+
+<CodeExample output={`3 уже занят? True
+{'id': 3, 'title': 'Залезть на дерево', 'done': False}`}>
+
+```python
+todos = {1: "Купить бамбук", 2: "Поспать", 3: "Залезть на дерево"}
+del todos[2]
+
+new_id = len(todos) + 1          # ошибка
+print(new_id, "уже занят?", new_id in todos)
+
+class TodoStore:
+    def __init__(self):
+        self.todos = {}
+        self.next_id = 1
+
+    def add(self, title):
+        todo = {"id": self.next_id, "title": title, "done": False}
+        self.todos[self.next_id] = todo
+        self.next_id += 1
+        return todo
+
+store = TodoStore()
+store.add("Купить бамбук")
+store.add("Поспать")
+del store.todos[2]
+print(store.add("Залезть на дерево"))
+```
+
+</CodeExample>
+
+`len(todos) + 1` выглядит нормально, пока что-нибудь не удалят: тогда новая задача получает id, который **уже занят**, и молча затирает старую. Счётчик, который только растёт (`next_id`), никогда не выдаёт один id дважды. Базы данных делают то же самое с автоинкрементными id.
+
+## Общая логика через Depends
+
+Три наших эндпоинта (`GET`, `PATCH` и `DELETE` для `/todos/{todo_id}`) начинаются одинаково: найти задачу или ответить 404. Скопировать этот `if` трижды — верный способ наплодить баги. Ответ FastAPI — **внедрение зависимостей (dependency injection)** через `Depends`: вы один раз пишете общую логику в виде функции, а FastAPI сам вызывает её перед вашим эндпоинтом.
+
+Вот идея на небольшом примере — помощник для постраничного вывода (пагинации), общий для двух эндпоинтов:
+
+<CodeExample output={`['бамбук', 'яблоко']
+['мёд', 'морковь', 'груша']
+['груша']
+422`}>
+
+```python
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+SNACKS = ["бамбук", "яблоко", "мёд", "морковь", "груша"]
+
+def pagination(skip: int = 0, limit: int = 2):
+    return {"skip": skip, "limit": limit}
+
+@app.get("/snacks")
+def list_snacks(page: dict = Depends(pagination)):
+    start = page["skip"]
+    return SNACKS[start:start + page["limit"]]
+
+@app.get("/snacks/reversed")
+def list_reversed(page: dict = Depends(pagination)):
+    start = page["skip"]
+    return SNACKS[::-1][start:start + page["limit"]]
+
+client = TestClient(app)
+print(client.get("/snacks").json())
+print(client.get("/snacks?skip=2&limit=3").json())
+print(client.get("/snacks/reversed?limit=1").json())
+print(client.get("/snacks?limit=lots").status_code)
+```
+
+</CodeExample>
+
+`page: dict = Depends(pagination)` означает: *«прежде чем вызвать меня, вызови `pagination` и передай мне результат»*. Собственные параметры **зависимости (dependency)** (`skip`, `limit`) читаются из запроса так же, как у любого эндпоинта, проходят валидацию (отсюда 422) и видны в `/docs`. Зависимость может и **выбросить** `HTTPException`, а ещё зависимости могут зависеть от других зависимостей.
+
+<Callout type="tip" title="За что профессионалы любят Depends">
+
+Через зависимости настоящие приложения на FastAPI делятся общими вещами: сессией базы данных, текущим пользователем, проверкой прав, настройками. А поскольку вызывает их FastAPI, **в тестах их можно подменить** через `app.dependency_overrides`, например чтобы каждый тест получал свежее пустое хранилище. Именно это вы и сделаете ниже.
+
+</Callout>
+
+## Порядок с APIRouter
+
+В настоящем проекте не держат все эндпоинты в `main.py`. `APIRouter` — это мини-приложение для одной части API: вы задаёте ему общий префикс `prefix` и подключаете к основному приложению:
+
+```text
+todo_api/
+├── main.py          app = FastAPI(); app.include_router(todos.router)
+├── models.py        TodoCreate, TodoUpdate, Todo
+├── store.py         TodoStore, get_store
+└── routers/
+    └── todos.py     router = APIRouter(prefix="/todos")
+```
+
+Вот хранилище, зависимости и первые два эндпоинта нашего API списка дел, организованные именно так (только в одном файле, чтобы код запускался здесь):
+
+<CodeExample output={`201 {'id': 1, 'title': 'Купить бамбук', 'done': False}
+{'id': 1, 'title': 'Купить бамбук', 'done': False}
+{'detail': 'Todo not found'}
+422`}>
+
+```python
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+class TodoCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+class Todo(BaseModel):
+    id: int
+    title: str
+    done: bool = False
+
+class TodoStore:
+    def __init__(self):
+        self.todos: dict[int, Todo] = {}
+        self.next_id = 1
+
+    def add(self, title: str) -> Todo:
+        todo = Todo(id=self.next_id, title=title)
+        self.todos[todo.id] = todo
+        self.next_id += 1
+        return todo
+
+store = TodoStore()
+
+def get_store() -> TodoStore:
+    return store
+
+def get_todo_or_404(
+    todo_id: int, store: TodoStore = Depends(get_store)
+) -> Todo:
+    if todo_id not in store.todos:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return store.todos[todo_id]
+
+router = APIRouter(prefix="/todos", tags=["todos"])
+
+@router.post("", status_code=201, response_model=Todo)
+def create_todo(
+    data: TodoCreate, store: TodoStore = Depends(get_store)
+):
+    return store.add(data.title)
+
+@router.get("/{todo_id}", response_model=Todo)
+def get_todo(todo: Todo = Depends(get_todo_or_404)):
+    return todo
+
+app = FastAPI(title="API списка дел")
+app.include_router(router)
+
+client = TestClient(app)
+response = client.post("/todos", json={"title": "Купить бамбук"})
+print(response.status_code, response.json())
+print(client.get("/todos/1").json())
+print(client.get("/todos/7").json())
+print(client.post("/todos", json={"title": ""}).status_code)
+```
+
+</CodeExample>
+
+Посмотрите, какой короткий получился `get_todo`: к моменту его запуска `get_todo_or_404` уже прочитала `todo_id` из пути, попросила хранилище у `get_store` и либо нашла задачу, либо остановила запрос с кодом 404. `PATCH` и `DELETE` могут использовать ту же самую зависимость.
+
+Несколько деталей:
+
+- При `prefix="/todos"` путь `""` означает сам `/todos`, а `"/{todo_id}"` — `/todos/{todo_id}`.
+- `tags=["todos"]` группирует эти эндпоинты под заголовком «todos» в `/docs`.
+- Эндпоинты получают хранилище через `get_store`, а не обращаются к глобальной переменной `store` напрямую. Именно эта лишняя строчка делает тестирование простым.
+
+<Callout type="warning" title="include_router копирует маршруты">
+
+`app.include_router(router)` копирует эндпоинты роутера **в этот момент**. Эндпоинты, добавленные в роутер позже, молча пропадают (вы получите 404 или 405). Сначала объявите все эндпоинты, а роутер подключайте в самом конце.
+
+</Callout>
+
+## Тестируем API с pytest
+
+В реальных проектах у каждого эндпоинта есть тесты (tests), и выглядят они так же, как в модуле про тестирование: **фикстура (fixture)** `client` и тестовые функции, которые отправляют запросы и проверяют ответы через `assert`. Главный трюк — дать каждому тесту **собственное свежее хранилище**, чтобы тесты никогда не зависели друг от друга и от порядка запуска. Вот как это выглядит на крошечном API заметок:
+
+<CodeExample output={`....                                                 [100%]
+4 passed in 0.01s`}>
+
+```python
+import pytest
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+class Note(BaseModel):
+    text: str
+
+notes: list[str] = []
+
+def get_notes() -> list[str]:
+    return notes
+
+app = FastAPI()
+
+@app.post("/notes", status_code=201)
+def add_note(note: Note, notes: list = Depends(get_notes)):
+    notes.append(note.text)
+    return {"count": len(notes)}
+
+@app.get("/notes")
+def list_notes(notes: list = Depends(get_notes)):
+    return notes
+
+@pytest.fixture
+def client():
+    fresh: list[str] = []                       # подготовка
+    app.dependency_overrides[get_notes] = lambda: fresh
+    yield TestClient(app)
+    app.dependency_overrides.clear()            # уборка
+
+def test_starts_empty(client):
+    assert client.get("/notes").json() == []
+
+def test_add_note(client):
+    response = client.post("/notes", json={"text": "Купить бамбук"})
+    assert response.status_code == 201
+    assert response.json() == {"count": 1}
+    assert client.get("/notes").json() == ["Купить бамбук"]
+
+def test_each_test_gets_a_fresh_list(client):
+    client.post("/notes", json={"text": "Поспать"})
+    assert client.get("/notes").json() == ["Поспать"]
+
+def test_text_is_required(client):
+    assert client.post("/notes", json={}).status_code == 422
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+`app.dependency_overrides[get_notes] = lambda: fresh` говорит FastAPI: *«везде, где эндпоинт просит `get_notes`, вызывай вместо неё вот это»*. После теста `.clear()` возвращает всё на место. Обратите внимание: `test_each_test_gets_a_fresh_list` видит только `"Поспать"`, а не заметку из предыдущего теста.
+
+<Callout type="warning" title="Одно хранилище на тест, а не на запрос">
+
+Так и хочется написать `app.dependency_overrides[get_store] = TodoStore`. Но FastAPI вызывает подмену **при каждом запросе**, так что каждый запрос получал бы новое пустое хранилище: вы создали бы задачу, а при попытке её получить — 404! Создайте хранилище один раз в фикстуре и возвращайте этот же объект: `lambda: fresh`.
+
+</Callout>
+
+## Запускаем по-настоящему
+
+Сохраните готовое приложение в `main.py` и запустите его:
+
+```bash
+fastapi dev main.py
+```
+
+Откройте `http://127.0.0.1:8000/docs`, нажмите **POST /todos**, затем **Try it out** и создайте несколько задач прямо из браузера. Можно также обращаться к API из другого терминала через `curl`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/todos \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Купить бамбук"}'
+curl "http://127.0.0.1:8000/todos?done=false"
+```
+
+А набор тестов запускайте, как обычно, командой `pytest`. Одно вы заметите сразу: стоит перезапустить сервер — и все задачи пропадут, ведь они жили только в памяти. Сохранять их в настоящей базе данных вы научитесь в следующем модуле, «Базы данных и SQLAlchemy».
+
+<Quiz
+  question="Зависимость get_todo_or_404 подключена как Depends(get_todo_or_404) в эндпоинтах GET, PATCH и DELETE. Клиент отправляет DELETE /todos/42, а задачи 42 нет. Что произойдёт?"
+  options={["Эндпоинт удаления выполнится и ничего не удалит", "get_todo_or_404 выбросит HTTPException, клиент получит 404, а эндпоинт удаления так и не выполнится", "FastAPI ответит 422, потому что 42 — некорректное значение", "Клиент получит 204 No Content"]}
+  answer={1}
+  explanation="FastAPI сначала выполняет зависимость. Она выбрасывает HTTPException(404), и это останавливает запрос ещё до вызова функции эндпоинта. Так одна зависимость защищает все три эндпоинта."
+/>
+
+<Quiz
+  question="Зачем тесты дают каждому тесту собственное свежее хранилище через app.dependency_overrides?"
+  options={["Потому что TestClient не умеет работать с глобальными переменными", "Чтобы каждый тест начинался из одного и того же известного состояния и тесты не влияли друг на друга", "Чтобы тесты работали быстрее", "Потому что pytest удаляет глобальные переменные между тестами"]}
+  answer={1}
+  explanation="С общим хранилищем задача, созданная в одном тесте, появилась бы в следующем, и результаты зависели бы от того, какие тесты запускались раньше. Свежее хранилище для каждого теста делает каждый тест независимым и воспроизводимым."
+/>
+
+<Exercise
+  language="python"
+  title="Мини-проект: API списка дел"
+  starter={`import pytest
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+
+class TodoCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+
+class TodoUpdate(BaseModel):
+    title: str | None = Field(
+        default=None, min_length=1, max_length=100
+    )
+    done: bool | None = None
+
+
+class Todo(BaseModel):
+    id: int
+    title: str
+    done: bool = False
+
+
+class TodoStore:
+    def __init__(self):
+        self.todos: dict[int, Todo] = {}
+        self.next_id = 1
+
+    def add(self, title: str) -> Todo:
+        todo = Todo(id=self.next_id, title=title)
+        self.todos[todo.id] = todo
+        self.next_id += 1
+        return todo
+
+
+store = TodoStore()
+
+
+def get_store() -> TodoStore:
+    return store
+
+
+router = APIRouter(prefix="/todos", tags=["todos"])
+
+
+@router.post("", status_code=201, response_model=Todo)
+def create_todo(
+    data: TodoCreate, store: TodoStore = Depends(get_store)
+):
+    return store.add(data.title)
+
+
+# TODO 1: зависимость get_todo_or_404(todo_id, store), которая
+#         возвращает Todo или выбрасывает 404 "Todo not found"
+
+# TODO 2: GET /todos -> список всех задач с необязательными
+#         параметрами запроса done (bool) и q (поиск по тексту
+#         без учёта регистра)
+
+# TODO 3: GET /todos/{todo_id} -> одна задача
+
+# TODO 4: PATCH /todos/{todo_id} -> меняет только те поля,
+#         которые прислали (тело: TodoUpdate)
+
+# TODO 5: DELETE /todos/{todo_id} -> 204 No Content
+
+
+app = FastAPI(title="API списка дел")
+app.include_router(router)   # эта строка должна идти после эндпоинтов
+
+
+# ---------- тесты (не меняйте их) ----------
+
+@pytest.fixture
+def client():
+    fresh = TodoStore()
+    app.dependency_overrides[get_store] = lambda: fresh
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def add(client, title):
+    return client.post("/todos", json={"title": title}).json()
+
+
+def test_create_todo(client):
+    response = client.post("/todos", json={"title": "Купить бамбук"})
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": 1, "title": "Купить бамбук", "done": False
+    }
+
+
+def test_empty_title_is_rejected(client):
+    response = client.post("/todos", json={"title": ""})
+    assert response.status_code == 422
+
+
+def test_list_todos(client):
+    add(client, "Купить бамбук")
+    add(client, "Поспать")
+    titles = [t["title"] for t in client.get("/todos").json()]
+    assert titles == ["Купить бамбук", "Поспать"]
+
+
+def test_get_todo(client):
+    todo = add(client, "Поспать")
+    assert client.get(f"/todos/{todo['id']}").json() == todo
+
+
+def test_unknown_todo_is_404(client):
+    assert client.get("/todos/99").status_code == 404
+    response = client.patch("/todos/99", json={"done": True})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Todo not found"}
+    assert client.delete("/todos/99").status_code == 404
+
+
+def test_update_changes_only_sent_fields(client):
+    todo = add(client, "Поспать")
+    url = f"/todos/{todo['id']}"
+    response = client.patch(url, json={"done": True})
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": todo["id"], "title": "Поспать", "done": True
+    }
+    assert client.get(url).json()["done"] is True
+
+
+def test_delete_todo(client):
+    todo = add(client, "Поспать")
+    url = f"/todos/{todo['id']}"
+    response = client.delete(url)
+    assert response.status_code == 204
+    assert client.get(url).status_code == 404
+
+
+def test_ids_are_never_reused(client):
+    first = add(client, "Раз")
+    add(client, "Два")
+    client.delete(f"/todos/{first['id']}")
+    assert add(client, "Три")["id"] == 3
+
+
+def test_filter_by_done(client):
+    add(client, "Поспать")
+    todo = add(client, "Поесть")
+    client.patch(f"/todos/{todo['id']}", json={"done": True})
+    done = client.get("/todos", params={"done": True}).json()
+    assert [t["title"] for t in done] == ["Поесть"]
+    to_do = client.get("/todos", params={"done": False}).json()
+    assert [t["title"] for t in to_do] == ["Поспать"]
+
+
+def test_search_ignores_case(client):
+    add(client, "Купить молоко")
+    add(client, "Погулять")
+    add(client, "Овсяное МОЛОКО")
+    found = client.get("/todos", params={"q": "Молоко"}).json()
+    assert [t["title"] for t in found] == ["Купить молоко", "Овсяное МОЛОКО"]
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "Все тесты в редакторе проходят", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 10" },
+    { name: "GET /todos/{todo_id} возвращает одну задачу, неизвестные id дают 404", check: "(c := TestClient(app)) and (t := c.post('/todos', json={'title': 'Feed Mei'}).json()) and c.get('/todos/' + str(t['id'])).json() == t and (r := c.get('/todos/9999')).status_code == 404 and r.json() == {'detail': 'Todo not found'}" },
+    { name: "GET /todos возвращает список задач", check: "(c := TestClient(app)) and (t := c.post('/todos', json={'title': 'Wash dishes'}).json()) and t in c.get('/todos').json() and all(set(x) == {'id', 'title', 'done'} for x in c.get('/todos').json())" },
+    { name: "?q= ищет по названиям без учёта регистра", check: "(c := TestClient(app)) and [c.post('/todos', json={'title': x}) for x in ['Buy ZEBRA food', 'zebra nap', 'Lion walk']] and [x['title'] for x in c.get('/todos?q=Zebra').json()] == ['Buy ZEBRA food', 'zebra nap']" },
+    { name: "?done= фильтрует по статусу (и работает вместе с q)", check: "(c := TestClient(app)) and (a := c.post('/todos', json={'title': 'koala one'}).json()) and (b := c.post('/todos', json={'title': 'koala two'}).json()) and c.patch('/todos/' + str(a['id']), json={'done': True}).status_code == 200 and [x['id'] for x in c.get('/todos?q=koala&done=true').json()] == [a['id']] and [x['id'] for x in c.get('/todos?q=koala&done=false').json()] == [b['id']]" },
+    { name: "PATCH меняет только присланные поля", check: "(c := TestClient(app)) and (t := c.post('/todos', json={'title': 'Old title'}).json()) and c.patch('/todos/' + str(t['id']), json={'done': True}).json() == {**t, 'done': True} and c.patch('/todos/' + str(t['id']), json={'title': 'New title'}).json() == {'id': t['id'], 'title': 'New title', 'done': True} and c.patch('/todos/' + str(t['id']), json={'title': ''}).status_code == 422 and c.patch('/todos/9999', json={'done': True}).status_code == 404" },
+    { name: "DELETE отвечает 204, задача исчезает, а id не используются повторно", check: "(c := TestClient(app)) and (t := c.post('/todos', json={'title': 'Temp'}).json()) and c.delete('/todos/' + str(t['id'])).status_code == 204 and c.get('/todos/' + str(t['id'])).status_code == 404 and c.delete('/todos/' + str(t['id'])).status_code == 404 and c.post('/todos', json={'title': 'Next'}).json()['id'] > t['id']" },
+  ]}
+>
+
+Доделайте API списка дел так, чтобы **прошли все десять тестов**. Модели, хранилище, `get_store`, роутер, `POST /todos` и набор тестов уже готовы. Вам нужно написать:
+
+1. Зависимость `get_todo_or_404(todo_id, store)`: вернуть `Todo` или выбросить **404** с `detail` `"Todo not found"`.
+2. `GET /todos`: все задачи списком, с двумя необязательными параметрами запроса: `done` (`bool`) оставляет только выполненные или только невыполненные задачи, а `q` — только задачи, в названии которых есть этот текст, **без учёта регистра**. Оба параметра можно использовать вместе.
+3. `GET /todos/{todo_id}`: одна задача.
+4. `PATCH /todos/{todo_id}`: тело `TodoUpdate`; изменить только присланные поля и вернуть обновлённую задачу.
+5. `DELETE /todos/{todo_id}`: удалить задачу и ответить **204**.
+
+Нажмите «Запустить», чтобы увидеть отчёт pytest: проваленные тесты подскажут, чего ещё не хватает. Не меняйте тесты: проверки к тому же обращаются к вашему API напрямую.
+
+<Hint>
+
+Скопируйте `get_todo_or_404` из урока, а `get_todo`, `update_todo` и `delete_todo` пусть принимают `todo: Todo = Depends(get_todo_or_404)`. Добавьте `response_model=list[Todo]` к эндпоинту списка, начните с `list(store.todos.values())` и отфильтруйте списковыми включениями; сравнивайте `q.lower() in t.title.lower()`. Для `PATCH` пройдитесь циклом по `data.model_dump(exclude_unset=True).items()` и используйте `setattr(todo, field, value)`. Эндпоинту `DELETE` нужны и задача, и хранилище: `del store.todos[todo.id]`, а в декораторе — `status_code=204`.
+
+</Hint>
+
+<Solution>
+
+```python
+import pytest
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+
+class TodoCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+
+
+class TodoUpdate(BaseModel):
+    title: str | None = Field(
+        default=None, min_length=1, max_length=100
+    )
+    done: bool | None = None
+
+
+class Todo(BaseModel):
+    id: int
+    title: str
+    done: bool = False
+
+
+class TodoStore:
+    def __init__(self):
+        self.todos: dict[int, Todo] = {}
+        self.next_id = 1
+
+    def add(self, title: str) -> Todo:
+        todo = Todo(id=self.next_id, title=title)
+        self.todos[todo.id] = todo
+        self.next_id += 1
+        return todo
+
+
+store = TodoStore()
+
+
+def get_store() -> TodoStore:
+    return store
+
+
+router = APIRouter(prefix="/todos", tags=["todos"])
+
+
+@router.post("", status_code=201, response_model=Todo)
+def create_todo(
+    data: TodoCreate, store: TodoStore = Depends(get_store)
+):
+    return store.add(data.title)
+
+
+def get_todo_or_404(
+    todo_id: int, store: TodoStore = Depends(get_store)
+) -> Todo:
+    if todo_id not in store.todos:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return store.todos[todo_id]
+
+
+@router.get("", response_model=list[Todo])
+def list_todos(
+    done: bool | None = None,
+    q: str | None = None,
+    store: TodoStore = Depends(get_store),
+):
+    todos = list(store.todos.values())
+    if done is not None:
+        todos = [t for t in todos if t.done == done]
+    if q:
+        todos = [t for t in todos if q.lower() in t.title.lower()]
+    return todos
+
+
+@router.get("/{todo_id}", response_model=Todo)
+def get_todo(todo: Todo = Depends(get_todo_or_404)):
+    return todo
+
+
+@router.patch("/{todo_id}", response_model=Todo)
+def update_todo(
+    data: TodoUpdate, todo: Todo = Depends(get_todo_or_404)
+):
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(todo, field, value)
+    return todo
+
+
+@router.delete("/{todo_id}", status_code=204)
+def delete_todo(
+    todo: Todo = Depends(get_todo_or_404),
+    store: TodoStore = Depends(get_store),
+):
+    del store.todos[todo.id]
+
+
+app = FastAPI(title="API списка дел")
+app.include_router(router)   # эта строка должна идти после эндпоинтов
+
+
+# ---------- тесты (не меняйте их) ----------
+
+@pytest.fixture
+def client():
+    fresh = TodoStore()
+    app.dependency_overrides[get_store] = lambda: fresh
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+def add(client, title):
+    return client.post("/todos", json={"title": title}).json()
+
+
+def test_create_todo(client):
+    response = client.post("/todos", json={"title": "Купить бамбук"})
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": 1, "title": "Купить бамбук", "done": False
+    }
+
+
+def test_empty_title_is_rejected(client):
+    response = client.post("/todos", json={"title": ""})
+    assert response.status_code == 422
+
+
+def test_list_todos(client):
+    add(client, "Купить бамбук")
+    add(client, "Поспать")
+    titles = [t["title"] for t in client.get("/todos").json()]
+    assert titles == ["Купить бамбук", "Поспать"]
+
+
+def test_get_todo(client):
+    todo = add(client, "Поспать")
+    assert client.get(f"/todos/{todo['id']}").json() == todo
+
+
+def test_unknown_todo_is_404(client):
+    assert client.get("/todos/99").status_code == 404
+    response = client.patch("/todos/99", json={"done": True})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Todo not found"}
+    assert client.delete("/todos/99").status_code == 404
+
+
+def test_update_changes_only_sent_fields(client):
+    todo = add(client, "Поспать")
+    url = f"/todos/{todo['id']}"
+    response = client.patch(url, json={"done": True})
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": todo["id"], "title": "Поспать", "done": True
+    }
+    assert client.get(url).json()["done"] is True
+
+
+def test_delete_todo(client):
+    todo = add(client, "Поспать")
+    url = f"/todos/{todo['id']}"
+    response = client.delete(url)
+    assert response.status_code == 204
+    assert client.get(url).status_code == 404
+
+
+def test_ids_are_never_reused(client):
+    first = add(client, "Раз")
+    add(client, "Два")
+    client.delete(f"/todos/{first['id']}")
+    assert add(client, "Три")["id"] == 3
+
+
+def test_filter_by_done(client):
+    add(client, "Поспать")
+    todo = add(client, "Поесть")
+    client.patch(f"/todos/{todo['id']}", json={"done": True})
+    done = client.get("/todos", params={"done": True}).json()
+    assert [t["title"] for t in done] == ["Поесть"]
+    to_do = client.get("/todos", params={"done": False}).json()
+    assert [t["title"] for t in to_do] == ["Поспать"]
+
+
+def test_search_ignores_case(client):
+    add(client, "Купить молоко")
+    add(client, "Погулять")
+    add(client, "Овсяное МОЛОКО")
+    found = client.get("/todos", params={"q": "Молоко"}).json()
+    assert [t["title"] for t in found] == ["Купить молоко", "Овсяное МОЛОКО"]
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Сначала спроектируйте API: один ресурс, пять эндпоинтов **CRUD**, коды ответа для успеха и неудачи и отдельные модели для создания, обновления и вывода.
+- Выбирайте id с помощью счётчика, который только растёт; `len(...) + 1` после удаления выдаёт уже занятые id.
+- `Depends(func)` выполняет общую логику перед эндпоинтом: её параметры берутся из запроса, она может выбросить `HTTPException`, а зависимости могут зависеть друг от друга (`get_todo_or_404` → `get_store`).
+- `APIRouter(prefix=..., tags=[...])` группирует эндпоинты; `app.include_router(router)` ставится **после** эндпоинтов.
+- Фильтрация через необязательные параметры запроса: `done: bool | None = None`, `q: str | None = None`.
+- Тестируйте с фикстурой `client`, которая задаёт в `app.dependency_overrides` **свежее хранилище на каждый тест**, а после теста вызывает `.clear()`.

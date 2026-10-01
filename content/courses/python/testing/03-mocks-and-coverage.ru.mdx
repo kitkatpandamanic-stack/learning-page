@@ -1,0 +1,458 @@
+---
+title: Моки, покрытие и TDD
+description: Заменяйте почту, API, часы и случайность тестовыми двойниками, используйте Mock, patch и monkeypatch, измеряйте покрытие и пишите тесты первыми.
+duration: 18
+xp: 25
+---
+
+Настоящий код общается с внешним миром. Он отправляет письма, вызывает веб-API, смотрит на часы и бросает кубики. Вы же не хотите, чтобы тесты писали настоящим клиентам, падали каждый раз, когда пропадает Wi-Fi, или проходили только до обеда. Решение — на время тестов заменять такие части подставными. В этом уроке вы узнаете, как это делается, а заодно освоите две привычки профессиональных команд: измерять **покрытие (coverage)** и писать **тесты первыми**. 🎭
+
+## Тестовые двойники
+
+**Тестовый двойник (test double)** — это всё, что подменяет настоящую вещь во время теста, как дублёр-каскадёр в кино. Вы встретите несколько названий:
+
+- **Заглушка (stub)** возвращает заготовленные ответы: «курс валюты всегда 1.25».
+- **Фейк (fake)** — простая работающая версия, например список в памяти вместо настоящей базы данных.
+- **Мок (mock)** вдобавок **запоминает, как его вызывали**, и тест может проверить: «письмо отправлено? кому? с каким текстом?»
+
+Проще всего использовать двойника, если устроить код так, чтобы его можно было **передать снаружи**. Это называется **внедрением зависимостей (dependency injection)**: функция не тянется сама к настоящему отправителю писем — вызывающий код передаёт его ей:
+
+<CodeExample output={`..                                                   [100%]
+2 passed in 0.01s`}>
+
+```python
+import pytest
+
+def welcome(user, send_email):
+    if not user["email"]:
+        return False
+    send_email(user["email"], f"Добро пожаловать, {user['name']}!")
+    return True
+
+def test_sends_a_welcome_email():
+    sent = []
+    fake_send = lambda to, text: sent.append((to, text))
+    user = {"name": "Мэй", "email": "mei@example.com"}
+    assert welcome(user, fake_send) is True
+    assert sent == [("mei@example.com", "Добро пожаловать, Мэй!")]
+
+def test_no_email_address_means_no_email():
+    sent = []
+    fake_send = lambda to, text: sent.append((to, text))
+    assert welcome({"name": "Сэм", "email": ""}, fake_send) is False
+    assert sent == []
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+В настоящем приложении вы бы вызвали `welcome(user, smtp_send)`. В тестах крошечный фейк записывает, что было бы отправлено. Никаких настоящих писем, никакой сети, и тест выполняется за миллисекунду.
+
+## Mock: двойник, который запоминает всё
+
+Писать фейки вручную быстро надоедает. Встроенный в Python **`unittest.mock.Mock`** создаёт их за вас. `Mock` можно вызвать с любыми аргументами, и он запомнит каждый вызов:
+
+<CodeExample output={`True
+1
+call('mei@example.com', 'Привет!')
+expected call not found.
+Expected: mock('sam@example.com', 'Привет!')
+  Actual: mock('mei@example.com', 'Привет!')
+1.25
+[call('EUR')]`}>
+
+```python
+from unittest.mock import Mock
+
+send = Mock()
+send("mei@example.com", "Привет!")
+print(send.called)
+print(send.call_count)
+print(send.call_args)
+
+send.assert_called_once_with("mei@example.com", "Привет!")
+try:
+    send.assert_called_once_with("sam@example.com", "Привет!")
+except AssertionError as error:
+    print(error)
+
+rates = Mock()
+rates.get_rate.return_value = 1.25
+print(rates.get_rate("EUR"))
+print(rates.get_rate.call_args_list)
+```
+
+</CodeExample>
+
+- `called`, `call_count`, `call_args` и `call_args_list` рассказывают, как использовался мок.
+- `assert_called_once_with(...)` проверяет, что мок вызвали ровно один раз и ровно с этими аргументами. Есть ещё `assert_called_with` (последний вызов), `assert_any_call` и `assert_not_called()`.
+- Любой атрибут мока — это тоже мок, поэтому `rates.get_rate` просто работает. Задайте **`return_value`**, чтобы выбрать, что он вернёт.
+
+У последнего пункта есть подвох: опечатка вроде `send.asert_called_once()` тоже молча «работает». Создавайте моки как `Mock(spec=RealClass)`, чтобы они отвергали атрибуты, которых нет у настоящего класса.
+
+## side_effect: ошибки и последовательности
+
+**`side_effect`** позволяет моку делать больше, чем возвращать одно значение. Передайте ему исключение — и мок его выбросит; передайте список — и каждый вызов вернёт (или выбросит) следующий элемент. Это идеально подходит, чтобы проверить, как код справляется с нестабильной сетью:
+
+<CodeExample output={`..                                                   [100%]
+2 passed in 0.01s`}>
+
+```python
+import pytest
+from unittest.mock import Mock
+
+def fetch_with_retry(fetch, attempts=3):
+    for attempt in range(attempts):
+        try:
+            return fetch()
+        except ConnectionError:
+            if attempt == attempts - 1:
+                raise
+
+def test_retries_until_it_works():
+    fetch = Mock(side_effect=[
+        ConnectionError("down"),
+        ConnectionError("down"),
+        {"temp": 21},
+    ])
+    assert fetch_with_retry(fetch) == {"temp": 21}
+    assert fetch.call_count == 3
+
+def test_gives_up_after_three_attempts():
+    fetch = Mock(side_effect=ConnectionError("down"))
+    with pytest.raises(ConnectionError):
+        fetch_with_retry(fetch)
+    assert fetch.call_count == 3
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+Заставить настоящий сервер дважды упасть, а потом ответить, почти невозможно. С моком это одна строка.
+
+## patch: временная замена
+
+Внедрение зависимостей — самый чистый вариант, но иногда код вызывает что-то напрямую, например `random.randint`. **`unittest.mock.patch`** **временно** заменяет имя и возвращает оригинал на место, когда блок `with` заканчивается:
+
+<CodeExample output={`.                                                    [100%]
+1 passed in 0.01s`}>
+
+```python
+import random
+import pytest
+from unittest.mock import patch
+
+def roll_for_treasure():
+    roll = random.randint(1, 6)
+    if roll == 6:
+        return "золотой бамбук"
+    return "ничего"
+
+def test_rolling_a_six_finds_treasure():
+    with patch("random.randint", return_value=6) as fake:
+        assert roll_for_treasure() == "золотой бамбук"
+    fake.assert_called_once_with(1, 6)
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+Строка `"random.randint"` говорит, **где** заменять: атрибут `randint` модуля `random`. Внутри блока `with` это `Mock` с `return_value=6`. Ещё можно использовать `@patch("random.randint")` как декоратор — тогда мок придёт в тест дополнительным аргументом.
+
+<Callout type="warning" title="Заменяйте там, где используется, а не там, где определено">
+
+Если в `weather.py` написано `from httpx import get`, а потом вызывается `get(...)`, то имя `get` теперь живёт **в `weather`**. Замена `"httpx.get"` изменит модуль httpx, но не собственную копию имени в weather, поэтому заменять нужно `"weather.get"`. Если же там написано `import httpx` и вызывается `httpx.get(...)`, замена `"httpx.get"` сработает. Простое правило: заменяйте имя в том модуле, который его **ищет**.
+
+</Callout>
+
+## Фикстура monkeypatch в pytest
+
+У pytest есть собственная встроенная фикстура для той же задачи — **`monkeypatch`**. Часто она проще, а ещё умеет работать с переменными окружения. Всё, что она изменила, автоматически откатывается, когда тест заканчивается:
+
+<CodeExample output={`...                                                  [100%]
+3 passed in 0.01s`}>
+
+```python
+import os
+import random
+import pytest
+
+def currency():
+    return os.environ.get("SHOP_CURRENCY", "GBP")
+
+def lucky_number():
+    return random.randint(1, 100)
+
+def test_default_currency(monkeypatch):
+    monkeypatch.delenv("SHOP_CURRENCY", raising=False)
+    assert currency() == "GBP"
+
+def test_currency_from_environment(monkeypatch):
+    monkeypatch.setenv("SHOP_CURRENCY", "EUR")
+    assert currency() == "EUR"
+
+def test_lucky_number(monkeypatch):
+    monkeypatch.setattr(random, "randint", lambda a, b: 42)
+    assert lucky_number() == 42
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+- `monkeypatch.setattr(module_or_object, "name", new_value)` заменяет атрибут.
+- `monkeypatch.setenv` и `monkeypatch.delenv` меняют переменные окружения — именно так настоящие приложения получают настройки вроде ключей API.
+
+Выбирайте, что вам удобнее: `patch`, когда потом нужен `Mock` для проверки, `monkeypatch` — для быстрых замен и переменных окружения.
+
+## Время и случайность: передавайте их снаружи
+
+Код, который где-то в глубине вызывает `datetime.now()` или `random.choice()`, при каждом запуске даёт разный ответ, и его трудно тестировать. Замена через patch работает, но профессиональное решение проще: **сделайте время или генератор случайных чисел параметром**, а настоящий оставьте значением по умолчанию:
+
+<CodeExample output={`...                                                  [100%]
+3 passed in 0.01s`}>
+
+```python
+import random
+from datetime import datetime
+import pytest
+
+def greeting(now=None):
+    now = now or datetime.now()
+    if now.hour < 12:
+        return "Доброе утро"
+    if now.hour < 18:
+        return "Добрый день"
+    return "Добрый вечер"
+
+def pick_winner(names, rng=random):
+    return rng.choice(sorted(names))
+
+def test_morning():
+    assert greeting(datetime(2026, 5, 1, 9, 30)) == "Доброе утро"
+
+def test_six_pm_is_evening():
+    assert greeting(datetime(2026, 5, 1, 18, 0)) == "Добрый вечер"
+
+def test_pick_winner_is_repeatable_with_a_seed():
+    names = ["Мэй", "Сэм", "Али"]
+    first = pick_winner(names, random.Random(7))
+    again = pick_winner(names, random.Random(7))
+    assert first == again
+    assert first in names
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+В приложении вы вызываете `greeting()` и `pick_winner(names)` как обычно. Тесты же передают фиксированное время или генератор `random.Random(seed)`, который всегда выдаёт одну и ту же последовательность. Никаких замен не нужно, и код к тому же становится гибче.
+
+## Покрытие: что пропустили ваши тесты?
+
+**Покрытие кода (code coverage)** показывает, какие строки вашего кода выполнились во время тестов. Строки, которые ни разу не выполнились, точно не протестированы. Обычно для этого используют плагин `pytest-cov` (в браузере он недоступен, так что попробуйте его на своём компьютере):
+
+```bash
+pip install pytest-cov
+pytest --cov=shop --cov-report=term-missing
+```
+
+После обычных результатов тестов вы получите такую таблицу:
+
+```text
+Name              Stmts   Miss  Cover   Missing
+-----------------------------------------------
+shop/__init__.py      0      0   100%
+shop/pricing.py      24      3    88%   31-33
+-----------------------------------------------
+TOTAL                24      3    88%
+```
+
+В столбце `Missing` перечислены номера строк, которые не запустил ни один тест, — здесь строки с 31 по 33 в `pricing.py`. Возможно, это ветка обработки ошибки, которую вы забыли протестировать. Добавьте `--cov-branch`, чтобы проверять ещё и то, что выполнились обе стороны каждого `if`. Команды часто добавляют `--cov-fail-under=80` в свой CI (сервер, который запускает тесты при каждом push), чтобы сборка падала, если покрытие снизилось.
+
+<Callout type="note" title="100% покрытия — это не 100% правильности">
+
+Покрытие говорит, что вы **не** протестировали. Оно не может сказать, проверяют ли ваши тесты **то, что нужно**: тест, который вызывает функцию без единого `assert`, всё равно её «покрывает». Используйте покрытие, чтобы находить пробелы, а не как счёт, который нужно довести до максимума. Многие команды целятся примерно в 80–90% и сосредотачиваются на важной логике.
+
+</Callout>
+
+## Цикл TDD: красный, зелёный, рефакторинг
+
+До сих пор вы сначала писали код, а потом тесты. **Разработка через тестирование (test-driven development, TDD)** переворачивает этот порядок и работает коротким циклом:
+
+1. **Красный (red)**: напишите небольшой тест для поведения, которого ещё нет. Запустите его и убедитесь, что он **падает**.
+2. **Зелёный (green)**: напишите самый простой код, при котором тест проходит.
+3. **Рефакторинг (refactor)**: приведите в порядок код (и тесты), пока все тесты остаются зелёными.
+
+Допустим, вам нужна функция `slugify`, которая превращает заголовок поста в часть URL. Начните с теста — ещё до того, как функция появилась:
+
+```python
+def test_spaces_become_dashes():
+    assert slugify("Hello World") == "hello-world"
+# Красный: NameError: name 'slugify' is not defined
+```
+
+Затем самый простой код, который проходит тест:
+
+```python
+def slugify(title):
+    return title.lower().replace(" ", "-")
+# Зелёный: 1 passed
+```
+
+Следующее поведение — следующий тест: знаки препинания должны исчезать. Тест падает (красный), вы улучшаете код (зелёный), а затем наводите порядок (рефакторинг). Через несколько циклов получается:
+
+<CodeExample output={`...                                                  [100%]
+3 passed in 0.01s`}>
+
+```python
+import re
+import pytest
+
+def slugify(title):
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    return "-".join(words)
+
+def test_spaces_become_dashes():
+    assert slugify("Hello World") == "hello-world"
+
+def test_punctuation_disappears():
+    assert slugify("Hi, Panda!") == "hi-panda"
+
+def test_extra_spaces_do_not_double_dashes():
+    assert slugify("  Big   news ") == "big-news"
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+Переписать код на `re.findall` на шаге рефакторинга было безопасно, потому что прежние тесты продолжали охранять старое поведение. TDD делает шаги маленькими, гарантирует, что каждый тест хоть раз был красным, и подталкивает к коду, который легко тестировать. Не каждая команда практикует строгий TDD, но почти каждый хороший разработчик использует этот цикл при исправлении ошибки: сначала тест, который её воспроизводит (красный), потом исправление (зелёный).
+
+<Callout type="tip" title="Не увлекайтесь моками">
+
+Подменяйте **края** программы: почту, сеть, часы, случайность, платёжные сервисы. Не подменяйте собственные маленькие функции и классы — тестируйте их по-настоящему. Тест, состоящий из одних моков, проверяет лишь то, что код вызывает что-то в определённом порядке, и ломается при каждом рефакторинге.
+
+</Callout>
+
+<Quiz
+  question="shop.py начинается с from random import randint и позже вызывает randint(1, 6). Тест хочет, чтобы этот вызов вернул 6. Что он должен заменить через patch?"
+  options={["random.randint", "shop.randint", "randint", "shop.random.randint"]}
+  answer={1}
+  explanation="from random import randint копирует имя в модуль shop, и shop ищет его там. Заменяйте там, где используется: shop.randint. Замена random.randint не изменила бы собственное имя в shop."
+/>
+
+<Quiz
+  question="fetch = Mock(side_effect=[1, ValueError('x')]). Что произойдёт при первом и втором вызове fetch()?"
+  options={[
+    "Оба вызова вернут 1",
+    "Первый вернёт 1, второй выбросит ValueError",
+    "Первый выбросит ValueError, второй вернёт 1",
+    "Оба вызова вернут список [1, ValueError('x')]",
+  ]}
+  answer={1}
+  explanation="Список в side_effect выдаёт по одному элементу на вызов, по порядку. Элементы-исключения выбрасываются, а не возвращаются."
+/>
+
+<Exercise
+  language="python"
+  title="Напоминания об абонементе"
+  starter={`import pytest
+from datetime import date
+from unittest.mock import Mock
+
+
+def send_reminders(members, today, send_email):
+    """Пишет участникам, чей абонемент заканчивается через 0–7 дней.
+    Возвращает, сколько писем отправлено."""
+    pass
+
+
+# Напишите тесты здесь, используя Mock вместо send_email
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "Отправляет одно письмо с правильным адресом и текстом", check: "send_reminders([{'email': 'a@x.io', 'ends': date(2026, 3, 5)}], date(2026, 3, 1), m := Mock()) == 1 and [c.args for c in m.call_args_list] == [('a@x.io', 'Ваш абонемент заканчивается 2026-03-05')]" },
+    { name: "День 0 и день 7 считаются, день 8 и истёкшие — нет", check: "send_reminders([{'email': e, 'ends': date(2026, 1, d)} for e, d in [('a', 10), ('b', 17), ('c', 18), ('d', 9)]], date(2026, 1, 10), m := Mock()) == 2 and [c.args[0] for c in m.call_args_list] == ['a', 'b']" },
+    { name: "Если никому не пора, писем нет", check: "send_reminders([{'email': 'z', 'ends': date(2027, 1, 1)}], date(2026, 1, 1), m := Mock()) == 0 and not m.called" },
+    { name: "Вы написали минимум 2 теста, и все они проходят", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 2" },
+    { name: "Ваши тесты ловят версию, которая ничего не отправляет", check: "_panda_pytest(patch={'send_reminders': lambda members, today, send_email: 0})['failed'] > 0" },
+    { name: "Ваши тесты ловят версию, которая пишет всем подряд", check: "_panda_pytest(patch={'send_reminders': lambda members, today, send_email: len([send_email(m['email'], 'Ваш абонемент заканчивается ' + str(m['ends'])) for m in members])})['failed'] > 0" },
+    { name: "Ваши тесты ловят версию с неправильным текстом", check: "_panda_pytest(patch={'send_reminders': lambda members, today, send_email: send_reminders(members, today, lambda to, text: send_email(to, text.upper()))})['failed'] > 0" },
+  ]}
+>
+
+Спортзал хочет напоминать участникам, что их абонемент скоро закончится. Напишите код **и** тесты к нему.
+
+1. Допишите `send_reminders(members, today, send_email)`. `members` — это список словарей вида `{"email": "mei@example.com", "ends": date(2026, 3, 5)}`. Для каждого участника, чей абонемент заканчивается в промежутке от `today` до 7 дней спустя (**обе границы включены**), вызовите `send_email(email, text)` с текстом `"Ваш абонемент заканчивается 2026-03-05"` (дата в том виде, в каком её выводит `str()`). Верните количество отправленных писем.
+2. Напишите минимум **2 теста**, которые передают `Mock()` в качестве `send_email` и фиксированный `today`:
+   - один, где участнику пора напомнить, — проверьте точный вызов через `assert_called_once_with(...)`,
+   - один, где напоминать некому (например, абонемент заканчивается в следующем году), — проверьте `assert_not_called()`.
+
+Затем проверки попробуют три сломанные версии `send_reminders`, и ваши тесты должны поймать каждую.
+
+<Hint>
+
+Разность двух дат — это `timedelta`: `(member["ends"] - today).days` — количество оставшихся дней. Отправляйте письмо, если это число от 0 до 7: `if 0 <= days_left <= 7:`. Текст соберите f-строкой: `f"Ваш абонемент заканчивается {member['ends']}"`. В тесте создайте `send = Mock()`, вызовите `send_reminders([...], date(2026, 3, 1), send)`, а затем `send.assert_called_once_with("mei@example.com", "Ваш абонемент заканчивается 2026-03-05")`.
+
+</Hint>
+
+<Solution>
+
+```python
+import pytest
+from datetime import date
+from unittest.mock import Mock
+
+
+def send_reminders(members, today, send_email):
+    """Пишет участникам, чей абонемент заканчивается через 0–7 дней.
+    Возвращает, сколько писем отправлено."""
+    sent = 0
+    for member in members:
+        days_left = (member["ends"] - today).days
+        if 0 <= days_left <= 7:
+            text = f"Ваш абонемент заканчивается {member['ends']}"
+            send_email(member["email"], text)
+            sent += 1
+    return sent
+
+
+def test_reminds_a_member_who_is_due():
+    send = Mock()
+    members = [{"email": "mei@example.com", "ends": date(2026, 3, 5)}]
+    count = send_reminders(members, date(2026, 3, 1), send)
+    assert count == 1
+    send.assert_called_once_with(
+        "mei@example.com", "Ваш абонемент заканчивается 2026-03-05"
+    )
+
+def test_no_email_when_nobody_is_due():
+    send = Mock()
+    members = [{"email": "sam@example.com", "ends": date(2027, 1, 1)}]
+    assert send_reminders(members, date(2026, 3, 1), send) == 0
+    send.assert_not_called()
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Тестовый двойник** (заглушка, фейк или мок) подменяет почту, API, часы или случайность во время тестов.
+- **Внедрение зависимостей** (передача помощников в виде параметров) — самый простой способ использовать двойников.
+- `Mock()` запоминает вызовы: проверяйте их через `assert_called_once_with`, `call_args` и похожие методы; задавайте `return_value`, чтобы выбрать результат.
+- `side_effect` заставляет мок выбросить исключение или вернуть последовательность значений.
+- `patch("module.name")` и фикстура `monkeypatch` в pytest временно подменяют что-либо; **заменяйте имя там, где его ищут**.
+- Делайте время и случайность параметрами (`now=None`, `rng=random`), чтобы тесты могли передавать фиксированные значения.
+- **Покрытие** (`pytest --cov`) показывает непротестированные строки; оно находит пробелы, но не доказывает правильность.
+- **TDD**: красный (падающий тест), зелёный (самый простой код), рефакторинг (наводим порядок, пока тесты проходят).

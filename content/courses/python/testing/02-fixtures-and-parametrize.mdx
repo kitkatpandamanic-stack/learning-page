@@ -1,0 +1,440 @@
+---
+title: Fixtures and Parametrize
+description: Share setup between tests with pytest fixtures, clean up with yield, run one test with many inputs and use tmp_path, skip and xfail.
+duration: 18
+xp: 25
+---
+
+Once you have more than a handful of tests, two things start to hurt. Every test builds the same objects at the top, and you copy the same test five times with different numbers. pytest has a tool for each: **fixtures** for shared setup and **parametrize** for many inputs. These two features are a big reason why pytest became Python's favourite test runner. 🧰
+
+## The problem: copied setup
+
+Here are tests for a music playlist. Look at how each one starts:
+
+```python
+def test_total_length():
+    playlist = Playlist("Road trip")
+    playlist.add("Hey Jude", 431)
+    playlist.add("Yellow", 266)
+    assert playlist.total_seconds() == 697
+
+def test_remove_song():
+    playlist = Playlist("Road trip")
+    playlist.add("Hey Jude", 431)
+    playlist.add("Yellow", 266)
+    playlist.remove("Yellow")
+    assert playlist.total_seconds() == 431
+```
+
+The **arrange** step is copied. If `Playlist` gets a new required argument, you'll fix it in every test. And the actual point of each test is buried under setup.
+
+## Fixtures: setup you ask for by name
+
+A **fixture** is a function marked with `@pytest.fixture` that prepares something for your tests. A test asks for it by having a **parameter with the same name**, and pytest passes in whatever the fixture returns:
+
+<CodeExample output={`...                                                  [100%]
+3 passed in 0.01s`}>
+
+```python
+import pytest
+
+class Playlist:
+    def __init__(self, name):
+        self.name = name
+        self.songs = {}
+
+    def add(self, title, seconds):
+        self.songs[title] = seconds
+
+    def remove(self, title):
+        del self.songs[title]
+
+    def total_seconds(self):
+        return sum(self.songs.values())
+
+@pytest.fixture
+def road_trip():
+    playlist = Playlist("Road trip")
+    playlist.add("Hey Jude", 431)
+    playlist.add("Yellow", 266)
+    return playlist
+
+def test_total_length(road_trip):
+    assert road_trip.total_seconds() == 697
+
+def test_remove_song(road_trip):
+    road_trip.remove("Yellow")
+    assert road_trip.total_seconds() == 431
+
+def test_add_song(road_trip):
+    road_trip.add("Wonderwall", 258)
+    assert len(road_trip.songs) == 3
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+You never call `road_trip()` yourself. pytest sees the parameter name, finds the fixture with that name and calls it **for every test**. So `test_remove_song` removing a song doesn't affect `test_add_song`: each test gets a brand-new playlist. That **isolation** matters a lot. Tests that share changing data pass or fail depending on the order they run in, which is a nightmare to debug.
+
+## Setup and teardown with yield
+
+Some things need **cleaning up** after the test: close a database connection, delete a file, stop a server. Write the fixture with `yield` instead of `return`. Code before `yield` is the setup, the yielded value goes to the test, and code after `yield` is the **teardown**, which runs when the test is finished, even if it failed:
+
+<CodeExample output={`open database
+test running
+.close database
+
+1 passed in 0.01s`}>
+
+```python
+import pytest
+
+class FakeDatabase:
+    def __init__(self):
+        self.rows = []
+        print("open database")
+
+    def close(self):
+        print("close database")
+
+@pytest.fixture
+def db():
+    database = FakeDatabase()   # setup
+    yield database              # the test runs here
+    database.close()            # teardown
+
+def test_starts_empty(db):
+    print("test running")
+    assert db.rows == []
+
+pytest.main([__file__, "-s"])
+```
+
+</CodeExample>
+
+Normally pytest hides whatever your tests print (it only shows it for failing tests). The `-s` option switches that off, so you can see the order: setup, the test, then teardown. The `.` before `close database` is pytest marking the test as passed, just before the teardown runs.
+
+If this reminds you of `@contextlib.contextmanager` from the [generators and context managers lesson](/learn/python/generators-and-context-managers), it should: it's the same "setup, yield, clean up" pattern.
+
+## Fixture scope
+
+By default a fixture runs once **per test** (its **scope** is `"function"`). That's the safest choice. If a fixture is slow and the tests only read from it, you can share one result between tests with a wider scope:
+
+<CodeExample output={`loading data (slow!)
+..
+2 passed in 0.01s`}>
+
+```python
+import pytest
+
+@pytest.fixture(scope="module")
+def big_data():
+    print("loading data (slow!)")
+    return list(range(1_000))
+
+def test_length(big_data):
+    assert len(big_data) == 1000
+
+def test_last(big_data):
+    assert big_data[-1] == 999
+
+pytest.main([__file__, "-s"])
+```
+
+</CodeExample>
+
+The data was loaded once for both tests. The scopes are `"function"` (default), `"class"`, `"module"` (once per test file) and `"session"` (once for the whole test run). In real projects, a database **engine** is often session-scoped, while each test still gets its own fresh, function-scoped **transaction** on top of it.
+
+<Callout type="warning" title="Shared fixtures must stay unchanged">
+
+With a wider scope, every test gets the **same** object. If one test changes it (appends to the list, deletes a row), the next test sees that change. Only widen the scope for things your tests treat as read-only.
+
+</Callout>
+
+## Sharing fixtures with conftest.py
+
+Fixtures that several test files need go into a special file called **`conftest.py`**. pytest loads it automatically, and every test in that folder (and its subfolders) can use its fixtures, with no import needed:
+
+```text
+shop/
+├── pricing.py
+└── tests/
+    ├── conftest.py        # shared fixtures live here
+    ├── test_cart.py
+    └── test_checkout.py
+```
+
+```python
+# tests/conftest.py
+import pytest
+from shop.cart import Cart
+
+@pytest.fixture
+def cart():
+    cart = Cart()
+    cart.add("tea", 3.50, quantity=2)
+    return cart
+```
+
+Now `def test_total(cart):` works in both `test_cart.py` and `test_checkout.py`. Fixtures can also ask for **other fixtures** the same way tests do: `def checkout(cart):` gets the `cart` fixture.
+
+pytest also comes with **built-in fixtures**. You'll meet `tmp_path` below and `monkeypatch` in the next lesson.
+
+## One test, many inputs: parametrize
+
+Testing a function with lots of inputs and expected outputs? Don't copy the test. **`@pytest.mark.parametrize`** runs one test function once for each set of values:
+
+<CodeExample output={`......                                               [100%]
+6 passed in 0.01s`}>
+
+```python
+import pytest
+
+def duration_text(seconds):
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes}:{secs:02}"
+
+@pytest.mark.parametrize("seconds, expected", [
+    (0, "0:00"),
+    (5, "0:05"),
+    (59, "0:59"),
+    (60, "1:00"),
+    (61, "1:01"),
+    (431, "7:11"),
+])
+def test_duration_text(seconds, expected):
+    assert duration_text(seconds) == expected
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+- The first argument names the parameters, as one string separated by commas.
+- The second is a list of tuples, one tuple per **case**.
+- pytest runs the test six times and counts each case as its own test.
+
+When a case fails, pytest names it with its values, for example `FAILED lesson.py::test_duration_text[61-1:01]`, so you know exactly which input broke. Adding a new case is now one line, which makes it easy to cover every boundary from the last lesson.
+
+## Temporary files with tmp_path
+
+Code that reads and writes files is awkward to test: you don't want tests to leave files lying around or overwrite real data. The built-in **`tmp_path`** fixture gives each test its own brand-new, empty folder as a `pathlib.Path`:
+
+<CodeExample output={`..                                                   [100%]
+2 passed in 0.01s`}>
+
+```python
+import json
+import pytest
+
+def save_playlist(path, songs):
+    path.write_text(json.dumps(songs))
+
+def load_playlist(path):
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+def test_save_then_load(tmp_path):
+    file = tmp_path / "playlist.json"
+    save_playlist(file, {"Yellow": 266})
+    assert load_playlist(file) == {"Yellow": 266}
+
+def test_missing_file_gives_empty_playlist(tmp_path):
+    assert load_playlist(tmp_path / "nope.json") == {}
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+Notice the design: the functions take the **path as a parameter** instead of using a fixed file name inside. That small choice is what makes them easy to test. pytest deletes old temporary folders for you.
+
+## Skip and xfail
+
+Sometimes a test shouldn't run right now. Two **marks** handle that:
+
+- `@pytest.mark.skip(reason=...)` skips a test, and `@pytest.mark.skipif(condition, reason=...)` skips it only when the condition is true (for example on Windows, or on an old Python version).
+- `@pytest.mark.xfail(reason=...)` means "we know this fails". It runs, but a failure doesn't turn the run red. It's handy for documenting a known bug until someone fixes it.
+
+<CodeExample output={`.sx                                                  [100%]
+1 passed, 1 skipped, 1 xfailed in 0.01s`}>
+
+```python
+import sys
+import pytest
+
+def shout(text):
+    return text.upper() + "!"
+
+def test_shout():
+    assert shout("hi") == "HI!"
+
+@pytest.mark.skipif(sys.version_info < (4, 0), reason="needs Python 4")
+def test_future_feature():
+    assert shout("hi") == "HI!!!"
+
+@pytest.mark.xfail(reason="bug: empty text should stay empty")
+def test_empty_text():
+    assert shout("") == ""
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+`s` marks a skipped test and `x` an expected failure. Use both sparingly: a skipped test checks nothing, and old `xfail`s tend to be forgotten.
+
+<Callout type="tip" title="What pros do">
+
+Real test suites lean on fixtures heavily: a fresh database for each test, a logged-in user, a test client for the web app. When a test starts with more than a few lines of setup, that's a sign the setup wants to become a fixture.
+
+</Callout>
+
+<Quiz
+  question="A fixture def numbers(): return [1, 2] has the default scope. test_a(numbers) appends 3 to it. Then test_b(numbers) asserts len(numbers) == 2. What happens to test_b?"
+  options={[
+    "It fails, because the list now has 3 items",
+    "It passes, because each test gets a fresh list",
+    "It fails, because fixtures can't return lists",
+    "It depends on which test pytest runs first",
+  ]}
+  answer={1}
+  explanation="The default scope is function: pytest calls the fixture again for every test, so test_b gets a new [1, 2] no matter what test_a did."
+/>
+
+<Quiz
+  question="A test is decorated with @pytest.mark.parametrize('n, expected', [(1, 1), (2, 4), (3, 9), (4, 16)]). How many tests does pytest report for it?"
+  options={["1", "2", "4", "8"]}
+  answer={2}
+  explanation="parametrize runs the test once per tuple in the list, and each run is reported as its own test: four cases, four tests."
+/>
+
+<Exercise
+  language="python"
+  title="Test the shopping cart"
+  starter={`import pytest
+
+class Cart:
+    def __init__(self):
+        self.items = {}   # name -> [price, quantity]
+
+    def add(self, name, price, quantity=1):
+        if name in self.items:
+            self.items[name][1] += quantity
+        else:
+            self.items[name] = [price, quantity]
+
+    def total(self):
+        return sum(p * q for p, q in self.items.values())
+
+
+def shipping_cost(total):
+    """Orders of 50 or more ship free, others cost 4.99."""
+    if total >= 50:
+        return 0
+    return 4.99
+
+
+# 1. A fixture called cart: 2 teas at 3.50 and 1 mug at 8
+
+
+# 2. Tests that use the cart fixture
+
+
+# 3. A parametrized test for shipping_cost
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "cart is a pytest fixture", check: "type(cart).__name__ == 'FixtureFunctionDefinition'" },
+    { name: "One of your tests uses parametrize", check: "any(m.name == 'parametrize' for f in list(globals().values()) for m in getattr(f, 'pytestmark', []))" },
+    { name: "At least 5 tests, all passing", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 5" },
+    { name: "Catches a total() that ignores quantities", check: "_panda_pytest(patch={'Cart': type('Cart', (Cart,), {'total': lambda self: sum(p for p, q in self.items.values())})})['failed'] > 0" },
+    { name: "Catches an add() that replaces the quantity", check: "_panda_pytest(patch={'Cart': type('Cart', (Cart,), {'add': lambda self, name, price, quantity=1: self.items.__setitem__(name, [price, quantity])})})['failed'] > 0" },
+    { name: "Catches > 50 instead of >= 50", check: "_panda_pytest(patch={'shipping_cost': lambda total: 0 if total > 50 else 4.99})['failed'] > 0" },
+    { name: "Catches shipping that is always free", check: "_panda_pytest(patch={'shipping_cost': lambda total: 0})['failed'] > 0" },
+  ]}
+>
+
+The cart and shipping code is correct. Write tests good enough to catch the bugs the checks will sneak in:
+
+1. Write a **fixture** called `cart` that returns a `Cart` with 2 teas at `3.50` and 1 mug at `8` already added.
+2. Write tests that use the `cart` fixture: check that `total()` is `15.0`, and that adding **more** of an item that's already in the cart increases its quantity (add 1 more tea: the tea quantity becomes 3 and the total `18.5`).
+3. Write **one parametrized** test for `shipping_cost` with at least three cases: a total below 50, a total of exactly 50, and one above 50.
+
+<Hint>
+
+The fixture is `@pytest.fixture` on a function `def cart():` that creates `Cart()`, calls `add("tea", 3.50, 2)` and `add("mug", 8)`, then returns it. A test that uses it is `def test_total(cart):`. For the shipping test, use `@pytest.mark.parametrize("total, expected", [(49.99, 4.99), (50, 0), (80, 0)])` above `def test_shipping(total, expected):`.
+
+</Hint>
+
+<Solution>
+
+```python
+import pytest
+
+class Cart:
+    def __init__(self):
+        self.items = {}   # name -> [price, quantity]
+
+    def add(self, name, price, quantity=1):
+        if name in self.items:
+            self.items[name][1] += quantity
+        else:
+            self.items[name] = [price, quantity]
+
+    def total(self):
+        return sum(p * q for p, q in self.items.values())
+
+
+def shipping_cost(total):
+    """Orders of 50 or more ship free, others cost 4.99."""
+    if total >= 50:
+        return 0
+    return 4.99
+
+
+@pytest.fixture
+def cart():
+    cart = Cart()
+    cart.add("tea", 3.50, 2)
+    cart.add("mug", 8)
+    return cart
+
+def test_total(cart):
+    assert cart.total() == 15.0
+
+def test_adding_more_of_an_item(cart):
+    cart.add("tea", 3.50)
+    assert cart.items["tea"] == [3.50, 3]
+    assert cart.total() == 18.5
+
+@pytest.mark.parametrize("total, expected", [
+    (10, 4.99),
+    (49.99, 4.99),
+    (50, 0),
+    (80, 0),
+])
+def test_shipping_cost(total, expected):
+    assert shipping_cost(total) == expected
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **fixture** (`@pytest.fixture`) prepares something for tests; a test gets it by naming it as a parameter.
+- With the default **function scope**, every test gets a fresh copy, which keeps tests isolated.
+- Use `yield` in a fixture for **teardown**: code after `yield` runs after the test, even if it failed.
+- `scope="module"` or `"session"` shares one result between tests; only do it for read-only, slow things.
+- Put shared fixtures in **`conftest.py`**; pytest loads it automatically.
+- `@pytest.mark.parametrize("a, b", [(...), (...)])` runs one test for many cases, each reported separately.
+- `tmp_path` gives each test its own empty folder; `skip`, `skipif` and `xfail` mark tests that shouldn't run or are known to fail.

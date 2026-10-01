@@ -12,6 +12,8 @@ type PythonMessage =
   | { type: "done"; id: number; raw: string };
 
 export const PYTHON_RUN_TIMEOUT_MS = 5000;
+// Checks may run the learner's pytest suite several times, so they get longer.
+export const PYTHON_CHECK_TIMEOUT_MS = 15_000;
 // Pyodide is about 10 MB (pandas about 15 MB more); give slow mobile
 // connections time to download it.
 const LOAD_TIMEOUT_MS = 120_000;
@@ -83,7 +85,7 @@ export function runPython(
 ): { result: Promise<RunResult>; cancel: () => void } {
   const {
     tests,
-    timeoutMs = PYTHON_RUN_TIMEOUT_MS,
+    timeoutMs = tests?.length ? PYTHON_CHECK_TIMEOUT_MS : PYTHON_RUN_TIMEOUT_MS,
     onLine,
     onStatus,
   } = options;

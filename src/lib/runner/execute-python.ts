@@ -36,8 +36,10 @@ os.environ["MPLBACKEND"] = "agg"
 os.environ["COLUMNS"] = "60"
 os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"  # e.g. anyio's, which warns once imported
 os.makedirs(_PANDA_DIR, exist_ok=True)
+# No cache files, and no unraisableexception plugin, whose gc.collect()
+# calls after each session cost ~0.3 s once FastAPI is loaded.
 with open(_PANDA_DIR + "/pytest.ini", "w") as f:
-    f.write("[pytest]\\naddopts = -q -p no:cacheprovider\\n")
+    f.write("[pytest]\\naddopts = -q -p no:cacheprovider -p no:unraisableexception\\n")
 
 class _PandaCounter:
     def __init__(self, emit):

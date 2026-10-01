@@ -1,0 +1,542 @@
+---
+title: Resilience Patterns
+description: Keep services standing when their dependencies fail, with timeouts, retries with backoff and jitter, idempotency keys, circuit breakers, rate limiters and graceful degradation.
+duration: 25
+xp: 25
+---
+
+In a system with many services, something is **always** broken somewhere: a database is restarting, a network link is slow, a partner's API is returning errors. You can't prevent that. What you can control is whether one small failure stays small or spreads until the whole site is down. This lesson is a toolbox of **resilience patterns** that senior engineers reach for every week. 🛡️
+
+One rule for the whole lesson: these patterns all involve **time** (waiting, expiring, refilling). Code that calls `time.time()` and `time.sleep()` directly is slow and flaky to test, so every example here takes the clock or the sleep function as a parameter. Tests pass a fake one, production passes the real one.
+
+## How things fail
+
+| Failure | What you see | Typical cause |
+| --- | --- | --- |
+| Crash | Connection refused, error straight away | Server down, deploy in progress |
+| Error response | HTTP 500/502/503 | Bug, overload, a dependency of a dependency |
+| Slowness | The call just... hangs | Overload, lock contention, a slow query, a lost packet |
+| Wrong answer | 200 OK with bad data | Bugs, stale caches |
+
+The sneakiest one is **slowness**. A crash fails fast and you move on. A hanging call holds on to a worker, a database connection and the user's patience. When every worker is stuck waiting for one slow dependency, your healthy service stops answering too. That's how failures **cascade**.
+
+## Timeouts: never wait forever
+
+Every call across the network needs a **timeout**: the longest you're willing to wait before giving up. Choose it from what the caller can afford, not from what the dependency usually takes.
+
+<CodeExample output={`recommendations timed out
+{'user': 'mei', 'picks': ['bestsellers']}`}>
+
+```python
+import asyncio
+
+async def personal_picks(user):
+    await asyncio.sleep(0.3)       # the service is having a bad day
+    return ["dumplings", "noodles"]
+
+async def homepage(user):
+    try:
+        async with asyncio.timeout(0.05):
+            picks = await personal_picks(user)
+    except TimeoutError:
+        print("recommendations timed out")
+        picks = ["bestsellers"]     # a fallback, not an error page
+    return {"user": user, "picks": picks}
+
+print(asyncio.run(homepage("mei")))
+```
+
+</CodeExample>
+
+You met `asyncio.timeout` in the [timeouts and cancellation lesson](/learn/python/timeouts-and-cancellation). HTTP clients and database drivers have their own timeout settings, which you set on your machine like this:
+
+```python
+import httpx
+
+# connect within 2 s, whole request within 5 s
+client = httpx.Client(timeout=httpx.Timeout(5.0, connect=2.0))
+
+import requests
+requests.get(url, timeout=(2, 5))   # (connect, read)
+
+from sqlalchemy import create_engine
+engine = create_engine(db_url, pool_timeout=3)
+```
+
+<Callout type="warning" title="Check the defaults">
+
+The popular `requests` library has **no timeout at all** by default: a call can hang forever. Many outages start with exactly that line. Make "every network call has a timeout" a code review rule.
+
+</Callout>
+
+## Retries with exponential backoff
+
+Many failures are **transient**: a blip in the network, a server restarting. Trying again often works. But *how* you retry matters a lot. If a struggling service gets every failed request retried instantly, its load doubles exactly when it can least handle it.
+
+**Exponential backoff** waits longer after each failure: 0.1 s, 0.2 s, 0.4 s, 0.8 s..., up to a **cap**. **Jitter** adds randomness, so a thousand clients that failed at the same moment don't all retry at the same moment too. The popular "full jitter" variant waits a random time between 0 and the backoff:
+
+<CodeExample output={`[0.1, 0.2, 0.4, 0.8, 1.6, 2.0]
+[0.064, 0.005, 0.11, 0.179, 1.178, 1.353]`}>
+
+```python
+import random
+
+def backoff(attempt, base=0.1, cap=2.0):
+    return min(cap, base * 2 ** attempt)
+
+def full_jitter(attempt, rand, base=0.1, cap=2.0):
+    return rand() * backoff(attempt, base, cap)
+
+print([backoff(n) for n in range(6)])
+
+rng = random.Random(42)    # seeded: same numbers every run
+print([round(full_jitter(n, rng.random), 3) for n in range(6)])
+```
+
+</CodeExample>
+
+Notice that `full_jitter` takes `rand` as a parameter, just like a clock. Tests can pass `lambda: 0.5` and know exactly what to expect.
+
+Now a retry helper. The `sleep` parameter defaults to the real `time.sleep`, but here we pass `waited.append`, so instead of sleeping it just records how long it *would* have slept:
+
+<CodeExample output={`attempt 1 failed (503), waiting 0.1s
+attempt 2 failed (timeout), waiting 0.2s
+here is your data
+total wait: 0.3 seconds`}>
+
+```python
+import time
+
+class TemporaryError(Exception):
+    pass
+
+def retry(fn, attempts=4, base=0.1, sleep=time.sleep,
+          retry_on=(TemporaryError,)):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except retry_on as error:
+            if attempt == attempts - 1:
+                raise                      # out of attempts
+            delay = base * 2 ** attempt
+            print(f"attempt {attempt + 1} failed ({error}),"
+                  f" waiting {delay:.1f}s")
+            sleep(delay)
+
+answers = iter([TemporaryError("503"), TemporaryError("timeout"),
+                "here is your data"])
+
+def flaky_service():
+    answer = next(answers)
+    if isinstance(answer, Exception):
+        raise answer
+    return answer
+
+waited = []
+print(retry(flaky_service, sleep=waited.append))
+print("total wait:", round(sum(waited), 2), "seconds")
+```
+
+</CodeExample>
+
+Only retry errors that might go away. Retrying a bad request just sends the same bad request again:
+
+| Retry | Don't retry |
+| --- | --- |
+| Timeouts, connection errors | 400 Bad Request, 422 validation errors |
+| 502, 503, 504 | 401/403 (retrying won't log you in) |
+| 429 Too Many Requests (wait for its `Retry-After` header) | 404 Not Found |
+
+In real projects you'd use a library such as **tenacity** (`@retry(stop=stop_after_attempt(4), wait=wait_random_exponential(max=2))`) rather than writing your own, but it does exactly this.
+
+<Callout type="danger" title="Retries multiply">
+
+If the web app retries 3 times, the API it calls retries 3 times, and that API's database client retries 3 times, one user click can turn into 27 database calls, all during an outage. This **retry storm** has taken down big sites. Retry at **one** layer (usually the outermost one that knows whether retrying is safe), keep the attempts low and always use backoff with jitter.
+
+</Callout>
+
+## Idempotency keys: safe to repeat
+
+Retries hide a nasty problem. Your app asks the payment service to charge £25 and the request times out. Did the charge happen? Maybe the payment went through and only the **response** got lost. If you retry, you might charge the customer twice.
+
+An operation is **idempotent** if doing it twice has the same effect as doing it once. `GET`, `PUT` and `DELETE` are meant to be idempotent; `POST` usually isn't. The fix is an **idempotency key**: the client creates a unique id **once per operation** (not once per attempt) and sends it with every retry. The server remembers the keys it has already handled and replays the stored response:
+
+<CodeExample output={`{'charge': 1, 'amount': 25}
+{'charge': 1, 'amount': 25}
+money taken: 1 time(s)`}>
+
+```python
+class PaymentService:
+    def __init__(self):
+        self.charges = []
+        self._done = {}      # idempotency key -> response
+
+    def charge(self, key, customer, amount):
+        if key in self._done:
+            return self._done[key]     # seen it: replay
+        self.charges.append((customer, amount))
+        response = {"charge": len(self.charges), "amount": amount}
+        self._done[key] = response
+        return response
+
+payments = PaymentService()
+key = "a3f9-order-1042"   # created ONCE by the client, e.g. uuid4()
+
+print(payments.charge(key, "mei", 25))
+# ...the response got lost, so the client retries:
+print(payments.charge(key, "mei", 25))
+print("money taken:", len(payments.charges), "time(s)")
+```
+
+</CodeExample>
+
+Payment APIs like Stripe work exactly like this, with an `Idempotency-Key` HTTP header. In production the keys live in the database with a **unique constraint** (so two retries arriving at the same moment can't both slip through) and expire after a day or so. The same idea makes queue workers safe: if a job may run twice, give it an id and skip ids you've already processed.
+
+## Circuit breakers: stop calling a dead service
+
+Retries help with short blips. But if a service has been down for five minutes, every request still waits for its timeout, retries, and fails, burning your workers and hammering a service that's trying to recover. A **circuit breaker** notices repeated failures and stops calling for a while, failing **fast** instead. It's named after the electrical switch that cuts the power before the wires melt.
+
+```text
+          N failures in a row
+ CLOSED ───────────────────────▶ OPEN
+   ▲                              │  (calls fail fast,
+   │                              │   no request is sent)
+   │ trial                        │ reset_timeout passes
+   │ succeeds                     ▼
+   └─────────────────────── HALF-OPEN
+                                  │
+               OPEN ◀─────────────┘ trial fails
+```
+
+| State | What happens to a call |
+| --- | --- |
+| **Closed** (normal) | Goes through. Failures in a row are counted; a success resets the count. |
+| **Open** | Refused straight away with an error, without touching the service. |
+| **Half-open** (after a cool-down) | One trial call goes through. Success closes the circuit, failure opens it again for another cool-down. |
+
+While the circuit is open, the caller gets an instant error that it can turn into a fallback (see graceful degradation below), and the broken service gets breathing room to recover. You'll build one in the exercise. In real projects, libraries such as **pybreaker** or **purgatory** do this, and service meshes (Istio, Envoy) can do it outside your code.
+
+## Rate limiting with a token bucket
+
+Resilience also means protecting **yourself** from too much traffic: a buggy client in a loop, a scraper, a spike. A **rate limiter** caps how many requests each client may make. The most popular algorithm is the **token bucket**:
+
+- Each client has a bucket that holds up to `capacity` tokens.
+- Tokens drip back in at a steady rate (say, 1 per second).
+- Each request takes one token. No token, no request: answer **429 Too Many Requests**.
+
+The capacity allows short **bursts**, and the refill rate sets the long-term average:
+
+<CodeExample output={`[True, True, True, False, False]
+[True, True, False]
+[True, True, True, False]`}>
+
+```python
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TokenBucket:
+    def __init__(self, capacity, per_second, clock):
+        self.capacity = capacity
+        self.per_second = per_second
+        self.clock = clock
+        self.tokens = capacity
+        self.updated = clock()
+
+    def allow(self):
+        now = self.clock()
+        earned = (now - self.updated) * self.per_second
+        self.tokens = min(self.capacity, self.tokens + earned)
+        self.updated = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+clock = FakeClock()
+bucket = TokenBucket(capacity=3, per_second=1, clock=clock.time)
+
+print([bucket.allow() for _ in range(5)])   # a burst
+clock.advance(2)
+print([bucket.allow() for _ in range(3)])   # 2 tokens earned
+clock.advance(60)
+print([bucket.allow() for _ in range(4)])   # never above 3
+```
+
+</CodeExample>
+
+There's no background timer refilling the bucket: each call works out how many tokens were **earned** since the last call. That makes it cheap enough to keep one bucket per user or per API key. With several API servers the buckets must be shared, so in production they usually live in Redis.
+
+## Graceful degradation
+
+When a dependency fails, ask: "what's the **least bad** thing we can show?" Very often it's not an error page. A shop whose recommendation service is down can still sell things:
+
+<CodeExample output={`(["mei's favourite curry"], 'live')
+(["mei's favourite curry"], 'stale')
+(['dumplings', 'noodles', 'bao'], 'popular')`}>
+
+```python
+class ServiceDown(Exception):
+    pass
+
+POPULAR = ["dumplings", "noodles", "bao"]
+last_good = {}
+
+def recommendations(user, fetch_live):
+    try:
+        picks = fetch_live(user)
+        last_good[user] = picks
+        return picks, "live"
+    except ServiceDown:
+        if user in last_good:
+            return last_good[user], "stale"
+        return POPULAR, "popular"
+
+def healthy(user):
+    return [f"{user}'s favourite curry"]
+
+def broken(user):
+    raise ServiceDown("recommendations service is down")
+
+print(recommendations("mei", healthy))
+print(recommendations("mei", broken))
+print(recommendations("kai", broken))
+```
+
+</CodeExample>
+
+Live data, then stale data, then a sensible default. Other forms of graceful degradation: turning off expensive features with a **feature flag** during an incident, **load shedding** (rejecting some low-priority requests early so the important ones still succeed) and **bulkheads** (separate worker pools per dependency, so one slow dependency can't use up every worker). Decide these fallbacks with your product team **before** the incident, not during it.
+
+<Callout type="tip" title="How the patterns fit together">
+
+A typical outgoing call is wrapped from the inside out: a **timeout** on each attempt, a **circuit breaker** around the call, a small number of **retries** with backoff and jitter around that (only for safe, idempotent requests), and a **fallback** when everything fails. Incoming traffic goes through a **rate limiter** first.
+
+</Callout>
+
+<Quiz
+  question="A client POSTs an order, the request times out, and it retries. The order gets created twice. What fixes this properly?"
+  options={[
+    "A longer timeout",
+    "More retries with exponential backoff",
+    "An idempotency key created once per order and sent with every attempt",
+    "A circuit breaker in front of the order service",
+  ]}
+  answer={2}
+  explanation="The first request may have succeeded even though the response was lost. With an idempotency key, the server recognises the retry and returns the stored response instead of creating a second order. Longer timeouts only make it rarer."
+/>
+
+<Quiz
+  question="A token bucket has capacity 10 and refills 2 tokens per second. A client has been idle for a minute and then sends 15 requests at once. How many are allowed?"
+  options={["2", "10", "15", "120"]}
+  answer={1}
+  explanation="The bucket never holds more than its capacity, so after the idle minute it has 10 tokens, not 120. The first 10 requests are allowed and the other 5 get 429 Too Many Requests."
+/>
+
+<Exercise
+  language="python"
+  title="Retry with a circuit breaker"
+  starter={`import time
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class CircuitOpenError(Exception):
+    """Raised instead of calling a service we know is down."""
+
+
+def retry(fn, attempts=3, base_delay=0.1, sleep=time.sleep):
+    # TODO: call fn(); on an exception wait base_delay * 2 ** n
+    # and try again, up to \`attempts\` calls in total.
+    # Re-raise the last error. Never retry CircuitOpenError.
+    return fn()
+
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold, reset_timeout, clock):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.clock = clock
+        self.failures = 0
+        self.opened_at = None    # None means the circuit is closed
+
+    @property
+    def state(self):
+        # TODO: "closed", "open" or "half-open"
+        return "closed"
+
+    def call(self, fn):
+        # TODO: refuse calls while open, count failures,
+        # open after failure_threshold failures in a row,
+        # let one trial call through when half-open
+        return fn()
+
+
+clock = FakeClock()
+breaker = CircuitBreaker(failure_threshold=3, reset_timeout=30,
+                         clock=clock.time)
+
+def broken_service():
+    raise ConnectionError("no answer")
+
+for _ in range(2):
+    try:
+        retry(lambda: breaker.call(broken_service),
+              sleep=clock.sleep)
+    except Exception as error:
+        print(type(error).__name__, "|", breaker.state)
+
+clock.sleep(30)
+print(breaker.state)
+print(breaker.call(lambda: "pong"), "|", breaker.state)
+`}
+  tests={[
+    { name: "The demo prints the expected lines", check: "__output == ['ConnectionError | open', 'CircuitOpenError | open', 'half-open', 'pong | closed']" },
+    { name: "retry() returns the result once a call succeeds", check: "[n := [], retry(lambda: 1 / 0 if n.append(1) or len(n) < 3 else 'ok', attempts=5, sleep=lambda s: None)][-1] == 'ok' and len(n) == 3" },
+    { name: "No waiting when the first call works", check: "[w := [], retry(lambda: 7, sleep=w.append)][-1] == 7 and w == []" },
+    { name: "Waits base_delay * 2 ** n, then re-raises the last error", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [n := [], w := [], _try(lambda: retry(lambda: n.append(1) or 1 / 0, attempts=4, base_delay=0.5, sleep=w.append))][-1] == 'ZeroDivisionError' and len(n) == 4 and w == [0.5, 1.0, 2.0]" },
+    { name: "Never retries CircuitOpenError", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [n := [], _try(lambda: retry(lambda: n.append(1) or (_ for _ in ()).throw(CircuitOpenError()), sleep=lambda s: None))][-1] == 'CircuitOpenError' and len(n) == 1" },
+    { name: "A closed breaker passes results through", check: "[c := FakeClock(), b := CircuitBreaker(3, 10, c.time)][-1].call(lambda: 42) == 42 and b.state == 'closed'" },
+    { name: "Opens after failure_threshold failures in a row", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), b := CircuitBreaker(3, 10, c.time), [_try(lambda: b.call(lambda: 1 / 0)) for _ in range(2)], b.state, _try(lambda: b.call(lambda: 1 / 0)), b.state][3:] == ['closed', 'ZeroDivisionError', 'open']" },
+    { name: "While open, refuses calls without calling fn", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), n := [], b := CircuitBreaker(1, 10, c.time), _try(lambda: b.call(lambda: 1 / 0)), c.sleep(9.9), _try(lambda: b.call(lambda: n.append(1)))][-1] == 'CircuitOpenError' and n == []" },
+    { name: "A success resets the failure count", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), b := CircuitBreaker(3, 10, c.time), _try(lambda: b.call(lambda: 1 / 0)), _try(lambda: b.call(lambda: 1 / 0)), b.call(lambda: 'ok'), _try(lambda: b.call(lambda: 1 / 0)), _try(lambda: b.call(lambda: 1 / 0)), b.state][-1] == 'closed'" },
+    { name: "Half-open after reset_timeout; a good trial closes it", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), b := CircuitBreaker(2, 10, c.time), _try(lambda: b.call(lambda: 1 / 0)), _try(lambda: b.call(lambda: 1 / 0)), c.sleep(10), b.state, b.call(lambda: 'hi'), b.state, _try(lambda: b.call(lambda: 1 / 0)), b.state][-5:] == ['half-open', 'hi', 'closed', 'ZeroDivisionError', 'closed']" },
+    { name: "A failed trial opens it again and restarts the timer", check: "exec('def _try(f):\\n    try:\\n        return f()\\n    except Exception as e:\\n        return type(e).__name__') or [c := FakeClock(), b := CircuitBreaker(5, 10, c.time), [_try(lambda: b.call(lambda: 1 / 0)) for _ in range(5)], c.sleep(15), b.state, _try(lambda: b.call(lambda: 1 / 0)), b.state, c.sleep(9), b.state, c.sleep(1), b.state][4::2] == ['half-open', 'open', 'open', 'half-open']" },
+  ]}>
+
+Build the two patterns that protect an outgoing call. Both get time from the outside: `sleep` and `clock` are parameters, and the tests pass a `FakeClock`.
+
+**`retry(fn, attempts=3, base_delay=0.1, sleep=time.sleep)`**
+
+1. Call `fn()` and return its result as soon as a call succeeds.
+2. If it raises an exception, wait `base_delay * 2 ** n` (0.1, 0.2, 0.4...) with `sleep(...)` and try again, up to `attempts` calls in total. Don't sleep after the last attempt: re-raise its error.
+3. Never retry a `CircuitOpenError`: re-raise it straight away (the breaker already knows the service is down).
+
+**`CircuitBreaker(failure_threshold, reset_timeout, clock)`**
+
+1. `state` is `"closed"` when `opened_at` is `None`, `"half-open"` when at least `reset_timeout` seconds have passed since `opened_at`, and `"open"` otherwise.
+2. `call(fn)`: when open, raise `CircuitOpenError` **without** calling `fn`. Otherwise call `fn()`.
+3. On a failure, count it and re-raise the original error. Open the circuit (set `opened_at` to the current time) when `failure_threshold` failures happened in a row, or when the failing call was the half-open trial.
+4. On a success, reset the failure count, close the circuit and return the result.
+
+<Hint>
+
+For `retry`, loop `for attempt in range(attempts):` with a `try`/`return fn()`. Put `except CircuitOpenError: raise` **before** `except Exception:`, because Python uses the first matching `except`. In the general handler, `raise` if `attempt == attempts - 1`, otherwise `sleep(base_delay * 2 ** attempt)`.
+
+For the breaker, `state` compares `self.clock() - self.opened_at` with `self.reset_timeout`. In `call`, check `if self.state == "open": raise CircuitOpenError(...)` first, then wrap `fn()` in `try`. In the `except Exception:` block, add 1 to `self.failures`; if the state is `"half-open"` or the failures reached the threshold, set `self.opened_at = self.clock()`; then `raise`.
+
+</Hint>
+
+<Solution>
+
+```python
+import time
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class CircuitOpenError(Exception):
+    """Raised instead of calling a service we know is down."""
+
+
+def retry(fn, attempts=3, base_delay=0.1, sleep=time.sleep):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except CircuitOpenError:
+            raise
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            sleep(base_delay * 2 ** attempt)
+
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold, reset_timeout, clock):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.clock = clock
+        self.failures = 0
+        self.opened_at = None    # None means the circuit is closed
+
+    @property
+    def state(self):
+        if self.opened_at is None:
+            return "closed"
+        if self.clock() - self.opened_at >= self.reset_timeout:
+            return "half-open"
+        return "open"
+
+    def call(self, fn):
+        if self.state == "open":
+            raise CircuitOpenError("service is down, not calling")
+        try:
+            result = fn()
+        except Exception:
+            self.failures += 1
+            if (self.state == "half-open"
+                    or self.failures >= self.failure_threshold):
+                self.opened_at = self.clock()
+            raise
+        self.failures = 0
+        self.opened_at = None
+        return result
+
+
+clock = FakeClock()
+breaker = CircuitBreaker(failure_threshold=3, reset_timeout=30,
+                         clock=clock.time)
+
+def broken_service():
+    raise ConnectionError("no answer")
+
+for _ in range(2):
+    try:
+        retry(lambda: breaker.call(broken_service),
+              sleep=clock.sleep)
+    except Exception as error:
+        print(type(error).__name__, "|", breaker.state)
+
+clock.sleep(30)
+print(breaker.state)
+print(breaker.call(lambda: "pong"), "|", breaker.state)
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Failures **cascade** when slow calls tie up workers; slowness is more dangerous than a clean crash.
+- Give every network call a **timeout**, chosen from what the caller can afford.
+- **Retry** only transient errors, with **exponential backoff** and **jitter**, at one layer only, to avoid retry storms.
+- **Idempotency keys** (one per operation, stored with a unique constraint) make retries of `POST`s and repeated jobs safe.
+- A **circuit breaker** fails fast while a dependency is down (closed → open → half-open) and lets it recover.
+- A **token bucket** allows short bursts but limits the average rate; reply 429 when it's empty.
+- **Graceful degradation**: live data, then stale data, then a sensible default, instead of an error page.
+- Inject **clocks, sleep and randomness** so all of these can be tested quickly and deterministically.

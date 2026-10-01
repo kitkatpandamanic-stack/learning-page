@@ -1,0 +1,480 @@
+---
+title: Тайм-ауты, отмена и ошибки
+description: Прекращайте ожидание по тайм-ауту, аккуратно отменяйте задачи, обрабатывайте ошибки сразу многих задач и познакомьтесь с async with, async for и асинхронными генераторами.
+duration: 20
+xp: 25
+---
+
+В реальном мире всё идёт не по плану. Сервер отвечает целую вечность, пользователь закрывает страницу посреди загрузки, один запрос из пятидесяти падает. Профессиональный асинхронный код готов ко всему этому. В этом уроке вы научитесь **сдаваться через какое-то время**, **отменять** ненужную работу и **обрабатывать ошибки** сразу многих задач. А потом посмотрите, где async встречается в настоящих проектах. 🛡️
+
+## Тайм-ауты: не ждите вечно
+
+Никогда не ждите сеть без ограничения. Если сервер зависнет, вместе с ним зависнет и ваша программа. **`asyncio.timeout(seconds)`** (Python 3.11+) ограничивает по времени любой код. Если время вышло, работа внутри отменяется, и вы получаете **`TimeoutError`** — ошибку **тайм-аута (timeout)**:
+
+<CodeExample output={`Сдались через 0.05 с
+<fast.html>`}>
+
+```python
+import asyncio
+
+async def fetch(page, seconds):
+    await asyncio.sleep(seconds)
+    return f"<{page}.html>"
+
+async def main():
+    try:
+        async with asyncio.timeout(0.05):
+            page = await fetch("slow", 1)
+            print(page)              # сюда не дойдём
+    except TimeoutError:
+        print("Сдались через 0.05 с")
+
+    async with asyncio.timeout(0.5):
+        print(await fetch("fast", 0.01))
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Медленная страница грузилась бы целую секунду, но мы останавливаемся через 0.05. Быстрая укладывается в свой лимит с большим запасом, поэтому тайм-аут ничего не делает.
+
+Более старая **`asyncio.wait_for(coro, timeout)`** делает то же самое для одной корутины, и вы встретите её во многих существующих проектах:
+
+<CodeExample output={`<fast.html>
+Время вышло!`}>
+
+```python
+import asyncio
+
+async def fetch(page, seconds):
+    await asyncio.sleep(seconds)
+    return f"<{page}.html>"
+
+async def main():
+    page = await asyncio.wait_for(fetch("fast", 0.01), timeout=0.1)
+    print(page)
+    try:
+        await asyncio.wait_for(fetch("slow", 1), timeout=0.05)
+    except TimeoutError:
+        print("Время вышло!")
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+`asyncio.timeout()` удобнее, когда лимит должен охватывать **несколько** шагов сразу, например «войти в систему и скачать отчёт, и всё это за 10 секунд».
+
+## Отмена задачи
+
+Иногда задача больше не нужна: пользователь нажал «Стоп» или другая задача уже нашла ответ. Вызовите **`task.cancel()`**. Это **отмена (cancellation)**: на текущем `await` внутрь задачи выбрасывается **`asyncio.CancelledError`**, чтобы она могла прибраться перед уходом:
+
+<CodeExample output={`Скачиваю movie.mp4...
+Отменено! Удаляю недокачанный файл
+Задача загрузки завершена
+main: задача отменена
+True`}>
+
+```python
+import asyncio
+
+async def download(name):
+    try:
+        print(f"Скачиваю {name}...")
+        await asyncio.sleep(1)         # отмена произойдёт здесь, во время ожидания
+        print("Готово")                # сюда не дойдём
+    except asyncio.CancelledError:
+        print("Отменено! Удаляю недокачанный файл")
+        raise                          # пусть отмена идёт дальше
+    finally:
+        print("Задача загрузки завершена")
+
+async def main():
+    task = asyncio.create_task(download("movie.mp4"))
+    await asyncio.sleep(0.02)          # даём ей начать
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        print("main: задача отменена")
+    print(task.cancelled())
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Тайм-ауты тоже работают через отмену: когда время вышло, `asyncio.timeout()` отменяет работу внутри, а затем превращает `CancelledError` в `TimeoutError`.
+
+<Callout type="warning" title="Не глотайте CancelledError">
+
+Если вы перехватываете `CancelledError`, чтобы прибраться, **выбросьте её снова** голым `raise` (или используйте `finally`, который выполняется, ничего не перехватывая). Если её проглотить, задача продолжит работу как ни в чём не бывало, а тайм-ауты и `TaskGroup` перестанут работать правильно. Хорошая новость: `CancelledError` **не** является подклассом `Exception`, поэтому общий `except Exception:` случайно её не поймает.
+
+</Callout>
+
+## Ошибки в gather
+
+Что будет, если одна из корутин в `gather` выбросит исключение? По умолчанию `gather` сразу передаёт вам **первую** ошибку. Но осторожно: **остальные корутины продолжают работать** в фоне:
+
+<CodeExample output={`Поймано: b: сбой
+a: готово`}>
+
+```python
+import asyncio
+
+async def job(name, seconds, fail=False):
+    await asyncio.sleep(seconds)
+    if fail:
+        raise ValueError(f"{name}: сбой")
+    print(f"{name}: готово")
+    return name
+
+async def main():
+    try:
+        await asyncio.gather(
+            job("a", 0.05),
+            job("b", 0.01, fail=True),
+        )
+    except ValueError as error:
+        print("Поймано:", error)
+    await asyncio.sleep(0.1)    # "a" всё ещё работает!
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+К тому же результат `a` теряется. Когда нужны **все** результаты, даже если часть заданий упала, передайте **`return_exceptions=True`**. Тогда ошибки возвращаются **внутри списка результатов** в виде объектов исключений, на своих местах:
+
+<CodeExample output={`['a', ValueError('b: сбой'), 'c']
+Успешно: a
+Ошибка: b: сбой
+Успешно: c`}>
+
+```python
+import asyncio
+
+async def job(name, seconds, fail=False):
+    await asyncio.sleep(seconds)
+    if fail:
+        raise ValueError(f"{name}: сбой")
+    return name
+
+async def main():
+    results = await asyncio.gather(
+        job("a", 0.03),
+        job("b", 0.01, fail=True),
+        job("c", 0.02),
+        return_exceptions=True,
+    )
+    print(results)
+    for result in results:
+        if isinstance(result, Exception):
+            print("Ошибка:", result)
+        else:
+            print("Успешно:", result)
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Это идеально для задачи «проверить 50 сайтов и сообщить, какие из них не работают»: один сломанный сайт не должен останавливать весь отчёт.
+
+## Ошибки в TaskGroup: ExceptionGroup и except*
+
+`TaskGroup` строже, и это хорошо. Когда задача падает, группа **отменяет все остальные задачи** и выбрасывает **`ExceptionGroup`** (группу исключений) со всеми возникшими ошибками. Ничего не продолжает работать у вас за спиной.
+
+`ExceptionGroup` обрабатывают с помощью **`except*`** (except со звёздочкой). Каждый блок `except*` забирает из группы ошибки своего типа, поэтому могут выполниться **несколько** блоков:
+
+<CodeExample output={`Проблема со значением: пустое название товара
+Проблема с типом: '42' — не название
+Задача «бамбук» отменена? True`}>
+
+```python
+import asyncio
+
+async def check_stock(item):
+    if item == "":
+        raise ValueError("пустое название товара")
+    if item.isdigit():
+        raise TypeError(f"{item!r} — не название")
+    await asyncio.sleep(0.1)
+    return f"{item}: в наличии"
+
+async def main():
+    try:
+        async with asyncio.TaskGroup() as tg:
+            ok = tg.create_task(check_stock("бамбук"))
+            tg.create_task(check_stock(""))
+            tg.create_task(check_stock("42"))
+    except* ValueError as group:
+        for error in group.exceptions:
+            print("Проблема со значением:", error)
+    except* TypeError as group:
+        for error in group.exceptions:
+            print("Проблема с типом:", error)
+    print("Задача «бамбук» отменена?", ok.cancelled())
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+- Внутри `except* ValueError as group` переменная `group` — сама группа исключений; настоящие ошибки лежат в её кортеже **`.exceptions`**.
+- Задача `"бамбук"` ничего плохого не сделала, но её **отменили**, потому что её группа упала.
+- Обычный `except ExceptionGroup:` тоже работает, если хочется обработать всё в одном месте.
+
+<Callout type="tip" title="gather или TaskGroup?">
+
+Используйте **`TaskGroup`**, когда задачи связаны между собой и падение одной означает, что не удалась вся работа (загрузка всех данных для одной страницы). Используйте **`gather(..., return_exceptions=True)`**, когда задания независимы и вам нужны все результаты, какие удастся получить (проверка множества сайтов).
+
+</Callout>
+
+## async with, async for и асинхронные генераторы
+
+Вы уже не раз использовали **`async with`**: `TaskGroup`, `Semaphore` и `timeout` — всё это **асинхронные менеджеры контекста (async context managers)**. Они такие же, как обычные блоки `with`, только подготовка и уборка могут использовать `await`, — идеально для открытия и закрытия сетевых соединений или соединений с базой данных.
+
+Точно так же **`async for`** перебирает **асинхронный итератор (async iterator)**, который может ждать через `await` между элементами. Проще всего создать его с помощью **асинхронного генератора (async generator)**: это `async def`, в котором есть `yield`. А `@asynccontextmanager` из `contextlib` превращает асинхронный генератор в асинхронный менеджер контекста — так же, как `@contextmanager` делает это для обычных:
+
+<CodeExample output={`Тик 1
+Тик 2
+Тик 3
+[1, 4, 9, 16]
+Подключаюсь к db
+Использую <соединение db>
+Закрыто: db`}>
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+async def ticker(count, seconds):    # асинхронный генератор
+    for number in range(1, count + 1):
+        await asyncio.sleep(seconds)
+        yield number
+
+@asynccontextmanager
+async def connection(name):
+    print(f"Подключаюсь к {name}")
+    await asyncio.sleep(0.01)
+    try:
+        yield f"<соединение {name}>"
+    finally:
+        await asyncio.sleep(0.01)
+        print(f"Закрыто: {name}")
+
+async def main():
+    async for tick in ticker(3, 0.01):
+        print("Тик", tick)
+
+    squares = [n * n async for n in ticker(4, 0.01)]
+    print(squares)
+
+    async with connection("db") as conn:
+        print("Использую", conn)
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Асинхронные генераторы отлично подходят для **потоков данных**: строк, приходящих из базы данных, сообщений из чата, страниц результатов от API. Вы обрабатываете каждый элемент, как только он пришёл, а не ждёте все сразу. (Класс тоже может быть асинхронным менеджером контекста, если определить в нём `async def __aenter__` и `async def __aexit__`.)
+
+## Где async используют по-настоящему
+
+**Веб-серверы.** FastAPI позволяет писать эндпоинты через `async def`. Пока один запрос ждёт базу данных или другой API, сервер обрабатывает другие запросы. Внутри эндпоинта можно использовать всё из этого модуля, например `gather`, чтобы загрузить две вещи сразу:
+
+<CodeExample output={`200
+{'id': 7, 'name': 'Мэй', 'orders': ['бамбук', 'чай']}`}>
+
+```python
+import asyncio
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+async def load_user(user_id):
+    await asyncio.sleep(0.05)     # как будто запрос к базе данных
+    return {"id": user_id, "name": "Мэй"}
+
+async def load_orders(user_id):
+    await asyncio.sleep(0.05)     # как будто вызов API
+    return ["бамбук", "чай"]
+
+@app.get("/users/{user_id}")
+async def get_user(user_id: int):
+    user, orders = await asyncio.gather(
+        load_user(user_id), load_orders(user_id)
+    )
+    return {**user, "orders": orders}
+
+client = TestClient(app)
+response = client.get("/users/7")
+print(response.status_code)
+print(response.json())
+```
+
+</CodeExample>
+
+Одно правило для FastAPI: внутри эндпоинта `async def` **никогда** не вызывайте блокирующий код (вроде `time.sleep` или библиотеки `requests`). Если без блокирующей библиотеки не обойтись, напишите вместо этого обычный эндпоинт `def`, и FastAPI сам запустит его в отдельном потоке.
+
+**HTTP-клиенты.** В библиотеке **httpx** есть `AsyncClient`, чтобы выполнять много запросов конкурентно. Настоящего доступа к сети в браузере нет, поэтому вот как это выглядит на вашем компьютере (`pip install httpx`):
+
+```python
+import asyncio
+import httpx
+
+URLS = [
+    "https://www.python.org",
+    "https://pypi.org",
+    "https://docs.python.org",
+]
+
+async def fetch(client, url):
+    response = await client.get(url)
+    return url, response.status_code
+
+async def main():
+    async with httpx.AsyncClient(timeout=10) as client:
+        results = await asyncio.gather(
+            *(fetch(client, url) for url in URLS),
+            return_exceptions=True,
+        )
+    for result in results:
+        print(result)
+
+asyncio.run(main())
+```
+
+Посмотрите, как много вам уже знакомо: `async with` для клиента (он открывает и закрывает соединения), `gather` для конкурентности, `return_exceptions=True`, чтобы один сломанный сайт не испортил остальные, и тайм-аут. Другие популярные асинхронные библиотеки — **aiohttp** (HTTP), **asyncpg** (PostgreSQL), асинхронный режим SQLAlchemy и **discord.py** для чат-ботов.
+
+<Quiz
+  question="Задачу отменяют, пока она ждёт на await asyncio.sleep(5) внутри try: ... except Exception: print('ошибка'). Что произойдёт?"
+  options={[
+    "Выведется ошибка, и задача продолжит работу",
+    "CancelledError пройдёт прямо сквозь except Exception, и задача завершится как отменённая",
+    "Ничего: cancel() работает только для задач, которые ещё не начались",
+    "Сначала закончится sleep, а потом задача будет отменена",
+  ]}
+  answer={1}
+  explanation="CancelledError наследуется от BaseException, а не от Exception, поэтому except Exception её не ловит. Ошибка возникает на await, и задача завершается как отменённая."
+/>
+
+<Quiz
+  question="В TaskGroup выполняются три задачи. Одна выбрасывает ValueError через 0.1 с; двум другим понадобилось бы 5 с. Что произойдёт?"
+  options={[
+    "Группа подождёт 5 с, а затем выбросит ValueError",
+    "ValueError будет проигнорирована, и две другие задачи закончат работу",
+    "Две другие задачи отменятся, и группа выбросит ExceptionGroup с этой ValueError внутри",
+    "Программа сразу упадёт, и перехватить ошибку будет никак нельзя",
+  ]}
+  answer={2}
+  explanation="Когда задача в TaskGroup падает, группа отменяет оставшиеся задачи и выбрасывает ExceptionGroup с ошибкой (или ошибками), которую можно обработать через except* ValueError."
+/>
+
+<Exercise
+  language="python"
+  title="Дашборд, который никогда не зависает"
+  starter={`import asyncio
+
+async def fetch(name, seconds):
+    """Изображает вызов сервиса. Некоторые сервисы сломаны."""
+    await asyncio.sleep(seconds)
+    if name.startswith("bad"):
+        raise ValueError(f"{name} сломан")
+    return f"{name}: работает"
+
+async def safe_fetch(name, seconds, timeout):
+    # Верните результат fetch(name, seconds), но:
+    # - "тайм-аут", если это дольше \`timeout\` секунд
+    # - "ошибка: <сообщение>", если возникла ValueError
+    pass
+
+async def fetch_all(jobs, timeout):
+    # jobs — список пар (name, seconds). Запустите все
+    # одновременно через safe_fetch и верните результаты
+    # в том же порядке, что и jobs.
+    pass
+
+async def main():
+    jobs = [("weather", 0.02), ("bad-news", 0.01),
+            ("slow-maps", 0.5), ("prices", 0.03)]
+    for result in await fetch_all(jobs, timeout=0.1):
+        print(result)
+
+asyncio.run(main())
+`}
+  tests={[
+    { name: "main() печатает четыре результата", check: "__output == ['weather: работает', 'ошибка: bad-news сломан', 'тайм-аут', 'prices: работает']" },
+    { name: "safe_fetch возвращает результат, если сервис достаточно быстрый", check: "asyncio.run(safe_fetch('tea', 0.01, 0.1)) == 'tea: работает'" },
+    { name: "safe_fetch возвращает 'тайм-аут' для медленных сервисов", check: "asyncio.run(safe_fetch('sloth', 0.3, 0.02)) == 'тайм-аут'" },
+    { name: "safe_fetch сдаётся вовремя, а не ждёт до конца", check: "exec('import time as _t\\n_s = _t.perf_counter()\\nasyncio.run(safe_fetch(\"sloth\", 0.4, 0.02))\\n_quick = _t.perf_counter() - _s < 0.2') or _quick" },
+    { name: "safe_fetch превращает ValueError в 'ошибка: ...'", check: "asyncio.run(safe_fetch('bad-cats', 0, 0.1)) == 'ошибка: bad-cats сломан'" },
+    { name: "fetch_all сохраняет порядок заданий", check: "asyncio.run(fetch_all([('b', 0.03), ('bad', 0.01), ('a', 0.02)], 0.1)) == ['b: работает', 'ошибка: bad сломан', 'a: работает']" },
+    { name: "fetch_all выполняет задания одновременно", check: "exec('import time as _t\\n_s = _t.perf_counter()\\n_r = asyncio.run(fetch_all([(\"x\", 0.06), (\"y\", 0.06), (\"z\", 0.06)], 0.2))\\n_fast = _t.perf_counter() - _s < 0.15') or (_fast and _r == ['x: работает', 'y: работает', 'z: работает'])" },
+  ]}
+>
+
+Вы делаете дашборд, который собирает данные из нескольких сервисов. Одни медленные, другие сломаны, но дашборд должен **всегда** что-то показывать, и быстро.
+
+1. Напишите `safe_fetch(name, seconds, timeout)`. Она ждёт `fetch(name, seconds)` и возвращает её результат, но возвращает `"тайм-аут"`, если это занимает больше `timeout` секунд, и `"ошибка: <сообщение>"` (например, `"ошибка: bad-news сломан"`), если `fetch` выбрасывает `ValueError`.
+2. Напишите `fetch_all(jobs, timeout)`. `jobs` — список пар `(name, seconds)`. Запустите их все **конкурентно** через `safe_fetch` и верните список результатов **в том же порядке**, что и `jobs`.
+
+После этого `main()` должна напечатать `weather: работает`, `ошибка: bad-news сломан`, `тайм-аут` и `prices: работает` — и всё примерно за 0.1 секунды.
+
+<Hint>
+
+В `safe_fetch` поместите `async with asyncio.timeout(timeout): return await fetch(name, seconds)` внутрь `try` с `except TimeoutError: return "тайм-аут"` и `except ValueError as error: return f"ошибка: {error}"`. В `fetch_all` — `return await asyncio.gather(*(safe_fetch(name, seconds, timeout) for name, seconds in jobs))`. Поскольку `safe_fetch` никогда не выбрасывает исключений, `return_exceptions=True` даже не нужен.
+
+</Hint>
+
+<Solution>
+
+```python
+import asyncio
+
+async def fetch(name, seconds):
+    """Изображает вызов сервиса. Некоторые сервисы сломаны."""
+    await asyncio.sleep(seconds)
+    if name.startswith("bad"):
+        raise ValueError(f"{name} сломан")
+    return f"{name}: работает"
+
+async def safe_fetch(name, seconds, timeout):
+    try:
+        async with asyncio.timeout(timeout):
+            return await fetch(name, seconds)
+    except TimeoutError:
+        return "тайм-аут"
+    except ValueError as error:
+        return f"ошибка: {error}"
+
+async def fetch_all(jobs, timeout):
+    return await asyncio.gather(
+        *(safe_fetch(name, seconds, timeout) for name, seconds in jobs)
+    )
+
+async def main():
+    jobs = [("weather", 0.02), ("bad-news", 0.01),
+            ("slow-maps", 0.5), ("prices", 0.03)]
+    for result in await fetch_all(jobs, timeout=0.1):
+        print(result)
+
+asyncio.run(main())
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **`async with asyncio.timeout(s):`** (или `asyncio.wait_for(coro, s)`) прекращает ожидание через `s` секунд и выбрасывает **`TimeoutError`**. Всегда ограничивайте сетевые вызовы по времени.
+- **`task.cancel()`** выбрасывает **`CancelledError`** внутри задачи на её текущем `await`. Прибирайтесь в `finally` (или перехватывайте и **выбрасывайте снова**); никогда не глотайте её.
+- **`gather`** передаёт первую ошибку, но остальные задания продолжают работать. С **`return_exceptions=True`** ошибки возвращаются в списке результатов.
+- Упавшая **`TaskGroup`** отменяет остальные свои задачи и выбрасывает **`ExceptionGroup`**; обрабатывайте её через **`except* SomeError`**.
+- **`async with`** работает с асинхронными менеджерами контекста (`TaskGroup`, `Semaphore`, клиенты, соединения); **`async for`** перебирает асинхронные итераторы, например **асинхронные генераторы** (`async def` + `yield`).
+- В настоящих проектах async лежит в основе веб-серверов вроде **FastAPI** (эндпоинты `async def`) и клиентов вроде `AsyncClient` из **httpx**. Никогда не блокируйте внутри них.

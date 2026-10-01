@@ -1,0 +1,491 @@
+---
+title: Caching and Optimisation
+description: Cache results with functools.cache and lru_cache, avoid stale caches, build your own LRU cache, save memory with generators, vectorise with numpy and know when to go native.
+duration: 24
+xp: 25
+---
+
+You've profiled your program and found the hot spot. Now what? There are only a few ways to make code faster: **do less work** (a better algorithm, or don't repeat work you've already done), **use less memory**, or **move the work into faster code** (C, via numpy or a native extension). This lesson walks through each, roughly in the order you should try them. ⚡
+
+## Don't repeat work: functools.cache
+
+If a function is **pure** (same arguments → same result, no side effects) and gets called again and again with the same arguments, you can remember its results. This is called **memoisation**, and `functools.cache` does it with one line:
+
+<CodeExample output={`832040
+calls: 31
+832040 calls: 31
+CacheInfo(hits=29, misses=31, maxsize=None, currsize=31)`}>
+
+```python
+from functools import cache
+
+calls = 0
+
+@cache
+def fib(n):
+    global calls
+    calls += 1
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+print(fib(30))
+print("calls:", calls)
+print(fib(30), "calls:", calls)    # answered from the cache
+print(fib.cache_info())
+```
+
+</CodeExample>
+
+Without `@cache`, `fib(30)` makes **2,692,537** calls, because it recomputes the same small values over and over. With the cache, each `n` from 0 to 30 is computed exactly **once** (31 calls), and every repeat is a dictionary lookup. That turns an exponential algorithm into a linear one.
+
+**`cache_info()`** is your dashboard: **hits** (answered from the cache), **misses** (had to compute), **maxsize** and **currsize** (how many results are stored). In production, a low hit rate means the cache only costs memory.
+
+## lru_cache: a cache with a size limit
+
+`@cache` never forgets anything, so it can grow forever. That's fine for `fib`, but not for, say, loading users by id on a busy server. **`@lru_cache(maxsize=N)`** keeps at most `N` results and throws away the **least recently used** one when it's full:
+
+<CodeExample output={`need user 1
+  loading user 1 from the database
+need user 2
+  loading user 2 from the database
+need user 1
+need user 3
+  loading user 3 from the database
+need user 2
+  loading user 2 from the database
+CacheInfo(hits=1, misses=4, maxsize=2, currsize=2)`}>
+
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=2)
+def load_user(user_id):
+    print(f"  loading user {user_id} from the database")
+    return {"id": user_id}
+
+for user_id in [1, 2, 1, 3, 2]:
+    print("need user", user_id)
+    load_user(user_id)
+
+print(load_user.cache_info())
+```
+
+</CodeExample>
+
+Follow it step by step: user 1 and 2 fill the cache. Asking for 1 again is a **hit**, and it makes 1 the most recently used. User 3 doesn't fit, so the least recently used one, user 2, is **evicted**. That's why user 2 has to be loaded again at the end.
+
+**LRU** ("least recently used") is the most popular eviction policy because it matches real traffic: things that were used recently are likely to be used again soon. (`@cache` is simply `@lru_cache(maxsize=None)`.)
+
+## Cache invalidation pitfalls
+
+Phil Karlton's famous joke goes: *"There are only two hard things in computer science: cache invalidation and naming things."* A cache is a **copy** of data, and copies go out of date. Here are the traps:
+
+<CodeExample output={`TypeError: unhashable type: 'list'
+6.5
+True
+True
+False`}>
+
+```python
+from functools import cache
+
+@cache
+def total(prices):
+    return sum(prices)
+
+try:
+    total([2.5, 4.0])
+except TypeError as error:
+    print("TypeError:", error)
+
+print(total((2.5, 4.0)))     # tuples are hashable
+
+stock = {"tea": 10}
+
+@cache
+def in_stock(item):
+    return stock[item] > 0
+
+print(in_stock("tea"))
+stock["tea"] = 0             # sold out!
+print(in_stock("tea"))       # stale answer
+in_stock.cache_clear()
+print(in_stock("tea"))
+```
+
+</CodeExample>
+
+1. **Arguments must be hashable.** The cache is a dict keyed by the arguments, so lists and dicts don't work. Pass tuples or frozensets instead.
+2. **Stale data.** `in_stock` reads a global that changed, but the cache doesn't know. Only cache **pure** functions, or call **`cache_clear()`** whenever the underlying data changes. Never cache anything that depends on the time, randomness, or a database that others write to (unless a slightly old answer is OK and you add an expiry time, which you'll build in the System Design module).
+3. **Memory.** An unbounded `@cache` on a function called with millions of different arguments is a memory leak with good intentions. Use `lru_cache(maxsize=...)` and watch `cache_info()`.
+
+<Callout type="warning" title="Don't put lru_cache on methods">
+
+`@lru_cache` on a method caches `self` as part of the key, so the cache keeps **every instance alive forever**: they can never be garbage-collected. Linters flag this (ruff/flake8-bugbear rule B019). For a value computed once per object, use **`@functools.cached_property`**, which stores the result on the instance itself:
+
+```python
+from functools import cached_property
+
+class Report:
+    def __init__(self, rows):
+        self.rows = rows
+
+    @cached_property
+    def total(self):          # computed on first access only
+        return sum(r["amount"] for r in self.rows)
+```
+
+</Callout>
+
+## Build your own: an LRU cache with OrderedDict
+
+`lru_cache` only wraps functions. Often you need a cache **object** instead: a per-request cache, a cache of rendered pages, a cache you can inspect in tests. The classic way to build one is with **`collections.OrderedDict`**, a dict that can move keys around in its order:
+
+<CodeExample output={`['blog', 'about', 'home']
+evict: blog <blog.html>
+['about', 'home']`}>
+
+```python
+from collections import OrderedDict
+
+recent = OrderedDict()
+for page in ["home", "blog", "about"]:
+    recent[page] = f"<{page}.html>"
+
+recent.move_to_end("home")       # "home" was just used
+print(list(recent))
+
+oldest, html = recent.popitem(last=False)
+print("evict:", oldest, html)
+print(list(recent))
+```
+
+</CodeExample>
+
+The two operations that make an LRU cache:
+
+- **`move_to_end(key)`** moves a key to the end, so the end is always "most recently used".
+- **`popitem(last=False)`** removes the item at the **start**, the least recently used one.
+
+Both are O(1), so the cache stays fast however big it gets. You'll build the full cache in the exercise below. (This is also a favourite interview question, so it's worth knowing by heart.)
+
+## Save memory with generators
+
+You met generators in Level 2: they produce values **one at a time** instead of building a whole list. That makes a huge difference to memory, which you can now prove with `tracemalloc`:
+
+<CodeExample output={`same answer: True
+list needs 100x+ more memory: True`}>
+
+```python
+import tracemalloc
+
+def peak_bytes(func):
+    tracemalloc.start()
+    result = func()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return result, peak
+
+n = 100_000
+total1, list_peak = peak_bytes(lambda: sum([x * x for x in range(n)]))
+total2, gen_peak = peak_bytes(lambda: sum(x * x for x in range(n)))
+
+print("same answer:", total1 == total2)
+print("list needs 100x+ more memory:", list_peak > 100 * gen_peak)
+```
+
+</CodeExample>
+
+The only difference is `[...]` versus `(...)`. The list version holds 100,000 numbers in memory at once (a few megabytes); the generator holds one at a time. With a 10 GB log file, that's the difference between "works" and "killed by the operating system".
+
+The rule of thumb: if you only **loop over** the values once (`sum`, `max`, `for`, writing to a file), use a generator. If you need `len()`, indexing or several passes, you need a list. Chains of generators make **pipelines** that process files of any size in constant memory:
+
+```python
+from collections import Counter
+
+lines = (line for line in open("access.log"))
+errors = (line for line in lines if " 500 " in line)
+paths = (line.split()[6] for line in errors)
+print(Counter(paths).most_common(5))   # never loads the whole file
+```
+
+## Vectorise with numpy
+
+A Python loop pays a small cost for **every** item: look up the variables, check the types, create a new number object. **numpy** stores numbers in compact arrays and runs whole operations in C, so one line works on a million numbers at once. This is called **vectorisation**:
+
+<CodeExample output={`[10.0, 4.0, 16.0, 3.5]
+[10.   4.  16.   3.5]
+33.5
+[4.  3.2]`}>
+
+```python
+import numpy as np
+
+prices = [2.5, 4.0, 3.2, 1.75]
+quantities = [4, 1, 5, 2]
+
+# Python loop: one multiplication at a time
+totals = []
+for price, qty in zip(prices, quantities):
+    totals.append(price * qty)
+print(totals)
+
+# numpy: one operation on whole arrays
+p = np.array(prices)
+q = np.array(quantities)
+print(p * q)
+print((p * q).sum())
+print(p[p > 3])            # filter without a loop
+```
+
+</CodeExample>
+
+Same results, but numpy did the multiplying, summing and filtering without a Python loop. On four items you won't notice. On a million, it's typically **50–100× faster**. Run it and see:
+
+<TryIt language="python" code={`import timeit
+import numpy as np
+
+n = 1_000_000
+values = list(range(n))
+array = np.arange(n, dtype=np.int64)
+
+def loop_sum_squares():
+    total = 0
+    for v in values:
+        total += v * v
+    return total
+
+def numpy_sum_squares():
+    return int((array * array).sum())
+
+print("same answer:", loop_sum_squares() == numpy_sum_squares())
+loop_t = min(timeit.repeat(loop_sum_squares, number=1, repeat=3))
+np_t = min(timeit.repeat(numpy_sum_squares, number=1, repeat=3))
+print(f"loop:  {loop_t * 1000:.1f} ms")
+print(f"numpy: {np_t * 1000:.1f} ms")
+print(f"numpy is {loop_t / np_t:.0f}x faster")
+`}
+/>
+
+<Callout type="note" title="numpy numbers have a fixed size">
+
+Python's `int` never overflows; numpy's do. `np.arange(n)` uses the platform's default integer type, which can be 32-bit (it is here in the browser), and squaring a million numbers then silently wraps around to wrong answers. That's why the demo says `dtype=np.int64`. When results look odd, check `array.dtype`. pandas (which is built on numpy) has the same behaviour.
+
+</Callout>
+
+## Cheap wins
+
+Before you reach for anything exotic, a few habits make ordinary Python faster. Run this to see how much each one gives:
+
+<TryIt language="python" code={`import math
+import timeit
+
+words = ["panda"] * 10_000
+numbers = range(10_000)
+
+def plus_equals():
+    text = ""
+    for w in words:
+        text += w + ","
+    return text
+
+def join():
+    return ",".join(words) + ","
+
+def append_loop():
+    out = []
+    for n in numbers:
+        out.append(n * 2)
+    return out
+
+def comprehension():
+    return [n * 2 for n in numbers]
+
+def global_lookup():
+    return [math.sqrt(n) for n in numbers]
+
+def local_lookup():
+    sqrt = math.sqrt          # look it up once
+    return [sqrt(n) for n in numbers]
+
+contests = [(plus_equals, join),
+            (append_loop, comprehension),
+            (global_lookup, local_lookup)]
+for slow, fast in contests:
+    assert slow() == fast()
+    t_slow = min(timeit.repeat(slow, number=50, repeat=3))
+    t_fast = min(timeit.repeat(fast, number=50, repeat=3))
+    print(f"{fast.__name__:>13} vs {slow.__name__:<13}"
+          f" {t_slow / t_fast:.1f}x faster")
+`}
+/>
+
+- **`"".join(parts)`** instead of `+=` on strings in a loop: strings are immutable, so `+=` may copy the whole text every time (O(n²) in the worst case). `join` computes the size once. This one is a big win.
+- **Comprehensions** instead of `append` loops: a bit faster and easier to read.
+- **Local names** instead of repeated global or attribute lookups (`sqrt = math.sqrt`, `append = out.append`): a small win in hot loops.
+- **Built-ins** (`sum`, `max`, `sorted`, `any`, `collections.Counter`) run in C; prefer them over hand-written loops.
+- **The right data structure**: a `set` for membership, a `dict` as an index, a `deque` for queues. That's the Big-O lesson again, and usually the biggest win of all.
+
+Notice how small the last two gaps are. Since Python 3.11 the interpreter got much faster at these cases, so old blog posts often promise more than you'll get. Readability first; tricks only in a hot loop that the profiler pointed at.
+
+## When to reach for native code
+
+Sometimes a hot loop is still too slow after all of the above: a custom simulation, parsing a binary format, an algorithm numpy can't express. Then you move **just that function** into compiled code and keep the rest in Python:
+
+- **Numba**: add `@numba.njit` to a numeric function using loops and numpy arrays, and it's compiled to machine code on first call. The quickest win for number crunching.
+- **Cython**: Python-like code with type declarations (`cdef int i`), compiled to a C extension. Mature, used by pandas and scikit-learn.
+- **mypyc**: compiles ordinary type-hinted Python modules to C extensions (mypy itself is compiled with it).
+- **Rust with PyO3 + maturin**: write the function in Rust and import it like any Python module. Memory-safe and very fast; this is how pydantic-core, polars, ruff and orjson are built.
+
+```rust
+use pyo3::prelude::*;
+
+#[pyfunction]
+fn count_words(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+```
+
+```bash
+maturin develop      # build it, then in Python: from mylib import count_words
+```
+
+The trade-off is real: a build step, a second language for the team, harder debugging. Seniors do it last, for a measured hot spot, and often the answer is "a library already did this" (numpy, polars, orjson, a database query).
+
+<Quiz
+  question="A function get_price(product_id) reads the current price from the database. A colleague adds @functools.cache to it to speed up the shop. What is the main risk?"
+  options={[
+    "It won't work because product ids are integers",
+    "Customers may see old prices after a price changes, because the cache never expires",
+    "It makes every call slower because of the cache lookup",
+    "The cache is cleared every time the function is called",
+  ]}
+  answer={1}
+  explanation="The function isn't pure: its result depends on data that changes. An unbounded cache keeps the first price forever (and grows with every product). You'd need invalidation (cache_clear when prices change) or a cache with an expiry time."
+/>
+
+<Quiz
+  question="An lru_cache(maxsize=2) function is called with 'a', 'b', 'a', 'c', 'b' in that order. How many of these calls are cache hits?"
+  options={["0", "1", "2", "3"]}
+  answer={1}
+  explanation="a miss, b miss, a hit (a is now most recent), c miss and evicts b (least recently used), b miss again. Only one hit."
+/>
+
+<Exercise
+  language="python"
+  title="Build an LRU cache"
+  starter={`from collections import OrderedDict
+
+class LRUCache:
+    """Keeps the \`capacity\` most recently used items."""
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.hits = 0
+        self.misses = 0
+        self._data = OrderedDict()
+
+    def get(self, key, default=None):
+        # Return the value (and mark it as recently used),
+        # or default if the key isn't cached.
+        pass
+
+    def put(self, key, value):
+        # Store the value as the most recently used item.
+        # Over capacity? Evict the least recently used one.
+        pass
+
+    def __len__(self):
+        return len(self._data)
+
+cache = LRUCache(2)
+cache.put("tea", 2.5)
+cache.put("cake", 4.0)
+cache.get("tea")
+cache.put("bun", 3.2)        # cache is full: who goes?
+print(cache.get("cake"), cache.get("tea"), cache.get("bun"))
+print(f"hits={cache.hits} misses={cache.misses} size={len(cache)}")
+`}
+  tests={[
+    { name: "Prints the expected result", check: "__output == ['None 2.5 3.2', 'hits=3 misses=1 size=2']" },
+    { name: "get returns a stored value", check: "[c := LRUCache(3), c.put('a', 1), c.get('a')][-1] == 1" },
+    { name: "Missing keys return default", check: "[c := LRUCache(3), c.get('nope'), c.get('nope', 'x')][1:] == [None, 'x']" },
+    { name: "Evicts the oldest item when full", check: "[c := LRUCache(2), c.put('a', 1), c.put('b', 2), c.put('c', 3), c.get('a'), c.get('b'), c.get('c')][-3:] == [None, 2, 3]" },
+    { name: "get marks an item as recently used", check: "[c := LRUCache(2), c.put('a', 1), c.put('b', 2), c.get('a'), c.put('c', 3), c.get('b'), c.get('a')][-2:] == [None, 1]" },
+    { name: "put on an existing key updates it and marks it as recent", check: "[c := LRUCache(2), c.put('a', 1), c.put('b', 2), c.put('a', 10), c.put('c', 3), len(c), c.get('a'), c.get('b')][-3:] == [2, 10, None]" },
+    { name: "Counts hits and misses", check: "[c := LRUCache(1), c.put('x', 1), c.get('x'), c.get('y'), c.get('x'), c.hits, c.misses][-2:] == [2, 1]" },
+    { name: "Never grows past capacity", check: "[c := LRUCache(3), [c.put(i, i * i) for i in range(10)], len(c), [c.get(i) for i in range(10)]][2:] == [3, [None] * 7 + [49, 64, 81]]" },
+    { name: "A cached None is still a hit", check: "[c := LRUCache(2), c.put('a', None), c.get('a', 'missing'), c.hits][-2:] == [None, 1]" },
+  ]}
+>
+
+Finish the `LRUCache` class so it behaves like the cache inside `lru_cache`:
+
+- **`get(key, default=None)`**: if the key is cached, count a **hit**, mark the key as most recently used and return its value. Otherwise count a **miss** and return `default`.
+- **`put(key, value)`**: store the value as the most recently used item (also when the key already exists). If the cache now holds more than `capacity` items, remove the **least recently used** one.
+- Both must be O(1): no loops, no sorting.
+
+Careful with one trap: a cached value can be `None`, so check whether the **key** is in the cache rather than whether the value is `None`. When it works, the bottom prints `None 2.5 3.2` and `hits=3 misses=1 size=2`. Bonus (not checked): raise `ValueError` for a capacity below 1.
+
+<Hint>
+
+In `get`: `if key not in self._data:` → `self.misses += 1` and `return default`. Otherwise `self.hits += 1`, `self._data.move_to_end(key)` and return `self._data[key]`.
+
+In `put`: `self._data[key] = value`, then `self._data.move_to_end(key)` (assigning to an existing key doesn't change its position). Then `if len(self._data) > self.capacity:` call `self._data.popitem(last=False)`.
+
+</Hint>
+
+<Solution>
+
+```python
+from collections import OrderedDict
+
+class LRUCache:
+    """Keeps the `capacity` most recently used items."""
+
+    def __init__(self, capacity):
+        if capacity < 1:
+            raise ValueError("capacity must be at least 1")
+        self.capacity = capacity
+        self.hits = 0
+        self.misses = 0
+        self._data = OrderedDict()
+
+    def get(self, key, default=None):
+        if key not in self._data:
+            self.misses += 1
+            return default
+        self.hits += 1
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def put(self, key, value):
+        self._data[key] = value
+        self._data.move_to_end(key)
+        if len(self._data) > self.capacity:
+            self._data.popitem(last=False)
+
+    def __len__(self):
+        return len(self._data)
+
+cache = LRUCache(2)
+cache.put("tea", 2.5)
+cache.put("cake", 4.0)
+cache.get("tea")
+cache.put("bun", 3.2)        # cache is full: who goes?
+print(cache.get("cake"), cache.get("tea"), cache.get("bun"))
+print(f"hits={cache.hits} misses={cache.misses} size={len(cache)}")
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Try optimisations in this order: **a better algorithm or data structure**, **don't repeat work** (caching), **less memory** (generators), **move work into C** (numpy, built-ins), and only then **native code**.
+- **`@functools.cache`** memoises pure functions; **`@lru_cache(maxsize=N)`** keeps only the N most recently used results. Check **`cache_info()`** for hits and misses.
+- Cache pitfalls: arguments must be hashable, cached data goes **stale** (`cache_clear()`), unbounded caches leak memory, and `lru_cache` on methods keeps instances alive (use `cached_property`).
+- An **LRU cache** = `OrderedDict` + `move_to_end(key)` on use + `popitem(last=False)` to evict.
+- **Generators** process one item at a time: constant memory for any amount of data.
+- **numpy** vectorisation runs whole-array operations in C, often 50–100× faster than loops; watch the `dtype`.
+- Cheap wins: `"".join`, comprehensions, built-ins, local names. Native code (Numba, Cython, mypyc, Rust/PyO3) is the last resort for a measured hot spot.

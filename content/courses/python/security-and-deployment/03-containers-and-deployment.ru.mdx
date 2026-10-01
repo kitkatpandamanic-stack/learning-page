@@ -1,0 +1,729 @@
+---
+title: Контейнеры и развёртывание
+description: Выпускайте Python-сервис как профессионал — проверенные настройки из окружения, структурированные логи, health check, Docker, воркеры за прокси, CI, развёртывание без простоя и мониторинг.
+duration: 25
+xp: 30
+---
+
+«На моей машине работает» — на этом останавливается большинство проектов, и именно здесь начинается настоящая работа. Сервис в продакшене должен одинаково запускаться на каждом сервере, сообщать, когда ему плохо, переживать развёртывания без потерянных запросов и оставлять достаточно следов, чтобы его можно было отладить в 3 часа ночи. В этом уроке вы соберёте части, которые живут в вашем Python-коде (настройки, логи, проверки работоспособности), а затем увидите, как вокруг них выстраиваются контейнеры, CI и мониторинг. 🚀
+
+## Настройки из окружения (по правилам 12 факторов)
+
+**Twelve-Factor App** («приложение двенадцати факторов») — это набор правил для сервисов, которые легко развёртывать; его написали инженеры Heroku. Правило номер три: **храните конфигурацию в окружении**. Одна и та же сборка (один и тот же Docker-образ) работает в разработке, на staging и в продакшене, а различаются только **переменные окружения (environment variables)**: адреса баз данных, секретные ключи, уровни логирования, флаги функций.
+
+Если читать `os.environ["WORKERS"]` по всему коду, возникают две проблемы: значения всегда **строки**, а опечатка или отсутствующее значение взорвётся только тогда, когда эта строка наконец выполнится, может быть, через несколько дней. Решение — **объект настроек**, который загружается и **проверяется один раз, при запуске**. Самую трудную часть берёт на себя Pydantic:
+
+<CodeExample output={`5 dev
+**********
+40
+database_url -> missing
+secret_key -> too_short
+workres -> extra_forbidden`}>
+
+```python
+from collections.abc import Mapping
+from typing import Literal
+
+from pydantic import (
+    BaseModel, ConfigDict, Field, SecretStr, ValidationError,
+)
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    database_url: str
+    secret_key: SecretStr = Field(min_length=32)
+    workers: int = Field(default=2, ge=1, le=32)
+
+def load_settings(env: Mapping[str, str]) -> Settings:
+    values = {
+        name.removeprefix("APP_").lower(): value
+        for name, value in env.items()
+        if name.startswith("APP_")
+    }
+    return Settings.model_validate(values)
+
+env = {
+    "APP_DATABASE_URL": "postgresql://db/shop",
+    "APP_SECRET_KEY": "x" * 40,
+    "APP_WORKERS": "4",
+    "HOME": "/home/mei",            # не наша: игнорируется
+}
+settings = load_settings(env)
+print(settings.workers + 1, settings.environment)
+print(settings.secret_key)
+print(len(settings.secret_key.get_secret_value()))
+
+bad = {"APP_SECRET_KEY": "short", "APP_WORKRES": "4"}
+try:
+    load_settings(bad)
+except ValidationError as e:
+    for error in e.errors():
+        print(error["loc"][0], "->", error["type"])
+```
+
+</CodeExample>
+
+В нескольких строках происходит много хорошего:
+
+- `"4"` превратилось в целое число `4`, а `ge=1, le=32` отклоняет нелепые значения.
+- **`SecretStr`** печатается как `**********`, поэтому ключ не может случайно утечь в логи или на страницы ошибок; чтобы его получить, нужно явно вызвать `get_secret_value()`.
+- **Префикс `APP_`** отделяет наши переменные от всего остального в окружении, а `extra="forbid"` превращает опечатку `APP_WORKRES` в ошибку, а не в молча проигнорированную настройку.
+- `load_settings` получает окружение **как параметр**. В приложении вы вызываете `load_settings(os.environ)`, а в тестах передаёте обычный словарь. Никакого monkeypatching не нужно.
+
+На вашем компьютере пакет **`pydantic-settings`** делает то же самое меньшим количеством кода и умеет читать локальный файл `.env`:
+
+```python
+# pip install pydantic-settings
+from pydantic import Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="APP_", env_file=".env"
+    )
+    database_url: str
+    secret_key: SecretStr = Field(min_length=32)
+    workers: int = 2
+
+settings = Settings()   # читает APP_* из окружения
+```
+
+<Callout type="tip" title="Падайте сразу и громко">
+
+Сервис со сломанной конфигурацией должен **отказаться запускаться** с понятным сообщением, в котором названа неправильная переменная. Во время развёртывания это значит, что новая версия так и не станет «здоровой», и старая продолжит обслуживать трафик, пока вы исправляете опечатку. Сервис, который всё равно запускается и падает на первом настоящем запросе, гораздо хуже.
+
+</Callout>
+
+## Структурированное логирование
+
+В продакшене логи никто не читает построчно: их собирают со всех серверов в инструмент вроде Grafana Loki, Datadog или CloudWatch и **ищут** по ним. Строку в свободной форме вроде `Order 42 placed, total 19.99` трудно фильтровать. **Структурированная** строка лога — это маленький JSON-объект с именованными полями, поэтому «покажи все предупреждения по заказу 42» становится простым запросом:
+
+<CodeExample output={`{"level": "INFO", "logger": "shop.orders", "msg": "order placed", "order_id": 42, "total": 19.99}
+{"level": "WARNING", "logger": "shop.orders", "msg": "payment slow", "order_id": 42, "ms": 2300}`}>
+
+```python
+import json
+import logging
+import sys
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        entry.update(getattr(record, "fields", {}))
+        return json.dumps(entry)
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(
+    level=logging.INFO, handlers=[handler], force=True
+)
+
+log = logging.getLogger("shop.orders")
+log.info("order placed",
+         extra={"fields": {"order_id": 42, "total": 19.99}})
+log.debug("cart details")     # ниже INFO: не выводится
+log.warning("payment slow",
+            extra={"fields": {"order_id": 42, "ms": 2300}})
+```
+
+</CodeExample>
+
+Настоящий форматтер добавляет ещё и время (`"time": self.formatTime(record)`); здесь мы его опустили, чтобы вывод был одинаковым при каждом запуске. Несколько привычек, которые делают **логирование (logging)** полезным:
+
+- **Пишите логи в stdout**, а не в файлы. Платформа контейнеров собирает stdout; это ещё одно правило двенадцати факторов.
+- Добавляйте **идентификатор запроса** (request id) в каждую строку лога запроса (его создаёт middleware и передаёт дальше, часто через `contextvars`), чтобы можно было проследить один запрос по всем его строкам и между сервисами.
+- Выбирайте уровни осознанно: `INFO` — для бизнес-событий, `WARNING` — для «странно, но обработано», `ERROR` — для «кому-то стоит на это посмотреть».
+- **Никогда не логируйте секреты и персональные данные**: пароли, токены, полные номера карт. Логируйте идентификаторы.
+
+Пакеты `structlog` и `python-json-logger` дают всё это в готовом виде.
+
+## Проверки работоспособности
+
+Балансировщики нагрузки и платформы контейнеров постоянно спрашивают ваш сервис *«ты в порядке?»*, вызывая HTTP-эндпоинт. Это **проверки работоспособности (health checks)**, и вопросов на самом деле два — если их перепутать, будут аварии:
+
+- **Liveness** («жив ли», `/health/live`): *работает ли процесс вообще?* Если нет, платформа его **перезапускает**. Держите эту проверку тривиальной.
+- **Readiness** («готов ли», `/health/ready`): *можете ли вы обрабатывать запросы прямо сейчас?* Если нет, балансировщик **перестаёт отправлять трафик** на этот экземпляр, пока тот не восстановится. Именно здесь проверяют базу данных.
+
+<CodeExample output={`{'status': 'ok'}
+{'status': 'ok', 'database': 'ok'}
+503 {'status': 'unavailable', 'database': 'down'}
+200`}>
+
+```python
+import sqlite3
+from collections.abc import Callable
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+
+def create_app(check_db: Callable[[], bool]) -> FastAPI:
+    app = FastAPI()
+
+    @app.get("/health/live")
+    def live():
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def ready():
+        try:
+            db_ok = check_db()
+        except Exception:
+            db_ok = False
+        if not db_ok:
+            return JSONResponse(
+                {"status": "unavailable", "database": "down"},
+                status_code=503,
+            )
+        return {"status": "ok", "database": "ok"}
+
+    return app
+
+conn = sqlite3.connect(":memory:")
+
+def check_sqlite() -> bool:
+    return conn.execute("SELECT 1").fetchone() == (1,)
+
+client = TestClient(create_app(check_sqlite))
+print(client.get("/health/live").json())
+print(client.get("/health/ready").json())
+
+conn.close()                          # база данных «падает»
+response = client.get("/health/ready")
+print(response.status_code, response.json())
+print(client.get("/health/live").status_code)
+```
+
+</CodeExample>
+
+Когда база данных падает, readiness отвечает **503 Service Unavailable**, а liveness остаётся довольной. Так и должно быть: перезапуск приложения базу данных не починит. Обратите внимание на **фабрику приложения (app factory)** `create_app(...)`: вместо глобального `app` функция собирает приложение из его зависимостей, поэтому тесты могут собрать его с поддельной проверкой базы данных.
+
+<Callout type="warning" title="Не позволяйте базе данных перезапускать весь парк">
+
+Классическая авария: кто-то проверяет базу данных в проверке **liveness**. У базы случается 30-секундная заминка, все экземпляры проваливают liveness, платформа перезапускает их все разом, и все они одновременно переподключаются, снова роняя базу. Держите liveness тривиальной, делайте эндпоинты проверок быстрыми и без аутентификации и не выдавайте в них подробности вроде версий внутренних систем.
+
+</Callout>
+
+## Упаковка приложения в контейнер
+
+**Образ (image) контейнера (container)** объединяет ваш код, его зависимости и интерпретатор Python в один артефакт, который одинаково работает на вашем ноутбуке, в CI и в продакшене. Хороший Dockerfile для Python-сервиса использует два приёма: **многоэтапную сборку (multi-stage build)** (зависимости ставятся на одном этапе, а в маленький финальный образ без компиляторов и кешей копируется только результат) и **пользователя без прав root** (если кто-то взломает приложение, внутри контейнера он не будет root):
+
+```dockerfile
+# ---- этап 1: собираем зависимости ----
+FROM python:3.14-slim AS build
+RUN python -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---- этап 2: маленький образ для запуска ----
+FROM python:3.14-slim
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/venv/bin:$PATH"
+RUN useradd --create-home --uid 10001 app
+WORKDIR /app
+COPY --from=build /venv /venv
+COPY src/ ./src/
+USER app
+EXPOSE 8000
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", \
+     "--port", "8000", "--proxy-headers"]
+```
+
+Разберём по строкам самое важное:
+
+- `requirements.txt` копируется и устанавливается **до** исходного кода. Docker кеширует каждый шаг, поэтому изменение кода не переустанавливает все пакеты.
+- `PYTHONUNBUFFERED=1` заставляет логи появляться сразу, а не ждать в буфере.
+- Код остаётся во владении root и доступен пользователю `app` только для чтения, поэтому взломанный процесс не сможет его переписать.
+- `CMD` записан **в форме списка**, поэтому uvicorn — главный процесс и получает сигнал `SIGTERM` при остановке (подробнее об этом ниже).
+
+Добавьте `.dockerignore`, чтобы секреты и мусор никогда не попадали в образ:
+
+```text
+# .dockerignore
+.env
+.git
+.venv
+__pycache__
+tests
+```
+
+Для локальной разработки **Docker Compose** запускает приложение вместе с базой данных одной командой (`docker compose up --build`):
+
+```yaml
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENVIRONMENT: dev
+      APP_DATABASE_URL: postgresql+psycopg://app:app@db:5432/app
+    env_file: .env          # APP_SECRET_KEY живёт здесь, а не в git
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+```
+
+Сервисы обращаются друг к другу по имени (`db:5432`), именованный том хранит базу данных между перезапусками, а `condition: service_healthy` ждёт, пока Postgres начнёт принимать подключения, прежде чем запустить API. Пароль для разработки `app` здесь допустим; секреты продакшена берутся из хранилища секретов платформы и никогда — из compose-файла в git.
+
+## Воркеры за обратным прокси
+
+В продакшене uvicorn не выставляют напрямую в интернет. Перед ним стоит **обратный прокси (reverse proxy)** (nginx, Caddy, Traefik или облачный балансировщик нагрузки), который занимается HTTPS-сертификатами, сжатием, медленными клиентами, ограничениями размера запросов, а часто и ограничением частоты, и затем передаёт запросы вашему приложению:
+
+```bash
+# один контейнер, несколько процессов-воркеров
+uvicorn src.main:app --host 0.0.0.0 --port 8000 \
+  --workers 4 --proxy-headers --forwarded-allow-ips "10.0.0.0/8"
+
+# или через собственный CLI FastAPI
+fastapi run src/main.py --workers 4
+```
+
+Несколько практических правил:
+
+- Один процесс Python использует для Python-кода **одно ядро процессора** (GIL из модуля о внутреннем устройстве), поэтому запускают несколько **процессов-воркеров** (worker processes), для асинхронных приложений — примерно по одному на ядро.
+- В **Kubernetes** и похожих платформах обычно выбирают **один воркер на контейнер** и больше реплик контейнеров: управлением процессами и перезапусками занимается платформа.
+- `--proxy-headers` заставляет uvicorn доверять заголовкам `X-Forwarded-For` и `X-Forwarded-Proto` от прокси, чтобы приложение видело настоящий IP клиента и `https`. Доверяйте им только с адресов вашего прокси (`--forwarded-allow-ips`), иначе клиенты смогут подделать свой IP и обойти ваши ограничения частоты.
+- Воркеры — это отдельные процессы: всё, что хранится в памяти (счётчик ограничения частоты, кеш), существует **в каждом воркере отдельно**. Общему состоянию место в Redis или в базе данных.
+
+## Непрерывная интеграция
+
+**CI** (continuous integration, непрерывная интеграция) автоматически запускает ваши проверки при каждом push и pull request, чтобы сломанный код никогда не попал в `main`. В GitHub Actions это YAML-файл в `.github/workflows/`:
+
+```yaml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest
+      - run: pip-audit -r requirements.txt
+
+  image:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+```
+
+Задача `test` при каждом pull request запускает линтер, тесты и аудит зависимостей. Только когда всё это проходит на `main`, задача `image` собирает Docker-образ и отправляет его в реестр **с тегом в виде хеша коммита**, так что вы всегда точно знаете, какой код запущен, и можете откатиться к любому прежнему тегу. Секреты берутся из зашифрованных секретов GitHub (`secrets.GITHUB_TOKEN`), а не из YAML, а `permissions` выдаёт задаче только то, что ей нужно. Дальше шаг развёртывания (или инструмент вроде Argo CD) выкатывает новый образ.
+
+## Развёртывание без простоя
+
+Пользователи не должны замечать **развёртывание (deployment)**. Распространённые стратегии:
+
+| Стратегия | Как работает | Компромисс |
+| --- | --- | --- |
+| **Rolling** (постепенная) | экземпляры заменяются по несколько за раз; каждый новый сначала должен пройти readiness | просто; какое-то время старая и новая версии работают бок о бок |
+| **Blue-green** («сине-зелёная») | запускается полный новый набор («зелёный»), затем весь трафик переключается разом | мгновенный откат обратным переключением; ненадолго нужна двойная мощность |
+| **Canary** («канареечная») | 1–5% трафика идёт на новую версию, вы следите за метриками, потом долю увеличиваете | проблемы ловятся рано и затрагивают немногих; нужен хороший мониторинг |
+
+Все они опираются на части из этого урока. **Проверки readiness** не пускают трафик на неготовые экземпляры. Важна и **плавная остановка (graceful shutdown)**: останавливая старый экземпляр, платформа отправляет `SIGTERM`, а uvicorn перестаёт принимать новые подключения и завершает текущие запросы перед выходом, так что дайте ему достаточно времени (`--timeout-graceful-shutdown`).
+
+Самое трудное обычно — **база данных**. Во время постепенного развёртывания старый и новый код работают с **одной и той же** схемой, поэтому изменения вносят обратно совместимыми шагами. Этот подход называется **expand and contract** («расширить и сжать»): сначала добавьте новый столбец (старый код его игнорирует), разверните код, который пишет в оба, заполните данные, переключите чтение и только в одном из следующих релизов удалите старый столбец. Переименовать столбец за один шаг — классический способ сломать развёртывание «без простоя».
+
+## Мониторинг и оповещения
+
+Когда сервис запущен, вам нужно знать, что он работает, **раньше**, чем об этом скажут пользователи. У наблюдаемости (observability) три опоры:
+
+- **Метрики**: числа во времени, дешёвые в хранении и отлично подходящие для дашбордов и оповещений. Для каждого сервиса отслеживайте метрики **RED**: **R**ate (запросов в секунду), **E**rrors (неудачные запросы) и **D**uration (задержка в виде перцентилей вроде p50 и p99, ведь средние значения прячут медленные запросы). Добавьте насыщение (saturation): процессор, память, подключения к базе данных. Prometheus и Grafana — классическая пара с открытым кодом.
+- **Логи**: структурированные события, о которых шла речь выше, — для подробностей того, что произошло.
+- **Трейсы (traces)**: путь одного запроса через все сервисы и обращения к базе данных с замерами времени, чтобы было видно, *где* именно медленно. Стандарт — **OpenTelemetry** с автоматической инструментацией для FastAPI, SQLAlchemy и httpx.
+
+Плюс **отслеживание ошибок** (Sentry и аналоги), которое группирует исключения вместе с их трассировками стека.
+
+**Оповещения** (alerts), которые будят человека, отправляйте только о **симптомах, которые чувствуют пользователи**: «доля ошибок выше 2% в течение 5 минут» или «задержка p99 больше 1 секунды», а не «процессор загружен на 80%». Команды часто задают **SLO** (service level objectives — цели уровня обслуживания, например «99,9% запросов за месяц успешны») и поднимают тревогу, когда допустимый запас отказов расходуется слишком быстро. Каждое оповещение должно требовать конкретного действия и ссылаться на **runbook** (инструкцию), где сказано, что проверить первым делом. Оповещение, которое срабатывает каждый день и которое все игнорируют, хуже, чем никакого: оно приучает людей игнорировать и настоящее.
+
+<Quiz
+  question="Во время развёртывания в новой версии опечатка в имени переменной окружения (APP_WORKRES). Её настройки используют extra='forbid' и проверяются при запуске, а платформа выполняет постепенное обновление с проверками readiness. Что произойдёт?"
+  options={[
+    "Новые экземпляры запустятся, проигнорируют настройку и возьмут число воркеров по умолчанию",
+    "Новые экземпляры откажутся запускаться, так и не станут готовыми, а старая версия продолжит обслуживать трафик",
+    "Упадут все экземпляры, включая старые",
+    "Pydantic автоматически исправит опечатку",
+  ]}
+  answer={1}
+  explanation="Валидация не проходит при запуске, поэтому новые экземпляры так и не проходят readiness, и постепенное обновление на этом останавливается. Старые экземпляры продолжают обрабатывать запросы, пока кто-нибудь не исправит переменную. Именно поэтому конфигурация должна падать сразу."
+/>
+
+<Quiz
+  question="База данных ненадолго недоступна. Какая проверка работоспособности должна провалиться?"
+  options={[
+    "Liveness, чтобы платформа перезапустила каждый экземпляр",
+    "Readiness, чтобы балансировщик перестал отправлять трафик, пока база данных не вернётся",
+    "Обе — на всякий случай",
+    "Никакая: проверки работоспособности никогда не должны смотреть на базу данных",
+  ]}
+  answer={1}
+  explanation="Readiness отвечает на вопрос, может ли экземпляр обслуживать запросы прямо сейчас, поэтому она должна провалиться, и трафик придерживается. Провал liveness перезапустил бы каждый экземпляр, что не починит базу данных и часто делает аварию только хуже."
+/>
+
+<Exercise
+  language="python"
+  title="Загрузчик настроек и проверки работоспособности"
+  starter={`from collections.abc import Callable, Mapping
+from typing import Literal
+
+import pytest
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from pydantic import (
+    BaseModel, ConfigDict, Field, SecretStr, ValidationError,
+    model_validator,
+)
+
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    app_name: str = "panda-api"
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    database_url: str
+    secret_key: SecretStr
+    debug: bool = False
+    workers: int = 2
+
+    # TODO 1: secret_key должен содержать не меньше 32 символов,
+    #         а workers — быть от 1 до 32 (используйте Field)
+
+    # TODO 2: model_validator(mode="after"), который выбрасывает
+    #         ValueError, когда debug включён в "prod"
+
+
+def load_settings(env: Mapping[str, str]) -> Settings:
+    # TODO 3: соберите Settings из переменных APP_* в env:
+    #         APP_DATABASE_URL -> database_url и так далее.
+    #         Все переменные без префикса APP_ игнорируйте.
+    raise NotImplementedError
+
+
+def create_app(
+    settings: Settings, check_db: Callable[[], bool]
+) -> FastAPI:
+    app = FastAPI(title=settings.app_name, debug=settings.debug)
+
+    @app.get("/health/live")
+    def live():
+        return {"status": "ok"}
+
+    # TODO 4: GET /health/ready
+    #   check_db() возвращает True -> 200 {"status": "ok",
+    #       "environment": settings.environment}
+    #   возвращает False или выбрасывает исключение -> 503 {"status": "unavailable"}
+
+    return app
+
+
+# ---------- тесты (не меняйте их) ----------
+
+GOOD_ENV = {
+    "APP_DATABASE_URL": "postgresql://db:5432/pandas",
+    "APP_SECRET_KEY": "k" * 40,
+    "APP_ENVIRONMENT": "staging",
+    "APP_WORKERS": "4",
+    "PATH": "/usr/bin",
+}
+
+
+def env_with(**changes):
+    env = dict(GOOD_ENV)
+    for name, value in changes.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
+def test_loads_and_converts_values():
+    settings = load_settings(GOOD_ENV)
+    assert settings.workers == 4
+    assert settings.environment == "staging"
+    assert settings.debug is False
+    assert settings.app_name == "panda-api"
+
+
+def test_secret_is_hidden():
+    settings = load_settings(GOOD_ENV)
+    assert "kkkk" not in repr(settings)
+    assert settings.secret_key.get_secret_value() == "k" * 40
+
+
+@pytest.mark.parametrize("changes", [
+    {"APP_DATABASE_URL": None},
+    {"APP_SECRET_KEY": "too-short"},
+    {"APP_WORKERS": "0"},
+    {"APP_WORKERS": "lots"},
+    {"APP_ENVIRONMENT": "production"},
+    {"APP_WORKRES": "4"},
+])
+def test_bad_config_fails_fast(changes):
+    with pytest.raises(ValidationError):
+        load_settings(env_with(**changes))
+
+
+def test_no_debug_in_prod():
+    env = env_with(APP_ENVIRONMENT="prod", APP_DEBUG="true")
+    with pytest.raises(ValidationError):
+        load_settings(env)
+    assert load_settings(env_with(APP_DEBUG="true")).debug
+
+
+def test_ready_when_database_is_up():
+    app = create_app(load_settings(GOOD_ENV), lambda: True)
+    response = TestClient(app).get("/health/ready")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok", "environment": "staging"
+    }
+
+
+def broken_db():
+    raise ConnectionError("database unreachable")
+
+
+@pytest.mark.parametrize("check_db", [lambda: False, broken_db])
+def test_not_ready_when_database_is_down(check_db):
+    app = create_app(load_settings(GOOD_ENV), check_db)
+    client = TestClient(app)
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+    assert client.get("/health/live").status_code == 200
+
+
+pytest.main([__file__])
+`}
+  tests={[
+    { name: "Все тесты в редакторе проходят", check: "(r := _panda_pytest())['failed'] == 0 and r['errors'] == 0 and r['passed'] >= 12" },
+    { name: "load_settings читает переменные APP_* и преобразует их типы", check: "(s := load_settings({'APP_DATABASE_URL': 'sqlite://', 'APP_SECRET_KEY': 'z' * 32, 'APP_WORKERS': '7', 'APP_DEBUG': '1', 'APP_APP_NAME': 'bamboo', 'USER': 'mei'})) and s.workers == 7 and s.debug is True and s.app_name == 'bamboo' and s.environment == 'dev' and s.database_url == 'sqlite://'" },
+    { name: "Короткие секреты, число воркеров вне диапазона и debug в prod отклоняются", check: "all([pytest.raises(ValidationError, load_settings, {'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 31}), pytest.raises(ValidationError, load_settings, {'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32, 'APP_WORKERS': '33'}), pytest.raises(ValidationError, load_settings, {'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32, 'APP_ENVIRONMENT': 'prod', 'APP_DEBUG': 'yes'})]) and load_settings({'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32, 'APP_ENVIRONMENT': 'prod', 'APP_WORKERS': '32'}).workers == 32" },
+    { name: "/health/ready отвечает 200 с окружением, когда база данных работает", check: "(c := TestClient(create_app(load_settings({'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32, 'APP_ENVIRONMENT': 'prod'}), lambda: True))) and (r := c.get('/health/ready')).status_code == 200 and r.json() == {'status': 'ok', 'environment': 'prod'}" },
+    { name: "/health/ready отвечает 503, когда проверка не проходит или выбрасывает исключение, а liveness остаётся OK", check: "(c := TestClient(create_app(load_settings({'APP_DATABASE_URL': 'x', 'APP_SECRET_KEY': 'z' * 32}), lambda: 1 / 0))) and (r := c.get('/health/ready')).status_code == 503 and r.json() == {'status': 'unavailable'} and c.get('/health/live').json() == {'status': 'ok'}" },
+  ]}
+>
+
+Соберите основу готовности сервиса к продакшену: загрузчик настроек с валидацией и эндпоинты проверки работоспособности. Добейтесь, чтобы прошли все двенадцать тестов:
+
+1. В `Settings` используйте `Field`, чтобы `secret_key` содержал **не меньше 32 символов**, а `workers` был **от 1 до 32**.
+2. Добавьте `@model_validator(mode="after")`, который выбрасывает `ValueError`, когда `debug` включён, а `environment` равно `"prod"`.
+3. Напишите `load_settings(env)`: возьмите каждую переменную, начинающуюся с `APP_`, уберите префикс, приведите остаток к нижнему регистру (`APP_DATABASE_URL` → `database_url`), всё остальное проигнорируйте и проверьте результат через `Settings.model_validate`.
+4. В `create_app` добавьте `GET /health/ready`: вызовите `check_db()`. Если она вернула `True`, ответьте `{"status": "ok", "environment": ...}`; если вернула `False` **или выбросила исключение**, ответьте **503** с `{"status": "unavailable"}`.
+
+<Hint>
+
+`secret_key: SecretStr = Field(min_length=32)` и `workers: int = Field(default=2, ge=1, le=32)`. Валидатор — это метод с декоратором `@model_validator(mode="after")`, который проверяет `self.environment == "prod" and self.debug` и в конце обязательно делает `return self`. Для загрузчика всё сделает словарное включение с `name.removeprefix("APP_").lower()` и `if name.startswith("APP_")`. Для 503 оберните `check_db()` в `try` / `except Exception` и верните `JSONResponse({"status": "unavailable"}, status_code=503)`.
+
+</Hint>
+
+<Solution>
+
+```python
+from collections.abc import Callable, Mapping
+from typing import Literal
+
+import pytest
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from pydantic import (
+    BaseModel, ConfigDict, Field, SecretStr, ValidationError,
+    model_validator,
+)
+
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    app_name: str = "panda-api"
+    environment: Literal["dev", "staging", "prod"] = "dev"
+    database_url: str
+    secret_key: SecretStr = Field(min_length=32)
+    debug: bool = False
+    workers: int = Field(default=2, ge=1, le=32)
+
+    @model_validator(mode="after")
+    def no_debug_in_prod(self):
+        if self.environment == "prod" and self.debug:
+            raise ValueError("в prod режим debug должен быть выключен")
+        return self
+
+
+def load_settings(env: Mapping[str, str]) -> Settings:
+    values = {
+        name.removeprefix("APP_").lower(): value
+        for name, value in env.items()
+        if name.startswith("APP_")
+    }
+    return Settings.model_validate(values)
+
+
+def create_app(
+    settings: Settings, check_db: Callable[[], bool]
+) -> FastAPI:
+    app = FastAPI(title=settings.app_name, debug=settings.debug)
+
+    @app.get("/health/live")
+    def live():
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def ready():
+        try:
+            db_ok = check_db()
+        except Exception:
+            db_ok = False
+        if not db_ok:
+            return JSONResponse(
+                {"status": "unavailable"}, status_code=503
+            )
+        return {"status": "ok", "environment": settings.environment}
+
+    return app
+
+
+# ---------- тесты (не меняйте их) ----------
+
+GOOD_ENV = {
+    "APP_DATABASE_URL": "postgresql://db:5432/pandas",
+    "APP_SECRET_KEY": "k" * 40,
+    "APP_ENVIRONMENT": "staging",
+    "APP_WORKERS": "4",
+    "PATH": "/usr/bin",
+}
+
+
+def env_with(**changes):
+    env = dict(GOOD_ENV)
+    for name, value in changes.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
+def test_loads_and_converts_values():
+    settings = load_settings(GOOD_ENV)
+    assert settings.workers == 4
+    assert settings.environment == "staging"
+    assert settings.debug is False
+    assert settings.app_name == "panda-api"
+
+
+def test_secret_is_hidden():
+    settings = load_settings(GOOD_ENV)
+    assert "kkkk" not in repr(settings)
+    assert settings.secret_key.get_secret_value() == "k" * 40
+
+
+@pytest.mark.parametrize("changes", [
+    {"APP_DATABASE_URL": None},
+    {"APP_SECRET_KEY": "too-short"},
+    {"APP_WORKERS": "0"},
+    {"APP_WORKERS": "lots"},
+    {"APP_ENVIRONMENT": "production"},
+    {"APP_WORKRES": "4"},
+])
+def test_bad_config_fails_fast(changes):
+    with pytest.raises(ValidationError):
+        load_settings(env_with(**changes))
+
+
+def test_no_debug_in_prod():
+    env = env_with(APP_ENVIRONMENT="prod", APP_DEBUG="true")
+    with pytest.raises(ValidationError):
+        load_settings(env)
+    assert load_settings(env_with(APP_DEBUG="true")).debug
+
+
+def test_ready_when_database_is_up():
+    app = create_app(load_settings(GOOD_ENV), lambda: True)
+    response = TestClient(app).get("/health/ready")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok", "environment": "staging"
+    }
+
+
+def broken_db():
+    raise ConnectionError("database unreachable")
+
+
+@pytest.mark.parametrize("check_db", [lambda: False, broken_db])
+def test_not_ready_when_database_is_down(check_db):
+    app = create_app(load_settings(GOOD_ENV), check_db)
+    client = TestClient(app)
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+    assert client.get("/health/live").status_code == 200
+
+
+pytest.main([__file__])
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Конфигурация по 12 факторам**: одна сборка для всех окружений, настройки из **переменных окружения**, загружаемые при запуске в проверенный неизменяемый объект настроек (префикс `APP_`, `extra="forbid"`, `SecretStr`), и **немедленное падение**, если что-то не так.
+- **Структурированные логи** — это строки JSON в stdout с именованными полями и идентификаторами запросов, и в них никогда нет секретов.
+- **Liveness** говорит «перезапусти меня, если это провалилось» и остаётся тривиальной; **readiness** говорит «не отправляй мне трафик» и проверяет зависимости вроде базы данных (503, если она недоступна). **Фабрика приложения** делает обе проверки легко тестируемыми.
+- Хороший **Dockerfile** многоэтапный, ставит зависимости до копирования кода, работает от **пользователя без прав root** и использует форму списка в `CMD`; **Compose** локально запускает приложение вместе с базой данных.
+- Запускайте несколько **воркеров uvicorn** (или по одному на контейнер в Kubernetes) за **обратным прокси**, который занимается HTTPS; доверяйте пересылаемым заголовкам только от прокси.
+- **CI** проверяет линтером, тестирует и проводит аудит каждого изменения, а затем собирает образ с тегом в виде хеша коммита.
+- **Развёртывание без простоя** (rolling, blue-green, canary) опирается на проверки readiness, плавную остановку и миграции базы данных по схеме expand and contract.
+- **Мониторьте** с помощью метрик (RED), логов и трейсов (OpenTelemetry) и поднимайте тревогу по симптомам, которые чувствуют пользователи, с runbook для каждого оповещения.

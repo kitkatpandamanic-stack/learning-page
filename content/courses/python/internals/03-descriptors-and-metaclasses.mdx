@@ -1,0 +1,554 @@
+---
+title: Descriptors and Metaclasses
+description: Learn how attribute lookup really works, write validated fields with descriptors, build plugin registries with __init_subclass__, and see why you rarely need a metaclass.
+duration: 25
+xp: 30
+---
+
+How does `@property` turn a method into something that looks like a plain attribute? How does `self` get passed to methods automatically? How do SQLAlchemy columns, Pydantic fields and Django models "know" their own names? All of it comes down to a small set of hooks in Python's **attribute lookup**. Frameworks use them constantly, and once you understand them, framework code stops looking like magic. This lesson goes from the everyday (descriptors, `__init_subclass__`) to the rare (metaclasses), and ends with a mini model layer you build yourself. 🪄
+
+## How Python finds an attribute
+
+When you write `obj.attr`, Python doesn't just look in one place. Instance attributes live in the object's **`__dict__`**; class attributes live on the class and its parents, searched in **MRO** order (method resolution order):
+
+<CodeExample output={`{'name': 'Mei'}
+False giant panda
+red panda giant panda
+['Panda', 'object']`}>
+
+```python
+class Panda:
+    species = "giant panda"       # class attribute
+
+    def __init__(self, name):
+        self.name = name          # instance attribute
+
+mei = Panda("Mei")
+print(mei.__dict__)
+print("species" in mei.__dict__, mei.species)
+
+mei.species = "red panda"         # shadows the class one
+print(mei.species, Panda.species)
+print([c.__name__ for c in Panda.__mro__])
+```
+
+</CodeExample>
+
+So far: instance first, then the class. But that's not the whole story. The full order that `object.__getattribute__` follows for `obj.attr` is:
+
+1. Look for `attr` on the **class** (through the MRO). If it's a **data descriptor** (an object with `__set__` or `__delete__`), call its `__get__` and stop.
+2. Otherwise, if `attr` is in **`obj.__dict__`**, return that.
+3. Otherwise, if the class had it: if it's a **non-data descriptor** (only `__get__`), call `__get__`; if it's a plain value, return it.
+4. Otherwise raise `AttributeError`, and if the class defines **`__getattr__`**, call that as a last resort.
+
+Don't memorise it yet; we'll meet every step in the examples below.
+
+## __getattr__ vs __getattribute__
+
+These two names look alike and behave very differently:
+
+- **`__getattr__`** is a **fallback**. It's called only when normal lookup fails (step 4). It's safe and common: proxies, lazy loading, friendly config objects.
+- **`__getattribute__`** is called for **every** attribute access, including the ones your own methods make. It's powerful and easy to get wrong.
+
+<CodeExample output={`True 8000
+True
+30`}>
+
+```python
+class Settings:
+    def __init__(self, values):
+        self._values = values
+
+    def __getattr__(self, name):
+        # only called when normal lookup FAILS
+        try:
+            return self._values[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+s = Settings({"debug": True, "port": 8000})
+print(s.debug, s.port)
+print(s._values is not None)   # found normally
+print(getattr(s, "timeout", 30))
+```
+
+</CodeExample>
+
+Notice we raise **`AttributeError`**, not `KeyError`, for missing names. That keeps `getattr(obj, name, default)` and `hasattr` working, as the last line shows.
+
+Overriding `__getattribute__` means every lookup goes through you, so you must call `super().__getattribute__` to do the real work, or you'll recurse forever:
+
+<CodeExample output={`['balance', 'balance']`}>
+
+```python
+class Audited:
+    def __init__(self):
+        self.reads = []
+        self.balance = 100
+
+    def __getattribute__(self, name):
+        # called for EVERY attribute access
+        if name != "reads":
+            super().__getattribute__("reads").append(name)
+        return super().__getattribute__(name)
+
+account = Audited()
+account.balance
+account.balance
+print(account.reads)
+```
+
+</CodeExample>
+
+<Callout type="warning" title="Prefer __getattr__">
+
+`__getattribute__` slows down every attribute access on the object and is a magnet for infinite-recursion bugs (`self.reads` inside it calls it again). In ten years of code review you'll approve a handful. When you only need to handle **missing** attributes, `__getattr__` is the right tool.
+
+</Callout>
+
+## Descriptors: objects that control attribute access
+
+A **descriptor** is any object with a `__get__`, `__set__` or `__delete__` method that is stored as a **class attribute**. When you access that attribute, Python calls the descriptor's method instead of just returning the object:
+
+<CodeExample output={`__get__ called, obj=<shop>
+42
+__get__ called, obj=None
+42`}>
+
+```python
+class Loud:
+    def __get__(self, obj, objtype=None):
+        print(f"__get__ called, obj={obj!r}")
+        return 42
+
+class Shop:
+    answer = Loud()       # a descriptor lives on the CLASS
+
+    def __repr__(self):
+        return "<shop>"
+
+print(Shop().answer)
+print(Shop.answer)
+```
+
+</CodeExample>
+
+`__get__` receives the **instance** (or `None` when accessed on the class itself) and the class. Descriptors are the machinery behind a surprising amount of Python.
+
+### Methods are descriptors
+
+Functions have a `__get__` method. That's how `self` works: when you access a function through an instance, its `__get__` returns a **bound method** that remembers the instance:
+
+<CodeExample output={`function
+True
+method True
+Welcome to Bamboo Mart`}>
+
+```python
+class Shop:
+    def __init__(self, name):
+        self.name = name
+
+    def greet(self):
+        return f"Welcome to {self.name}"
+
+shop = Shop("Bamboo Mart")
+func = Shop.__dict__["greet"]
+print(type(func).__name__)
+print(hasattr(func, "__get__"))
+
+bound = func.__get__(shop, Shop)   # what shop.greet does
+print(type(bound).__name__, bound.__self__ is shop)
+print(bound())
+```
+
+</CodeExample>
+
+Functions only have `__get__`, so they're **non-data** descriptors (step 3): an instance attribute with the same name would hide a method. `@staticmethod` and `@classmethod` are descriptors too, with different `__get__` behaviour.
+
+### property is a data descriptor
+
+`property` has `__get__` **and** `__set__`, so it's a **data** descriptor and wins even over the instance's `__dict__` (step 1):
+
+<CodeExample output={`68.0
+property
+True`}>
+
+```python
+class Temperature:
+    def __init__(self, celsius):
+        self._celsius = celsius
+
+    @property
+    def fahrenheit(self):
+        return self._celsius * 9 / 5 + 32
+
+t = Temperature(20)
+t.__dict__["fahrenheit"] = 0     # sneak a value in
+print(t.fahrenheit)              # the property still wins
+print(type(Temperature.__dict__["fahrenheit"]).__name__)
+print(hasattr(property, "__set__"))
+```
+
+</CodeExample>
+
+That precedence is exactly what makes validation possible: a data descriptor gets to see **every** read and write, no matter what's in `__dict__`.
+
+## A reusable validated field
+
+A `property` validates one attribute of one class. If ten classes need "a positive number", copying ten properties is painful. A descriptor class is a **reusable property**. The extra hook **`__set_name__`** (called once, when the class is created) tells the descriptor which attribute name it was assigned to:
+
+<CodeExample output={`3.5 4.0
+ValueError: price must be > 0, got -1
+{'name': 'Tea', 'price': 3.5, 'stock': 10}`}>
+
+```python
+class Positive:
+    def __set_name__(self, owner, name):
+        self.name = name                 # e.g. "price"
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self                  # accessed on the class
+        return obj.__dict__[self.name]
+
+    def __set__(self, obj, value):
+        if value <= 0:
+            raise ValueError(f"{self.name} must be > 0, got {value}")
+        obj.__dict__[self.name] = value
+
+class Product:
+    price = Positive()
+    stock = Positive()
+
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price               # goes through __set__
+        self.stock = stock
+
+tea = Product("Tea", 3.5, 10)
+coffee = Product("Coffee", 4.0, 5)
+print(tea.price, coffee.price)
+
+try:
+    tea.price = -1
+except ValueError as error:
+    print("ValueError:", error)
+print(tea.__dict__)
+```
+
+</CodeExample>
+
+Three details that separate a working descriptor from a buggy one:
+
+- **Store the value on the instance** (`obj.__dict__[self.name]`), never on the descriptor (`self.value = value`). There is **one** descriptor object per class, shared by every instance: storing on it means all products share one price.
+- Storing under the **same name** in `obj.__dict__` is safe because a data descriptor beats the instance dict (step 1), so reads still go through `__get__`.
+- Return **`self`** when `obj is None`, so `Product.price` gives you the descriptor (tools and docs generators rely on this).
+
+This is, in miniature, how ORM columns (`mapped_column`), Pydantic fields and Django model fields work.
+
+## __init_subclass__: hooks for subclasses
+
+Often a base class wants to **react when someone subclasses it**: register the subclass, check it, or configure it. Since Python 3.6 you can do that with an ordinary classmethod hook, **`__init_subclass__`**, which runs every time a subclass is created. Keyword arguments in the class line are passed to it. A classic use is a **plugin registry**:
+
+<CodeExample output={`['csv', 'tsv']
+id,name
+1,Mei`}>
+
+```python
+class Exporter:
+    registry = {}
+
+    def __init_subclass__(cls, fmt, **kwargs):
+        super().__init_subclass__(**kwargs)
+        Exporter.registry[fmt] = cls
+
+    def export(self, rows):
+        raise NotImplementedError
+
+class CsvExporter(Exporter, fmt="csv"):
+    def export(self, rows):
+        return "\n".join(",".join(r) for r in rows)
+
+class TsvExporter(Exporter, fmt="tsv"):
+    def export(self, rows):
+        return "\n".join("\t".join(r) for r in rows)
+
+print(sorted(Exporter.registry))
+exporter = Exporter.registry["csv"]()
+print(exporter.export([["id", "name"], ["1", "Mei"]]))
+```
+
+</CodeExample>
+
+Adding a JSON exporter is now one new class, with no `if fmt == ...` chain to update. Always call `super().__init_subclass__(**kwargs)` so that several base classes with hooks can cooperate.
+
+## Class decorators
+
+A **class decorator** is a function that receives a finished class and returns it (usually the same one, modified). You already use one daily: `@dataclass` reads the annotations and adds `__init__`, `__repr__` and `__eq__`. Writing your own is just like the function decorators from [the decorators lesson](/learn/python/decorators):
+
+<CodeExample output={`User(name='Mei', role='admin')`}>
+
+```python
+import inspect
+
+def auto_repr(cls):
+    params = inspect.signature(cls.__init__).parameters
+    fields = list(params)[1:]          # skip self
+
+    def __repr__(self):
+        args = ", ".join(
+            f"{f}={getattr(self, f)!r}" for f in fields
+        )
+        return f"{cls.__name__}({args})"
+
+    cls.__repr__ = __repr__
+    return cls
+
+@auto_repr
+class User:
+    def __init__(self, name, role):
+        self.name = name
+        self.role = role
+
+print(User("Mei", "admin"))
+```
+
+</CodeExample>
+
+Class decorator or `__init_subclass__`? A decorator is **opt-in per class** and explicit at the definition. `__init_subclass__` applies **automatically to every subclass**, which is what you want for a framework base class.
+
+## Metaclasses: the class of a class
+
+In the first lesson of this module you saw that `type(int)` is `type`. Classes are objects, and the class that **creates classes** is called a **metaclass**. The default metaclass is `type`, and you can call it directly to build a class at runtime: `type(name, bases, namespace)`. The `class` statement does exactly this for you:
+
+<CodeExample output={`Mei (Panda) 4
+<class 'type'> <class '__main__.Panda'>`}>
+
+```python
+def describe(self):
+    return f"{self.name} ({type(self).__name__})"
+
+Panda = type("Panda", (object,), {
+    "legs": 4,
+    "__init__": lambda self, name: setattr(self, "name", name),
+    "describe": describe,
+})
+
+mei = Panda("Mei")
+print(mei.describe(), mei.legs)
+print(type(Panda), type(mei))
+```
+
+</CodeExample>
+
+A **custom metaclass** subclasses `type` and overrides how classes are created (usually `__new__` or `__init__`). Here's one that refuses to create a class if a public method has no docstring:
+
+<CodeExample output={`RequireDocs
+TypeError: Shipping.ship needs a docstring`}>
+
+```python
+class RequireDocs(type):
+    def __new__(mcls, name, bases, namespace):
+        for attr, value in namespace.items():
+            if callable(value) and not attr.startswith("_"):
+                if not value.__doc__:
+                    raise TypeError(f"{name}.{attr} needs a docstring")
+        return super().__new__(mcls, name, bases, namespace)
+
+class Service(metaclass=RequireDocs):
+    pass
+
+class Billing(Service):
+    def charge(self, amount):
+        """Charge the customer."""
+        return amount
+
+print(type(Billing).__name__)
+
+try:
+    class Shipping(Service):
+        def ship(self, parcel):
+            return parcel
+except TypeError as error:
+    print("TypeError:", error)
+```
+
+</CodeExample>
+
+The check runs at **class creation time**, when the module is imported, not when someone calls the method. Subclasses inherit the metaclass, so `Billing` and `Shipping` are checked too.
+
+You've been using metaclasses all along: `enum.Enum` uses `EnumType` (that's why you can iterate over an enum class and `Color(1)` looks up a member), `abc.ABC` uses `ABCMeta` (which refuses to instantiate classes with missing abstract methods), and Pydantic's `BaseModel` and SQLAlchemy's `DeclarativeBase` have their own.
+
+### Why you rarely need one
+
+The docstring checker above could have been a five-line `__init_subclass__`. That's the pattern: since 3.6, `__init_subclass__` and `__set_name__` cover most things that once required a metaclass. Metaclasses have real costs:
+
+- **Conflicts**: a class can only have one metaclass. Inheriting from two bases with different metaclasses (say, an ABC and a Pydantic model) raises `TypeError: metaclass conflict` unless someone writes a combined metaclass.
+- **Surprise**: they change what the `class` statement means, far away from the code that's affected.
+- **Tooling**: type checkers and IDEs understand decorators and descriptors much better than custom metaclass magic.
+
+<Callout type="tip" title="Reach for the smallest tool">
+
+When you want to customise classes, try these in order and stop at the first that works: a plain function or composition, a **decorator**, a **descriptor** (per-attribute behaviour), **`__init_subclass__`** (react to subclasses), and only then a **metaclass** (when you must change how the class object itself is built or behaves, like `Enum` does). Most senior engineers write a metaclass about once a decade, and that's healthy.
+
+</Callout>
+
+<Quiz
+  question="A class has a property called total. Someone writes obj.__dict__['total'] = 0 and then reads obj.total. What do they get?"
+  options={[
+    "0, because the instance dict is checked first",
+    "The property's computed value, because a data descriptor beats the instance dict",
+    "An AttributeError",
+    "It depends on the order the attributes were defined",
+  ]}
+  answer={1}
+  explanation="property defines both __get__ and __set__, so it's a data descriptor. Data descriptors on the class are checked before the instance __dict__, so the property is always used."
+/>
+
+<Quiz
+  question="A descriptor's __set__ does self.value = value and __get__ returns self.value. What goes wrong with two instances a and b of the class?"
+  options={[
+    "Nothing, each instance gets its own value",
+    "Setting a.x also changes b.x, because there is one descriptor shared by the whole class",
+    "It raises RecursionError",
+    "The value is lost when the method returns",
+  ]}
+  answer={1}
+  explanation="The descriptor object is a class attribute, created once. Storing on self (the descriptor) shares the value across all instances. Store per-instance data on obj instead, e.g. obj.__dict__[self.name]."
+/>
+
+<Exercise
+  language="python"
+  title="Build a mini model layer"
+  starter={`class Field:
+    def __init__(self, kind, minimum=None):
+        self.kind = kind
+        self.minimum = minimum
+
+    def __get__(self, obj, objtype=None):
+        return self.value
+
+    def __set__(self, obj, value):
+        self.value = value
+
+
+class Model:
+    registry = {}
+    fields = []
+
+    def __init__(self, **values):
+        for name, value in values.items():
+            setattr(self, name, value)
+
+
+class Product(Model):
+    name = Field(str)
+    price = Field(float, minimum=0)
+    stock = Field(int, minimum=0)
+
+
+tea = Product(name="Tea", price=3.5, stock=10)
+mug = Product(name="Mug", price=8.0, stock=2)
+print(tea.name, tea.price, mug.name, mug.price)
+print(Product.fields, Model.registry)
+`}
+  tests={[
+    { name: "Each instance keeps its own values", check: "(a := Product(name='A', price=1.0, stock=1)) is not None and (b := Product(name='B', price=2.0, stock=2)) is not None and (a.name, a.price, a.stock, b.name, b.price, b.stock) == ('A', 1.0, 1, 'B', 2.0, 2)" },
+    { name: "Product.price returns the Field, which knows its name", check: "isinstance(Product.price, Field) and Product.price.name == 'price'" },
+    { name: "A wrong type raises TypeError naming the field", check: "exec('try:\\n    Product(name=\"Tea\", price=\"cheap\", stock=1)\\n    _ok = False\\nexcept TypeError as e:\\n    _ok = \"price\" in str(e)') or _ok" },
+    { name: "A value below the minimum raises ValueError naming the field", check: "exec('try:\\n    Product(name=\"Tea\", price=-1.0, stock=1)\\n    _ok = False\\nexcept ValueError as e:\\n    _ok = \"price\" in str(e)') or _ok" },
+    { name: "A rejected update keeps the old value", check: "exec('_p = Product(name=\"Tea\", price=1.0, stock=1)\\ntry:\\n    _p.stock = -5\\n    _ok = False\\nexcept ValueError:\\n    _ok = _p.stock == 1') or _ok" },
+    { name: "The minimum itself is allowed", check: "Product(name='Free', price=0.0, stock=0).price == 0.0" },
+    { name: "Product.fields lists the fields in order and Product is registered", check: "Product.fields == ['name', 'price', 'stock'] and Model.registry.get('Product') is Product" },
+    { name: "Works for any new model class", check: "exec('class _Order(Model):\\n    total = Field(float, minimum=0)\\n    note = Field(str)') or (_Order.fields == ['total', 'note'] and Model.registry['_Order'] is _Order and _Order(total=2.5, note=\"hi\").total == 2.5 and Product.fields == ['name', 'price', 'stock'])" },
+  ]}
+>
+
+Build a tiny model layer, the way ORMs and Pydantic do it under the hood. Run the starter first: `tea.name` prints `Mug`, because the `Field` descriptor stores its value in the wrong place, and nothing is validated or registered.
+
+1. **`Field`** is a data descriptor:
+   - `__set_name__` remembers the attribute name.
+   - `__get__` returns the `Field` itself when accessed on the class, and the instance's own value otherwise.
+   - `__set__` raises `TypeError` if the value isn't an instance of `kind`, and `ValueError` if `minimum` is set and the value is below it. Both messages must contain the field's name. Valid values are stored **per instance**.
+2. **`Model`** gets an `__init_subclass__` that, for every subclass:
+   - sets `cls.fields` to the list of its `Field` attribute names, in the order they're defined;
+   - registers the class in `Model.registry` under its class name.
+
+When you're done, the starter's demo prints `Tea 3.5 Mug 8.0` and `['name', 'price', 'stock'] {'Product': <class '__main__.Product'>}`.
+
+<Hint>
+
+Store values with `obj.__dict__[self.name] = value` and read them with `obj.__dict__[self.name]`; in `__get__`, start with `if obj is None: return self`. Check the type with `isinstance(value, self.kind)` and the minimum with `self.minimum is not None and value < self.minimum`. In `__init_subclass__(cls, **kwargs)`, call `super().__init_subclass__(**kwargs)`, then loop over `vars(cls).items()` (a class's own namespace keeps definition order) and keep the names whose value `isinstance(value, Field)`.
+
+</Hint>
+
+<Solution>
+
+```python
+class Field:
+    def __init__(self, kind, minimum=None):
+        self.kind = kind
+        self.minimum = minimum
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return obj.__dict__[self.name]
+
+    def __set__(self, obj, value):
+        if not isinstance(value, self.kind):
+            kind = self.kind.__name__
+            raise TypeError(f"{self.name} must be {kind}")
+        if self.minimum is not None and value < self.minimum:
+            raise ValueError(
+                f"{self.name} must be >= {self.minimum}"
+            )
+        obj.__dict__[self.name] = value
+
+
+class Model:
+    registry = {}
+    fields = []
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls.fields = [
+            name for name, value in vars(cls).items()
+            if isinstance(value, Field)
+        ]
+        Model.registry[cls.__name__] = cls
+
+    def __init__(self, **values):
+        for name, value in values.items():
+            setattr(self, name, value)
+
+
+class Product(Model):
+    name = Field(str)
+    price = Field(float, minimum=0)
+    stock = Field(int, minimum=0)
+
+
+tea = Product(name="Tea", price=3.5, stock=10)
+mug = Product(name="Mug", price=8.0, stock=2)
+print(tea.name, tea.price, mug.name, mug.price)
+print(Product.fields, Model.registry)
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- `obj.attr` checks, in order: **data descriptors** on the class, the instance **`__dict__`**, **non-data descriptors** and plain class attributes, then **`__getattr__`** as a fallback.
+- **`__getattr__`** handles missing attributes (raise `AttributeError`); **`__getattribute__`** intercepts every access and is rarely worth it.
+- A **descriptor** is a class attribute with `__get__`/`__set__`/`__delete__`. Functions are non-data descriptors (that's how bound methods and `self` work); `property` is a data descriptor.
+- A validated-field descriptor uses **`__set_name__`** to learn its name and stores values **on the instance**, never on itself.
+- **`__init_subclass__`** runs for every subclass: ideal for plugin registries and framework base classes. **Class decorators** like `@dataclass` modify one class explicitly.
+- A **metaclass** is the class of a class (`type` by default); `type(name, bases, namespace)` builds classes at runtime. `Enum`, `ABC`, Pydantic and SQLAlchemy use them.
+- Reach for metaclasses **last**: decorators, descriptors and `__init_subclass__` solve most problems with fewer surprises.

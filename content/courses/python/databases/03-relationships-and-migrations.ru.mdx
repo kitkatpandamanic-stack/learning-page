@@ -1,0 +1,500 @@
+---
+title: Связи и миграции
+description: Связывайте модели через ForeignKey и relationship(), делайте запросы по нескольким таблицам, избегайте проблемы N+1 и безопасно меняйте схему миграциями Alembic.
+duration: 20
+xp: 25
+---
+
+Настоящие данные связаны между собой: у автора **много** книг, в плейлисте много песен, в проекте много задач. В уроке [Основы SQL](/learn/python/sql-basics) вы связывали таблицы внешним ключом и `JOIN`. Теперь сделаем то же самое через ORM, чтобы можно было просто писать `author.books` или `book.author.name`. А потом вы узнаете, как менять таблицы приложения, в котором уже есть данные, с помощью **миграций (migrations)**. 🔗
+
+## ForeignKey и relationship()
+
+Связь (relationship) **«один ко многим» (one-to-many)** состоит из двух частей с каждой стороны:
+
+- На стороне «многих» (`Book`) — **столбец внешнего ключа** `author_id`, в котором хранится id автора. Это настоящие данные в таблице.
+- С обеих сторон — атрибут **`relationship()`**, который даёт доступ к связанным объектам Python: `book.author` и `author.books`. Это не столбцы: SQLAlchemy заполняет их за вас.
+
+<CodeExample output={`['Emma', 'Persuasion']
+1 Jane Austen
+3 2`}>
+
+```python
+from sqlalchemy import create_engine, ForeignKey
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Author(Base):
+    __tablename__ = "authors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    books: Mapped[list["Book"]] = relationship(
+        back_populates="author"
+    )
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+    author: Mapped["Author"] = relationship(back_populates="books")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    austen = Author(name="Jane Austen")
+    austen.books.append(Book(title="Emma"))
+    persuasion = Book(title="Persuasion", author=austen)
+    print([book.title for book in austen.books])
+
+    dahl = Author(name="Roald Dahl", books=[Book(title="Matilda")])
+    session.add_all([austen, dahl])   # книги тоже сохраняются
+    session.commit()
+
+    print(persuasion.author_id, persuasion.author.name)
+    matilda = dahl.books[0]
+    print(matilda.id, matilda.author_id)
+```
+
+</CodeExample>
+
+На что обратить внимание:
+
+- **`ForeignKey("authors.id")`** использует имя **таблицы** и столбца, чтобы база данных знала: `author_id` должен совпадать с каким-то `id` в `authors`.
+- **`Mapped[list["Book"]]`** означает «список книг», а **`Mapped["Author"]`** — «один автор». Имена взяты в кавычки, потому что в момент создания `Author` класс `Book` ещё не определён.
+- **`back_populates`** соединяет две стороны: каждая называет атрибут на другом классе. Поэтому, когда мы указали `author=austen` у *Persuasion*, книга сразу появилась в `austen.books` — ещё до всякого сохранения.
+- `author_id` вы сами никогда не задаёте. Вместе с авторами добавляются и их книги (это называется **каскадом (cascade)**), а при коммите SQLAlchemy сначала вставляет авторов, а потом заполняет `author_id` у каждой книги.
+
+## Запросы через связь
+
+Когда вы впервые обращаетесь к `author.books` или `book.author`, связанные строки загружаются автоматически. Чтобы **фильтровать** по другой таблице, добавьте к `select()` метод **`.join()`**. Если соединять через связь (`Book.author`), условие `ON` писать не нужно:
+
+<CodeExample output={`['Matilda', 'The BFG']
+Jane Austen: книг — 2, страниц — 723
+Roald Dahl: книг — 2, страниц — 448`}>
+
+```python
+from sqlalchemy import create_engine, ForeignKey, select, func
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Author(Base):
+    __tablename__ = "authors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    books: Mapped[list["Book"]] = relationship(
+        back_populates="author"
+    )
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    pages: Mapped[int]
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+    author: Mapped["Author"] = relationship(back_populates="books")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    session.add_all([
+        Author(name="Jane Austen", books=[
+            Book(title="Emma", pages=474),
+            Book(title="Persuasion", pages=249)]),
+        Author(name="Roald Dahl", books=[
+            Book(title="Matilda", pages=240),
+            Book(title="The BFG", pages=208)]),
+    ])
+    session.commit()
+
+    stmt = (
+        select(Book)
+        .join(Book.author)
+        .where(Author.name == "Roald Dahl")
+        .order_by(Book.title)
+    )
+    print([book.title for book in session.scalars(stmt)])
+
+    stmt = (
+        select(Author.name, func.count(Book.id), func.sum(Book.pages))
+        .join(Author.books)
+        .group_by(Author.id)
+        .order_by(Author.name)
+    )
+    for name, count, pages in session.execute(stmt):
+        print(f"{name}: книг — {count}, страниц — {pages}")
+```
+
+</CodeExample>
+
+Когда вы выбираете несколько столбцов, а не одну модель, используйте **`session.execute()`**: каждая строка результата распаковывается как кортеж. Если обернуть длинную инструкцию в скобки, каждую её часть можно написать на отдельной строке — так их и оформляют в большинстве проектов.
+
+<Callout type="note" title="Удаление родителя">
+
+Что должно случиться с книгами автора, если автора удалили? По умолчанию SQLAlchemy ставит их `author_id` в `NULL`, а здесь это закончится ошибкой, потому что столбец обязательный. Если дочерние объекты не могут существовать без родителя, скажите об этом явно: `relationship(back_populates="author", cascade="all, delete-orphan")` удаляет книги вместе с автором.
+
+</Callout>
+
+## Проблема N+1 и selectinload
+
+Загружать связанные объекты только при обращении к ним (**ленивая загрузка, lazy loading**) удобно, но за этим прячется классическая ловушка производительности. Пройдите циклом по 100 авторам, читая `author.books`, — и вы выполните **1** запрос за авторами и ещё **100**, по одному на каждого автора: это **проблема N+1 (N+1 problem)**. Здесь мы считаем запросы с помощью обработчика события (event listener):
+
+<CodeExample output={`ленивая загрузка: 6
+selectinload: 2`}>
+
+```python
+from sqlalchemy import create_engine, ForeignKey, select, event
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+    selectinload,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Author(Base):
+    __tablename__ = "authors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    books: Mapped[list["Book"]] = relationship(
+        back_populates="author"
+    )
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+    author: Mapped["Author"] = relationship(back_populates="books")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+queries = []
+
+@event.listens_for(engine, "before_cursor_execute")
+def count_query(conn, cursor, statement, *args):
+    queries.append(statement)
+
+with Session(engine) as session:
+    for i in range(1, 6):
+        session.add(Author(name=f"Автор {i}",
+                           books=[Book(title=f"Книга {i}")]))
+    session.commit()
+
+def list_books(stmt):
+    queries.clear()
+    with Session(engine) as session:
+        for author in session.scalars(stmt):
+            titles = [book.title for book in author.books]
+    return len(queries)
+
+print("ленивая загрузка:", list_books(select(Author)))
+print("selectinload:", list_books(
+    select(Author).options(selectinload(Author.books))
+))
+```
+
+</CodeExample>
+
+С 5 авторами ленивая версия выполняет 6 запросов. С 10 000 авторов их было бы 10 001, и каждый — это поход к серверу базы данных. **`.options(selectinload(Author.books))`** загружает все книги **одним** дополнительным запросом (`SELECT ... WHERE author_id IN (1, 2, 3, ...)`), так что запросов всегда 2, сколько бы ни было авторов.
+
+<Callout type="tip" title="Как заметить N+1 в реальных проектах">
+
+Каждый раз, когда вы идёте циклом по объектам и внутри цикла трогаете связь, спросите себя: «А не N+1 ли это?» — и добавьте `selectinload`. Чтобы увидеть SQL, который выполняет SQLAlchemy, создайте движок через `create_engine(url, echo=True)`: каждый запрос будет попадать в лог. Другой вариант — `joinedload`: он использует один `JOIN` и хорошо подходит для стороны «один», например `Book.author`.
+
+</Callout>
+
+## Зачем нужны миграции?
+
+`create_all()` создаёт только таблицы, которых **ещё нет**. Существующую таблицу он никогда не меняет. Поэтому когда версия 2 вашего приложения добавляет в модель столбец, база, уже заполненная данными, его не получит:
+
+<CodeExample output={`['id', 'title']
+table books has no column named isbn`}>
+
+```python
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session,
+)
+
+engine = create_engine("sqlite://")
+
+class Base(DeclarativeBase):
+    pass
+
+class Book(Base):                 # версия 1 приложения
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+
+Base.metadata.create_all(engine)
+
+class NewBase(DeclarativeBase):
+    pass
+
+class NewBook(NewBase):           # версия 2 добавляет столбец
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    isbn: Mapped[str | None]
+
+NewBase.metadata.create_all(engine)   # таблица есть — пропущено!
+columns = inspect(engine).get_columns("books")
+print([column["name"] for column in columns])
+
+with Session(engine) as session:
+    session.add(NewBook(title="Dune", isbn="9780441013593"))
+    try:
+        session.commit()
+    except OperationalError as error:
+        print(error.orig)
+```
+
+</CodeExample>
+
+Просто удалить базу и начать заново нельзя: в ней данные ваших пользователей. Вместо этого вы пишете **миграцию (migration)** — небольшой скрипт, который меняет схему шаг за шагом (*«добавить столбец `isbn` в `books`»*) и умеет отменить это изменение. Миграции хранятся в системе контроля версий рядом с кодом, поэтому любую копию базы данных (на вашем ноутбуке, у коллеги, на тестовом сервере, в продакшене) можно привести ровно к одной и той же версии.
+
+## Как работать с Alembic
+
+**Alembic** — инструмент для миграций от команды SQLAlchemy. В этом браузере он не запускается, поэтому вот рабочий процесс, которым вы будете пользоваться на своём компьютере. Один раз на проект настройте его:
+
+```bash
+pip install alembic
+alembic init migrations
+```
+
+Появятся файл `alembic.ini` (укажите в нём `sqlalchemy.url` вашей базы) и папка `migrations/`. В `migrations/env.py` укажите Alembic на ваши модели, чтобы он мог сравнивать их с базой данных:
+
+```python
+from myapp.models import Base
+
+target_metadata = Base.metadata
+```
+
+Дальше при каждом изменении моделей:
+
+```bash
+alembic revision --autogenerate -m "add isbn to books"
+alembic upgrade head
+```
+
+- **`alembic revision --autogenerate`** сравнивает ваши модели с базой данных и пишет новый файл миграции в `migrations/versions/`.
+- **`alembic upgrade head`** выполняет все миграции, которых в базе ещё не было. Какие уже выполнены, Alembic запоминает в маленькой таблице `alembic_version`.
+- `alembic downgrade -1` отменяет последнюю миграцию; `alembic history` и `alembic current` показывают, где вы находитесь.
+
+Сгенерированная миграция выглядит так. `upgrade()` вносит изменение, а `downgrade()` его отменяет:
+
+```python
+"""add isbn to books
+
+Revision ID: 3f2a1c9d8b7e
+Revises: 1a2b3c4d5e6f
+"""
+from alembic import op
+import sqlalchemy as sa
+
+revision = "3f2a1c9d8b7e"
+down_revision = "1a2b3c4d5e6f"
+
+
+def upgrade():
+    op.add_column(
+        "books", sa.Column("isbn", sa.String(13), nullable=True)
+    )
+
+
+def downgrade():
+    op.drop_column("books", "isbn")
+```
+
+<Callout type="warning" title="Привычки, которые вас спасут">
+
+**Всегда читайте** автоматически сгенерированную миграцию перед запуском: Alembic не отличает переименованный столбец от удалённого плюс нового и с радостью удалит ваши данные. Коммитьте файлы миграций в git вместе с изменением модели. Никогда не правьте миграцию, которая уже выполнилась на чужой базе, — напишите новую. А когда добавляете обязательный столбец в таблицу, где уже есть строки, задайте ему значение по умолчанию (`server_default=...`), иначе обновление упадёт.
+
+</Callout>
+
+В тестах Alembic обычно не используют, а вызывают `Base.metadata.create_all()` на свежей базе в памяти — точно как в этих уроках: это быстро, и каждый тест начинается с чистого листа.
+
+<Quiz
+  question="В связи «один ко многим», где у автора (Author) много книг (Book), куда помещается столбец внешнего ключа?"
+  options={[
+    "В таблицу authors, как book_id",
+    "В таблицу books, как author_id",
+    "В обе таблицы",
+    "В третью таблицу, которая их связывает",
+  ]}
+  answer={1}
+  explanation="Связь хранит сторона «многих»: у каждой книги есть один author_id, указывающий на authors.id. Автор не может хранить много id книг в одном столбце. (Отдельную связующую таблицу используют для связей «многие ко многим».)"
+/>
+
+<Quiz
+  question="Ваша страница загружает 50 проектов и показывает задачи каждого, читая project.tasks в цикле. Сколько запросов выполнится при ленивой загрузке по умолчанию и сколько — с selectinload(Project.tasks)?"
+  options={["1 и 1", "50 и 2", "51 и 2", "51 и 51"]}
+  answer={2}
+  explanation="Ленивая загрузка выполняет 1 запрос за проектами и ещё по 1 на задачи каждого проекта: всего 51 (проблема N+1). selectinload загружает все задачи одним дополнительным запросом: всего 2."
+/>
+
+<Exercise
+  language="python"
+  title="Плейлисты и песни"
+  starter={`from sqlalchemy import create_engine, ForeignKey, select, func
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+    selectinload,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+
+# 1. Playlist: таблица "playlists", id, name, songs (связь)
+# 2. Song: таблица "songs", id, title, seconds,
+#    playlist_id (внешний ключ) и playlist (связь)
+
+
+def new_session():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+def create_playlist(session, name, songs):
+    # songs — список кортежей (title, seconds);
+    # сохранить плейлист с песнями и вернуть его
+    pass
+
+
+def playlist_length(session, name):
+    # сумма секунд всех песен плейлиста (0, если песен нет)
+    pass
+
+
+def song_counts(session):
+    # словарь: имя плейлиста -> число песен (не больше 2 запросов)
+    pass
+
+
+# Когда модели будут готовы, уберите знаки #, чтобы попробовать:
+# with new_session() as session:
+#     create_playlist(session, "Chill", [("Lo-fi", 120), ("Rain", 200)])
+#     create_playlist(session, "Run", [("Fast", 90)])
+#     print(playlist_length(session, "Chill"))
+#     print(song_counts(session))
+`}
+  tests={[
+    { name: "Таблицы Playlist и Song, внешний ключ на playlists.id", check: "Playlist.__tablename__ == 'playlists' and Song.__tablename__ == 'songs' and [fk.target_fullname for fk in Song.__table__.c.playlist_id.foreign_keys] == ['playlists.id']" },
+    { name: "playlist.songs и song.playlist связаны через back_populates", check: "(p := Playlist(name='Mix')).songs.append(s := Song(title='A', seconds=60)) is None and s.playlist is p and Song(title='B', seconds=1, playlist=p) in p.songs" },
+    { name: "create_playlist сохраняет плейлист и его песни", check: "[s := new_session(), p := create_playlist(s, 'Chill', [('Lo-fi', 120), ('Rain', 200)]), s.rollback()] and p.id == 1 and [x.title for x in p.songs] == ['Lo-fi', 'Rain'] and p.songs[1].playlist_id == 1 and p.songs[0].playlist is p" },
+    { name: "playlist_length складывает секунды", check: "[s := new_session(), create_playlist(s, 'Chill', [('Lo-fi', 120), ('Rain', 200)]), create_playlist(s, 'Run', [('Fast', 90)])] and playlist_length(s, 'Chill') == 320 and playlist_length(s, 'Run') == 90 and playlist_length(s, 'Nope') == 0" },
+    { name: "song_counts считает песни, включая пустые плейлисты", check: "[s := new_session(), create_playlist(s, 'Chill', [('Lo-fi', 120), ('Rain', 200)]), create_playlist(s, 'Empty', []), create_playlist(s, 'Run', [('Fast', 90)])] and song_counts(s) == {'Chill': 2, 'Empty': 0, 'Run': 1}" },
+    { name: "song_counts избегает N+1 (не больше 2 запросов)", check: "exec('from sqlalchemy import event as _ev\\n_s = new_session()\\nfor _i in range(5):\\n    create_playlist(_s, f\"P{_i}\", [(\"a\", 1), (\"b\", 2)])\\n_s.expunge_all()\\n_q = []\\n_ev.listen(_s.get_bind(), \"before_cursor_execute\", lambda *a: _q.append(1))\\n_c = song_counts(_s)') or (_c == {f'P{i}': 2 for i in range(5)} and len(_q) <= 2)" },
+  ]}
+>
+
+Опишите **плейлисты**, в каждом из которых много **песен**:
+
+1. Напишите модель `Playlist` (таблица `"playlists"`: `id`, `name` и связь `songs`) и модель `Song` (таблица `"songs"`: `id`, `title`, `seconds`, внешний ключ `playlist_id` на `playlists.id` и связь `playlist`). Соедините две связи через `back_populates`.
+2. `create_playlist(session, name, songs)`: `songs` — это список кортежей `(title, seconds)`. Создайте плейлист вместе с песнями, закоммитьте и верните `Playlist`.
+3. `playlist_length(session, name)`: верните сумму `seconds` всех песен плейлиста с этим именем, используя запрос с join. Если песен нет, верните `0`.
+4. `song_counts(session)`: верните словарь «имя плейлиста → число песен» (у пустых плейлистов — `0`). Избегайте проблемы N+1: **не больше 2 запросов**.
+
+<Hint>
+
+Повторите пару `Author`/`Book`: `songs: Mapped[list["Song"]] = relationship(back_populates="playlist")` и `playlist: Mapped["Playlist"] = relationship(back_populates="songs")`. Для длительности — `select(func.sum(Song.seconds)).join(Song.playlist).where(Playlist.name == name)` и `session.scalar(...)` (SUM по нулю строк даёт `None`, поэтому добавьте `or 0`). Для подсчёта загрузите `select(Playlist).options(selectinload(Playlist.songs))` и используйте `len(playlist.songs)`.
+
+</Hint>
+
+<Solution>
+
+```python
+from sqlalchemy import create_engine, ForeignKey, select, func
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+    selectinload,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Playlist(Base):
+    __tablename__ = "playlists"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    songs: Mapped[list["Song"]] = relationship(
+        back_populates="playlist"
+    )
+
+
+class Song(Base):
+    __tablename__ = "songs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    seconds: Mapped[int]
+    playlist_id: Mapped[int] = mapped_column(
+        ForeignKey("playlists.id")
+    )
+    playlist: Mapped["Playlist"] = relationship(
+        back_populates="songs"
+    )
+
+
+def new_session():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+def create_playlist(session, name, songs):
+    playlist = Playlist(name=name)
+    for title, seconds in songs:
+        playlist.songs.append(Song(title=title, seconds=seconds))
+    session.add(playlist)
+    session.commit()
+    return playlist
+
+
+def playlist_length(session, name):
+    stmt = (
+        select(func.sum(Song.seconds))
+        .join(Song.playlist)
+        .where(Playlist.name == name)
+    )
+    return session.scalar(stmt) or 0
+
+
+def song_counts(session):
+    stmt = select(Playlist).options(selectinload(Playlist.songs))
+    return {p.name: len(p.songs) for p in session.scalars(stmt)}
+
+
+with new_session() as session:
+    create_playlist(session, "Chill", [("Lo-fi", 120), ("Rain", 200)])
+    create_playlist(session, "Run", [("Fast", 90)])
+    print(playlist_length(session, "Chill"))
+    print(song_counts(session))
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- «Один ко многим»: на стороне «многих» есть столбец **внешнего ключа** — `mapped_column(ForeignKey("table.id"))`.
+- **`relationship()`** даёт доступ к связанным объектам (`book.author`, `author.books`); **`back_populates`** держит обе стороны в согласии.
+- Добавление родителя сохраняет и его новых потомков; внешние ключи SQLAlchemy заполняет при коммите. Используйте `cascade="all, delete-orphan"`, если потомки должны удаляться вместе с родителем.
+- Фильтруйте по нескольким таблицам через `select(Book).join(Book.author).where(Author.name == ...)`; для нескольких столбцов используйте `session.execute()`, а для отчётов — `group_by`.
+- Обращение к связи внутри цикла порождает **проблему N+1**; `.options(selectinload(...))` загружает всё одним дополнительным запросом.
+- `create_all()` никогда не меняет существующие таблицы. Это делают **миграции** (Alembic): `alembic revision --autogenerate -m "..."`, проверьте файл, затем `alembic upgrade head`.

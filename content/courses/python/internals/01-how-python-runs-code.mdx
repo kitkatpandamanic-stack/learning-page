@@ -1,0 +1,512 @@
+---
+title: How Python Runs Your Code
+description: Follow your code from source to bytecode to the interpreter loop, read dis output, and master objects, names, identity and aliasing.
+duration: 22
+xp: 25
+---
+
+You've written a lot of Python by now: APIs, tests, async code, data analysis. But what actually **happens** when you press Run? Senior developers don't need to know every detail of the interpreter, but a good mental model explains a whole family of "weird" bugs: a list that changes when you didn't touch it, a default argument that remembers old calls, an `is` check that works on your laptop and fails in production. In this lesson we open the hood. 🔧
+
+## CPython: the Python you're running
+
+"Python" is a language, defined by its official language reference. The program that runs it is an **implementation**. The standard one, which you download from python.org, is **CPython**: an interpreter written in C. There are others, like **PyPy** (a fast implementation with a JIT compiler) and **MicroPython** (for tiny chips), but almost everyone runs CPython, and so does this site:
+
+<CodeExample output={`cpython
+(3, 14)`}>
+
+```python
+import sys
+
+print(sys.implementation.name)
+print(sys.version_info[:2])
+```
+
+</CodeExample>
+
+<Callout type="note" title="CPython in your browser">
+
+PandaDev runs your code with **Pyodide**, which is CPython itself compiled to WebAssembly. Everything in this lesson is real CPython 3.14 behaviour, not a simulation. A few details (like object sizes in bytes) differ from a 64-bit laptop, and we'll point them out.
+
+</Callout>
+
+## From source to bytecode
+
+CPython doesn't run your text directly. It works in two steps:
+
+1. **Compile**: the source is parsed and turned into **bytecode**, a compact list of simple instructions for an imaginary machine. The result is a **code object**.
+2. **Interpret**: the **interpreter loop** (in C, a big loop that is essentially "read the next instruction, do it, repeat") executes the bytecode.
+
+You can do both steps yourself with the built-in `compile()` and `exec()`:
+
+<CodeExample output={`code
+('price', 'total')
+(2, None)
+10`}>
+
+```python
+source = "total = price * 2"
+code = compile(source, "<demo>", "exec")
+
+print(type(code).__name__)
+print(code.co_names)
+print(code.co_consts)
+
+namespace = {"price": 5}
+exec(code, namespace)
+print(namespace["total"])
+```
+
+</CodeExample>
+
+The code object knows which **names** it uses (`price`, `total`) and which **constants** (`2`, plus the `None` that every module "returns"). Every function you write has one too, in `func.__code__`.
+
+## Reading bytecode with dis
+
+The **`dis`** module ("disassembler") shows the instructions in a code object:
+
+<CodeExample output={`  3           RESUME                   0
+
+  4           LOAD_FAST_BORROW_LOAD_FAST_BORROW 1 (a, b)
+              BINARY_OP                0 (+)
+              RETURN_VALUE`}>
+
+```python
+import dis
+
+def add(a, b):
+    return a + b
+
+dis.dis(add)
+```
+
+</CodeExample>
+
+How to read it: the left number is the **source line**, then the **instruction name**, its argument, and a human-friendly hint in brackets. The interpreter is a **stack machine**:
+
+- `LOAD_FAST_BORROW_LOAD_FAST_BORROW` pushes the local variables `a` and `b` onto a stack. (It's two loads fused into one instruction; "borrow" is a 3.14 optimisation that skips some bookkeeping you'll meet in the next lesson.)
+- `BINARY_OP (+)` pops two values, adds them and pushes the result.
+- `RETURN_VALUE` pops the result and returns it.
+- `RESUME` is a bookkeeping instruction at the start of every function.
+
+Since Python 3.11, CPython is a **specialising adaptive interpreter**: after a function has run a few times, it rewrites instructions into faster versions for the types it actually sees. Watch `BINARY_OP` become an integer-only add:
+
+<CodeExample output={`  3           RESUME_CHECK             0
+
+  4           LOAD_FAST_BORROW_LOAD_FAST_BORROW 1 (a, b)
+              BINARY_OP_ADD_INT        0 (+)
+              RETURN_VALUE`}>
+
+```python
+import dis
+
+def add(a, b):
+    return a + b
+
+for i in range(1000):
+    add(i, 1)
+
+dis.dis(add, adaptive=True)
+```
+
+</CodeExample>
+
+If you later call `add("a", "b")`, the specialised instruction notices the wrong types and falls back. This is why "warm" Python code is noticeably faster than it was in 3.10. Since 3.13 CPython also has an experimental **JIT compiler**, but it's a build option and switched off by default even where it's included, so don't count on it yet.
+
+You can also inspect instructions as data with `dis.get_instructions`, which is handy in tools and tests:
+
+<CodeExample output={`True True`}>
+
+```python
+import dis
+
+def total(prices):
+    result = 0
+    for price in prices:
+        result += price
+    return result
+
+ops = [i.opname for i in dis.get_instructions(total)]
+print("FOR_ITER" in ops, "JUMP_BACKWARD" in ops)
+```
+
+</CodeExample>
+
+A `for` loop is just `FOR_ITER` (get the next item, or jump out when there isn't one) and `JUMP_BACKWARD` (go back to the top). No magic.
+
+<Callout type="warning" title="Bytecode is an implementation detail">
+
+The exact instructions change in **every** Python release (`LOAD_FAST_BORROW` didn't exist before 3.14). Use `dis` to understand and to settle arguments, but never write code that depends on specific opcodes, and never ship `.pyc` files as if they were a stable format.
+
+</Callout>
+
+## .pyc files and __pycache__
+
+Compiling takes time, so when you **import** a module CPython saves its bytecode in a `__pycache__` folder next to the source. The file name includes the Python version, so several versions can share a project:
+
+<CodeExample output={`shop/__pycache__/prices.cpython-314.pyc`}>
+
+```python
+import importlib.util
+
+print(importlib.util.cache_from_source("shop/prices.py"))
+```
+
+</CodeExample>
+
+Next time, CPython checks whether the `.py` file changed (by default it compares the modification time and size stored in the `.pyc`) and, if not, loads the bytecode directly. A few practical facts:
+
+- Only **imported** modules are cached. The script you run with `python app.py` is compiled fresh every time.
+- `.pyc` files make **startup** faster, not your code. The bytecode runs at the same speed either way.
+- `__pycache__` belongs in `.gitignore`. Docker images often precompile on purpose for faster container start-up:
+
+```bash
+python -m compileall src/          # precompile a whole folder
+PYTHONDONTWRITEBYTECODE=1 pytest   # don't write .pyc files at all
+```
+
+## Everything is an object
+
+In Python, **every value is an object**: numbers, strings, `None`, but also functions, modules and classes. Each object has an **identity** (`id()`, unique while it's alive), a **type** (`type()`), and a **value**:
+
+<CodeExample output={`int
+str
+function
+module
+type
+NoneType
+<class 'type'> <class 'type'>
+greet True`}>
+
+```python
+import math
+
+def greet():
+    return "hi"
+
+for thing in [42, "panda", greet, math, int, None]:
+    print(type(thing).__name__)
+
+print(type(int), type(type))
+print(greet.__name__, math.pi > 3)
+```
+
+</CodeExample>
+
+Classes are objects whose type is `type`, and `type` is its own type. Keep that strange loop in mind: it's the door to metaclasses in the third lesson of this module.
+
+## Names bind to objects
+
+Here is the single most useful mental model in Python: **variables are not boxes, they are name tags**. Assignment never copies anything; it ties a name to an object. Two names can be tied to the same object:
+
+<CodeExample output={`True True
+True False
+True
+[1, 2, 3, 4]`}>
+
+```python
+a = [1, 2, 3]
+b = a          # a second name for the SAME list
+c = [1, 2, 3]  # a different list with equal contents
+
+print(a == b, a is b)
+print(a == c, a is c)
+print(id(a) == id(b))
+
+b.append(4)
+print(a)
+```
+
+</CodeExample>
+
+- `==` compares **values** (it calls `__eq__`).
+- `is` compares **identity**: are these the very same object?
+
+Function calls work the same way. The parameter becomes a new name for the caller's object (this is sometimes called **call by sharing**). So a function can **mutate** an object you passed in, but **rebinding** its parameter does nothing outside:
+
+<CodeExample output={`['tea', 'milk']
+panda`}>
+
+```python
+def add_item(cart, item):
+    cart.append(item)      # mutates the caller's list
+
+def rename(name):
+    name = name.upper()    # rebinds the local name only
+
+shopping = ["tea"]
+add_item(shopping, "milk")
+print(shopping)
+
+title = "panda"
+rename(title)
+print(title)
+```
+
+</CodeExample>
+
+A subtle one: `+=` **mutates** a mutable object in place, but **rebinds** the name for an immutable one. Same operator, different behaviour, because lists implement `__iadd__` and tuples don't:
+
+<CodeExample output={`[1, 2, 3]
+(1, 2) (1, 2, 3)`}>
+
+```python
+nums = [1, 2]
+alias = nums
+nums += [3]          # list +=: mutates in place
+print(alias)
+
+point = (1, 2)
+same = point
+point += (3,)        # tuple +=: builds a NEW tuple
+print(same, point)
+```
+
+</CodeExample>
+
+## Aliasing bugs you'll meet in real code
+
+Once you see names as tags, three classic bugs become obvious. Here they are together:
+
+<CodeExample output={`[[9, 0, 0], [9, 0, 0]]
+[[9, 0, 0], [0, 0, 0]]
+['new']
+['new', 'sale']`}>
+
+```python
+grid = [[0] * 3] * 2
+grid[0][0] = 9
+print(grid)
+
+grid = [[0] * 3 for _ in range(2)]
+grid[0][0] = 9
+print(grid)
+
+def add_tag(tag, tags=[]):
+    tags.append(tag)
+    return tags
+
+print(add_tag("new"))
+print(add_tag("sale"))
+```
+
+</CodeExample>
+
+1. **`[[0] * 3] * 2`** repeats the **same** inner list twice. Both rows are one object. A comprehension builds a new inner list each time.
+2. **Mutable default arguments**: the default `[]` is created **once**, when the `def` line runs, and stored on the function. Every call without `tags` shares that one list. The fix is `tags=None` and `if tags is None: tags = []` inside.
+3. **Mutating your input** (not shown): a function that calls `.sort()` or `.append()` on a parameter changes the caller's data, often far away from where the bug shows up.
+
+When you do need an independent copy, remember that `copy.copy` is **shallow** (the outer object is new, the things inside are shared) and `copy.deepcopy` copies all the way down:
+
+<CodeExample output={`['fast', 'cheap']
+['fast']`}>
+
+```python
+import copy
+
+config = {"name": "shop", "tags": ["fast"]}
+shallow = copy.copy(config)
+deep = copy.deepcopy(config)
+
+config["tags"].append("cheap")
+print(shallow["tags"])
+print(deep["tags"])
+```
+
+</CodeExample>
+
+War story: a team cached a "default settings" dict and handed it to every request, and one endpoint did `settings["currency"] = "EUR"` for European users. Within an hour, *every* user saw euros. The fix was one `deepcopy` (or better, an immutable frozen dataclass).
+
+## Interning: a curiosity, not a feature
+
+Sometimes `is` seems to work on numbers and strings. That's because CPython **reuses** some immutable objects to save memory:
+
+<CodeExample output={`True
+False True
+True False
+True`}>
+
+```python
+import sys
+
+a = int("256")
+b = int("256")
+print(a is b)        # small ints are cached
+
+x = int("1000")
+y = int("1000")
+print(x is y, x == y)
+
+s = "".join(["pan", "da"])   # built at run time
+t = "panda"                  # a literal in the code
+print(s == t, s is t)
+print(sys.intern(s) is t)
+```
+
+</CodeExample>
+
+- Integers from **-5 to 256** are created once at startup and shared.
+- Many strings that look like identifiers (and literals in your code) are **interned**: stored once in a table. `sys.intern()` lets you intern strings yourself, which can save memory when you have millions of repeated keys.
+- The compiler may also share equal constants within one file, so `x = 1000; y = 1000; x is y` can be `True` in one place and `False` in another.
+
+<Callout type="danger" title="Never use is for values">
+
+Use `==` to compare numbers, strings, lists and so on. Use `is` only for **singletons**: `x is None`, `x is True`/`False` (rarely), or sentinel objects you created yourself. Python even prints a `SyntaxWarning` when you write `x is 1000`. Code that relies on interning works in tests and breaks on bigger or computed values.
+
+</Callout>
+
+## Frames and the call stack
+
+Each time a function is called, CPython creates a **frame**: the function's local variables, a pointer to its code object, the current instruction, and a link to the **caller's** frame. Those links form the **call stack**, which is exactly what a traceback prints when something goes wrong.
+
+You can walk it yourself (`sys._getframe` is CPython-specific; the portable, slower option is `inspect.stack()`):
+
+<CodeExample output={`['pay', 'checkout']
+1000`}>
+
+```python
+import sys
+
+def call_stack():
+    frame = sys._getframe(1)   # skip this helper
+    names = []
+    while frame.f_code.co_name != "<module>":
+        names.append(frame.f_code.co_name)
+        frame = frame.f_back
+    return names
+
+def checkout():
+    return pay()
+
+def pay():
+    return call_stack()
+
+print(checkout())
+print(sys.getrecursionlimit())
+```
+
+</CodeExample>
+
+Python limits how deep the stack can grow (the **recursion limit**, 1000 by default) and raises `RecursionError` beyond it, rather than crashing the process. That's why deep recursion over big data (like walking a long linked list) should become a loop in Python. Debuggers, profilers and logging all read frames to know "where am I?"; you'll lean on that when profiling in the next module.
+
+<Quiz
+  question="a = [1, 2]; b = a; b += [3]. What is a now?"
+  options={[
+    "[1, 2]",
+    "[1, 2, 3]",
+    "It raises an error",
+    "[1, 2] or [1, 2, 3] depending on interning",
+  ]}
+  answer={1}
+  explanation="a and b are two names for one list. For lists, += calls __iadd__, which extends the list in place, so the change is visible through a too."
+/>
+
+<Quiz
+  question="Which comparison is the correct, reliable choice?"
+  options={[
+    "if count is 0:",
+    "if name is 'admin':",
+    "if result is None:",
+    "if items is []:",
+  ]}
+  answer={2}
+  explanation="None is a singleton, so identity is exactly right. The others compare values and must use ==; they only work by accident (or never, in the case of a fresh [] list)."
+/>
+
+<Exercise
+  language="python"
+  title="Fix the aliasing bugs"
+  starter={`def make_board(rows, cols):
+    """A rows x cols board filled with '.'."""
+    return [["."] * cols] * rows
+
+
+def add_score(name, score, scores={}):
+    """Add a score to scores (a new dict if none given)."""
+    scores[name] = score
+    return scores
+
+
+def top_three(scores):
+    """The three highest scores, highest first."""
+    scores.sort(reverse=True)
+    return scores[:3]
+
+
+board = make_board(2, 3)
+board[0][0] = "X"
+print(board)
+
+print(add_score("mei", 5))
+print(add_score("li", 7))
+
+results = [3, 9, 1, 7]
+print(top_three(results), results)
+`}
+  tests={[
+    { name: "make_board builds the right shape", check: "make_board(3, 2) == [['.', '.'], ['.', '.'], ['.', '.']]" },
+    { name: "Board rows are independent lists", check: "(b := make_board(2, 3)) and (b[0].__setitem__(0, 'X') or b[1][0] == '.') and b[0] is not b[1]" },
+    { name: "add_score starts fresh on every call", check: "add_score('a', 1) == {'a': 1} and add_score('b', 2) == {'b': 2}" },
+    { name: "add_score still updates a dict you pass in", check: "(d := {'x': 1}) and add_score('y', 2, d) is d and d == {'x': 1, 'y': 2}" },
+    { name: "top_three returns the highest three", check: "top_three([5, 1, 8, 3, 9]) == [9, 8, 5] and top_three([2, 4]) == [4, 2]" },
+    { name: "top_three leaves the caller's list alone", check: "(s := [3, 9, 1, 7]) and top_three(s) == [9, 7, 3] and s == [3, 9, 1, 7]" },
+  ]}
+>
+
+These three helpers from a game's code base each have an **aliasing bug**. Run the code to see them, then fix each function without changing its name or parameters' meaning:
+
+1. `make_board(rows, cols)`: every row must be its **own** list.
+2. `add_score(name, score, scores=...)`: calling it without `scores` must start with a **fresh** dict every time; passing a dict must still update and return **that** dict.
+3. `top_three(scores)`: return the three highest scores, highest first, **without changing** the list passed in.
+
+<Hint>
+
+Use a list comprehension for the board: `[["."] * cols for _ in range(rows)]` (the inner `* cols` is fine because strings are immutable). For the default, use `scores=None` and create the dict inside: `if scores is None: scores = {}`. For `top_three`, `sorted()` returns a new list, while `.sort()` changes the original.
+
+</Hint>
+
+<Solution>
+
+```python
+def make_board(rows, cols):
+    """A rows x cols board filled with '.'."""
+    return [["."] * cols for _ in range(rows)]
+
+
+def add_score(name, score, scores=None):
+    """Add a score to scores (a new dict if none given)."""
+    if scores is None:
+        scores = {}
+    scores[name] = score
+    return scores
+
+
+def top_three(scores):
+    """The three highest scores, highest first."""
+    return sorted(scores, reverse=True)[:3]
+
+
+board = make_board(2, 3)
+board[0][0] = "X"
+print(board)
+
+print(add_score("mei", 5))
+print(add_score("li", 7))
+
+results = [3, 9, 1, 7]
+print(top_three(results), results)
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **CPython** compiles source into **bytecode** (a code object), then its **interpreter loop** executes it on a stack machine.
+- **`dis`** shows the bytecode; since 3.11 the interpreter **specialises** hot instructions for the types it sees. Opcodes change every release, so never depend on them.
+- Imported modules are cached as **`.pyc`** files in `__pycache__`; that speeds up start-up, not execution.
+- **Everything is an object** with an identity, a type and a value; even functions, modules and classes.
+- **Names bind to objects**; assignment and function calls never copy. `==` compares values, `is` compares identity.
+- Watch for **aliasing bugs**: `[[x] * n] * m`, mutable default arguments, and functions that mutate their inputs. `copy.deepcopy` makes fully independent copies.
+- Small-int and string **interning** is a memory trick; use `is` only for `None` and other singletons.
+- Each call gets a **frame**; frames link into the **call stack** that tracebacks, debuggers and profilers read.

@@ -1,0 +1,550 @@
+---
+title: Безопасный код
+description: Думайте как атакующий и закрывайте классические дыры в Python API — внедрение, небезопасную десериализацию, слабое хеширование паролей, утёкшие секреты и уязвимые зависимости.
+duration: 22
+xp: 25
+---
+
+Большинство взломов совсем не хитроумны. Это f-строка в SQL-запросе, пароль, сохранённый как обычный хеш SHA-256, или API-ключ, закоммиченный на GitHub, который бот находит за считаные минуты. Хорошая новость: несколько привычек закрывают большую часть этих дыр, и ни одна из них не сложная. В этом уроке вы научитесь думать об **угрозах**, а затем по очереди исправите классические ошибки с помощью инструментов, которыми профессионалы пользуются сегодня. 🔐
+
+## Думайте как атакующий
+
+Безопасность начинается с простого вопроса: **что может пойти не так и кто этого добьётся?** Это называется **моделированием угроз (threat modelling)**, и для него не нужен особый метод. Для каждой функции приложения спросите себя:
+
+- **Что мы защищаем?** Пароли, персональные данные, деньги, возможность что-то менять.
+- **Где к нам попадают недоверенные данные?** Каждое тело запроса, параметр строки запроса, заголовок, загруженный файл, вебхук и даже данные из вашей собственной базы, которые когда-то ввёл пользователь. Граница между «данными, которые мы контролируем» и «данными, которые может прислать кто угодно», называется **границей доверия (trust boundary)**.
+- **Что будет, если этой частью злоупотребят?** Если ответ — «кто-то прочитает почту всех пользователей», эта часть заслуживает больше внимания, чем опечатка в сообщении лога.
+
+Проект **OWASP** (Open Worldwide Application Security Project) публикует списки самых распространённых рисков. В Python API вы снова и снова будете встречать вот эти:
+
+| Риск | Типичная ошибка в Python | Решение |
+| --- | --- | --- |
+| Внедрение (injection) | f-строки в SQL или командах оболочки | параметры, никакого `shell=True` |
+| Сломанная аутентификация (authentication) | быстрые хеши, угадываемые токены | bcrypt/argon2, `secrets` |
+| Сломанный контроль доступа | проверяют вход, но не *владение* | проверять права в каждом запросе |
+| Небезопасная десериализация | `pickle.loads` / `eval` на данных пользователя | JSON + валидация |
+| Ошибки конфигурации | режим отладки, секреты в коде | настройки из окружения |
+| Уязвимые компоненты | старые, незафиксированные зависимости | `pip-audit`, частые обновления |
+
+Хорошее практическое правило — **эшелонированная защита (defence in depth)**: никогда не полагайтесь на одну-единственную проверку. Валидируйте ввод, *и* используйте параметризованные запросы, *и* давайте пользователю базы данных только те права, которые ему нужны.
+
+## Внедрение: никогда не собирайте запросы из строк
+
+Вы уже встречали это в модуле про базы данных, и эта уязвимость не зря остаётся номером один. Когда вы вставляете ввод пользователя в SQL-строку, этот ввод может **изменить смысл запроса**:
+
+<CodeExample output={`SQL: SELECT name FROM users WHERE name = 'mei'
+[('mei',)]
+SQL: SELECT name FROM users WHERE name = 'x' OR '1'='1'
+[('mei',), ('po',), ('boss',)]
+[]`}>
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.execute("CREATE TABLE users (name TEXT, is_admin INTEGER)")
+conn.executemany(
+    "INSERT INTO users VALUES (?, ?)",
+    [("mei", 0), ("po", 0), ("boss", 1)],
+)
+
+def find_unsafe(name):
+    sql = f"SELECT name FROM users WHERE name = '{name}'"
+    print("SQL:", sql)
+    return conn.execute(sql).fetchall()
+
+def find_safe(name):
+    sql = "SELECT name FROM users WHERE name = ?"
+    return conn.execute(sql, (name,)).fetchall()
+
+attack = "x' OR '1'='1"
+print(find_unsafe("mei"))
+print(find_unsafe(attack))
+print(find_safe(attack))
+```
+
+</CodeExample>
+
+Кавычка атакующего раньше времени закрывает строку, а `OR '1'='1'` делает условие истинным для **каждой строки** таблицы. С **параметром** (`?`) база данных получает запрос и значение по отдельности, поэтому значение всегда считается просто данными: никого не зовут `x' OR '1'='1`, и результат пуст.
+
+Та же идея работает везде, где вы собираете «код» из строк:
+
+- **SQLAlchemy**: `select(User).where(User.name == name)` параметризуется за вас. Если вы всё же пишете сырой SQL, используйте `text("... WHERE name = :name")` с `{"name": name}`, но никогда не f-строку.
+- **Команды оболочки**: `subprocess.run(["convert", filename, "out.png"])` со **списком** аргументов. `shell=True` вместе с вводом пользователя позволяет кому-то дописать `; rm -rf ~`.
+- **Пути к файлам**: имя файла вроде `../../etc/passwd` выходит за пределы папки загрузок. Разрешите путь (resolve) и проверьте, что он всё ещё внутри ожидаемой папки.
+
+## Никогда не применяйте eval и unpickle к недоверенным данным
+
+`eval()` и `exec()` выполняют любой код на Python, так что `eval(user_input)` отдаёт ваш сервер тому, кто прислал запрос. Менее очевиден **`pickle`**: загрузка pickle может вызвать любую функцию, которую этот pickle попросит. Вот безобидное доказательство:
+
+<CodeExample output={`Сюрприз! Это выполнилось внутри loads()
+{'name': 'Mei', 'age': 3}`}>
+
+```python
+import json
+import pickle
+
+class Gift:
+    def __reduce__(self):
+        # говорит pickle: «чтобы восстановить меня, вызови print(...)»
+        return (print, ("Сюрприз! Это выполнилось внутри loads()",))
+
+payload = pickle.dumps(Gift())   # то, что прислал бы атакующий
+pickle.loads(payload)             # жертва всего лишь *загружает* это
+
+data = json.loads('{"name": "Mei", "age": 3}')
+print(data)
+```
+
+</CodeExample>
+
+Жертва никогда не вызывала `print`: хватило просто **загрузить** байты. Замените `print` на `os.system` — и игра окончена. Поэтому правила такие:
+
+- Данные извне (запросы, загрузки, cookie, очереди сообщений) разбирают как **JSON** (или CSV, или другой простой формат данных), но никогда не через `pickle`, `marshal`, `eval` или `yaml.load`. Для YAML используйте `yaml.safe_load`.
+- Если вам действительно нужно превратить текст вроде `"[1, 2, 3]"` в значения Python, `ast.literal_eval` принимает только литералы, а не вызовы функций.
+
+<Callout type="danger" title="pickle — для данных, которые вы записали сами">
+
+`pickle` подходит, чтобы кешировать собственные объекты на собственном диске. Но как только байты могли пройти через чужие руки (cookie, загрузка, общий кеш, «файл модели», скачанный из интернета), относитесь к `pickle.loads` точно так же, как к `eval`. Именно поэтому файлы моделей машинного обучения — реальный путь для атак, и поэтому существуют форматы вроде `safetensors`.
+
+</Callout>
+
+## Валидируйте всё на границе
+
+Безопасно разобрать JSON — первый шаг; второй — **проверить, что данные имеют смысл**. Pydantic, который FastAPI использует для каждого тела запроса, позволяет один раз описать, какие данные допустимы. Для безопасности важны две настройки: **ограничения** (длины, диапазоны, шаблоны) и **`extra="forbid"`**, который отклоняет неожиданные поля:
+
+<CodeExample output={`mei_panda
+('username',) string_pattern_mismatch
+('password',) string_too_short
+('is_admin',) extra_forbidden`}>
+
+```python
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+class SignUp(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(
+        min_length=3, max_length=30, pattern=r"^[a-z0-9_]+$"
+    )
+    password: str = Field(min_length=12, max_length=128)
+
+ok = SignUp(username="mei_panda", password="bamboo-forest-42")
+print(ok.username)
+
+try:
+    SignUp(
+        username="Mei; DROP TABLE",
+        password="short",
+        is_admin=True,
+    )
+except ValidationError as e:
+    for error in e.errors():
+        print(error["loc"], error["type"])
+```
+
+</CodeExample>
+
+Этот `is_admin=True` — настоящая атака под названием **массовое присваивание (mass assignment)**: форма регистрации, которая копирует каждое пришедшее поле в объект пользователя, позволяет кому угодно сделать себя администратором. Её предотвращают две привычки: отдельные входные модели, в которых есть только то, что клиенту *разрешено* задавать (как `TodoCreate` и `Todo` в модуле про веб-API), и отказ от неизвестных полей. Верхние границы вроде `max_length=128` тоже важны: без них кто-нибудь пришлёт «пароль» на 50 МБ и надолго займёт ваш сервер его хешированием.
+
+Валидация отвечает за **форму** данных, а не за безопасность в любом месте назначения. Совершенно корректное имя пользователя всё равно попадает в SQL через параметр, а в HTML — через экранирование вашего шаблонизатора.
+
+## Секретам место в окружении
+
+API-ключи, пароли к базе данных и ключи подписи никогда не должны быть записаны в коде. Код копируют, вставляют в чаты, отправляют на GitHub, и он остаётся в истории git **навсегда**, даже если вы удалите строку. Боты сканируют публичные репозитории в поисках ключей в течение минут после push. Вместо этого читайте **секреты (secrets)** из **переменных окружения (environment variables)**, которые платформа (Docker, ваш облачный провайдер, CI) задаёт при запуске приложения:
+
+<CodeExample output={`ключ загружен: True
+Не задана переменная окружения DATABASE_URL`}>
+
+```python
+import os
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Не задана переменная окружения {name}")
+    return value
+
+os.environ["PAYMENT_API_KEY"] = "sk_test_123"   # задаёт платформа
+key = require_env("PAYMENT_API_KEY")
+print("ключ загружен:", key.startswith("sk_test_"))
+
+try:
+    require_env("DATABASE_URL")
+except RuntimeError as e:
+    print(e)
+```
+
+</CodeExample>
+
+Обратите внимание на две детали. Приложение **падает сразу** (fail fast) с понятным сообщением, когда секрета нет, а не ковыляет дальше, чтобы упасть позже. И оно никогда **не печатает секрет**, только факт о нём. Секреты в логах и на страницах ошибок утекли ровно так же, как секреты в коде.
+
+Для локальной разработки переменные обычно хранят в файле `.env`, который **никогда не коммитят**:
+
+```bash
+# .env  (только локально)
+DATABASE_URL=postgresql://dev:dev@localhost/app
+PAYMENT_API_KEY=sk_test_123
+
+# .gitignore
+.env
+```
+
+Вместо него закоммитьте `.env.example` с именами переменных и ненастоящими значениями, чтобы коллеги знали, что задать. В продакшене используйте хранилище секретов вашей платформы. Полноценный загрузчик настроек с валидацией вы соберёте в [уроке о контейнерах и развёртывании](/learn/python/containers-and-deployment).
+
+<Callout type="warning" title="Ключ утёк? Замените его">
+
+Если секрет когда-либо попал в коммит или был опубликован где-то в открытом доступе, удалить его недостаточно: он остался в истории и, возможно, уже скопирован. Сначала **отзовите его и создайте новый**, а потом наводите порядок. Инструменты вроде `gitleaks` или сканирование секретов на GitHub ловят большинство утечек ещё до того, как они случились.
+
+</Callout>
+
+## Хеширование паролей: почему не SHA-256?
+
+Пароли никогда не хранят — хранят только **хеш (hash)**: односторонний «отпечаток», с которым можно сверить попытку входа. Соблазнительно взять `hashlib.sha256`. Вот почему это ошибка:
+
+<CodeExample output={`password123
+True`}>
+
+```python
+import hashlib
+
+def sha256(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+leaked_hash = sha256("password123")     # из украденной базы данных
+
+common = ["123456", "qwerty", "iloveyou", "password123"]
+lookup = {sha256(word): word for word in common}
+
+print(lookup.get(leaked_hash))
+print(sha256("password123") == leaked_hash)
+```
+
+</CodeExample>
+
+Две проблемы:
+
+1. **Нет соли.** Один и тот же пароль всегда даёт один и тот же хеш, поэтому атакующие один раз заранее вычисляют хеши миллионов популярных паролей (это **радужная таблица (rainbow table)**, как наш словарь `lookup`) и взламывают всех пользователей сразу. А у двух пользователей с одинаковым паролем ещё и одинаковый хеш.
+2. **Слишком быстро.** SHA-256 задуман быстрым. Одна игровая видеокарта считает **миллиарды** хешей SHA-256 в секунду, так что даже с солью короткие пароли быстро сдаются.
+
+Функции **хеширования паролей (password hashing)** решают обе проблемы: они добавляют к каждому хешу случайную **соль (salt)** и работают **намеренно медленно** (а Argon2 ещё и требует много памяти), причём их стоимость можно повышать по мере того, как компьютеры становятся быстрее. Использовать стоит два алгоритма: **bcrypt** и **Argon2id**.
+
+### bcrypt
+
+<CodeExample output={`b'$2b$04$'
+60
+True
+False
+False True`}>
+
+```python
+import bcrypt
+
+password = "bamboo-forest-42".encode()
+
+# rounds=4, чтобы урок работал быстро; в продакшене используйте 12 или больше
+hashed = bcrypt.hashpw(password, bcrypt.gensalt(rounds=4))
+print(hashed[:7])
+print(len(hashed))
+
+print(bcrypt.checkpw(password, hashed))
+print(bcrypt.checkpw(b"bamboo-forest-43", hashed))
+
+again = bcrypt.hashpw(password, bcrypt.gensalt(rounds=4))
+print(again == hashed, bcrypt.checkpw(password, again))
+```
+
+</CodeExample>
+
+Строка хеша хранит всё, что нужно для проверки: `$2b$` — это алгоритм, `04` — стоимость (каждая +1 удваивает работу), дальше идут соль и сам хеш. Если захешировать один и тот же пароль дважды, хеши получатся **разными** (разные соли), но `checkpw` принимает оба. Одна ловушка: bcrypt использует только первые **72 байта** пароля, а актуальный пакет `bcrypt` выбрасывает `ValueError` для более длинного ввода — ещё одна причина задать `max_length` во входной модели.
+
+### Argon2id
+
+**Argon2id** победил в конкурсе Password Hashing Competition и стоит первым в текущих рекомендациях OWASP для новых проектов. У пакета `argon2-cffi` безопасные настройки по умолчанию:
+
+<CodeExample output={`argon2id
+True
+неверный пароль
+False`}>
+
+```python
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+
+ph = PasswordHasher()    # разумные современные настройки по умолчанию
+stored = ph.hash("bamboo-forest-42")
+print(stored.split("$")[1])
+
+print(ph.verify(stored, "bamboo-forest-42"))
+try:
+    ph.verify(stored, "wrong guess")
+except VerifyMismatchError:
+    print("неверный пароль")
+
+print(ph.check_needs_rehash(stored))
+```
+
+</CodeExample>
+
+Обратите внимание на порядок аргументов: `verify(hash, password)`, а неверный пароль **выбрасывает исключение**, а не возвращает `False`. `check_needs_rehash` сообщает, что сохранённый хеш создан со старыми, более слабыми настройками. Стандартный приём — перехешировать пароль сразу после успешного входа, и тогда вся база пользователей со временем обновится сама.
+
+<Callout type="tip" title="Что же выбрать?">
+
+Оба варианта хороши. Для новых проектов по возможности берите **Argon2id**, а **bcrypt** (стоимость 12 или больше) — если ваш фреймворк или команда уже его используют. Подберите стоимость так, чтобы один хеш занимал на вашем сервере примерно 100–500 мс: достаточно медленно, чтобы помешать атакующему, перебирающему миллиарды вариантов, и достаточно быстро для одного входа. Никогда не изобретайте собственную схему и никогда не используйте для паролей голые MD5, SHA-1 или SHA-256.
+
+</Callout>
+
+## Сравнение секретов и создание токенов
+
+Ещё два инструмента из стандартной библиотеки закрывают две тонкие дыры.
+
+**Атаки по времени (timing attacks).** `a == b` для строк останавливается на **первом несовпадающем символе**. Сравнение угаданного API-ключа с настоящим чуть-чуть быстрее, когда неверен первый символ, чем когда верны первые десять, и атакующие могут измерить это на тысячах запросов, чтобы подобрать ключ символ за символом. `hmac.compare_digest` всегда работает одинаковое время, что бы ни совпало.
+
+**Угадываемые токены.** Модуль `random` создан для симуляций, а не для безопасности: его вывод можно **предсказать**, если увидеть достаточно значений. Для всего, что атакующий не должен угадать (ссылки для сброса пароля, идентификаторы сессий, API-ключи), используйте модуль **`secrets`**: он берёт данные из криптографически стойкого генератора операционной системы.
+
+<CodeExample output={`True
+False
+str 43
+False
+32`}>
+
+```python
+import hmac
+import secrets
+
+API_KEY = "k3y-from-the-environment"
+
+def is_valid_key(given: str) -> bool:
+    return hmac.compare_digest(given.encode(), API_KEY.encode())
+
+print(is_valid_key("k3y-from-the-environment"))
+print(is_valid_key("k3y-from-the-environmenX"))
+
+token = secrets.token_urlsafe(32)   # 32 случайных байта
+print(type(token).__name__, len(token))
+print(secrets.token_urlsafe(32) == token)
+print(len(secrets.token_hex(16)))
+```
+
+</CodeExample>
+
+`token_urlsafe(32)` даёт 32 случайных байта (256 бит) в виде строки из 43 символов, безопасной для URL. `token_hex(16)` даёт 16 байт в виде 32 шестнадцатеричных символов. 32 байта — хороший выбор по умолчанию для всего долгоживущего.
+
+Совет профессионала: API-ключи и токены сброса тоже храните в базе данных **в виде хеша** (здесь подойдёт быстрый SHA-256, потому что токен, в отличие от пароля, длинный и случайный), чтобы утечка базы не раздала всем рабочие ключи.
+
+## Аудит зависимостей
+
+Ваше приложение по большей части состоит из **чужого кода**: проект на FastAPI легко подтягивает 40+ пакетов. Когда в одном из них находят **уязвимость (vulnerability)**, она получает публичный идентификатор **CVE**, и атакующие начинают её искать. `pip-audit` сверяет установленные пакеты или файл requirements с базой уязвимостей Python:
+
+```bash
+pip install pip-audit
+pip-audit                       # текущее окружение
+pip-audit -r requirements.txt   # или файл requirements
+
+# Found 1 known vulnerability in 1 package
+# Name     Version ID                  Fix Versions
+# -------- ------- ------------------- ------------
+# jinja2   3.1.2   GHSA-h5c8-rqwp-cp95 3.1.3
+```
+
+Полезные привычки вокруг него:
+
+- **Фиксируйте** точные версии в lock-файле (`uv lock`, `pip-tools`, Poetry), чтобы в продакшене работало ровно то, что вы протестировали.
+- Запускайте `pip-audit` в **CI** при каждом push (вы увидите это в уроке о развёртывании), и пусть **Dependabot** или **Renovate** автоматически открывают PR с обновлениями.
+- Добавьте статический анализатор вроде **Bandit** или правил `S` в Ruff: они отмечают `eval`, `pickle.loads`, `shell=True`, захардкоженные пароли и SQL, собранный из строк.
+- Меньше зависимостей — меньше того, что нужно проверять: подумайте дважды, прежде чем добавлять пакет ради одной маленькой функции.
+
+<Quiz
+  question="Коллега хранит пароли как sha256(salt + password) со случайной солью для каждого пользователя. Почему этого всё ещё недостаточно?"
+  options={[
+    "SHA-256 можно обратить и получить пароль",
+    "Из-за соли хеш становится слишком длинным для базы данных",
+    "SHA-256 задуман быстрым, поэтому атакующие всё ещё могут перебирать миллиарды вариантов в секунду",
+    "Из-за случайной соли пользователь больше никогда не сможет войти",
+  ]}
+  answer={2}
+  explanation="Соль решает проблему радужных таблиц и одинаковых хешей, но SHA-256 всё равно очень быстрый, поэтому атакующие могут перебором подобрать популярные и короткие пароли. Функции хеширования паролей вроде bcrypt и Argon2id намеренно медленные, и их можно настраивать."
+/>
+
+<Quiz
+  question="Какая строка безопасно ищет пользователя по имени, пришедшему из запроса?"
+  options={[
+    "conn.execute(f\"SELECT * FROM users WHERE name = '{name}'\")",
+    "conn.execute(\"SELECT * FROM users WHERE name = ?\", (name,))",
+    "conn.execute(\"SELECT * FROM users WHERE name = '\" + name + \"'\")",
+    "conn.execute(\"SELECT * FROM users WHERE name = '%s'\" % name)",
+  ]}
+  answer={1}
+  explanation="Только параметризованный вариант передаёт значение отдельно от SQL, поэтому оно никогда не изменит запрос. Остальные три вставляют текст прямо в SQL-строку, а это открывает дорогу внедрению."
+/>
+
+<Exercise
+  language="python"
+  title="Исправьте небезопасный вход"
+  starter={`import hashlib
+import random
+import sqlite3
+import string
+
+import bcrypt
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def verify_password(password: str, stored: str) -> bool:
+    return hash_password(password) == stored
+
+
+def find_user(conn, username: str):
+    sql = (
+        "SELECT id, username, password_hash FROM users "
+        f"WHERE username = '{username}'"
+    )
+    return conn.execute(sql).fetchone()
+
+
+def login(conn, username: str, password: str) -> bool:
+    user = find_user(conn, username)
+    if user is None:
+        return False
+    return verify_password(password, user[2])
+
+
+def make_reset_token() -> str:
+    letters = string.ascii_letters + string.digits
+    return "".join(random.choice(letters) for _ in range(12))
+
+
+def check_api_key(given: str, expected: str) -> bool:
+    return given == expected
+
+
+# ---------- подготовка и короткая демонстрация (менять не нужно) ----------
+
+def create_db(users: dict[str, str]):
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, "
+        "username TEXT UNIQUE, password_hash TEXT)"
+    )
+    for username, password in users.items():
+        conn.execute(
+            "INSERT INTO users (username, password_hash) "
+            "VALUES (?, ?)",
+            (username, hash_password(password)),
+        )
+    return conn
+
+
+conn = create_db({"mei": "bamboo-forest-42", "po": "dumplings!"})
+print("mei входит:", login(conn, "mei", "bamboo-forest-42"))
+print("неверный пароль:", login(conn, "mei", "guess"))
+print("внедрение находит:", find_user(conn, "x' OR '1'='1"))
+`}
+  tests={[
+    { name: "hash_password использует bcrypt (или Argon2)", check: "(h := hash_password('bamboo-forest-42')).startswith(('$2a$', '$2b$', '$argon2'))" },
+    { name: "Хеши с солью: один и тот же пароль даёт разные хеши", check: "hash_password('same password') != hash_password('same password')" },
+    { name: "verify_password принимает верный пароль и отклоняет остальные", check: "(h := hash_password('Koala-Tea-99')) and verify_password('Koala-Tea-99', h) and not verify_password('koala-tea-99', h)" },
+    { name: "find_user использует параметризованный запрос (внедрение никого не находит)", check: "(c := create_db({'mei': 'bamboo-forest-42', 'zhu': 'red-lantern-7'})) and find_user(c, 'zhu')[1] == 'zhu' and find_user(c, \"x' OR '1'='1\") is None and find_user(c, \"zhu' --\") is None" },
+    { name: "login по-прежнему работает от начала до конца", check: "(c := create_db({'mei': 'bamboo-forest-42', 'zhu': 'red-lantern-7'})) and login(c, 'zhu', 'red-lantern-7') and not login(c, 'zhu', 'bamboo-forest-42') and not login(c, 'ghost', 'red-lantern-7')" },
+    { name: "make_reset_token использует secrets.token_urlsafe с 32 байтами", check: "(t := make_reset_token()) and isinstance(t, str) and len(t) >= 43 and t != make_reset_token() and 'token_urlsafe' in make_reset_token.__code__.co_names" },
+    { name: "check_api_key использует hmac.compare_digest", check: "check_api_key('s3cret-key', 's3cret-key') and not check_api_key('s3cret-kez', 's3cret-key') and not check_api_key('', 's3cret-key') and 'compare_digest' in check_api_key.__code__.co_names" },
+  ]}
+>
+
+Этот код входа «работает», но в нём четыре дыры в безопасности. Нажмите «Запустить»: последняя строка показывает, как атака внедрением находит пользователя (вместе с хешем его пароля!). Исправьте код, не меняя `create_db` и демонстрацию:
+
+1. `hash_password` должна использовать **bcrypt** со случайной солью. Возьмите `bcrypt.gensalt(rounds=4)`, чтобы проверки шли быстро (в продакшене было бы 12 или больше), и верните хеш как `str`.
+2. `verify_password` должна сверять пароль с сохранённым хешем bcrypt.
+3. `find_user` должна использовать **параметризованный** запрос.
+4. `make_reset_token` должна использовать `secrets.token_urlsafe(32)`, а `check_api_key` — сравнивать через `hmac.compare_digest`.
+
+Когда закончите, демонстрация должна напечатать `True`, `False` и `внедрение находит: None`.
+
+<Hint>
+
+bcrypt работает с байтами: `bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=4)).decode()` даёт строку, а `bcrypt.checkpw(password.encode(), stored.encode())` проверяет её. В `find_user` замените часть с f-строкой на `"WHERE username = ?"` и вызовите `conn.execute(sql, (username,))`. Не забудьте `import hmac` и `import secrets` и сравнивайте байты: `hmac.compare_digest(given.encode(), expected.encode())`.
+
+</Hint>
+
+<Solution>
+
+```python
+import hmac
+import secrets
+import sqlite3
+
+import bcrypt
+
+
+def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt(rounds=4)   # 12+ в продакшене
+    return bcrypt.hashpw(password.encode(), salt).decode()
+
+
+def verify_password(password: str, stored: str) -> bool:
+    return bcrypt.checkpw(password.encode(), stored.encode())
+
+
+def find_user(conn, username: str):
+    sql = (
+        "SELECT id, username, password_hash FROM users "
+        "WHERE username = ?"
+    )
+    return conn.execute(sql, (username,)).fetchone()
+
+
+def login(conn, username: str, password: str) -> bool:
+    user = find_user(conn, username)
+    if user is None:
+        return False
+    return verify_password(password, user[2])
+
+
+def make_reset_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def check_api_key(given: str, expected: str) -> bool:
+    return hmac.compare_digest(given.encode(), expected.encode())
+
+
+# ---------- подготовка и короткая демонстрация (менять не нужно) ----------
+
+def create_db(users: dict[str, str]):
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, "
+        "username TEXT UNIQUE, password_hash TEXT)"
+    )
+    for username, password in users.items():
+        conn.execute(
+            "INSERT INTO users (username, password_hash) "
+            "VALUES (?, ?)",
+            (username, hash_password(password)),
+        )
+    return conn
+
+
+conn = create_db({"mei": "bamboo-forest-42", "po": "dumplings!"})
+print("mei входит:", login(conn, "mei", "bamboo-forest-42"))
+print("неверный пароль:", login(conn, "mei", "guess"))
+print("внедрение находит:", find_user(conn, "x' OR '1'='1"))
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Моделирование угроз**: спрашивайте, что вы защищаете, где недоверенные данные пересекают **границу доверия** и чего будет стоить злоупотребление. Стройте защиту в несколько слоёв.
+- **Внедрение**: всегда используйте параметры запроса (`?`, `:name`, выражения SQLAlchemy) и списки аргументов для `subprocess`, но никогда не f-строки.
+- Никогда не применяйте `eval`, `exec` или `pickle.loads` к данным извне; разбирайте **JSON** и валидируйте его.
+- Валидируйте на границе с помощью **pydantic**: ограничения на каждом поле и `extra="forbid"` против массового присваивания.
+- **Секреты** берутся из переменных окружения, никогда не коммитятся и не печатаются, а при утечке заменяются.
+- Хешируйте пароли с помощью **Argon2id** или **bcrypt** (соль, медленно, настраиваемо), но никогда не SHA-256.
+- Сравнивайте секреты через **`hmac.compare_digest`**, а токены создавайте через **`secrets.token_urlsafe(32)`**.
+- Фиксируйте версии зависимостей и запускайте **`pip-audit`** (плюс Bandit или правила безопасности Ruff) в CI.

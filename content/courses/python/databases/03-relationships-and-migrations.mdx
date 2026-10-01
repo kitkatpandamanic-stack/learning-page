@@ -1,0 +1,500 @@
+---
+title: Relationships and Migrations
+description: Link models with ForeignKey and relationship(), query across tables, avoid the N+1 problem and change your schema safely with Alembic migrations.
+duration: 20
+xp: 25
+---
+
+Real data is connected: an author **has many** books, a playlist has many songs, a project has many tasks. In [SQL Basics](/learn/python/sql-basics) you linked tables with a foreign key and a `JOIN`. Now you'll do the same with the ORM, so you can simply write `author.books` or `book.author.name`. Then you'll learn how to change the tables of an app that already has data in it, using **migrations**. 🔗
+
+## ForeignKey and relationship()
+
+A **one-to-many** relationship takes two pieces on each side:
+
+- On the "many" side (`Book`), a **foreign key column** `author_id` that stores the author's id. That's the real data in the table.
+- On both sides, a **`relationship()`** attribute that gives you the linked Python objects: `book.author` and `author.books`. These are not columns; SQLAlchemy fills them in for you.
+
+<CodeExample output={`['Emma', 'Persuasion']
+1 Jane Austen
+3 2`}>
+
+```python
+from sqlalchemy import create_engine, ForeignKey
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Author(Base):
+    __tablename__ = "authors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    books: Mapped[list["Book"]] = relationship(
+        back_populates="author"
+    )
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+    author: Mapped["Author"] = relationship(back_populates="books")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    austen = Author(name="Jane Austen")
+    austen.books.append(Book(title="Emma"))
+    persuasion = Book(title="Persuasion", author=austen)
+    print([book.title for book in austen.books])
+
+    dahl = Author(name="Roald Dahl", books=[Book(title="Matilda")])
+    session.add_all([austen, dahl])   # books are saved too
+    session.commit()
+
+    print(persuasion.author_id, persuasion.author.name)
+    matilda = dahl.books[0]
+    print(matilda.id, matilda.author_id)
+```
+
+</CodeExample>
+
+What to notice:
+
+- **`ForeignKey("authors.id")`** uses the **table** name and column, so the database knows that `author_id` must match an `id` in `authors`.
+- **`Mapped[list["Book"]]`** means "a list of books" and **`Mapped["Author"]`** means "one author". The names are in quotes because `Book` isn't defined yet when `Author` is created.
+- **`back_populates`** connects the two sides: each names the attribute on the other class. That's why setting `author=austen` on *Persuasion* immediately added it to `austen.books`, even before anything was saved.
+- You never set `author_id` yourself. Adding the authors also adds their books (this is called a **cascade**), and on commit SQLAlchemy inserts the authors first, then fills in each book's `author_id`.
+
+## Querying across a relationship
+
+Reading `author.books` or `book.author` loads the linked rows when you first access them. To **filter** by another table, add **`.join()`** to your `select()`. Joining via the relationship (`Book.author`) means you don't have to write the `ON` condition:
+
+<CodeExample output={`['Matilda', 'The BFG']
+Jane Austen: 2 books, 723 pages
+Roald Dahl: 2 books, 448 pages`}>
+
+```python
+from sqlalchemy import create_engine, ForeignKey, select, func
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Author(Base):
+    __tablename__ = "authors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    books: Mapped[list["Book"]] = relationship(
+        back_populates="author"
+    )
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    pages: Mapped[int]
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+    author: Mapped["Author"] = relationship(back_populates="books")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+with Session(engine) as session:
+    session.add_all([
+        Author(name="Jane Austen", books=[
+            Book(title="Emma", pages=474),
+            Book(title="Persuasion", pages=249)]),
+        Author(name="Roald Dahl", books=[
+            Book(title="Matilda", pages=240),
+            Book(title="The BFG", pages=208)]),
+    ])
+    session.commit()
+
+    stmt = (
+        select(Book)
+        .join(Book.author)
+        .where(Author.name == "Roald Dahl")
+        .order_by(Book.title)
+    )
+    print([book.title for book in session.scalars(stmt)])
+
+    stmt = (
+        select(Author.name, func.count(Book.id), func.sum(Book.pages))
+        .join(Author.books)
+        .group_by(Author.id)
+        .order_by(Author.name)
+    )
+    for name, count, pages in session.execute(stmt):
+        print(f"{name}: {count} books, {pages} pages")
+```
+
+</CodeExample>
+
+When you select several columns instead of one model, use **`session.execute()`**: each result row unpacks like a tuple. Wrapping a long statement in brackets lets you put each part on its own line, which is how most projects format them.
+
+<Callout type="note" title="Deleting a parent">
+
+What should happen to an author's books when the author is deleted? By default SQLAlchemy sets their `author_id` to `NULL`, which fails here because the column is required. If the children can't exist without the parent, say so: `relationship(back_populates="author", cascade="all, delete-orphan")` deletes the books together with the author.
+
+</Callout>
+
+## The N+1 problem and selectinload
+
+Loading related objects only when you touch them (**lazy loading**) is convenient, but it hides a classic performance trap. Loop over 100 authors and read `author.books`, and you run **1** query for the authors plus **100** more, one per author: the **N+1 problem**. Here we count the queries with an event listener:
+
+<CodeExample output={`lazy: 6
+selectinload: 2`}>
+
+```python
+from sqlalchemy import create_engine, ForeignKey, select, event
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+    selectinload,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+class Author(Base):
+    __tablename__ = "authors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    books: Mapped[list["Book"]] = relationship(
+        back_populates="author"
+    )
+
+class Book(Base):
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+    author: Mapped["Author"] = relationship(back_populates="books")
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+
+queries = []
+
+@event.listens_for(engine, "before_cursor_execute")
+def count_query(conn, cursor, statement, *args):
+    queries.append(statement)
+
+with Session(engine) as session:
+    for i in range(1, 6):
+        session.add(Author(name=f"Author {i}",
+                           books=[Book(title=f"Book {i}")]))
+    session.commit()
+
+def list_books(stmt):
+    queries.clear()
+    with Session(engine) as session:
+        for author in session.scalars(stmt):
+            titles = [book.title for book in author.books]
+    return len(queries)
+
+print("lazy:", list_books(select(Author)))
+print("selectinload:", list_books(
+    select(Author).options(selectinload(Author.books))
+))
+```
+
+</CodeExample>
+
+With 5 authors, the lazy version runs 6 queries. With 10,000 authors it would run 10,001, and each one is a trip to the database server. **`.options(selectinload(Author.books))`** loads all the books in **one** extra query (`SELECT ... WHERE author_id IN (1, 2, 3, ...)`), so it's always 2 queries, however many authors there are.
+
+<Callout type="tip" title="Spotting N+1 in real projects">
+
+Whenever you loop over objects and touch a relationship inside the loop, think "N+1?" and add `selectinload`. To see the SQL SQLAlchemy runs, create the engine with `create_engine(url, echo=True)` and every query is logged. `joinedload` is the other option: it uses a single `JOIN` and suits "one" sides like `Book.author`.
+
+</Callout>
+
+## Why migrations?
+
+`create_all()` only creates tables that **don't exist yet**. It never changes an existing table. So when version 2 of your app adds a column to a model, a database that's already full of data won't get it:
+
+<CodeExample output={`['id', 'title']
+table books has no column named isbn`}>
+
+```python
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, Session,
+)
+
+engine = create_engine("sqlite://")
+
+class Base(DeclarativeBase):
+    pass
+
+class Book(Base):                 # version 1 of the app
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+
+Base.metadata.create_all(engine)
+
+class NewBase(DeclarativeBase):
+    pass
+
+class NewBook(NewBase):           # version 2 adds a column
+    __tablename__ = "books"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    isbn: Mapped[str | None]
+
+NewBase.metadata.create_all(engine)   # table exists: skipped!
+columns = inspect(engine).get_columns("books")
+print([column["name"] for column in columns])
+
+with Session(engine) as session:
+    session.add(NewBook(title="Dune", isbn="9780441013593"))
+    try:
+        session.commit()
+    except OperationalError as error:
+        print(error.orig)
+```
+
+</CodeExample>
+
+You can't just delete the database and start again: it holds your users' data. Instead you write a **migration**: a small script that changes the schema step by step (*"add column `isbn` to `books`"*) and can also undo it. Migrations are kept in version control next to your code, so every copy of the database (your laptop, a teammate's, the test server, production) can be brought to exactly the same version.
+
+## The Alembic workflow
+
+**Alembic** is the migration tool made by the SQLAlchemy team. It doesn't run in this browser, so here's the workflow you'll use on your own machine. Set it up once per project:
+
+```bash
+pip install alembic
+alembic init migrations
+```
+
+This creates an `alembic.ini` file (set `sqlalchemy.url` to your database there) and a `migrations/` folder. In `migrations/env.py`, point Alembic at your models so it can compare them with the database:
+
+```python
+from myapp.models import Base
+
+target_metadata = Base.metadata
+```
+
+Then, every time you change your models:
+
+```bash
+alembic revision --autogenerate -m "add isbn to books"
+alembic upgrade head
+```
+
+- **`alembic revision --autogenerate`** compares your models with the database and writes a new migration file in `migrations/versions/`.
+- **`alembic upgrade head`** runs all migrations the database hasn't had yet. Alembic remembers which ones ran in a small `alembic_version` table.
+- `alembic downgrade -1` undoes the latest migration; `alembic history` and `alembic current` show where you are.
+
+A generated migration looks like this. `upgrade()` makes the change and `downgrade()` undoes it:
+
+```python
+"""add isbn to books
+
+Revision ID: 3f2a1c9d8b7e
+Revises: 1a2b3c4d5e6f
+"""
+from alembic import op
+import sqlalchemy as sa
+
+revision = "3f2a1c9d8b7e"
+down_revision = "1a2b3c4d5e6f"
+
+
+def upgrade():
+    op.add_column(
+        "books", sa.Column("isbn", sa.String(13), nullable=True)
+    )
+
+
+def downgrade():
+    op.drop_column("books", "isbn")
+```
+
+<Callout type="warning" title="Migration habits that save you">
+
+**Always read** an autogenerated migration before running it: Alembic can't tell a renamed column from a deleted one plus a new one, and would happily drop your data. Commit migration files to git together with the model change. Never edit a migration that has already run on someone else's database; write a new one instead. And when you add a required column to a table that already has rows, give it a default (`server_default=...`) or the upgrade will fail.
+
+</Callout>
+
+In tests you usually skip Alembic and call `Base.metadata.create_all()` on a fresh in-memory database, exactly as in these lessons: it's fast and every test starts clean.
+
+<Quiz
+  question="In a one-to-many relationship where an Author has many Books, where does the foreign key column go?"
+  options={[
+    "In the authors table, as book_id",
+    "In the books table, as author_id",
+    "In both tables",
+    "In a third table that links them",
+  ]}
+  answer={1}
+  explanation="The many side stores the link: each book has one author_id pointing at authors.id. An author can't store many book ids in one column. (A separate link table is used for many-to-many relationships.)"
+/>
+
+<Quiz
+  question="Your page loads 50 projects and shows each project's tasks by reading project.tasks in a loop. How many queries run with default lazy loading, and how many with selectinload(Project.tasks)?"
+  options={["1 and 1", "50 and 2", "51 and 2", "51 and 51"]}
+  answer={2}
+  explanation="Lazy loading runs 1 query for the projects plus 1 per project for its tasks: 51 (the N+1 problem). selectinload loads all the tasks in one extra query: 2 in total."
+/>
+
+<Exercise
+  language="python"
+  title="Playlists and songs"
+  starter={`from sqlalchemy import create_engine, ForeignKey, select, func
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+    selectinload,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+
+# 1. Playlist: table "playlists", id, name, songs (relationship)
+# 2. Song: table "songs", id, title, seconds,
+#    playlist_id (foreign key) and playlist (relationship)
+
+
+def new_session():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+def create_playlist(session, name, songs):
+    # songs is a list of (title, seconds) tuples;
+    # save the playlist with its songs and return it
+    pass
+
+
+def playlist_length(session, name):
+    # total seconds of the playlist's songs (0 if none)
+    pass
+
+
+def song_counts(session):
+    # dict of playlist name -> number of songs (2 queries max)
+    pass
+
+
+# Once the models exist, remove the # signs to try it:
+# with new_session() as session:
+#     create_playlist(session, "Chill", [("Lo-fi", 120), ("Rain", 200)])
+#     create_playlist(session, "Run", [("Fast", 90)])
+#     print(playlist_length(session, "Chill"))
+#     print(song_counts(session))
+`}
+  tests={[
+    { name: "Playlist and Song tables, with a foreign key to playlists.id", check: "Playlist.__tablename__ == 'playlists' and Song.__tablename__ == 'songs' and [fk.target_fullname for fk in Song.__table__.c.playlist_id.foreign_keys] == ['playlists.id']" },
+    { name: "playlist.songs and song.playlist are linked with back_populates", check: "(p := Playlist(name='Mix')).songs.append(s := Song(title='A', seconds=60)) is None and s.playlist is p and Song(title='B', seconds=1, playlist=p) in p.songs" },
+    { name: "create_playlist saves the playlist and its songs", check: "[s := new_session(), p := create_playlist(s, 'Chill', [('Lo-fi', 120), ('Rain', 200)]), s.rollback()] and p.id == 1 and [x.title for x in p.songs] == ['Lo-fi', 'Rain'] and p.songs[1].playlist_id == 1 and p.songs[0].playlist is p" },
+    { name: "playlist_length adds up the seconds", check: "[s := new_session(), create_playlist(s, 'Chill', [('Lo-fi', 120), ('Rain', 200)]), create_playlist(s, 'Run', [('Fast', 90)])] and playlist_length(s, 'Chill') == 320 and playlist_length(s, 'Run') == 90 and playlist_length(s, 'Nope') == 0" },
+    { name: "song_counts counts songs, including empty playlists", check: "[s := new_session(), create_playlist(s, 'Chill', [('Lo-fi', 120), ('Rain', 200)]), create_playlist(s, 'Empty', []), create_playlist(s, 'Run', [('Fast', 90)])] and song_counts(s) == {'Chill': 2, 'Empty': 0, 'Run': 1}" },
+    { name: "song_counts avoids N+1 (at most 2 queries)", check: "exec('from sqlalchemy import event as _ev\\n_s = new_session()\\nfor _i in range(5):\\n    create_playlist(_s, f\"P{_i}\", [(\"a\", 1), (\"b\", 2)])\\n_s.expunge_all()\\n_q = []\\n_ev.listen(_s.get_bind(), \"before_cursor_execute\", lambda *a: _q.append(1))\\n_c = song_counts(_s)') or (_c == {f'P{i}': 2 for i in range(5)} and len(_q) <= 2)" },
+  ]}
+>
+
+Model **playlists** that each have many **songs**:
+
+1. Write a `Playlist` model (table `"playlists"`: `id`, `name`, and a `songs` relationship) and a `Song` model (table `"songs"`: `id`, `title`, `seconds`, a `playlist_id` foreign key to `playlists.id`, and a `playlist` relationship). Link the two relationships with `back_populates`.
+2. `create_playlist(session, name, songs)`: `songs` is a list of `(title, seconds)` tuples. Create the playlist with its songs, commit, and return the `Playlist`.
+3. `playlist_length(session, name)`: return the total `seconds` of the songs in the playlist with that name, using a query with a join. Return `0` if there are none.
+4. `song_counts(session)`: return a dict of each playlist's name to its number of songs (empty playlists count `0`). Avoid the N+1 problem: use **at most 2 queries**.
+
+<Hint>
+
+Copy the `Author`/`Book` pair: `songs: Mapped[list["Song"]] = relationship(back_populates="playlist")` and `playlist: Mapped["Playlist"] = relationship(back_populates="songs")`. For the length, `select(func.sum(Song.seconds)).join(Song.playlist).where(Playlist.name == name)` and `session.scalar(...)` (a SUM of no rows is `None`, so add `or 0`). For the counts, load `select(Playlist).options(selectinload(Playlist.songs))` and use `len(playlist.songs)`.
+
+</Hint>
+
+<Solution>
+
+```python
+from sqlalchemy import create_engine, ForeignKey, select, func
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column, relationship, Session,
+    selectinload,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Playlist(Base):
+    __tablename__ = "playlists"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    songs: Mapped[list["Song"]] = relationship(
+        back_populates="playlist"
+    )
+
+
+class Song(Base):
+    __tablename__ = "songs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    seconds: Mapped[int]
+    playlist_id: Mapped[int] = mapped_column(
+        ForeignKey("playlists.id")
+    )
+    playlist: Mapped["Playlist"] = relationship(
+        back_populates="songs"
+    )
+
+
+def new_session():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return Session(engine)
+
+
+def create_playlist(session, name, songs):
+    playlist = Playlist(name=name)
+    for title, seconds in songs:
+        playlist.songs.append(Song(title=title, seconds=seconds))
+    session.add(playlist)
+    session.commit()
+    return playlist
+
+
+def playlist_length(session, name):
+    stmt = (
+        select(func.sum(Song.seconds))
+        .join(Song.playlist)
+        .where(Playlist.name == name)
+    )
+    return session.scalar(stmt) or 0
+
+
+def song_counts(session):
+    stmt = select(Playlist).options(selectinload(Playlist.songs))
+    return {p.name: len(p.songs) for p in session.scalars(stmt)}
+
+
+with new_session() as session:
+    create_playlist(session, "Chill", [("Lo-fi", 120), ("Rain", 200)])
+    create_playlist(session, "Run", [("Fast", 90)])
+    print(playlist_length(session, "Chill"))
+    print(song_counts(session))
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- One-to-many: the "many" side has a **foreign key** column, `mapped_column(ForeignKey("table.id"))`.
+- **`relationship()`** gives you the linked objects (`book.author`, `author.books`); **`back_populates`** keeps both sides in sync.
+- Adding a parent also saves its new children; SQLAlchemy fills in the foreign keys on commit. Use `cascade="all, delete-orphan"` when children should be deleted with their parent.
+- Filter across tables with `select(Book).join(Book.author).where(Author.name == ...)`; use `session.execute()` for several columns and `group_by` for reports.
+- Touching a relationship in a loop causes the **N+1 problem**; `.options(selectinload(...))` loads everything in one extra query.
+- `create_all()` never changes existing tables. **Migrations** (Alembic) do: `alembic revision --autogenerate -m "..."`, review the file, then `alembic upgrade head`.

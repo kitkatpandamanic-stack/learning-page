@@ -1,0 +1,480 @@
+---
+title: Timeouts, Cancellation and Errors
+description: Stop waiting with timeouts, cancel tasks cleanly, handle errors from many tasks at once, and meet async with, async for and async generators.
+duration: 20
+xp: 25
+---
+
+In the real world, things go wrong. A server takes forever to answer, a user closes the page halfway through a download, one request out of fifty crashes. Professional async code plans for all of this. In this lesson you'll learn to **give up after a while**, **cancel** work you no longer need, and **handle errors** from many tasks at once. Then you'll see where async shows up in real projects. 🛡️
+
+## Timeouts: don't wait forever
+
+Never wait for the network without a limit. A server that hangs would make your program hang too. **`asyncio.timeout(seconds)`** (Python 3.11+) wraps any code in a time limit. If the time runs out, the work inside is cancelled and you get a **`TimeoutError`**:
+
+<CodeExample output={`Gave up after 0.05 s
+<fast.html>`}>
+
+```python
+import asyncio
+
+async def fetch(page, seconds):
+    await asyncio.sleep(seconds)
+    return f"<{page}.html>"
+
+async def main():
+    try:
+        async with asyncio.timeout(0.05):
+            page = await fetch("slow", 1)
+            print(page)              # never reached
+    except TimeoutError:
+        print("Gave up after 0.05 s")
+
+    async with asyncio.timeout(0.5):
+        print(await fetch("fast", 0.01))
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+The slow page would take a whole second, but we stop after 0.05. The fast one finishes well inside its limit, so the timeout does nothing.
+
+The older **`asyncio.wait_for(coro, timeout)`** does the same for a single coroutine, and you'll see it in lots of existing code:
+
+<CodeExample output={`<fast.html>
+Timed out!`}>
+
+```python
+import asyncio
+
+async def fetch(page, seconds):
+    await asyncio.sleep(seconds)
+    return f"<{page}.html>"
+
+async def main():
+    page = await asyncio.wait_for(fetch("fast", 0.01), timeout=0.1)
+    print(page)
+    try:
+        await asyncio.wait_for(fetch("slow", 1), timeout=0.05)
+    except TimeoutError:
+        print("Timed out!")
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+`asyncio.timeout()` is nicer when the limit should cover **several** steps together, like "log in and download the report, all within 10 seconds".
+
+## Cancelling a task
+
+Sometimes you no longer need a task: the user clicked "Stop", or another task already found the answer. Call **`task.cancel()`**. At its current `await`, the task gets an **`asyncio.CancelledError`** thrown into it, so it can clean up on its way out:
+
+<CodeExample output={`Downloading movie.mp4...
+Cancelled! Deleting the half-finished file
+Download task ended
+main: the task was cancelled
+True`}>
+
+```python
+import asyncio
+
+async def download(name):
+    try:
+        print(f"Downloading {name}...")
+        await asyncio.sleep(1)         # cancelled while waiting here
+        print("Finished")              # never reached
+    except asyncio.CancelledError:
+        print("Cancelled! Deleting the half-finished file")
+        raise                          # let the cancellation continue
+    finally:
+        print("Download task ended")
+
+async def main():
+    task = asyncio.create_task(download("movie.mp4"))
+    await asyncio.sleep(0.02)          # let it start
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        print("main: the task was cancelled")
+    print(task.cancelled())
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Cancellation is how timeouts work too: when time runs out, `asyncio.timeout()` cancels the work inside, then turns the `CancelledError` into a `TimeoutError` for you.
+
+<Callout type="warning" title="Don't swallow CancelledError">
+
+If you catch `CancelledError` to clean up, **re-raise** it with a bare `raise` (or use `finally`, which runs without catching anything). If you swallow it, the task carries on as if nothing happened, and timeouts and `TaskGroup` stop working properly. Good news: `CancelledError` is **not** a subclass of `Exception`, so a general `except Exception:` won't catch it by accident.
+
+</Callout>
+
+## Errors in gather
+
+What happens when one of the coroutines in `gather` raises an exception? By default, `gather` passes the **first** error on to you straight away. But watch out: the **other coroutines keep running** in the background:
+
+<CodeExample output={`Caught: b failed
+a finished`}>
+
+```python
+import asyncio
+
+async def job(name, seconds, fail=False):
+    await asyncio.sleep(seconds)
+    if fail:
+        raise ValueError(f"{name} failed")
+    print(f"{name} finished")
+    return name
+
+async def main():
+    try:
+        await asyncio.gather(
+            job("a", 0.05),
+            job("b", 0.01, fail=True),
+        )
+    except ValueError as error:
+        print("Caught:", error)
+    await asyncio.sleep(0.1)    # "a" is still running!
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+And you lose the result of `a`. When you want **every** result, even if some jobs fail, pass **`return_exceptions=True`**. Errors then come back **inside the results list** as exception objects, in the right positions:
+
+<CodeExample output={`['a', ValueError('b failed'), 'c']
+OK: a
+Error: b failed
+OK: c`}>
+
+```python
+import asyncio
+
+async def job(name, seconds, fail=False):
+    await asyncio.sleep(seconds)
+    if fail:
+        raise ValueError(f"{name} failed")
+    return name
+
+async def main():
+    results = await asyncio.gather(
+        job("a", 0.03),
+        job("b", 0.01, fail=True),
+        job("c", 0.02),
+        return_exceptions=True,
+    )
+    print(results)
+    for result in results:
+        if isinstance(result, Exception):
+            print("Error:", result)
+        else:
+            print("OK:", result)
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+This is perfect for "check 50 websites and report which ones are down": one broken site shouldn't stop the whole report.
+
+## Errors in a TaskGroup: ExceptionGroup and except*
+
+A `TaskGroup` is stricter, and that's a good thing. When a task fails, the group **cancels all the other tasks** and raises an **`ExceptionGroup`** containing every error that happened. Nothing keeps running behind your back.
+
+Handle an `ExceptionGroup` with **`except*`** (except-star). Each `except*` clause takes the errors of its type out of the group, so **several** clauses can run:
+
+<CodeExample output={`Value problem: empty item name
+Type problem: '42' is not a name
+bamboo task cancelled? True`}>
+
+```python
+import asyncio
+
+async def check_stock(item):
+    if item == "":
+        raise ValueError("empty item name")
+    if item.isdigit():
+        raise TypeError(f"{item!r} is not a name")
+    await asyncio.sleep(0.1)
+    return f"{item}: in stock"
+
+async def main():
+    try:
+        async with asyncio.TaskGroup() as tg:
+            ok = tg.create_task(check_stock("bamboo"))
+            tg.create_task(check_stock(""))
+            tg.create_task(check_stock("42"))
+    except* ValueError as group:
+        for error in group.exceptions:
+            print("Value problem:", error)
+    except* TypeError as group:
+        for error in group.exceptions:
+            print("Type problem:", error)
+    print("bamboo task cancelled?", ok.cancelled())
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+- Inside `except* ValueError as group`, `group` is itself an exception group; its **`.exceptions`** tuple holds the actual errors.
+- The `"bamboo"` task did nothing wrong, but it was **cancelled** because its group failed.
+- A normal `except ExceptionGroup:` works too, if you want to handle everything in one place.
+
+<Callout type="tip" title="gather or TaskGroup?">
+
+Use a **`TaskGroup`** when the tasks belong together, and one failing means the whole job failed (loading all the data for one page). Use **`gather(..., return_exceptions=True)`** when the jobs are independent and you want every result you can get (checking many websites).
+
+</Callout>
+
+## async with, async for and async generators
+
+You've already used **`async with`** several times: `TaskGroup`, `Semaphore` and `timeout` are all **async context managers**. They're just like normal `with` blocks, except that setting up and cleaning up can `await`, which is perfect for opening and closing network or database connections.
+
+Similarly, **`async for`** loops over an **async iterator**, which may `await` between items. The easiest way to make one is an **async generator**: an `async def` that uses `yield`. And `@asynccontextmanager` from `contextlib` turns an async generator into an async context manager, just like `@contextmanager` does for normal ones:
+
+<CodeExample output={`Tick 1
+Tick 2
+Tick 3
+[1, 4, 9, 16]
+Connecting to db
+Using <db connection>
+Closed db`}>
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+async def ticker(count, seconds):    # an async generator
+    for number in range(1, count + 1):
+        await asyncio.sleep(seconds)
+        yield number
+
+@asynccontextmanager
+async def connection(name):
+    print(f"Connecting to {name}")
+    await asyncio.sleep(0.01)
+    try:
+        yield f"<{name} connection>"
+    finally:
+        await asyncio.sleep(0.01)
+        print(f"Closed {name}")
+
+async def main():
+    async for tick in ticker(3, 0.01):
+        print("Tick", tick)
+
+    squares = [n * n async for n in ticker(4, 0.01)]
+    print(squares)
+
+    async with connection("db") as conn:
+        print("Using", conn)
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Async generators are great for **streams**: rows arriving from a database, messages from a chat, pages of results from an API. You process each item as it arrives instead of waiting for all of them. (A class can also be an async context manager by defining `async def __aenter__` and `async def __aexit__`.)
+
+## Where async is used for real
+
+**Web servers.** FastAPI lets you write endpoints with `async def`. While one request awaits a database or another API, the server handles other requests. Inside an endpoint you can use everything from this module, like `gather` to load two things at once:
+
+<CodeExample output={`200
+{'id': 7, 'name': 'Mei', 'orders': ['bamboo', 'tea']}`}>
+
+```python
+import asyncio
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+async def load_user(user_id):
+    await asyncio.sleep(0.05)     # pretend database query
+    return {"id": user_id, "name": "Mei"}
+
+async def load_orders(user_id):
+    await asyncio.sleep(0.05)     # pretend API call
+    return ["bamboo", "tea"]
+
+@app.get("/users/{user_id}")
+async def get_user(user_id: int):
+    user, orders = await asyncio.gather(
+        load_user(user_id), load_orders(user_id)
+    )
+    return {**user, "orders": orders}
+
+client = TestClient(app)
+response = client.get("/users/7")
+print(response.status_code)
+print(response.json())
+```
+
+</CodeExample>
+
+One rule for FastAPI: inside an `async def` endpoint, **never** call blocking code (like `time.sleep` or the `requests` library). If you must use a blocking library, write a plain `def` endpoint instead, and FastAPI will run it in a thread for you.
+
+**HTTP clients.** The **httpx** library has an `AsyncClient` for making many requests concurrently. Real network access isn't available in the browser, so here's what it looks like on your own computer (`pip install httpx`):
+
+```python
+import asyncio
+import httpx
+
+URLS = [
+    "https://www.python.org",
+    "https://pypi.org",
+    "https://docs.python.org",
+]
+
+async def fetch(client, url):
+    response = await client.get(url)
+    return url, response.status_code
+
+async def main():
+    async with httpx.AsyncClient(timeout=10) as client:
+        results = await asyncio.gather(
+            *(fetch(client, url) for url in URLS),
+            return_exceptions=True,
+        )
+    for result in results:
+        print(result)
+
+asyncio.run(main())
+```
+
+Look how much you recognise: `async with` for the client (it opens and closes connections), `gather` for concurrency, `return_exceptions=True` so one broken site doesn't spoil the rest, and a timeout. Other popular async libraries are **aiohttp** (HTTP), **asyncpg** (PostgreSQL), SQLAlchemy's async mode, and **discord.py** for chat bots.
+
+<Quiz
+  question="A task is cancelled while it waits at await asyncio.sleep(5) inside try: ... except Exception: print('error'). What happens?"
+  options={[
+    "It prints error and the task carries on",
+    "The CancelledError passes straight through except Exception, and the task ends as cancelled",
+    "Nothing: cancel() only works on tasks that haven't started",
+    "The sleep finishes first, then the task is cancelled",
+  ]}
+  answer={1}
+  explanation="CancelledError inherits from BaseException, not Exception, so except Exception doesn't catch it. The error is raised at the await and the task ends as cancelled."
+/>
+
+<Quiz
+  question="Three tasks run in a TaskGroup. One raises ValueError after 0.1 s; the other two would take 5 s. What happens?"
+  options={[
+    "The group waits 5 s, then raises ValueError",
+    "The ValueError is ignored and the other two finish",
+    "The other two are cancelled and the group raises an ExceptionGroup containing the ValueError",
+    "The program crashes immediately without any way to catch it",
+  ]}
+  answer={2}
+  explanation="When a task in a TaskGroup fails, the group cancels the remaining tasks and raises an ExceptionGroup with the error(s), which you can handle with except* ValueError."
+/>
+
+<Exercise
+  language="python"
+  title="A dashboard that never hangs"
+  starter={`import asyncio
+
+async def fetch(name, seconds):
+    """Pretends to call a service. Some services are broken."""
+    await asyncio.sleep(seconds)
+    if name.startswith("bad"):
+        raise ValueError(f"{name} is broken")
+    return f"{name}: ok"
+
+async def safe_fetch(name, seconds, timeout):
+    # Return fetch(name, seconds)'s result, but:
+    # - "timeout" if it takes longer than \`timeout\` seconds
+    # - "error: <message>" if it raises a ValueError
+    pass
+
+async def fetch_all(jobs, timeout):
+    # jobs is a list of (name, seconds) pairs. Run them all
+    # at the same time with safe_fetch and return the
+    # results in the same order as jobs.
+    pass
+
+async def main():
+    jobs = [("weather", 0.02), ("bad-news", 0.01),
+            ("slow-maps", 0.5), ("prices", 0.03)]
+    for result in await fetch_all(jobs, timeout=0.1):
+        print(result)
+
+asyncio.run(main())
+`}
+  tests={[
+    { name: "main() prints the four results", check: "__output == ['weather: ok', 'error: bad-news is broken', 'timeout', 'prices: ok']" },
+    { name: "safe_fetch returns the result when it's fast enough", check: "asyncio.run(safe_fetch('tea', 0.01, 0.1)) == 'tea: ok'" },
+    { name: "safe_fetch returns 'timeout' for slow services", check: "asyncio.run(safe_fetch('sloth', 0.3, 0.02)) == 'timeout'" },
+    { name: "safe_fetch gives up on time instead of waiting", check: "exec('import time as _t\\n_s = _t.perf_counter()\\nasyncio.run(safe_fetch(\"sloth\", 0.4, 0.02))\\n_quick = _t.perf_counter() - _s < 0.2') or _quick" },
+    { name: "safe_fetch turns a ValueError into 'error: ...'", check: "asyncio.run(safe_fetch('bad-cats', 0, 0.1)) == 'error: bad-cats is broken'" },
+    { name: "fetch_all keeps the order of the jobs", check: "asyncio.run(fetch_all([('b', 0.03), ('bad', 0.01), ('a', 0.02)], 0.1)) == ['b: ok', 'error: bad is broken', 'a: ok']" },
+    { name: "fetch_all runs the jobs at the same time", check: "exec('import time as _t\\n_s = _t.perf_counter()\\n_r = asyncio.run(fetch_all([(\"x\", 0.06), (\"y\", 0.06), (\"z\", 0.06)], 0.2))\\n_fast = _t.perf_counter() - _s < 0.15') or (_fast and _r == ['x: ok', 'y: ok', 'z: ok'])" },
+  ]}
+>
+
+You're building a dashboard that collects data from several services. Some are slow, some are broken, but the dashboard must **always** show something, and quickly.
+
+1. Write `safe_fetch(name, seconds, timeout)`. It awaits `fetch(name, seconds)` and returns its result, but returns `"timeout"` if that takes longer than `timeout` seconds, and `"error: <message>"` (e.g. `"error: bad-news is broken"`) if `fetch` raises a `ValueError`.
+2. Write `fetch_all(jobs, timeout)`. `jobs` is a list of `(name, seconds)` pairs. Run all of them **concurrently** with `safe_fetch` and return the list of results **in the same order** as `jobs`.
+
+`main()` should then print `weather: ok`, `error: bad-news is broken`, `timeout` and `prices: ok`, in about 0.1 seconds in total.
+
+<Hint>
+
+In `safe_fetch`, put `async with asyncio.timeout(timeout): return await fetch(name, seconds)` inside a `try`, with `except TimeoutError: return "timeout"` and `except ValueError as error: return f"error: {error}"`. In `fetch_all`, `return await asyncio.gather(*(safe_fetch(name, seconds, timeout) for name, seconds in jobs))`. Because `safe_fetch` never raises, you don't even need `return_exceptions=True`.
+
+</Hint>
+
+<Solution>
+
+```python
+import asyncio
+
+async def fetch(name, seconds):
+    """Pretends to call a service. Some services are broken."""
+    await asyncio.sleep(seconds)
+    if name.startswith("bad"):
+        raise ValueError(f"{name} is broken")
+    return f"{name}: ok"
+
+async def safe_fetch(name, seconds, timeout):
+    try:
+        async with asyncio.timeout(timeout):
+            return await fetch(name, seconds)
+    except TimeoutError:
+        return "timeout"
+    except ValueError as error:
+        return f"error: {error}"
+
+async def fetch_all(jobs, timeout):
+    return await asyncio.gather(
+        *(safe_fetch(name, seconds, timeout) for name, seconds in jobs)
+    )
+
+async def main():
+    jobs = [("weather", 0.02), ("bad-news", 0.01),
+            ("slow-maps", 0.5), ("prices", 0.03)]
+    for result in await fetch_all(jobs, timeout=0.1):
+        print(result)
+
+asyncio.run(main())
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **`async with asyncio.timeout(s):`** (or `asyncio.wait_for(coro, s)`) stops waiting after `s` seconds and raises **`TimeoutError`**. Always put a limit on network calls.
+- **`task.cancel()`** raises **`CancelledError`** inside the task at its current `await`. Clean up with `finally` (or catch and **re-raise**); never swallow it.
+- **`gather`** passes on the first error, but the other jobs keep running. With **`return_exceptions=True`**, errors come back in the results list.
+- A failing **`TaskGroup`** cancels its other tasks and raises an **`ExceptionGroup`**; handle it with **`except* SomeError`**.
+- **`async with`** uses async context managers (`TaskGroup`, `Semaphore`, clients, connections); **`async for`** loops over async iterators like **async generators** (`async def` + `yield`).
+- In real projects, async powers web servers like **FastAPI** (`async def` endpoints) and clients like **httpx**'s `AsyncClient`. Never block inside them.

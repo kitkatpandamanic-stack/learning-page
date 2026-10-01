@@ -1,0 +1,550 @@
+---
+title: Secure Coding
+description: Think like an attacker and close the classic holes in Python APIs - injection, unsafe deserialisation, weak password hashing, leaked secrets and vulnerable dependencies.
+duration: 22
+xp: 25
+---
+
+Most security breaches aren't clever. They're an f-string in a SQL query, a password stored as a plain SHA-256 hash, or an API key committed to GitHub and found by a bot within minutes. The good news: a handful of habits close most of these holes, and none of them is hard. In this lesson you'll learn to think about **threats**, then fix the classic mistakes one by one, with the tools pros use today. 🔐
+
+## Think like an attacker
+
+Security starts with a simple question: **what could go wrong, and who would make it go wrong?** This is called **threat modelling**, and it doesn't need a fancy method. For every feature, ask:
+
+- **What are we protecting?** Passwords, personal data, money, the ability to change things.
+- **Where does untrusted data come in?** Every request body, query parameter, header, uploaded file, webhook and even data from your own database that a user once typed. The line between "data we control" and "data anyone can send" is a **trust boundary**.
+- **What happens if this part is abused?** If the answer is "someone reads every user's email", it deserves more care than a typo in a log message.
+
+The **OWASP** project (Open Worldwide Application Security Project) publishes lists of the most common risks. For a Python API, these are the ones you'll meet again and again:
+
+| Risk | Typical Python mistake | Fix |
+| --- | --- | --- |
+| Injection | f-strings in SQL or shell commands | parameters, no `shell=True` |
+| Broken authentication | fast hashes, guessable tokens | bcrypt/argon2, `secrets` |
+| Broken access control | checking login but not *ownership* | check permissions on every request |
+| Unsafe deserialisation | `pickle.loads` / `eval` on user data | JSON + validation |
+| Security misconfiguration | debug mode, secrets in code | config from the environment |
+| Vulnerable components | old, unpinned dependencies | `pip-audit`, update often |
+
+A good rule of thumb is **defence in depth**: never rely on a single check. Validate input *and* use parametrised queries *and* give the database user only the permissions it needs.
+
+## Injection: never build queries from strings
+
+You met this in the databases module, and it's still number one for a reason. When you paste user input into a SQL string, the input can **change the meaning of the query**:
+
+<CodeExample output={`SQL: SELECT name FROM users WHERE name = 'mei'
+[('mei',)]
+SQL: SELECT name FROM users WHERE name = 'x' OR '1'='1'
+[('mei',), ('po',), ('boss',)]
+[]`}>
+
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory:")
+conn.execute("CREATE TABLE users (name TEXT, is_admin INTEGER)")
+conn.executemany(
+    "INSERT INTO users VALUES (?, ?)",
+    [("mei", 0), ("po", 0), ("boss", 1)],
+)
+
+def find_unsafe(name):
+    sql = f"SELECT name FROM users WHERE name = '{name}'"
+    print("SQL:", sql)
+    return conn.execute(sql).fetchall()
+
+def find_safe(name):
+    sql = "SELECT name FROM users WHERE name = ?"
+    return conn.execute(sql, (name,)).fetchall()
+
+attack = "x' OR '1'='1"
+print(find_unsafe("mei"))
+print(find_unsafe(attack))
+print(find_safe(attack))
+```
+
+</CodeExample>
+
+The attacker's quote closes the string early, and `OR '1'='1'` makes the condition true for **every row**. With a **parameter** (`?`), the database receives the query and the value separately, so the value is always treated as plain data: nobody is called `x' OR '1'='1`, so the result is empty.
+
+The same idea applies everywhere you build "code" from strings:
+
+- **SQLAlchemy**: `select(User).where(User.name == name)` is parametrised for you. If you ever write raw SQL, use `text("... WHERE name = :name")` with `{"name": name}`, never an f-string.
+- **Shell commands**: `subprocess.run(["convert", filename, "out.png"])` with a **list** of arguments. `shell=True` with user input lets someone add `; rm -rf ~`.
+- **File paths**: a filename like `../../etc/passwd` escapes your upload folder. Resolve the path and check it's still inside the folder you expect.
+
+## Never eval or unpickle untrusted input
+
+`eval()` and `exec()` run any Python code, so `eval(user_input)` hands your server to whoever sends the request. Less obvious is **`pickle`**: loading a pickle can call any function the pickle asks for. Here's a harmless proof:
+
+<CodeExample output={`Surprise! This ran inside loads()
+{'name': 'Mei', 'age': 3}`}>
+
+```python
+import json
+import pickle
+
+class Gift:
+    def __reduce__(self):
+        # tells pickle: "to rebuild me, call print(...)"
+        return (print, ("Surprise! This ran inside loads()",))
+
+payload = pickle.dumps(Gift())   # what an attacker would send
+pickle.loads(payload)             # the victim only *loads* it
+
+data = json.loads('{"name": "Mei", "age": 3}')
+print(data)
+```
+
+</CodeExample>
+
+The victim never called `print`: simply **loading** the bytes did. Swap `print` for `os.system` and it's game over. So the rules are:
+
+- Data from outside (requests, uploads, cookies, message queues) is parsed as **JSON** (or CSV, or another plain data format), never with `pickle`, `marshal`, `eval` or `yaml.load`. For YAML, use `yaml.safe_load`.
+- If you really need to turn text like `"[1, 2, 3]"` into Python values, `ast.literal_eval` only accepts literals, not function calls.
+
+<Callout type="danger" title="pickle is for data you wrote yourself">
+
+`pickle` is fine for caching your own objects on your own disk. The moment the bytes could have been touched by someone else (a cookie, an upload, a shared cache, a "model file" downloaded from the internet), treat `pickle.loads` exactly like `eval`. Machine-learning model files are a real-world attack route for this reason, which is why formats like `safetensors` exist.
+
+</Callout>
+
+## Validate everything at the boundary
+
+Parsing JSON safely is step one; step two is **checking that the data makes sense**. Pydantic, which FastAPI uses for every request body, lets you describe valid data once. Two settings matter for security: **limits** (lengths, ranges, patterns) and **`extra="forbid"`**, which rejects fields you didn't expect:
+
+<CodeExample output={`mei_panda
+('username',) string_pattern_mismatch
+('password',) string_too_short
+('is_admin',) extra_forbidden`}>
+
+```python
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+class SignUp(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(
+        min_length=3, max_length=30, pattern=r"^[a-z0-9_]+$"
+    )
+    password: str = Field(min_length=12, max_length=128)
+
+ok = SignUp(username="mei_panda", password="bamboo-forest-42")
+print(ok.username)
+
+try:
+    SignUp(
+        username="Mei; DROP TABLE",
+        password="short",
+        is_admin=True,
+    )
+except ValidationError as e:
+    for error in e.errors():
+        print(error["loc"], error["type"])
+```
+
+</CodeExample>
+
+That `is_admin=True` is a real attack called **mass assignment**: a sign-up form that copies every incoming field onto the user object lets anyone make themselves an admin. Two habits prevent it: separate input models that only contain what a client *may* set (like `TodoCreate` vs `Todo` in the web APIs module), and rejecting unknown fields. Upper limits like `max_length=128` matter too: without them, someone can send a 50 MB "password" and keep your server busy hashing it.
+
+Validation is about **shape**, not about safety for every destination. A perfectly valid username still goes into SQL through a parameter, and into HTML through your template engine's escaping.
+
+## Secrets belong in the environment
+
+API keys, database passwords and signing keys must never be written in your code. Code gets copied, pasted into chats, pushed to GitHub and stays in git history **forever**, even after you delete the line. Bots scan public repositories for keys within minutes of a push. Instead, read secrets from **environment variables**, which the platform (Docker, your cloud provider, CI) sets when the app starts:
+
+<CodeExample output={`key loaded: True
+Missing environment variable DATABASE_URL`}>
+
+```python
+import os
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Missing environment variable {name}")
+    return value
+
+os.environ["PAYMENT_API_KEY"] = "sk_test_123"   # set by the platform
+key = require_env("PAYMENT_API_KEY")
+print("key loaded:", key.startswith("sk_test_"))
+
+try:
+    require_env("DATABASE_URL")
+except RuntimeError as e:
+    print(e)
+```
+
+</CodeExample>
+
+Notice two details. The app **fails fast** with a clear message when a secret is missing, instead of limping on and crashing later. And it never **prints the secret**, only a fact about it. Secrets in logs and error pages are just as leaked as secrets in code.
+
+For local development, people keep variables in a `.env` file that is **never committed**:
+
+```bash
+# .env  (local only)
+DATABASE_URL=postgresql://dev:dev@localhost/app
+PAYMENT_API_KEY=sk_test_123
+
+# .gitignore
+.env
+```
+
+Commit a `.env.example` with the variable names and fake values instead, so teammates know what to set. In production, use your platform's secret store. You'll build a proper, validated settings loader in the [containers and deployment lesson](/learn/python/containers-and-deployment).
+
+<Callout type="warning" title="Leaked a key? Rotate it">
+
+If a secret was ever committed or pasted somewhere public, deleting it isn't enough: it's in the history and maybe already copied. **Revoke it and create a new one** first, then clean up. Tools like `gitleaks` or GitHub's secret scanning catch most leaks before they happen.
+
+</Callout>
+
+## Hashing passwords: why not SHA-256?
+
+You never store passwords, only a **hash**: a one-way fingerprint you can check a login attempt against. The tempting choice is `hashlib.sha256`. Here's why that's wrong:
+
+<CodeExample output={`password123
+True`}>
+
+```python
+import hashlib
+
+def sha256(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+leaked_hash = sha256("password123")     # from a stolen database
+
+common = ["123456", "qwerty", "iloveyou", "password123"]
+lookup = {sha256(word): word for word in common}
+
+print(lookup.get(leaked_hash))
+print(sha256("password123") == leaked_hash)
+```
+
+</CodeExample>
+
+Two problems:
+
+1. **No salt.** The same password always gives the same hash, so attackers precompute hashes for millions of common passwords once (a **rainbow table**, like our `lookup` dict) and crack every user at the same time. Two users with the same password also have the same hash.
+2. **Too fast.** SHA-256 was designed to be fast. A single gaming GPU computes **billions** of SHA-256 hashes per second, so even salted, short passwords fall quickly.
+
+Password hashing functions fix both: they add a random **salt** to every hash and are **deliberately slow** (and with Argon2, memory-hungry), with a cost you can raise as computers get faster. The two to use are **bcrypt** and **Argon2id**.
+
+### bcrypt
+
+<CodeExample output={`b'$2b$04$'
+60
+True
+False
+False True`}>
+
+```python
+import bcrypt
+
+password = "bamboo-forest-42".encode()
+
+# rounds=4 keeps this lesson fast; use 12 or more in production
+hashed = bcrypt.hashpw(password, bcrypt.gensalt(rounds=4))
+print(hashed[:7])
+print(len(hashed))
+
+print(bcrypt.checkpw(password, hashed))
+print(bcrypt.checkpw(b"bamboo-forest-43", hashed))
+
+again = bcrypt.hashpw(password, bcrypt.gensalt(rounds=4))
+print(again == hashed, bcrypt.checkpw(password, again))
+```
+
+</CodeExample>
+
+The hash string stores everything needed to check it later: `$2b$` is the algorithm, `04` the cost (each +1 doubles the work), followed by the salt and the hash. Hashing the same password twice gives **different** hashes (different salts), yet `checkpw` accepts both. One gotcha: bcrypt only uses the first **72 bytes** of a password, and the current `bcrypt` package raises `ValueError` for longer input, which is one more reason for that `max_length` on your input model.
+
+### Argon2id
+
+**Argon2id** won the Password Hashing Competition and is the first choice in OWASP's current recommendations for new projects. The `argon2-cffi` package has safe defaults:
+
+<CodeExample output={`argon2id
+True
+wrong password
+False`}>
+
+```python
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+
+ph = PasswordHasher()    # sensible modern defaults
+stored = ph.hash("bamboo-forest-42")
+print(stored.split("$")[1])
+
+print(ph.verify(stored, "bamboo-forest-42"))
+try:
+    ph.verify(stored, "wrong guess")
+except VerifyMismatchError:
+    print("wrong password")
+
+print(ph.check_needs_rehash(stored))
+```
+
+</CodeExample>
+
+Note the argument order: `verify(hash, password)`, and a wrong password **raises** instead of returning `False`. `check_needs_rehash` tells you when a stored hash used older, weaker settings: the standard trick is to re-hash the password right after a successful login, so your whole user base upgrades itself over time.
+
+<Callout type="tip" title="Which one should I pick?">
+
+Both are good choices. Use **Argon2id** for new projects if you can, **bcrypt** (cost 12 or more) if your framework or team already uses it. Tune the cost so one hash takes roughly 100–500 ms on your server: slow enough to hurt an attacker making billions of guesses, fast enough for one login. Never invent your own scheme, and never use plain MD5, SHA-1 or SHA-256 for passwords.
+
+</Callout>
+
+## Comparing secrets and making tokens
+
+Two more tools from the standard library close two subtle holes.
+
+**Timing attacks.** `a == b` on strings stops at the **first different character**. Comparing a guessed API key against the real one is a tiny bit faster when the first character is wrong than when the first ten are right, and attackers can measure that over thousands of requests to guess a key character by character. `hmac.compare_digest` always takes the same time, whatever matches.
+
+**Guessable tokens.** The `random` module is designed for simulations, not security: its output can be **predicted** after seeing enough of it. For anything an attacker must not guess (reset links, session ids, API keys) use the **`secrets`** module, which reads from the operating system's cryptographically secure generator.
+
+<CodeExample output={`True
+False
+str 43
+False
+32`}>
+
+```python
+import hmac
+import secrets
+
+API_KEY = "k3y-from-the-environment"
+
+def is_valid_key(given: str) -> bool:
+    return hmac.compare_digest(given.encode(), API_KEY.encode())
+
+print(is_valid_key("k3y-from-the-environment"))
+print(is_valid_key("k3y-from-the-environmenX"))
+
+token = secrets.token_urlsafe(32)   # 32 random bytes
+print(type(token).__name__, len(token))
+print(secrets.token_urlsafe(32) == token)
+print(len(secrets.token_hex(16)))
+```
+
+</CodeExample>
+
+`token_urlsafe(32)` gives 32 random bytes (256 bits) as a 43-character string that is safe in URLs. `token_hex(16)` gives 16 bytes as 32 hex characters. 32 bytes is a good default for anything long-lived.
+
+A pro tip: store API keys and reset tokens **hashed** in the database too (a fast SHA-256 is fine here, because the token is long and random, unlike a password), so a database leak doesn't hand out working keys.
+
+## Auditing your dependencies
+
+Your app is mostly **other people's code**: a FastAPI project easily pulls in 40+ packages. When a vulnerability is found in one of them, it gets a public **CVE** id, and attackers start scanning for it. `pip-audit` checks your installed packages or requirements file against the Python vulnerability database:
+
+```bash
+pip install pip-audit
+pip-audit                       # the current environment
+pip-audit -r requirements.txt   # or a requirements file
+
+# Found 1 known vulnerability in 1 package
+# Name     Version ID                  Fix Versions
+# -------- ------- ------------------- ------------
+# jinja2   3.1.2   GHSA-h5c8-rqwp-cp95 3.1.3
+```
+
+Good habits around it:
+
+- **Pin** exact versions with a lock file (`uv lock`, `pip-tools`, Poetry) so production runs exactly what you tested.
+- Run `pip-audit` in **CI** on every push (you'll see that in the deployment lesson), and let **Dependabot** or **Renovate** open update PRs automatically.
+- Add a static checker such as **Bandit** or Ruff's `S` rules: they flag `eval`, `pickle.loads`, `shell=True`, hard-coded passwords and SQL built from strings.
+- Fewer dependencies means fewer things to audit: think twice before adding a package for one small function.
+
+<Quiz
+  question="A teammate stores passwords as sha256(salt + password) with a random salt per user. Why is that still not good enough?"
+  options={[
+    "SHA-256 can be reversed to get the password back",
+    "The salt makes the hash too long for the database",
+    "SHA-256 is designed to be fast, so attackers can still try billions of guesses per second",
+    "Random salts mean the user can never log in again",
+  ]}
+  answer={2}
+  explanation="The salt fixes rainbow tables and identical hashes, but SHA-256 is still extremely fast, so attackers can brute-force common and short passwords. Password hashes like bcrypt and Argon2id are deliberately slow and tunable."
+/>
+
+<Quiz
+  question="Which line is the safe way to look up a user by a name that came from a request?"
+  options={[
+    "conn.execute(f\"SELECT * FROM users WHERE name = '{name}'\")",
+    "conn.execute(\"SELECT * FROM users WHERE name = ?\", (name,))",
+    "conn.execute(\"SELECT * FROM users WHERE name = '\" + name + \"'\")",
+    "conn.execute(\"SELECT * FROM users WHERE name = '%s'\" % name)",
+  ]}
+  answer={1}
+  explanation="Only the parametrised version sends the value separately from the SQL, so it can never change the query. The other three all paste the text into the SQL string, which allows injection."
+/>
+
+<Exercise
+  language="python"
+  title="Fix the insecure login"
+  starter={`import hashlib
+import random
+import sqlite3
+import string
+
+import bcrypt
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def verify_password(password: str, stored: str) -> bool:
+    return hash_password(password) == stored
+
+
+def find_user(conn, username: str):
+    sql = (
+        "SELECT id, username, password_hash FROM users "
+        f"WHERE username = '{username}'"
+    )
+    return conn.execute(sql).fetchone()
+
+
+def login(conn, username: str, password: str) -> bool:
+    user = find_user(conn, username)
+    if user is None:
+        return False
+    return verify_password(password, user[2])
+
+
+def make_reset_token() -> str:
+    letters = string.ascii_letters + string.digits
+    return "".join(random.choice(letters) for _ in range(12))
+
+
+def check_api_key(given: str, expected: str) -> bool:
+    return given == expected
+
+
+# ---------- setup and a quick demo (no changes needed) ----------
+
+def create_db(users: dict[str, str]):
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, "
+        "username TEXT UNIQUE, password_hash TEXT)"
+    )
+    for username, password in users.items():
+        conn.execute(
+            "INSERT INTO users (username, password_hash) "
+            "VALUES (?, ?)",
+            (username, hash_password(password)),
+        )
+    return conn
+
+
+conn = create_db({"mei": "bamboo-forest-42", "po": "dumplings!"})
+print("mei logs in:", login(conn, "mei", "bamboo-forest-42"))
+print("wrong password:", login(conn, "mei", "guess"))
+print("injection finds:", find_user(conn, "x' OR '1'='1"))
+`}
+  tests={[
+    { name: "hash_password uses bcrypt (or Argon2)", check: "(h := hash_password('bamboo-forest-42')).startswith(('$2a$', '$2b$', '$argon2'))" },
+    { name: "Hashes are salted: the same password gives different hashes", check: "hash_password('same password') != hash_password('same password')" },
+    { name: "verify_password accepts the right password and rejects others", check: "(h := hash_password('Koala-Tea-99')) and verify_password('Koala-Tea-99', h) and not verify_password('koala-tea-99', h)" },
+    { name: "find_user uses a parametrised query (injection finds nobody)", check: "(c := create_db({'mei': 'bamboo-forest-42', 'zhu': 'red-lantern-7'})) and find_user(c, 'zhu')[1] == 'zhu' and find_user(c, \"x' OR '1'='1\") is None and find_user(c, \"zhu' --\") is None" },
+    { name: "login still works end to end", check: "(c := create_db({'mei': 'bamboo-forest-42', 'zhu': 'red-lantern-7'})) and login(c, 'zhu', 'red-lantern-7') and not login(c, 'zhu', 'bamboo-forest-42') and not login(c, 'ghost', 'red-lantern-7')" },
+    { name: "make_reset_token uses secrets.token_urlsafe with 32 bytes", check: "(t := make_reset_token()) and isinstance(t, str) and len(t) >= 43 and t != make_reset_token() and 'token_urlsafe' in make_reset_token.__code__.co_names" },
+    { name: "check_api_key uses hmac.compare_digest", check: "check_api_key('s3cret-key', 's3cret-key') and not check_api_key('s3cret-kez', 's3cret-key') and not check_api_key('', 's3cret-key') and 'compare_digest' in check_api_key.__code__.co_names" },
+  ]}
+>
+
+This login code "works", but it has four security holes. Press Run: the last line shows an injection attack finding a user (with their password hash!). Fix it without changing `create_db` or the demo:
+
+1. `hash_password` must use **bcrypt** with a random salt. Use `bcrypt.gensalt(rounds=4)` so the checks run quickly (in production you'd use 12 or more), and return the hash as a `str`.
+2. `verify_password` must check a password against a stored bcrypt hash.
+3. `find_user` must use a **parametrised** query.
+4. `make_reset_token` must use `secrets.token_urlsafe(32)`, and `check_api_key` must compare with `hmac.compare_digest`.
+
+When you're done, the demo should print `True`, `False` and `injection finds: None`.
+
+<Hint>
+
+bcrypt works with bytes: `bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=4)).decode()` gives a string, and `bcrypt.checkpw(password.encode(), stored.encode())` checks it. In `find_user`, replace the f-string part with `"WHERE username = ?"` and call `conn.execute(sql, (username,))`. Remember to `import hmac` and `import secrets`, and compare bytes with `hmac.compare_digest(given.encode(), expected.encode())`.
+
+</Hint>
+
+<Solution>
+
+```python
+import hmac
+import secrets
+import sqlite3
+
+import bcrypt
+
+
+def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt(rounds=4)   # 12+ in production
+    return bcrypt.hashpw(password.encode(), salt).decode()
+
+
+def verify_password(password: str, stored: str) -> bool:
+    return bcrypt.checkpw(password.encode(), stored.encode())
+
+
+def find_user(conn, username: str):
+    sql = (
+        "SELECT id, username, password_hash FROM users "
+        "WHERE username = ?"
+    )
+    return conn.execute(sql, (username,)).fetchone()
+
+
+def login(conn, username: str, password: str) -> bool:
+    user = find_user(conn, username)
+    if user is None:
+        return False
+    return verify_password(password, user[2])
+
+
+def make_reset_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def check_api_key(given: str, expected: str) -> bool:
+    return hmac.compare_digest(given.encode(), expected.encode())
+
+
+# ---------- setup and a quick demo (no changes needed) ----------
+
+def create_db(users: dict[str, str]):
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, "
+        "username TEXT UNIQUE, password_hash TEXT)"
+    )
+    for username, password in users.items():
+        conn.execute(
+            "INSERT INTO users (username, password_hash) "
+            "VALUES (?, ?)",
+            (username, hash_password(password)),
+        )
+    return conn
+
+
+conn = create_db({"mei": "bamboo-forest-42", "po": "dumplings!"})
+print("mei logs in:", login(conn, "mei", "bamboo-forest-42"))
+print("wrong password:", login(conn, "mei", "guess"))
+print("injection finds:", find_user(conn, "x' OR '1'='1"))
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Threat modelling**: ask what you protect, where untrusted data crosses a **trust boundary**, and what abuse would cost. Layer your defences.
+- **Injection**: always use query parameters (`?`, `:name`, SQLAlchemy expressions) and argument lists for `subprocess`, never f-strings.
+- Never `eval`, `exec` or `pickle.loads` data from outside; parse **JSON** and validate it.
+- Validate at the boundary with **pydantic**: limits on every field and `extra="forbid"` against mass assignment.
+- **Secrets** come from environment variables, are never committed or printed, and get rotated if they leak.
+- Hash passwords with **Argon2id** or **bcrypt** (salted, slow, tunable), never SHA-256.
+- Compare secrets with **`hmac.compare_digest`** and generate tokens with **`secrets.token_urlsafe(32)`**.
+- Pin dependencies and run **`pip-audit`** (plus Bandit or Ruff's security rules) in CI.

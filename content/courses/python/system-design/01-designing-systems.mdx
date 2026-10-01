@@ -1,0 +1,470 @@
+---
+title: Designing Systems
+description: Turn requirements into a system design with back-of-the-envelope maths, load balancers, caches, replicas, shards, queues and the CAP trade-off.
+duration: 25
+xp: 25
+---
+
+So far you've built one app on one machine. Real products have millions of users, and a single server can't keep up with that. **System design** is the art of choosing the big pieces (servers, databases, caches, queues) and how they talk to each other. There's rarely one right answer, only trade-offs. In this lesson you'll learn the vocabulary and, more importantly, how to reason about which piece you need and *why*. 🏗️
+
+Our running example: **PandaRun**, a mobile game with a global leaderboard. Players finish a run, the app sends their score, and everyone can see the top 100 and their own rank.
+
+## Start with requirements, not boxes
+
+The most common mistake in design discussions (and interviews) is drawing boxes before anyone has agreed what the system must do. Split the requirements into two kinds:
+
+| Kind | Question it answers | PandaRun examples |
+| --- | --- | --- |
+| **Functional** | What does it do? | Submit a score; show the top 100; show my rank |
+| **Non-functional** | How well must it do it? | Top 100 loads in under 200 ms; 99.9% uptime; a new score may take a few seconds to appear |
+
+Non-functional requirements drive the design. "Show the top 100" is easy on a laptop. "Show the top 100 to 3,000 people per second, in under 200 ms, even when a server dies" is a system design problem.
+
+Also write down what's **out of scope** ("no friends list in v1"). It keeps the discussion focused, and it stops a design from quietly growing until nobody can build it.
+
+## Back-of-the-envelope maths
+
+Before choosing technology, estimate the **load**. You don't need precision, just the right order of magnitude: is it 10 requests per second, or 10,000? Those need very different systems.
+
+<CodeExample output={`Score writes per day: 10,000,000
+Average writes/s:     116
+Peak writes/s:        347
+Peak reads/s:         3,472
+Storage per year:     365 GB`}>
+
+```python
+daily_users = 2_000_000
+games_per_user = 5
+seconds_per_day = 86_400
+
+writes_per_day = daily_users * games_per_user
+avg_writes = writes_per_day / seconds_per_day
+peak_writes = avg_writes * 3        # evenings are busy
+peak_reads = peak_writes * 10       # 10 reads per write
+
+bytes_per_score = 100
+gb_per_year = writes_per_day * 365 * bytes_per_score / 1e9
+
+print(f"Score writes per day: {writes_per_day:,}")
+print(f"Average writes/s:     {avg_writes:,.0f}")
+print(f"Peak writes/s:        {peak_writes:,.0f}")
+print(f"Peak reads/s:         {peak_reads:,.0f}")
+print(f"Storage per year:     {gb_per_year:,.0f} GB")
+```
+
+</CodeExample>
+
+What these numbers tell us: a few hundred writes per second is fine for one well-tuned database. Thousands of reads per second of the **same** top-100 list is a strong hint that we want a **cache**. And 365 GB a year fits on one disk, so we don't need sharding on day one.
+
+A few numbers worth memorising:
+
+| Rule of thumb | Value |
+| --- | --- |
+| Seconds in a day | 86,400 (about 10⁵) |
+| Read from memory | ~100 nanoseconds |
+| Read from an SSD | ~100 microseconds (1,000× slower than memory) |
+| Network round trip in one data centre | ~0.5 ms |
+| Round trip Europe ↔ US | ~80–150 ms |
+| One Python web worker | hundreds of simple requests/s |
+
+<Callout type="tip" title="Peak, not average">
+
+Traffic is never flat. A game peaks in the evening, a shop on Black Friday, a news site when something happens. Design for the **peak** (often 2–10× the average), and say your multiplier out loud so others can challenge it.
+
+</Callout>
+
+## Scaling up vs scaling out
+
+When one server isn't enough, you have two options:
+
+| | Scale **up** (vertical) | Scale **out** (horizontal) |
+| --- | --- | --- |
+| What | A bigger machine: more CPU, RAM | More machines of the same size |
+| Pros | No code changes, simple | Almost no upper limit, survives a machine dying |
+| Cons | There's a biggest machine; still one point of failure | Needs a load balancer, servers must be **stateless** |
+| Good for | Databases (at first), quick fixes | Web/API servers, workers |
+
+A senior answer is usually "both": scale up the database for as long as it's cheap, and scale out the stateless API servers from the start.
+
+**Stateless** means a server keeps nothing important in its own memory between requests: sessions go into a shared store (a database or Redis), files into object storage (like S3). Then any server can handle any request, and you can add or remove servers freely.
+
+## Load balancers
+
+A **load balancer** (LB) sits in front of your servers and spreads the requests between them. It also runs **health checks** (for example calling `/health` every few seconds) and stops sending traffic to a server that doesn't answer.
+
+```text
+                ┌──▶ [ app-1 ] ──┐
+ users ──▶ [LB] ┼──▶ [ app-2 ] ──┼──▶ [ database ]
+                └──▶ [ app-3 ] ──┘
+```
+
+Two common ways to choose a server:
+
+<CodeExample output={`['app-1', 'app-2', 'app-3', 'app-1', 'app-2']
+app-2`}>
+
+```python
+from itertools import cycle
+
+class RoundRobin:
+    def __init__(self, servers):
+        self._next = cycle(servers)
+
+    def pick(self):
+        return next(self._next)
+
+def least_connections(active):
+    return min(active, key=active.get)
+
+lb = RoundRobin(["app-1", "app-2", "app-3"])
+print([lb.pick() for _ in range(5)])
+
+active = {"app-1": 12, "app-2": 3, "app-3": 7}
+print(least_connections(active))
+```
+
+</CodeExample>
+
+**Round robin** takes turns and is great when requests are similar. **Least connections** sends the next request to the least busy server, which helps when some requests are slow. In practice you configure this in nginx, HAProxy or your cloud's load balancer rather than writing it yourself, but now you know what the setting means.
+
+## Caching
+
+A **cache** keeps a copy of data somewhere faster (memory, Redis) so you don't recompute or re-read it every time. The most common pattern is **cache-aside** (also called lazy loading): the application checks the cache first and only goes to the database on a **miss**.
+
+```text
+ get(user 1)
+     │
+     ▼
+ ┌────────┐  hit   ┌────────────────┐
+ │ cache  │──────▶ │ return value   │
+ └────────┘        └────────────────┘
+     │ miss
+     ▼
+ ┌────────┐        ┌────────────────┐
+ │   DB   │──────▶ │ store in cache │──▶ return value
+ └────────┘        └────────────────┘
+```
+
+<CodeExample output={`['mei', 'kai', 'mei', 'mei', 'luna', 'kai', 'mei']
+7 requests, 3 DB reads
+mei-mei | DB reads: 4`}>
+
+```python
+db = {1: "mei", 2: "kai", 3: "luna"}
+db_reads = 0
+cache = {}
+
+def load_name(user_id):
+    global db_reads
+    db_reads += 1
+    return db[user_id]
+
+def get_name(user_id):
+    if user_id in cache:              # 1. try the cache
+        return cache[user_id]
+    name = load_name(user_id)         # 2. miss: ask the DB
+    cache[user_id] = name             # 3. remember it
+    return name
+
+def rename(user_id, new_name):
+    db[user_id] = new_name            # write the DB first
+    cache.pop(user_id, None)          # then drop the cached copy
+
+requests = [1, 2, 1, 1, 3, 2, 1]
+names = [get_name(uid) for uid in requests]
+print(names)
+print(f"{len(requests)} requests, {db_reads} DB reads")
+
+rename(1, "mei-mei")
+print(get_name(1), "| DB reads:", db_reads)
+```
+
+</CodeExample>
+
+Seven requests, only three database reads: a **hit ratio** of 4/7. On the PandaRun leaderboard, where thousands of people read the same top 100, the hit ratio would be close to 100%.
+
+The hard part is keeping the cache **fresh**. There's a famous joke that the two hardest things in computer science are cache invalidation, naming things and off-by-one errors. Your main tools:
+
+| Tool | How it works | Trade-off |
+| --- | --- | --- |
+| **TTL** (time to live) | Each entry expires after N seconds | Simple and self-healing, but data can be up to N seconds stale |
+| **Invalidate on write** | When data changes, delete the cache key (like `rename` above) | Fresh, but every write path must remember to do it |
+| **Both** | Invalidate on write, plus a TTL as a safety net | What most real systems do |
+
+Note the order in `rename`: write the database **first**, then delete the cache entry. The other way round, another request could re-cache the old value between the two steps.
+
+<Callout type="warning" title="Caches hide problems until they don't">
+
+A team once restarted all their Redis nodes at the same moment. The cache was empty, every request went to the database at once, and the database fell over. This is called a **cache stampede**. A cache that the system can't survive without is no longer an optimisation: it's a critical dependency. Protect the database with limits, warm the cache gradually and add small random offsets to TTLs so keys don't all expire together.
+
+</Callout>
+
+## Database replicas and sharding
+
+The database is usually the hardest part to scale, because it holds **state**. Two tools, in the order you should reach for them:
+
+**Read replicas.** One **primary** database takes all the writes and streams the changes to one or more **replicas**, which serve reads. It's perfect for read-heavy apps like PandaRun. The catch is **replication lag**: a replica may be a fraction of a second behind, so a player who just submitted a score might not see it yet if you read from a replica. A common fix is "read your own writes from the primary".
+
+```text
+            writes                      reads
+ app ───────────────▶ [ primary ] ─┬─▶ [ replica 1 ] ◀── app
+                                   └─▶ [ replica 2 ] ◀── app
+                       (replication, slightly delayed)
+```
+
+**Sharding** (partitioning). When the data or the writes are too big for one machine, split them: each **shard** holds part of the data, chosen by a **shard key** such as the user id.
+
+<CodeExample output={`mei -> shard 1
+kai -> shard 0
+luna -> shard 2
+bao -> shard 0
+Adding a 4th shard moves 74% of users`}>
+
+```python
+import zlib
+
+def shard_for(key, shards):
+    return zlib.crc32(key.encode()) % shards
+
+for user in ["mei", "kai", "luna", "bao"]:
+    print(user, "-> shard", shard_for(user, 3))
+
+users = [f"user{i}" for i in range(10_000)]
+moved = sum(shard_for(u, 3) != shard_for(u, 4) for u in users)
+print(f"Adding a 4th shard moves {moved / len(users):.0%} of users")
+```
+
+</CodeExample>
+
+Two lessons hide in this example. First, we use `zlib.crc32`, not Python's built-in `hash()`: `hash()` of a string changes every time Python starts (a security feature), so different servers would disagree about where a user lives. Second, plain `hash % n` means adding one shard moves about three quarters of the data. Real systems use **consistent hashing** or a lookup table of key ranges, so adding a shard only moves a small slice.
+
+Sharding is powerful but expensive: queries across shards, joins and transactions all get harder. Treat it as a last resort, after indexes, caching, replicas and a bigger machine.
+
+## Queues and background workers
+
+Some work doesn't need to happen while the user waits: sending emails, resizing images, recalculating rankings. Put a **job** on a **queue** and return straight away (HTTP status **202 Accepted**). Separate **worker** processes take jobs off the queue and do the slow part.
+
+```text
+ API ──put job──▶ [ queue ] ──get job──▶ worker 1
+                     │      └─get job──▶ worker 2
+               (jobs wait here when workers are busy)
+```
+
+<CodeExample output={`{'status': 202, 'queued': 1}
+{'status': 202, 'queued': 2}
+updating rankings: mei 4200
+updating rankings: kai 3100
+jobs left: 0`}>
+
+```python
+from collections import deque
+
+jobs = deque()
+
+def submit_score(player, score):
+    """The API endpoint: quick, it only queues the work."""
+    jobs.append({"player": player, "score": score})
+    return {"status": 202, "queued": len(jobs)}
+
+def worker():
+    """Runs elsewhere and does the slow part."""
+    while jobs:
+        job = jobs.popleft()
+        print(f"updating rankings: {job['player']} {job['score']}")
+
+print(submit_score("mei", 4200))
+print(submit_score("kai", 3100))
+worker()
+print("jobs left:", len(jobs))
+```
+
+</CodeExample>
+
+The queue also **absorbs spikes**: if 10,000 scores arrive in one second, they wait in the queue and the workers catch up, instead of the database being hit all at once. In production the queue is a separate service (RabbitMQ, Redis, Amazon SQS, Kafka) and the workers use a library such as Celery, RQ, Dramatiq or arq. Two things to plan for: a job may run **more than once** (so make jobs safe to repeat, which you'll see in the next lesson), and jobs that keep failing go to a **dead-letter queue** for a human to look at.
+
+## CAP in plain words
+
+When data lives on several machines, the network between them will sometimes fail (a **partition**). At that moment, a machine that can't reach the others must choose:
+
+- **Consistency (C):** refuse to answer (or return an error) rather than risk giving out-of-date data.
+- **Availability (A):** answer anyway with what it has, which might be stale.
+
+That's the **CAP theorem**: during a **P**artition you get **C** or **A**, not both. When the network is fine, you can have both. It's not an exotic theory, it's a product decision:
+
+| Data | Better choice | Why |
+| --- | --- | --- |
+| Bank balance, stock in a shop | Consistency | Selling the last item twice costs real money |
+| Leaderboard, likes, view counts | Availability | Being a few seconds out of date is fine |
+| Shopping basket | Availability | A slightly stale basket beats an error page |
+
+Systems that choose availability are usually **eventually consistent**: replicas may disagree for a short while, but they catch up once the network heals. For PandaRun, "a new score may take a few seconds to appear" in our requirements is exactly that choice, written down.
+
+<Quiz
+  question="Your API servers keep each user's login session in a Python dict in memory. You add a second server behind a round-robin load balancer. What goes wrong?"
+  options={[
+    "Nothing, the load balancer copies the sessions between servers",
+    "Users get logged out randomly, because the other server doesn't have their session",
+    "The database gets twice as many writes",
+    "Round robin only works with one server",
+  ]}
+  answer={1}
+  explanation="The servers are not stateless: a request that lands on the other server finds no session. Keep sessions in a shared store (database, Redis) so any server can handle any request."
+/>
+
+<Quiz
+  question="Reads of the top-100 leaderboard are crushing the database, but writes are fine and the data is only 365 GB a year. What should you try first?"
+  options={[
+    "Shard the database by user id",
+    "Rewrite the service in another language",
+    "Cache the top 100 with a short TTL and add a read replica",
+    "Switch to a database that chooses availability in CAP",
+  ]}
+  answer={2}
+  explanation="It's a read problem on a small, hot piece of data: a cache with a short TTL removes almost all of those reads, and a replica helps the rest. Sharding solves too-much-data or too-many-writes problems, at a high cost."
+/>
+
+<Exercise
+  language="python"
+  title="Cache-aside with a TTL"
+  starter={`class FakeClock:
+    """A clock for tests: time only moves when we say so."""
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class CacheAside:
+    def __init__(self, load, ttl, clock):
+        self.load = load      # function: key -> value (slow)
+        self.ttl = ttl        # seconds an entry stays fresh
+        self.clock = clock    # function: -> current time
+        self.hits = 0
+        self.misses = 0
+        self._entries = {}    # key -> (value, expires_at)
+
+    def get(self, key):
+        # TODO: return a fresh cached value (a hit), or load,
+        # store with an expiry time and return it (a miss)
+        self.misses += 1
+        return self.load(key)
+
+    def invalidate(self, key):
+        # TODO: forget the cached value for key
+        pass
+
+
+prices = {"tea": 3.5, "mug": 8.0}
+clock = FakeClock()
+cache = CacheAside(lambda item: prices[item], ttl=60,
+                   clock=clock.time)
+
+print(cache.get("tea"), cache.get("tea"))   # miss, hit
+prices["tea"] = 4.0
+clock.advance(30)
+print(cache.get("tea"))                     # still cached: 3.5
+clock.advance(30)
+print(cache.get("tea"))                     # expired: 4.0
+prices["mug"] = 9.0
+cache.invalidate("mug")
+print(cache.get("mug"))                     # 9.0
+print("hits:", cache.hits, "misses:", cache.misses)
+`}
+  tests={[
+    { name: "The demo prints the expected lines", check: "__output == ['3.5 3.5', '3.5', '4.0', '9.0', 'hits: 2 misses: 3']" },
+    { name: "A fresh entry is served without calling load", check: "[c := FakeClock(), calls := [], k := CacheAside(lambda x: calls.append(x) or x * 2, 10, c.time), k.get('ab'), k.get('ab'), k.get('ab')][-1] == 'abab' and calls == ['ab']" },
+    { name: "Still fresh just before the TTL ends", check: "[c := FakeClock(), calls := [], k := CacheAside(lambda x: calls.append(x) or len(calls), 10, c.time), k.get('a'), c.advance(9.9), k.get('a')][-1] == 1 and len(calls) == 1" },
+    { name: "Expired exactly when the TTL has passed", check: "[c := FakeClock(), calls := [], k := CacheAside(lambda x: calls.append(x) or len(calls), 10, c.time), k.get('a'), c.advance(10), k.get('a')][-1] == 2" },
+    { name: "A reload starts a new TTL", check: "[c := FakeClock(), calls := [], k := CacheAside(lambda x: calls.append(x) or len(calls), 5, c.time), k.get('a'), c.advance(5), k.get('a'), c.advance(4), k.get('a')][-1] == 2" },
+    { name: "invalidate() forces exactly one reload", check: "[c := FakeClock(), calls := [], k := CacheAside(lambda x: calls.append(x) or len(calls), 100, c.time), k.get('a'), k.invalidate('a'), k.get('a'), k.get('a')][-1] == 2 and calls == ['a', 'a']" },
+    { name: "Counts hits and misses; unknown keys can be invalidated", check: "[c := FakeClock(), k := CacheAside(str.upper, 100, c.time), k.invalidate('never-seen'), k.get('x'), k.get('y'), k.get('x'), k.hits, k.misses][-2:] == [1, 2]" },
+  ]}
+>
+
+Finish the `CacheAside` class so it really caches. The clock is **injected**: the class calls `self.clock()` to learn the time, so tests can use a `FakeClock` instead of waiting for real seconds (in production you'd pass `time.monotonic`).
+
+1. `get(key)`: if the key is cached and still fresh, count a **hit** and return the cached value. Otherwise count a **miss**, call `self.load(key)`, store the value together with its expiry time (`now + ttl`) and return it.
+2. An entry is fresh while `now < expires_at`, so at exactly `ttl` seconds it has expired.
+3. `invalidate(key)`: forget the key. Invalidating a key that isn't cached must not crash.
+
+<Hint>
+
+Read the time once at the start of `get`: `now = self.clock()`. Look up `entry = self._entries.get(key)`; if it's not `None`, unpack `value, expires_at = entry` and return the value (after `self.hits += 1`) when `now < expires_at`. Otherwise load, then `self._entries[key] = (value, now + self.ttl)`. For `invalidate`, `dict.pop(key, None)` removes a key without failing when it's missing.
+
+</Hint>
+
+<Solution>
+
+```python
+class FakeClock:
+    """A clock for tests: time only moves when we say so."""
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class CacheAside:
+    def __init__(self, load, ttl, clock):
+        self.load = load      # function: key -> value (slow)
+        self.ttl = ttl        # seconds an entry stays fresh
+        self.clock = clock    # function: -> current time
+        self.hits = 0
+        self.misses = 0
+        self._entries = {}    # key -> (value, expires_at)
+
+    def get(self, key):
+        now = self.clock()
+        entry = self._entries.get(key)
+        if entry is not None:
+            value, expires_at = entry
+            if now < expires_at:
+                self.hits += 1
+                return value
+        self.misses += 1
+        value = self.load(key)
+        self._entries[key] = (value, now + self.ttl)
+        return value
+
+    def invalidate(self, key):
+        self._entries.pop(key, None)
+
+
+prices = {"tea": 3.5, "mug": 8.0}
+clock = FakeClock()
+cache = CacheAside(lambda item: prices[item], ttl=60,
+                   clock=clock.time)
+
+print(cache.get("tea"), cache.get("tea"))   # miss, hit
+prices["tea"] = 4.0
+clock.advance(30)
+print(cache.get("tea"))                     # still cached: 3.5
+clock.advance(30)
+print(cache.get("tea"))                     # expired: 4.0
+prices["mug"] = 9.0
+cache.invalidate("mug")
+print(cache.get("mug"))                     # 9.0
+print("hits:", cache.hits, "misses:", cache.misses)
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Start with **functional** and **non-functional** requirements (and what's out of scope); the non-functional ones drive the design.
+- **Back-of-the-envelope maths** (requests per second at peak, storage per year) tells you the order of magnitude, and which problems you actually have.
+- **Scale up** with a bigger machine, **scale out** with more machines behind a **load balancer**; scaling out needs **stateless** servers.
+- **Cache-aside**: check the cache, on a miss load from the DB and store it. Keep it fresh with a **TTL** plus **invalidation on write**, and beware of stampedes.
+- **Read replicas** spread reads (watch out for replication lag); **sharding** splits data by a shard key and is a last resort.
+- **Queues and workers** move slow work out of the request and absorb traffic spikes; jobs may run twice.
+- **CAP**: during a network partition, choose consistency or availability, per kind of data.

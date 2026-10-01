@@ -1,0 +1,554 @@
+---
+title: Дескрипторы и метаклассы
+description: Узнайте, как на самом деле ищутся атрибуты, напишите поля с валидацией на дескрипторах, соберите реестр плагинов через __init_subclass__ и поймите, почему метакласс нужен редко.
+duration: 25
+xp: 30
+---
+
+Как `@property` превращает метод в нечто, похожее на обычный атрибут? Как `self` автоматически передаётся в методы? Откуда столбцы SQLAlchemy, поля Pydantic и модели Django «знают» собственные имена? Всё это сводится к небольшому набору хуков в **поиске атрибутов** (attribute lookup) Python. Фреймворки используют их постоянно, и как только вы в них разберётесь, код фреймворков перестанет выглядеть магией. Этот урок идёт от повседневного (дескрипторы, `__init_subclass__`) к редкому (метаклассы) и заканчивается мини-слоем моделей, который вы соберёте сами. 🪄
+
+## Как Python находит атрибут
+
+Когда вы пишете `obj.attr`, Python смотрит не в одно место. Атрибуты экземпляра живут в **`__dict__`** объекта; атрибуты класса — в самом классе и его родителях, которые перебираются в порядке **MRO** (method resolution order, порядок разрешения методов):
+
+<CodeExample output={`{'name': 'Mei'}
+False большая панда
+малая панда большая панда
+['Panda', 'object']`}>
+
+```python
+class Panda:
+    species = "большая панда"     # атрибут класса
+
+    def __init__(self, name):
+        self.name = name          # атрибут экземпляра
+
+mei = Panda("Mei")
+print(mei.__dict__)
+print("species" in mei.__dict__, mei.species)
+
+mei.species = "малая панда"       # заслоняет атрибут класса
+print(mei.species, Panda.species)
+print([c.__name__ for c in Panda.__mro__])
+```
+
+</CodeExample>
+
+Пока всё просто: сначала экземпляр, потом класс. Но это не вся история. Полный порядок, по которому `object.__getattribute__` ищет `obj.attr`, такой:
+
+1. Найти `attr` в **классе** (по MRO). Если это **дескриптор данных** (data descriptor — объект с `__set__` или `__delete__`), вызвать его `__get__` и остановиться.
+2. Иначе, если `attr` есть в **`obj.__dict__`**, вернуть его.
+3. Иначе, если атрибут нашёлся в классе: если это **дескриптор не-данных** (non-data descriptor — только `__get__`), вызвать `__get__`; если это обычное значение, вернуть его.
+4. Иначе выбросить `AttributeError`, а если в классе определён **`__getattr__`**, вызвать его как последнее средство.
+
+Пока не заучивайте это: каждый шаг встретится в примерах ниже.
+
+## __getattr__ против __getattribute__
+
+Эти два имени похожи, а ведут себя очень по-разному:
+
+- **`__getattr__`** — это **запасной вариант** (fallback). Он вызывается, только когда обычный поиск не удался (шаг 4). Он безопасен и встречается часто: прокси, ленивая загрузка, удобные объекты конфигурации.
+- **`__getattribute__`** вызывается при **каждом** обращении к атрибуту, включая обращения из ваших собственных методов. Он мощный, и в нём легко ошибиться.
+
+<CodeExample output={`True 8000
+True
+30`}>
+
+```python
+class Settings:
+    def __init__(self, values):
+        self._values = values
+
+    def __getattr__(self, name):
+        # вызывается, только когда обычный поиск НЕ УДАЛСЯ
+        try:
+            return self._values[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+s = Settings({"debug": True, "port": 8000})
+print(s.debug, s.port)
+print(s._values is not None)   # найден обычным способом
+print(getattr(s, "timeout", 30))
+```
+
+</CodeExample>
+
+Обратите внимание: для отсутствующих имён мы выбрасываем **`AttributeError`**, а не `KeyError`. Благодаря этому продолжают работать `getattr(obj, name, default)` и `hasattr`, как показывает последняя строка.
+
+Если вы переопределяете `__getattribute__`, через вас проходит каждый поиск, поэтому для настоящей работы нужно вызывать `super().__getattribute__`, иначе получится бесконечная рекурсия:
+
+<CodeExample output={`['balance', 'balance']`}>
+
+```python
+class Audited:
+    def __init__(self):
+        self.reads = []
+        self.balance = 100
+
+    def __getattribute__(self, name):
+        # вызывается при КАЖДОМ обращении к атрибуту
+        if name != "reads":
+            super().__getattribute__("reads").append(name)
+        return super().__getattribute__(name)
+
+account = Audited()
+account.balance
+account.balance
+print(account.reads)
+```
+
+</CodeExample>
+
+<Callout type="warning" title="Предпочитайте __getattr__">
+
+`__getattribute__` замедляет каждое обращение к атрибутам объекта и притягивает баги с бесконечной рекурсией (`self.reads` внутри него снова вызывает его же). За десять лет код-ревью вы одобрите таких от силы несколько штук. Когда нужно обработать только **отсутствующие** атрибуты, правильный инструмент — `__getattr__`.
+
+</Callout>
+
+## Дескрипторы: объекты, управляющие доступом к атрибутам
+
+**Дескриптор** (descriptor) — это любой объект с методом `__get__`, `__set__` или `__delete__`, который хранится как **атрибут класса**. Когда вы обращаетесь к такому атрибуту, Python вызывает метод дескриптора, а не просто возвращает объект:
+
+<CodeExample output={`вызван __get__, obj=<shop>
+42
+вызван __get__, obj=None
+42`}>
+
+```python
+class Loud:
+    def __get__(self, obj, objtype=None):
+        print(f"вызван __get__, obj={obj!r}")
+        return 42
+
+class Shop:
+    answer = Loud()       # дескриптор живёт в КЛАССЕ
+
+    def __repr__(self):
+        return "<shop>"
+
+print(Shop().answer)
+print(Shop.answer)
+```
+
+</CodeExample>
+
+`__get__` получает **экземпляр** (или `None`, если обращаются к самому классу) и класс. Дескрипторы — это механизм, на котором держится удивительно большая часть Python.
+
+### Методы — это дескрипторы
+
+У функций есть метод `__get__`. Так и работает `self`: когда вы обращаетесь к функции через экземпляр, её `__get__` возвращает **связанный метод** (bound method), который помнит экземпляр:
+
+<CodeExample output={`function
+True
+method True
+Добро пожаловать в Bamboo Mart`}>
+
+```python
+class Shop:
+    def __init__(self, name):
+        self.name = name
+
+    def greet(self):
+        return f"Добро пожаловать в {self.name}"
+
+shop = Shop("Bamboo Mart")
+func = Shop.__dict__["greet"]
+print(type(func).__name__)
+print(hasattr(func, "__get__"))
+
+bound = func.__get__(shop, Shop)   # то, что делает shop.greet
+print(type(bound).__name__, bound.__self__ is shop)
+print(bound())
+```
+
+</CodeExample>
+
+У функций есть только `__get__`, поэтому они — дескрипторы **не-данных** (шаг 3): атрибут экземпляра с тем же именем заслонил бы метод. `@staticmethod` и `@classmethod` — тоже дескрипторы, просто с другим поведением `__get__`.
+
+### property — дескриптор данных
+
+У `property` есть и `__get__`, **и** `__set__`, поэтому это дескриптор **данных**, и он побеждает даже `__dict__` экземпляра (шаг 1):
+
+<CodeExample output={`68.0
+property
+True`}>
+
+```python
+class Temperature:
+    def __init__(self, celsius):
+        self._celsius = celsius
+
+    @property
+    def fahrenheit(self):
+        return self._celsius * 9 / 5 + 32
+
+t = Temperature(20)
+t.__dict__["fahrenheit"] = 0     # подсовываем значение
+print(t.fahrenheit)              # property всё равно побеждает
+print(type(Temperature.__dict__["fahrenheit"]).__name__)
+print(hasattr(property, "__set__"))
+```
+
+</CodeExample>
+
+Именно этот приоритет и делает возможной валидацию: дескриптор данных видит **каждое** чтение и каждую запись, что бы ни лежало в `__dict__`.
+
+## Переиспользуемое поле с валидацией
+
+`property` проверяет один атрибут одного класса. Если десяти классам нужно «положительное число», копировать десять свойств мучительно. Класс-дескриптор — это **переиспользуемое свойство**. Дополнительный хук **`__set_name__`** (вызывается один раз, при создании класса) сообщает дескриптору, какому имени атрибута его присвоили:
+
+<CodeExample output={`3.5 4.0
+ValueError: price должно быть > 0, получено -1
+{'name': 'Tea', 'price': 3.5, 'stock': 10}`}>
+
+```python
+class Positive:
+    def __set_name__(self, owner, name):
+        self.name = name                 # например, "price"
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self                  # обращение через класс
+        return obj.__dict__[self.name]
+
+    def __set__(self, obj, value):
+        if value <= 0:
+            raise ValueError(f"{self.name} должно быть > 0, получено {value}")
+        obj.__dict__[self.name] = value
+
+class Product:
+    price = Positive()
+    stock = Positive()
+
+    def __init__(self, name, price, stock):
+        self.name = name
+        self.price = price               # проходит через __set__
+        self.stock = stock
+
+tea = Product("Tea", 3.5, 10)
+coffee = Product("Coffee", 4.0, 5)
+print(tea.price, coffee.price)
+
+try:
+    tea.price = -1
+except ValueError as error:
+    print("ValueError:", error)
+print(tea.__dict__)
+```
+
+</CodeExample>
+
+Три детали, которые отличают работающий дескриптор от бажного:
+
+- **Храните значение в экземпляре** (`obj.__dict__[self.name]`), а не в дескрипторе (`self.value = value`). Объект-дескриптор **один** на класс и общий для всех экземпляров: если хранить значение в нём, у всех товаров окажется одна цена.
+- Хранить значение под **тем же именем** в `obj.__dict__` безопасно, потому что дескриптор данных побеждает словарь экземпляра (шаг 1), так что чтение всё равно идёт через `__get__`.
+- Возвращайте **`self`**, когда `obj is None`, чтобы `Product.price` отдавал сам дескриптор (на это полагаются инструменты и генераторы документации).
+
+Так, в миниатюре, устроены столбцы ORM (`mapped_column`), поля Pydantic и поля моделей Django.
+
+## __init_subclass__: хуки для подклассов
+
+Часто базовому классу нужно **реагировать, когда от него наследуются**: зарегистрировать подкласс, проверить его или настроить. Начиная с Python 3.6 это делается обычным хуком-методом класса **`__init_subclass__`**, который выполняется при каждом создании подкласса. Ему передаются именованные аргументы из строки `class`. Классическое применение — **реестр плагинов** (plugin registry):
+
+<CodeExample output={`['csv', 'tsv']
+id,name
+1,Mei`}>
+
+```python
+class Exporter:
+    registry = {}
+
+    def __init_subclass__(cls, fmt, **kwargs):
+        super().__init_subclass__(**kwargs)
+        Exporter.registry[fmt] = cls
+
+    def export(self, rows):
+        raise NotImplementedError
+
+class CsvExporter(Exporter, fmt="csv"):
+    def export(self, rows):
+        return "\n".join(",".join(r) for r in rows)
+
+class TsvExporter(Exporter, fmt="tsv"):
+    def export(self, rows):
+        return "\n".join("\t".join(r) for r in rows)
+
+print(sorted(Exporter.registry))
+exporter = Exporter.registry["csv"]()
+print(exporter.export([["id", "name"], ["1", "Mei"]]))
+```
+
+</CodeExample>
+
+Чтобы добавить экспорт в JSON, теперь достаточно одного нового класса — не нужно дописывать цепочку `if fmt == ...`. Всегда вызывайте `super().__init_subclass__(**kwargs)`, чтобы несколько базовых классов с хуками могли работать вместе.
+
+## Декораторы классов
+
+**Декоратор класса** (class decorator) — это функция, которая получает готовый класс и возвращает его (обычно тот же самый, но изменённый). Один такой вы используете каждый день: `@dataclass` читает аннотации и добавляет `__init__`, `__repr__` и `__eq__`. Свой пишется так же, как декораторы функций из [урока о декораторах](/learn/python/decorators):
+
+<CodeExample output={`User(name='Mei', role='admin')`}>
+
+```python
+import inspect
+
+def auto_repr(cls):
+    params = inspect.signature(cls.__init__).parameters
+    fields = list(params)[1:]          # пропускаем self
+
+    def __repr__(self):
+        args = ", ".join(
+            f"{f}={getattr(self, f)!r}" for f in fields
+        )
+        return f"{cls.__name__}({args})"
+
+    cls.__repr__ = __repr__
+    return cls
+
+@auto_repr
+class User:
+    def __init__(self, name, role):
+        self.name = name
+        self.role = role
+
+print(User("Mei", "admin"))
+```
+
+</CodeExample>
+
+Декоратор класса или `__init_subclass__`? Декоратор **подключается к каждому классу отдельно** и явно виден в определении. `__init_subclass__` применяется **автоматически ко всем подклассам** — как раз то, что нужно базовому классу фреймворка.
+
+## Метаклассы: класс класса
+
+В первом уроке этого модуля вы видели, что `type(int)` — это `type`. Классы — это объекты, а класс, который **создаёт классы**, называется **метаклассом** (metaclass). Метакласс по умолчанию — `type`, и его можно вызвать напрямую, чтобы создать класс во время выполнения: `type(name, bases, namespace)`. Инструкция `class` делает за вас ровно это:
+
+<CodeExample output={`Mei (Panda) 4
+<class 'type'> <class '__main__.Panda'>`}>
+
+```python
+def describe(self):
+    return f"{self.name} ({type(self).__name__})"
+
+Panda = type("Panda", (object,), {
+    "legs": 4,
+    "__init__": lambda self, name: setattr(self, "name", name),
+    "describe": describe,
+})
+
+mei = Panda("Mei")
+print(mei.describe(), mei.legs)
+print(type(Panda), type(mei))
+```
+
+</CodeExample>
+
+**Собственный метакласс** наследуется от `type` и переопределяет то, как создаются классы (обычно `__new__` или `__init__`). Вот метакласс, который отказывается создавать класс, если у публичного метода нет докстринга:
+
+<CodeExample output={`RequireDocs
+TypeError: Shipping.ship: нужен докстринг`}>
+
+```python
+class RequireDocs(type):
+    def __new__(mcls, name, bases, namespace):
+        for attr, value in namespace.items():
+            if callable(value) and not attr.startswith("_"):
+                if not value.__doc__:
+                    raise TypeError(f"{name}.{attr}: нужен докстринг")
+        return super().__new__(mcls, name, bases, namespace)
+
+class Service(metaclass=RequireDocs):
+    pass
+
+class Billing(Service):
+    def charge(self, amount):
+        """Списать деньги с клиента."""
+        return amount
+
+print(type(Billing).__name__)
+
+try:
+    class Shipping(Service):
+        def ship(self, parcel):
+            return parcel
+except TypeError as error:
+    print("TypeError:", error)
+```
+
+</CodeExample>
+
+Проверка выполняется **в момент создания класса**, то есть при импорте модуля, а не когда кто-то вызывает метод. Подклассы наследуют метакласс, поэтому `Billing` и `Shipping` тоже проверяются.
+
+Метаклассами вы пользовались всё это время: `enum.Enum` использует `EnumType` (поэтому по классу перечисления можно итерироваться, а `Color(1)` находит элемент), `abc.ABC` использует `ABCMeta` (он не даёт создавать экземпляры классов, у которых не реализованы абстрактные методы), а у `BaseModel` из Pydantic и `DeclarativeBase` из SQLAlchemy есть свои.
+
+### Почему метакласс нужен редко
+
+Проверку докстрингов выше можно было бы написать пятистрочным `__init_subclass__`. Это общая закономерность: начиная с 3.6, `__init_subclass__` и `__set_name__` покрывают почти всё, для чего раньше требовался метакласс. А у метаклассов есть реальная цена:
+
+- **Конфликты**: у класса может быть только один метакласс. Наследование от двух базовых классов с разными метаклассами (скажем, ABC и модели Pydantic) выбрасывает `TypeError: metaclass conflict`, если только кто-нибудь не напишет объединённый метакласс.
+- **Неожиданность**: они меняют смысл инструкции `class`, причём далеко от кода, на который это влияет.
+- **Инструменты**: проверщики типов и IDE понимают декораторы и дескрипторы гораздо лучше, чем магию собственных метаклассов.
+
+<Callout type="tip" title="Берите самый маленький инструмент">
+
+Когда хочется настроить поведение классов, пробуйте варианты в таком порядке и остановитесь на первом, который сработает: обычная функция или композиция, **декоратор**, **дескриптор** (поведение отдельного атрибута), **`__init_subclass__`** (реакция на подклассы) и только потом **метакласс** (когда нужно изменить, как создаётся или ведёт себя сам объект класса, как это делает `Enum`). Большинство senior-инженеров пишут метакласс примерно раз в десять лет, и это нормально.
+
+</Callout>
+
+<Quiz
+  question="У класса есть свойство total. Кто-то пишет obj.__dict__['total'] = 0, а затем читает obj.total. Что он получит?"
+  options={[
+    "0, потому что словарь экземпляра проверяется первым",
+    "Вычисленное значение свойства, потому что дескриптор данных побеждает словарь экземпляра",
+    "AttributeError",
+    "Зависит от порядка, в котором были определены атрибуты",
+  ]}
+  answer={1}
+  explanation="property определяет и __get__, и __set__, поэтому это дескриптор данных. Дескрипторы данных в классе проверяются раньше __dict__ экземпляра, поэтому всегда используется свойство."
+/>
+
+<Quiz
+  question="__set__ дескриптора делает self.value = value, а __get__ возвращает self.value. Что пойдёт не так с двумя экземплярами класса a и b?"
+  options={[
+    "Ничего, у каждого экземпляра своё значение",
+    "Присваивание a.x изменит и b.x, потому что дескриптор один на весь класс",
+    "Возникнет RecursionError",
+    "Значение потеряется, когда метод вернёт управление",
+  ]}
+  answer={1}
+  explanation="Объект-дескриптор — это атрибут класса, он создаётся один раз. Если хранить значение в self (в дескрипторе), оно общее для всех экземпляров. Данные отдельного экземпляра храните в obj, например obj.__dict__[self.name]."
+/>
+
+<Exercise
+  language="python"
+  title="Соберите мини-слой моделей"
+  starter={`class Field:
+    def __init__(self, kind, minimum=None):
+        self.kind = kind
+        self.minimum = minimum
+
+    def __get__(self, obj, objtype=None):
+        return self.value
+
+    def __set__(self, obj, value):
+        self.value = value
+
+
+class Model:
+    registry = {}
+    fields = []
+
+    def __init__(self, **values):
+        for name, value in values.items():
+            setattr(self, name, value)
+
+
+class Product(Model):
+    name = Field(str)
+    price = Field(float, minimum=0)
+    stock = Field(int, minimum=0)
+
+
+tea = Product(name="Tea", price=3.5, stock=10)
+mug = Product(name="Mug", price=8.0, stock=2)
+print(tea.name, tea.price, mug.name, mug.price)
+print(Product.fields, Model.registry)
+`}
+  tests={[
+    { name: "У каждого экземпляра свои значения", check: "(a := Product(name='A', price=1.0, stock=1)) is not None and (b := Product(name='B', price=2.0, stock=2)) is not None and (a.name, a.price, a.stock, b.name, b.price, b.stock) == ('A', 1.0, 1, 'B', 2.0, 2)" },
+    { name: "Product.price возвращает Field, который знает своё имя", check: "isinstance(Product.price, Field) and Product.price.name == 'price'" },
+    { name: "Неверный тип выбрасывает TypeError с именем поля", check: "exec('try:\\n    Product(name=\"Tea\", price=\"cheap\", stock=1)\\n    _ok = False\\nexcept TypeError as e:\\n    _ok = \"price\" in str(e)') or _ok" },
+    { name: "Значение меньше минимума выбрасывает ValueError с именем поля", check: "exec('try:\\n    Product(name=\"Tea\", price=-1.0, stock=1)\\n    _ok = False\\nexcept ValueError as e:\\n    _ok = \"price\" in str(e)') or _ok" },
+    { name: "Отклонённое изменение сохраняет старое значение", check: "exec('_p = Product(name=\"Tea\", price=1.0, stock=1)\\ntry:\\n    _p.stock = -5\\n    _ok = False\\nexcept ValueError:\\n    _ok = _p.stock == 1') or _ok" },
+    { name: "Сам минимум разрешён", check: "Product(name='Free', price=0.0, stock=0).price == 0.0" },
+    { name: "Product.fields перечисляет поля по порядку, а Product зарегистрирован", check: "Product.fields == ['name', 'price', 'stock'] and Model.registry.get('Product') is Product" },
+    { name: "Работает для любого нового класса модели", check: "exec('class _Order(Model):\\n    total = Field(float, minimum=0)\\n    note = Field(str)') or (_Order.fields == ['total', 'note'] and Model.registry['_Order'] is _Order and _Order(total=2.5, note=\"hi\").total == 2.5 and Product.fields == ['name', 'price', 'stock'])" },
+  ]}
+>
+
+Соберите крошечный слой моделей — так, как это делают внутри ORM и Pydantic. Сначала запустите заготовку: `tea.name` печатает `Mug`, потому что дескриптор `Field` хранит значение не там, где нужно, а валидации и регистрации нет вовсе.
+
+1. **`Field`** — дескриптор данных:
+   - `__set_name__` запоминает имя атрибута.
+   - `__get__` возвращает сам `Field` при обращении через класс и собственное значение экземпляра в остальных случаях.
+   - `__set__` выбрасывает `TypeError`, если значение не является экземпляром `kind`, и `ValueError`, если задан `minimum` и значение меньше него. Оба сообщения должны содержать имя поля. Корректные значения хранятся **в каждом экземпляре отдельно**.
+2. **`Model`** получает `__init_subclass__`, который для каждого подкласса:
+   - записывает в `cls.fields` список имён его атрибутов-`Field` в порядке их определения;
+   - регистрирует класс в `Model.registry` под именем класса.
+
+Когда всё будет готово, демо из заготовки напечатает `Tea 3.5 Mug 8.0` и `['name', 'price', 'stock'] {'Product': <class '__main__.Product'>}`.
+
+<Hint>
+
+Сохраняйте значения через `obj.__dict__[self.name] = value` и читайте через `obj.__dict__[self.name]`; в `__get__` начните с `if obj is None: return self`. Тип проверяйте через `isinstance(value, self.kind)`, а минимум — через `self.minimum is not None and value < self.minimum`. В `__init_subclass__(cls, **kwargs)` вызовите `super().__init_subclass__(**kwargs)`, затем пройдите по `vars(cls).items()` (собственное пространство имён класса сохраняет порядок определения) и оставьте имена, значения которых удовлетворяют `isinstance(value, Field)`.
+
+</Hint>
+
+<Solution>
+
+```python
+class Field:
+    def __init__(self, kind, minimum=None):
+        self.kind = kind
+        self.minimum = minimum
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return obj.__dict__[self.name]
+
+    def __set__(self, obj, value):
+        if not isinstance(value, self.kind):
+            kind = self.kind.__name__
+            raise TypeError(f"{self.name} должно быть типа {kind}")
+        if self.minimum is not None and value < self.minimum:
+            raise ValueError(
+                f"{self.name} должно быть >= {self.minimum}"
+            )
+        obj.__dict__[self.name] = value
+
+
+class Model:
+    registry = {}
+    fields = []
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls.fields = [
+            name for name, value in vars(cls).items()
+            if isinstance(value, Field)
+        ]
+        Model.registry[cls.__name__] = cls
+
+    def __init__(self, **values):
+        for name, value in values.items():
+            setattr(self, name, value)
+
+
+class Product(Model):
+    name = Field(str)
+    price = Field(float, minimum=0)
+    stock = Field(int, minimum=0)
+
+
+tea = Product(name="Tea", price=3.5, stock=10)
+mug = Product(name="Mug", price=8.0, stock=2)
+print(tea.name, tea.price, mug.name, mug.price)
+print(Product.fields, Model.registry)
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- `obj.attr` проверяет по порядку: **дескрипторы данных** в классе, **`__dict__`** экземпляра, **дескрипторы не-данных** и обычные атрибуты класса, а затем **`__getattr__`** как запасной вариант.
+- **`__getattr__`** обрабатывает отсутствующие атрибуты (выбрасывайте `AttributeError`); **`__getattribute__`** перехватывает каждое обращение, и он редко того стоит.
+- **Дескриптор** — атрибут класса с `__get__`/`__set__`/`__delete__`. Функции — дескрипторы не-данных (так работают связанные методы и `self`); `property` — дескриптор данных.
+- Дескриптор поля с валидацией узнаёт своё имя через **`__set_name__`** и хранит значения **в экземпляре**, а не в себе.
+- **`__init_subclass__`** выполняется для каждого подкласса: идеально для реестров плагинов и базовых классов фреймворков. **Декораторы классов** вроде `@dataclass` явно изменяют один класс.
+- **Метакласс** — это класс класса (по умолчанию `type`); `type(name, bases, namespace)` создаёт классы во время выполнения. Их используют `Enum`, `ABC`, Pydantic и SQLAlchemy.
+- Берите метаклассы **в последнюю очередь**: декораторы, дескрипторы и `__init_subclass__` решают большинство задач с меньшим количеством сюрпризов.

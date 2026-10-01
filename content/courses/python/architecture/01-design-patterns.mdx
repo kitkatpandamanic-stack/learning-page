@@ -1,0 +1,488 @@
+---
+title: Design Patterns the Pythonic Way
+description: SOLID in Python terms, composition over inheritance, Protocols, and the strategy, registry, observer and adapter patterns, plus when patterns do more harm than good.
+duration: 22
+xp: 25
+---
+
+Somewhere around the 5,000-line mark, every codebase starts asking the same questions: *where does this new feature go? Why does changing the invoice code break the emails?* **Design patterns** are the names experienced developers give to answers that keep working. They're a shared vocabulary: say "make it a strategy" in a code review and everyone knows what you mean. 🧱
+
+There's a catch, though. Most pattern books were written for Java and C++, and copying them line by line into Python gives you a lot of classes that do nothing. In this lesson you'll learn the handful of patterns that really earn their keep in Python, in their **Pythonic** form, which is often just a function, a dict or a `Protocol`.
+
+## SOLID in Python terms
+
+**SOLID** is five design principles you'll hear about in every architecture discussion. Here is what each one means day to day in Python:
+
+| Principle | In one sentence | What it looks like in Python |
+| --- | --- | --- |
+| **S**ingle responsibility | A piece of code should have one reason to change | Small functions and classes; split "fetch, format and email the report" into three |
+| **O**pen/closed | Add behaviour by adding code, not by editing old code | A registry or a strategy instead of a growing `if/elif` chain |
+| **L**iskov substitution | A subclass must work wherever its parent works | Don't override a method just to raise `NotImplementedError` |
+| **I**nterface segregation | Don't force code to depend on methods it doesn't use | Small `Protocol`s with one or two methods |
+| **D**ependency inversion | Depend on abstractions, not on concrete details | Pass collaborators in, typed as a `Protocol` |
+
+Here's the classic single-responsibility smell. This class has **three** reasons to change: a new database, a new report layout, a new email provider:
+
+```python
+class ReportService:
+    def send_weekly_report(self, team_id):
+        rows = sqlite3.connect("app.db").execute(...)  # storage
+        html = "<table>" + ...                         # formatting
+        smtplib.SMTP("mail.example.com").sendmail(...) # delivery
+```
+
+Every change to one of them risks breaking the other two, and you can't test the formatting without a database and a mail server. The rest of this lesson (and this module) is about pulling those jobs apart and plugging them back together.
+
+<Callout type="note" title="Principles, not laws">
+
+SOLID is a set of smells to notice, not a checklist to satisfy. A 40-line script doesn't need dependency inversion. Ask "what is likely to change, and what would that change break?" and apply the principle that protects that spot.
+
+</Callout>
+
+## Composition over inheritance
+
+Inheritance says **"is a"**: a `Panda` is an `Animal`. It's the right tool for real "is a" relationships, but it's often used just to share code, and that gets messy fast. Imagine notifications that can go by email or SMS, in a polite or a shouting style. With inheritance you'd write `PoliteEmailNotifier`, `ShoutingEmailNotifier`, `PoliteSmsNotifier`, `ShoutingSmsNotifier`... and adding Slack makes six classes.
+
+**Composition** says **"has a"**: a notifier *has* a sender and *has* a formatter, and you combine them however you like:
+
+<CodeExample output={`email to mei: Hello! Lunch is ready. Thanks!
+SMS to sam: LUNCH IS READY!!!`}>
+
+```python
+class EmailSender:
+    def send(self, to, text):
+        return f"email to {to}: {text}"
+
+class SmsSender:
+    def send(self, to, text):
+        return f"SMS to {to}: {text}"
+
+class Polite:
+    def format(self, text):
+        return f"Hello! {text}. Thanks!"
+
+class Shouting:
+    def format(self, text):
+        return text.upper() + "!!!"
+
+class Notifier:
+    def __init__(self, sender, formatter):
+        self.sender = sender
+        self.formatter = formatter
+
+    def notify(self, to, text):
+        return self.sender.send(to, self.formatter.format(text))
+
+text = "Lunch is ready"
+print(Notifier(EmailSender(), Polite()).notify("mei", text))
+print(Notifier(SmsSender(), Shouting()).notify("sam", text))
+```
+
+</CodeExample>
+
+Two senders plus two formatters is four small classes and **any** combination. Adding Slack is one new class; nothing else changes (that's open/closed). And in a test you can hand `Notifier` a fake sender that just records messages.
+
+A good rule of thumb: inherit from **framework base classes** (`BaseModel`, `DeclarativeBase`, `Exception`) and for true "is a" relationships; use composition for everything else. Deep inheritance trees (four or more levels) are a classic sign that composition was the better choice.
+
+## Protocols: duck typing with type hints
+
+Notice that `Notifier` never checked that `sender` was an `EmailSender`. It just called `.send()`. That's **duck typing**: if it has a `send` method, it's a sender. `typing.Protocol` lets you write that idea down as a type, so editors and type checkers (mypy, pyright) can check it:
+
+<CodeExample output={`email to ops
+True
+False`}>
+
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Sender(Protocol):
+    def send(self, to: str, text: str) -> str: ...
+
+class EmailSender:              # no "(Sender)" anywhere!
+    def send(self, to: str, text: str) -> str:
+        return f"email to {to}"
+
+class Printer:
+    def print_page(self, text: str) -> str:
+        return "printing"
+
+def alert(sender: Sender, to: str) -> str:
+    return sender.send(to, "Server is down")
+
+print(alert(EmailSender(), "ops"))
+print(isinstance(EmailSender(), Sender))
+print(isinstance(Printer(), Sender))
+```
+
+</CodeExample>
+
+This is **structural typing**: a class matches a Protocol because of its *shape* (its methods), not because it inherits from anything. `EmailSender` doesn't even import `Sender`. That's what makes Protocols perfect for dependency inversion: your business code says "I need something with `send(to, text)`", and third-party classes, fakes and real implementations all fit without knowing about each other.
+
+- The `...` body means "no implementation here, this is just the shape".
+- `@runtime_checkable` allows `isinstance` checks, but they only check that the method **names** exist, not their arguments. The real checking happens in your type checker.
+- The alternative is `abc.ABC` with `@abstractmethod`: classes must **inherit** from it, and Python refuses to create objects that forget a method. You'll use that in the next lesson. Rule of thumb: Protocol when outside code should fit without changes, ABC when you own every implementation and want a hard error.
+
+## Strategy: functions are already strategies
+
+The **strategy pattern** means "make an algorithm swappable". In Java that's an interface plus one class per algorithm. In Python, functions are objects, so **a strategy is usually just a function**:
+
+<CodeExample output={`80
+56.0
+75 30
+40.0`}>
+
+```python
+from typing import Callable
+
+PriceRule = Callable[[float], float]
+
+def regular(total: float) -> float:
+    return total
+
+def black_friday(total: float) -> float:
+    return round(total * 0.7, 2)
+
+def loyalty(total: float) -> float:
+    return total - 5 if total >= 50 else total
+
+def checkout(total: float, rule: PriceRule = regular) -> float:
+    return rule(total)
+
+print(checkout(80))
+print(checkout(80, black_friday))
+print(checkout(80, loyalty), checkout(30, loyalty))
+print(checkout(80, lambda t: t / 2))
+```
+
+</CodeExample>
+
+`Callable[[float], float]` reads "a function that takes a float and returns a float". `checkout` doesn't contain a single `if` about promotions: the marketing team can invent a new one tomorrow and it's a new three-line function. You've already used this pattern without the name: `sorted(items, key=len)` takes a strategy for comparing items.
+
+Use a class (or a Protocol with several methods) when a strategy needs **settings or state**, like `PercentOff(20)`, or more than one operation. Otherwise, a function is simpler.
+
+## Factory and registry
+
+Sometimes the choice of strategy arrives as **data**: `"csv"` from a query string, `"stripe"` from a config file. A **factory** turns that name into the right object, and a **registry** lets each implementation sign itself up, usually with a decorator:
+
+<CodeExample output={`['csv', 'json']
+name,xp
+Mei,120
+Sam,80
+[{"name": "Mei", "xp": 120}]
+unknown format 'xml' (csv, json)`}>
+
+```python
+import json
+
+EXPORTERS = {}
+
+def exporter(name):
+    def register(func):
+        EXPORTERS[name] = func
+        return func
+    return register
+
+@exporter("json")
+def to_json(rows):
+    return json.dumps(rows)
+
+@exporter("csv")
+def to_csv(rows):
+    lines = [",".join(rows[0])]
+    lines += [",".join(str(v) for v in r.values()) for r in rows]
+    return "\n".join(lines)
+
+def make_exporter(name):
+    try:
+        return EXPORTERS[name]
+    except KeyError:
+        known = ", ".join(sorted(EXPORTERS))
+        raise ValueError(f"unknown format {name!r} ({known})")
+
+rows = [{"name": "Mei", "xp": 120}, {"name": "Sam", "xp": 80}]
+print(sorted(EXPORTERS))
+print(make_exporter("csv")(rows))
+print(make_exporter("json")(rows[:1]))
+try:
+    make_exporter("xml")
+except ValueError as error:
+    print(error)
+```
+
+</CodeExample>
+
+Compare that with the version every project starts with:
+
+```python
+def export(rows, name):
+    if name == "json":
+        ...
+    elif name == "csv":
+        ...
+    elif name == "xml":     # every new format edits this function
+        ...
+```
+
+With the registry, adding XML is a new decorated function, possibly in a new file, and `make_exporter` never changes. This is exactly how pytest plugins, FastAPI routes (`@app.get` registers a function) and Django's admin work. Two details matter: the decorator must **return** the function (or the name `to_csv` becomes `None`), and the factory gives a **helpful error** listing the valid names.
+
+## Observer: events instead of calls
+
+When a user signs up, you need to send a welcome email, add them to the newsletter and notify the sales team. If `sign_up()` calls all three, it knows about email, newsletters and sales, and every new "when X happens, also do Y" request edits it again. The **observer pattern** flips this: `sign_up()` just announces *"a user signed up"*, and anyone interested **subscribes**:
+
+<CodeExample output={`send welcome email to mei@example.com
+add mei@example.com to newsletter
+ship order 42`}>
+
+```python
+from collections import defaultdict
+from typing import Callable
+
+Handler = Callable[[dict], None]
+
+class EventBus:
+    def __init__(self):
+        self._handlers: dict[str, list[Handler]] = defaultdict(list)
+
+    def subscribe(self, event: str, handler: Handler) -> None:
+        self._handlers[event].append(handler)
+
+    def publish(self, event: str, data: dict) -> None:
+        for handler in self._handlers[event]:
+            handler(data)
+
+bus = EventBus()
+bus.subscribe("user_signed_up",
+              lambda d: print("send welcome email to", d["email"]))
+bus.subscribe("user_signed_up",
+              lambda d: print("add", d["email"], "to newsletter"))
+bus.subscribe("order_paid", lambda d: print("ship order", d["id"]))
+
+bus.publish("user_signed_up", {"email": "mei@example.com"})
+bus.publish("order_paid", {"id": 42})
+bus.publish("nobody_listens", {})
+```
+
+</CodeExample>
+
+The publisher doesn't know who is listening, or whether anyone is (`"nobody_listens"` is fine). At a larger scale the same idea becomes a message queue (RabbitMQ, Kafka, SQS) between services. The price is **indirection**: reading `publish(...)` no longer tells you what happens next, so keep event names in one place and don't use events for things that must happen in order inside one operation.
+
+<Callout type="warning" title="Exceptions in handlers">
+
+In this simple bus, if one handler raises, the handlers after it never run, and the error bubbles up into the code that published the event. Real event systems decide this on purpose: either log the error and carry on, or run handlers later in a background worker with retries. A failing newsletter service should never stop a user from signing up.
+
+</Callout>
+
+## Adapter: make it fit
+
+You've designed a clean `PaymentGateway` Protocol, and then the business picks a payment provider whose SDK uses different method names and euros instead of cents. Don't let that SDK leak into your code. Write an **adapter**: a small class that has *your* interface on the outside and calls *their* API on the inside:
+
+<CodeExample output={`ZP-mei-12.5`}>
+
+```python
+from typing import Protocol
+
+class PaymentGateway(Protocol):
+    def charge(self, cents: int, customer: str) -> str: ...
+
+# A third-party SDK we can't change: other names, other units
+class ZebraPayClient:
+    def make_payment(self, amount_eur: float, account_id: str):
+        return {"status": "ok", "ref": f"ZP-{account_id}-{amount_eur}"}
+
+class ZebraPayAdapter:
+    def __init__(self, client: ZebraPayClient):
+        self.client = client
+
+    def charge(self, cents: int, customer: str) -> str:
+        result = self.client.make_payment(cents / 100, customer)
+        if result["status"] != "ok":
+            raise RuntimeError("payment failed")
+        return result["ref"]
+
+def buy_bamboo(gateway: PaymentGateway) -> str:
+    return gateway.charge(1250, "mei")
+
+print(buy_bamboo(ZebraPayAdapter(ZebraPayClient())))
+```
+
+</CodeExample>
+
+All the ZebraPay knowledge (method name, euro conversion, how it reports errors) lives in one class. When the company switches providers, which happens more often than anyone plans for, you write one new adapter and `buy_bamboo` never notices. Adapters are also where you translate the vendor's exceptions into your own, so the rest of the code never has to `except ZebraPayTimeout`.
+
+## When patterns hurt
+
+Patterns solve problems. Without the problem, they're just extra layers. Some anti-patterns you'll meet in real code reviews:
+
+- **The one-implementation interface.** A `UserRepositoryInterface`, a `UserRepositoryImpl` and a `UserRepositoryFactory`, for one class that will never have a second version. Add the abstraction when the second implementation (or a test fake) actually appears.
+- **Java in Python.** `getName()` / `setName()` methods (use attributes, and `@property` if you later need logic), a class with only a `__call__` method (use a function), a `Singleton` class (a module is already a singleton: create the object once in a module and import it).
+- **Patterns as a goal.** "Let's use the visitor pattern here" in a planning meeting is a red flag. Start from the change you expect, then pick the smallest pattern that makes it easy.
+- **Speculative generality.** A plugin system for exporters when the product has one export button. YAGNI: *You Aren't Gonna Need It*. Refactoring later, with tests, is cheap; carrying unused flexibility forever is not.
+
+A team once replaced a 30-line function with an `AbstractExporterFactoryProvider` hierarchy "to be ready for new formats". Two years later there was still only CSV, and every new developer lost a day finding where the CSV code actually lived. Simple code you can change beats clever code you can't read.
+
+<Quiz
+  question="Which change best follows the open/closed principle for a function export(rows, name) with a long if/elif chain over format names?"
+  options={["Add another elif for each new format", "Register each format function in a dict with a decorator and look it up by name", "Make one subclass of a base Exporter class per format and keep the if/elif to pick between them", "Put all formats in one big class with a method per format"]}
+  answer={1}
+  explanation="With a registry, a new format is new code (a decorated function) and the lookup never changes. The other options all still require editing existing code whenever a format is added."
+/>
+
+<Quiz
+  question="EmailSender has a send(to, text) method but does not inherit from anything. A function is typed as alert(sender: Sender) where Sender is a Protocol with send(to, text). Is EmailSender a valid Sender?"
+  options={["No, it must inherit from Sender", "Yes, Protocols match by structure, so having a matching send method is enough", "Only if it is decorated with @runtime_checkable", "Only if Sender is also an abc.ABC"]}
+  answer={1}
+  explanation="That's structural typing: a class satisfies a Protocol when it has the right methods with compatible signatures. No inheritance or registration is needed. @runtime_checkable only adds isinstance support."
+/>
+
+<Exercise
+  language="python"
+  title="Pluggable shipping for a shop"
+  starter={`from dataclasses import dataclass
+from typing import Callable
+
+
+@dataclass
+class Order:
+    id: int
+    subtotal: float
+    weight_kg: float
+
+
+ShippingRule = Callable[[Order], float]
+SHIPPING: dict[str, ShippingRule] = {}
+
+
+# TODO 1: a decorator factory shipping(name) that registers
+#         a rule in SHIPPING under that name (and returns it)
+
+
+# TODO 2: three registered rules:
+#   "standard": 4.99, but free (0.0) when subtotal >= 50
+#   "express":  9.99 + 2 per kg, rounded to 2 decimals
+#   "pickup":   always 0.0
+
+
+# TODO 3: get_shipping(name) returns the rule, or raises
+#         ValueError("unknown shipping method: <name>")
+
+
+# TODO 4: class Checkout(shipping_rule)
+#   on_paid(listener)  remembers a listener
+#   pay(order)         total = subtotal + shipping, rounded
+#                      to 2 decimals; calls every listener
+#                      as listener(order, total), in order;
+#                      returns the total
+
+
+checkout = Checkout(get_shipping("express"))
+checkout.on_paid(lambda o, t: print(f"Order {o.id} paid: {t}"))
+checkout.pay(Order(1, 20.0, 1.5))
+`}
+  tests={[
+    { name: "The three rules are registered by name", check: "sorted(SHIPPING) == ['express', 'pickup', 'standard']" },
+    { name: "standard costs 4.99 and is free from 50", check: "get_shipping('standard')(Order(1, 20, 1)) == 4.99 and get_shipping('standard')(Order(2, 49.99, 1)) == 4.99 and get_shipping('standard')(Order(3, 50, 9)) == 0" },
+    { name: "express adds 2 per kg, pickup is free", check: "get_shipping('express')(Order(1, 20, 1.5)) == 12.99 and get_shipping('express')(Order(2, 99, 0.25)) == 10.49 and get_shipping('pickup')(Order(3, 5, 30)) == 0" },
+    { name: "Unknown names raise a helpful ValueError", check: "exec('try:\\n    get_shipping(\"drone\")\\n    _msg = None\\nexcept ValueError as e:\\n    _msg = str(e)') or _msg == 'unknown shipping method: drone'" },
+    { name: "New rules plug in with the decorator, which returns the rule", check: "(f := shipping('drone')(lambda o: 1.5)) is not None and get_shipping('drone')(Order(1, 1, 1)) == 1.5 and SHIPPING.pop('drone') is f" },
+    { name: "pay returns the rounded total", check: "Checkout(get_shipping('express')).pay(Order(7, 20.1, 1)) == 32.09 and Checkout(lambda o: 2.5).pay(Order(8, 10, 1)) == 12.5" },
+    { name: "pay notifies every listener in order", check: "(log := []) == [] and (c := Checkout(get_shipping('pickup'))) and c.on_paid(lambda o, t: log.append(('a', o.id, t))) is None and c.on_paid(lambda o, t: log.append(('b', o.id, t))) is None and c.pay(Order(5, 30, 2)) == 30 and log == [('a', 5, 30), ('b', 5, 30)]" },
+  ]}
+>
+
+Build the shipping part of an online shop so that the marketing team can add new shipping methods **without editing existing code**.
+
+1. A decorator factory `shipping(name)` that stores the decorated rule in `SHIPPING[name]` and **returns the rule**.
+2. Three registered rules, each a function taking an `Order` and returning the shipping cost: `"standard"` (4.99, free from a subtotal of 50), `"express"` (9.99 plus 2 per kg, rounded to 2 decimals) and `"pickup"` (always 0).
+3. A factory `get_shipping(name)` that returns the rule, or raises `ValueError("unknown shipping method: drone")` for an unknown name like `"drone"`.
+4. A class `Checkout` that receives any shipping rule (a strategy). `on_paid(listener)` subscribes an observer; `pay(order)` works out `subtotal + shipping` rounded to 2 decimals, calls every listener as `listener(order, total)` in the order they subscribed, and returns the total.
+
+When you press Run, you should see `Order 1 paid: 32.99`.
+
+<Hint>
+
+The decorator factory is the `exporter(name)` example from the lesson: an outer function taking `name`, an inner `register(rule)` that does `SHIPPING[name] = rule` and `return rule`. For express use `round(9.99 + 2 * order.weight_kg, 2)`. In `Checkout.__init__`, keep the rule and an empty list of listeners; `pay` loops over the list after computing `round(order.subtotal + self.shipping_rule(order), 2)`.
+
+</Hint>
+
+<Solution>
+
+```python
+from dataclasses import dataclass
+from typing import Callable
+
+
+@dataclass
+class Order:
+    id: int
+    subtotal: float
+    weight_kg: float
+
+
+ShippingRule = Callable[[Order], float]
+SHIPPING: dict[str, ShippingRule] = {}
+
+
+def shipping(name: str):
+    def register(rule: ShippingRule) -> ShippingRule:
+        SHIPPING[name] = rule
+        return rule
+    return register
+
+
+@shipping("standard")
+def standard(order: Order) -> float:
+    return 0.0 if order.subtotal >= 50 else 4.99
+
+
+@shipping("express")
+def express(order: Order) -> float:
+    return round(9.99 + 2 * order.weight_kg, 2)
+
+
+@shipping("pickup")
+def pickup(order: Order) -> float:
+    return 0.0
+
+
+def get_shipping(name: str) -> ShippingRule:
+    if name not in SHIPPING:
+        raise ValueError(f"unknown shipping method: {name}")
+    return SHIPPING[name]
+
+
+PaidListener = Callable[[Order, float], None]
+
+
+class Checkout:
+    def __init__(self, shipping_rule: ShippingRule):
+        self.shipping_rule = shipping_rule
+        self.listeners: list[PaidListener] = []
+
+    def on_paid(self, listener: PaidListener) -> None:
+        self.listeners.append(listener)
+
+    def pay(self, order: Order) -> float:
+        total = round(order.subtotal + self.shipping_rule(order), 2)
+        for listener in self.listeners:
+            listener(order, total)
+        return total
+
+
+checkout = Checkout(get_shipping("express"))
+checkout.on_paid(lambda o, t: print(f"Order {o.id} paid: {t}"))
+checkout.pay(Order(1, 20.0, 1.5))
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Patterns are a **shared vocabulary** for solutions that keep working; in Python they're often a function, a dict or a Protocol rather than a class hierarchy.
+- **SOLID**: one reason to change, extend by adding code, subclasses must really substitute, small interfaces, depend on abstractions. Use them as smells to notice, not rules to obey.
+- Prefer **composition** ("has a") over inheritance ("is a") for sharing behaviour; inherit from framework base classes and for true "is a" relationships.
+- **`typing.Protocol`** describes a shape; any class with matching methods fits (structural typing). `abc.ABC` requires inheritance and refuses incomplete classes.
+- **Strategy** = pass a function. **Factory/registry** = a decorator fills a dict, a factory looks names up with a helpful error. **Observer** = subscribe handlers, publish events. **Adapter** = wrap a third-party API behind your interface.
+- Patterns without a problem are just layers: add abstractions when the second implementation or the test fake actually appears.

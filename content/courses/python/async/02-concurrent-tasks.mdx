@@ -1,0 +1,408 @@
+---
+title: Running Tasks Concurrently
+description: Run many coroutines at once with gather, create_task and TaskGroup, handle results as they finish, limit concurrency with a Semaphore and share work through a Queue.
+duration: 18
+xp: 25
+---
+
+In the last lesson you learned that `await` lets the event loop run *something else* while a coroutine waits. But what is that something else? You have to give the loop several jobs at once. This lesson shows the tools for that, the same ones real scrapers, API clients and web servers use every day. 🚀
+
+All the examples pretend to download web pages with `asyncio.sleep()`, because there's no network here. In a real project, the sleep would be an `await client.get(url)`, and everything else would stay the same.
+
+## gather: run several and collect the results
+
+**`asyncio.gather()`** takes several coroutines, runs them concurrently and returns a **list of their results**:
+
+<CodeExample output={`Fetching home...
+Fetching about...
+Fetching blog...
+Got about
+Got blog
+Got home
+['<home.html>', '<about.html>', '<blog.html>']
+Faster than one by one: True`}>
+
+```python
+import asyncio
+import time
+
+async def fetch(page, seconds):
+    print(f"Fetching {page}...")
+    await asyncio.sleep(seconds)
+    print(f"Got {page}")
+    return f"<{page}.html>"
+
+async def main():
+    start = time.perf_counter()
+    pages = await asyncio.gather(
+        fetch("home", 0.15),
+        fetch("about", 0.05),
+        fetch("blog", 0.1),
+    )
+    elapsed = time.perf_counter() - start
+    print(pages)
+    print("Faster than one by one:", elapsed < 0.3)
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+The pages finish in a different order (about, blog, home), but the results list is always in the **same order as the arguments**. That makes it easy to match results to inputs.
+
+When you have a list of things, build the coroutines with a generator expression and unpack them with `*`:
+
+```python
+pages = ["home", "about", "blog"]
+results = await asyncio.gather(*(fetch(p, 0.1) for p in pages))
+```
+
+## create_task: start now, await later
+
+`gather` starts things and waits for them in one go. Sometimes you want to start a job **in the background**, carry on with other work, and only collect the result later. That's what **`asyncio.create_task()`** does: it wraps a coroutine in a **Task** and schedules it on the loop straight away.
+
+<CodeExample output={`Task created
+Fetching home...
+Doing other work while it downloads
+Got home
+<home.html>
+Done? True`}>
+
+```python
+import asyncio
+
+async def fetch(page, seconds):
+    print(f"Fetching {page}...")
+    await asyncio.sleep(seconds)
+    print(f"Got {page}")
+    return f"<{page}.html>"
+
+async def main():
+    task = asyncio.create_task(fetch("home", 0.05))
+    print("Task created")
+    await asyncio.sleep(0)     # give the loop a turn
+    print("Doing other work while it downloads")
+    page = await task          # now wait for the result
+    print(page)
+    print("Done?", task.done())
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Notice that "Task created" is printed **before** "Fetching home...". A new task doesn't run until the current coroutine reaches an `await` and gives the loop a turn. `await asyncio.sleep(0)` is a handy way to do exactly that.
+
+<Callout type="warning" title="Keep a reference to your tasks">
+
+The event loop only keeps a *weak* reference to tasks. If you write `asyncio.create_task(job())` without storing the result anywhere, Python may garbage-collect the task before it finishes! Always keep tasks in a variable or a list (or use a `TaskGroup`, below), and `await` them at some point so you also see their errors.
+
+</Callout>
+
+## TaskGroup: the modern way
+
+Since Python 3.11, **`asyncio.TaskGroup`** is the recommended way to run a bunch of tasks. You create tasks inside an `async with` block, and the block **doesn't finish until every task in it has finished**:
+
+<CodeExample output={`Both tasks started
+<home.html>
+<blog.html>`}>
+
+```python
+import asyncio
+
+async def fetch(page, seconds):
+    await asyncio.sleep(seconds)
+    return f"<{page}.html>"
+
+async def main():
+    async with asyncio.TaskGroup() as tg:
+        home = tg.create_task(fetch("home", 0.1))
+        blog = tg.create_task(fetch("blog", 0.05))
+        print("Both tasks started")
+    # here, every task in the group has finished
+    print(home.result())
+    print(blog.result())
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Why prefer it over loose `create_task` calls? The group keeps the references for you, you can't forget to wait for a task, and if one task **fails**, the group cancels the others and reports the error properly. You'll see that in the next lesson.
+
+After the block, read each result with **`task.result()`**.
+
+## as_completed: handle results as they arrive
+
+`gather` waits until **everything** is done. If you want to deal with each result **as soon as it's ready** (say, to show progress or to save pages one by one), loop over **`asyncio.as_completed()`**. It hands you the jobs in the order they finish:
+
+<CodeExample output={`Finished: <about.html>
+Finished: <blog.html>
+Finished: <home.html>`}>
+
+```python
+import asyncio
+
+async def fetch(page, seconds):
+    await asyncio.sleep(seconds)
+    return f"<{page}.html>"
+
+async def main():
+    tasks = [
+        asyncio.create_task(fetch("home", 0.15)),
+        asyncio.create_task(fetch("about", 0.05)),
+        asyncio.create_task(fetch("blog", 0.1)),
+    ]
+    for next_done in asyncio.as_completed(tasks):
+        page = await next_done
+        print("Finished:", page)
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Each item from `as_completed` is something to `await`, and awaiting it gives you the next result to arrive. The order depends on timing, so it's **not** the order of your list.
+
+## Limiting concurrency with a Semaphore
+
+Starting 10,000 downloads at once sounds fast, but the website will probably block you, and your computer may run out of network connections. Real programs set a **limit**: "at most N at a time".
+
+An **`asyncio.Semaphore(n)`** is a counter with `n` free slots. `async with semaphore:` takes a slot (or **waits** until one is free) and gives it back at the end of the block:
+
+<CodeExample output={`Start a.jpg (1 running)
+Start b.jpg (2 running)
+Done a.jpg
+Start c.jpg (2 running)
+Done b.jpg
+Start d.jpg (2 running)
+Done c.jpg
+Start e.jpg (2 running)
+Done e.jpg
+Done d.jpg
+['A.JPG', 'B.JPG', 'C.JPG', 'D.JPG', 'E.JPG']`}>
+
+```python
+import asyncio
+
+SECONDS = {"a.jpg": 0.08, "b.jpg": 0.12, "c.jpg": 0.06,
+           "d.jpg": 0.10, "e.jpg": 0.04}
+limit = asyncio.Semaphore(2)    # at most 2 at a time
+running = 0
+
+async def download(name):
+    global running
+    async with limit:           # wait for a free slot
+        running += 1
+        print(f"Start {name} ({running} running)")
+        await asyncio.sleep(SECONDS[name])
+        running -= 1
+        print(f"Done {name}")
+    return name.upper()
+
+async def main():
+    results = await asyncio.gather(
+        *(download(name) for name in SECONDS)
+    )
+    print(results)
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+All five downloads are started by `gather`, but only two get past `async with limit` at any moment. As soon as one finishes, the next waiting one starts. You still get all the results, in order.
+
+## Producer and consumer with a Queue
+
+Sometimes work arrives bit by bit: orders come into a restaurant, URLs are discovered while crawling, messages come in from users. The classic pattern is **producer/consumer**:
+
+- **producers** put jobs into an **`asyncio.Queue`** with `await queue.put(job)`;
+- a fixed number of **workers** (consumers) take jobs out with `await queue.get()`, one at a time, forever.
+
+<CodeExample output={`Ordered soup
+Ordered dumplings
+Mei cooks soup
+Bo cooks dumplings
+Ordered noodles
+Ordered tea
+Mei serves soup
+Mei cooks noodles
+Mei serves noodles
+Mei cooks tea
+Bo serves dumplings
+Mei serves tea
+Kitchen closed`}>
+
+```python
+import asyncio
+
+COOK_TIME = {"soup": 0.04, "dumplings": 0.1,
+             "noodles": 0.03, "tea": 0.05}
+
+async def waiter(queue):            # the producer
+    for dish in COOK_TIME:
+        await queue.put(dish)       # waits if the queue is full
+        print(f"Ordered {dish}")
+
+async def chef(name, queue):        # a consumer
+    while True:
+        dish = await queue.get()    # waits for an order
+        print(f"{name} cooks {dish}")
+        await asyncio.sleep(COOK_TIME[dish])
+        print(f"{name} serves {dish}")
+        queue.task_done()           # mark this order as finished
+
+async def main():
+    queue = asyncio.Queue(maxsize=2)
+    chefs = [
+        asyncio.create_task(chef("Mei", queue)),
+        asyncio.create_task(chef("Bo", queue)),
+    ]
+    await waiter(queue)
+    await queue.join()              # until every order is done
+    for task in chefs:
+        task.cancel()               # stop the endless workers
+    print("Kitchen closed")
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Follow the story in the output:
+
+1. The waiter puts two orders in. The queue has `maxsize=2`, so `put("noodles")` has to **wait** until a chef takes something out. This is called **backpressure**: a fast producer can't bury slow workers under a mountain of jobs.
+2. Two chefs means at most two dishes are cooked at once. Mei is quick with the soup, so she also takes the noodles and the tea.
+3. Every `get()` is matched by a `task_done()`. **`queue.join()`** waits until every job put in has been marked as done.
+4. The chefs loop forever, so at the end we **cancel** them. (More about cancelling in the next lesson.)
+
+<Callout type="tip" title="Which tool when?">
+
+- A fixed set of jobs, need all results: **`TaskGroup`** (or `gather`).
+- Start something now, collect it later: **`create_task`**, and keep the task!
+- Process results as they arrive: **`as_completed`**.
+- Too many jobs at once: **`Semaphore`**.
+- Jobs keep arriving, a fixed team of workers: **`Queue`**.
+
+</Callout>
+
+<Quiz
+  question="results = await asyncio.gather(fetch('a', 0.3), fetch('b', 0.1), fetch('c', 0.2)), where fetch returns its first argument. What is results?"
+  options={[
+    "['b', 'c', 'a'], the order they finished",
+    "['a', 'b', 'c'], the order of the arguments",
+    "Only 'b', the first one to finish",
+    "It depends on timing, so you can't know",
+  ]}
+  answer={1}
+  explanation="gather always returns results in the same order as the coroutines you passed in, no matter which one finished first. Use as_completed if you want them in finishing order."
+/>
+
+<Quiz
+  question="You start 10 downloads with gather, and each one runs inside async with sem: where sem = asyncio.Semaphore(3). What is the largest number of downloads running at the same moment?"
+  options={["1", "3", "7", "10"]}
+  answer={1}
+  explanation="All 10 coroutines start, but only 3 can hold a slot of the semaphore at once. The others wait at async with sem: until a slot is released."
+/>
+
+<Exercise
+  language="python"
+  title="A polite downloader"
+  starter={`import asyncio
+
+stats = {"running": 0, "peak": 0}
+
+async def fetch(url):
+    """Pretends to download a page and returns its size."""
+    stats["running"] += 1
+    stats["peak"] = max(stats["peak"], stats["running"])
+    await asyncio.sleep(0.02)
+    stats["running"] -= 1
+    return len(url) * 100
+
+async def fetch_all(urls, limit):
+    # Fetch every URL concurrently, but never more than
+    # \`limit\` at the same time. Return the sizes in the
+    # same order as urls.
+    pass
+
+async def main():
+    urls = ["panda.dev", "bamboo.org", "zoo.com",
+            "tea.io", "nap.net"]
+    sizes = await fetch_all(urls, 2)
+    print(sizes)
+    print("Peak:", stats["peak"])
+
+asyncio.run(main())
+`}
+  tests={[
+    { name: "main() prints the sizes in order", check: "__output[0] == '[900, 1000, 700, 600, 700]'" },
+    { name: "Results keep the order of the URLs", check: "asyncio.run(fetch_all(['ab', 'c', 'defg'], 2)) == [200, 100, 400]" },
+    { name: "An empty list gives an empty list", check: "list(asyncio.run(fetch_all([], 3))) == []" },
+    { name: "Never more than limit at once (limit 3)", check: "[stats.update(running=0, peak=0), asyncio.run(fetch_all(['x'] * 7, 3)), stats['peak']][2] <= 3" },
+    { name: "Really runs limit downloads at once (limit 3)", check: "[stats.update(running=0, peak=0), asyncio.run(fetch_all(['x'] * 7, 3)), stats['peak']][2] == 3" },
+    { name: "limit 1 means one at a time", check: "[stats.update(running=0, peak=0), asyncio.run(fetch_all(['x', 'yy', 'z'], 1))][1] == [100, 200, 100] and stats['peak'] == 1" },
+  ]}
+>
+
+Websites don't like it when you hammer them with hundreds of requests at once. Write `fetch_all(urls, limit)`:
+
+- It downloads every URL with the given `fetch(url)` coroutine (don't change `fetch`; it records how many downloads run at once in `stats`).
+- Downloads run **concurrently**, but never more than `limit` at the same time.
+- It returns the list of sizes in the **same order** as `urls`.
+
+For the URLs in `main()` with a limit of 2, it should print `[900, 1000, 700, 600, 700]` and `Peak: 2`.
+
+<Hint>
+
+Inside `fetch_all`, create `semaphore = asyncio.Semaphore(limit)`. Write a small inner coroutine `fetch_one(url)` that does `async with semaphore:` and then `return await fetch(url)`. Finally `return await asyncio.gather(*(fetch_one(url) for url in urls))`. `gather` keeps the order for you.
+
+</Hint>
+
+<Solution>
+
+```python
+import asyncio
+
+stats = {"running": 0, "peak": 0}
+
+async def fetch(url):
+    """Pretends to download a page and returns its size."""
+    stats["running"] += 1
+    stats["peak"] = max(stats["peak"], stats["running"])
+    await asyncio.sleep(0.02)
+    stats["running"] -= 1
+    return len(url) * 100
+
+async def fetch_all(urls, limit):
+    semaphore = asyncio.Semaphore(limit)
+
+    async def fetch_one(url):
+        async with semaphore:
+            return await fetch(url)
+
+    return await asyncio.gather(*(fetch_one(url) for url in urls))
+
+async def main():
+    urls = ["panda.dev", "bamboo.org", "zoo.com",
+            "tea.io", "nap.net"]
+    sizes = await fetch_all(urls, 2)
+    print(sizes)
+    print("Peak:", stats["peak"])
+
+asyncio.run(main())
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **`asyncio.gather(*coros)`** runs coroutines concurrently and returns their results **in argument order**.
+- **`asyncio.create_task(coro)`** starts a coroutine in the background; it runs once you `await` something. Keep a reference and `await` it later.
+- **`async with asyncio.TaskGroup() as tg:`** with `tg.create_task(...)` is the modern, safe way: the block waits for all its tasks; read them with `task.result()`.
+- **`asyncio.as_completed(tasks)`** gives you results in the order they **finish**.
+- **`asyncio.Semaphore(n)`** with `async with` limits how many jobs run at once.
+- **`asyncio.Queue`**: producers `put()`, workers `get()` and call `task_done()`; `queue.join()` waits for all jobs; cancel the workers at the end.

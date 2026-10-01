@@ -1,0 +1,422 @@
+---
+title: Profiling
+description: Measure before you optimise. Time code with timeit, find hot spots with cProfile and pstats, track memory with tracemalloc and spot Big-O problems.
+duration: 22
+xp: 25
+---
+
+Every experienced developer has a story like this one: a team spends a week rewriting a "slow" JSON parser in a faster library, ships it, and the page is exactly as slow as before. The real problem was a database query inside a loop, which nobody had measured. The first rule of performance work is short: **measure, don't guess**. 🔍
+
+This module is about making Python code fast. We start with the most important skill, which is finding out **where** the time and memory actually go.
+
+## Measure, don't guess
+
+Your intuition about what's slow is usually wrong, and so is everybody else's. Programs spend most of their time in a few small **hot spots**, often in places nobody suspects. So performance work always follows the same loop:
+
+1. **Reproduce** the slow case with realistic data.
+2. **Measure** it to get a baseline number.
+3. **Profile** to find the hot spot.
+4. **Fix** only that hot spot.
+5. **Measure again** to prove it helped, and run the tests to prove it still works.
+
+Python's standard library comes with three tools for this: **`timeit`** to time a small piece of code, **`cProfile`** to see which functions take the time, and **`tracemalloc`** to see which lines use the memory.
+
+## timeit: timing small pieces of code
+
+Timing code with two `time.perf_counter()` calls works, but it's noisy: one run can be slowed down by anything else your computer is doing. The **`timeit`** module runs the code **many times** and gives you the total in seconds:
+
+<CodeExample output={`float
+set is 50x+ faster: True`}>
+
+```python
+import timeit
+
+items = list(range(10_000))
+lookup = set(items)
+
+list_time = timeit.timeit(lambda: 9_999 in items, number=1_000)
+set_time = timeit.timeit(lambda: 9_999 in lookup, number=1_000)
+
+print(type(list_time).__name__)   # total seconds for 1,000 runs
+print("set is 50x+ faster:", list_time > 50 * set_time)
+```
+
+</CodeExample>
+
+We don't print the actual times here, because they change from run to run and from computer to computer. The **ratio** is what matters, and checking `in` on a set is hundreds of times faster than on a list of 10,000 items. Run it yourself and look at the real numbers:
+
+<TryIt language="python" code={`import timeit
+
+items = list(range(10_000))
+lookup = set(items)
+
+# repeat() runs the whole measurement several times
+list_runs = timeit.repeat(lambda: 9_999 in items,
+                          number=1_000, repeat=5)
+set_runs = timeit.repeat(lambda: 9_999 in lookup,
+                         number=1_000, repeat=5)
+
+# the fastest run is the least disturbed by other programs
+print(f"list: {min(list_runs) * 1000:.3f} ms per 1,000 lookups")
+print(f"set:  {min(set_runs) * 1000:.3f} ms per 1,000 lookups")
+print(f"set is {min(list_runs) / min(set_runs):.0f}x faster")
+`}
+/>
+
+Two habits of people who benchmark for a living:
+
+- Use **`timeit.repeat()`** and take the **minimum**. Slower runs were disturbed by something else; the minimum is closest to the true cost.
+- Time on the command line for quick experiments. `-s` is setup code that isn't timed:
+
+```bash
+python -m timeit -s "items = list(range(10_000))" "9_999 in items"
+# 5000 loops, best of 5: 52.1 usec per loop
+```
+
+## Big-O in practice
+
+`timeit` tells you **how long** something takes for one input. **Big-O** tells you how the time **grows** when the input grows, and that's what decides whether your code survives real data.
+
+Here are two ways to find the items two lists have in common. Instead of timing them, we count the steps, which shows the growth exactly:
+
+<CodeExample output={`n=   10: nested       100 steps, set    10 steps
+n=  100: nested    10,000 steps, set   100 steps
+n= 1000: nested 1,000,000 steps, set 1,000 steps`}>
+
+```python
+def common_nested(a, b):
+    steps, found = 0, []
+    for x in a:
+        for y in b:
+            steps += 1
+            if x == y:
+                found.append(x)
+    return found, steps
+
+def common_set(a, b):
+    steps, found = 0, []
+    lookup = set(b)
+    for x in a:
+        steps += 1
+        if x in lookup:
+            found.append(x)
+    return found, steps
+
+for n in [10, 100, 1_000]:
+    a = list(range(n))
+    b = list(range(n // 2, n + n // 2))
+    slow, nested = common_nested(a, b)
+    fast, flat = common_set(a, b)
+    assert slow == fast
+    print(f"n={n:>5}: nested {nested:>9,} steps, "
+          f"set {flat:>5,} steps")
+```
+
+</CodeExample>
+
+Both functions return the same answer. But the nested loop is **O(n²)** ("quadratic"): 10 times more data means **100 times** more work. The set version is **O(n)** ("linear"): 10 times more data, 10 times more work. With 1,000 items you won't notice; with 1,000,000 users, the nested loop needs a trillion steps.
+
+The everyday Big-O facts that cause most real slowdowns:
+
+| Operation                                 | Cost     |
+| ----------------------------------------- | -------- |
+| `x in list`, `list.index(x)`, `list.count(x)` | O(n)     |
+| `x in set`, `x in dict`, `d[key]`             | O(1)     |
+| `list.append(x)`, `list.pop()`                | O(1)     |
+| `list.insert(0, x)`, `list.pop(0)`            | O(n), use `collections.deque` |
+| `sorted(items)`                               | O(n log n) |
+| a loop inside a loop over the same data       | O(n²)    |
+
+<Callout type="tip" title="The hidden loop">
+
+The nastiest O(n²) bugs don't look like two loops. `if user in active_users:` inside a `for` loop is a loop in a loop when `active_users` is a list. So is `results = results + [x]` (it copies the whole list each time) and `emails[:i]` in a loop. When code gets slow as data grows, look for an `in`, a slice or a `.count()` on a list inside a loop.
+
+</Callout>
+
+## cProfile: where does the time go?
+
+For a whole program, timing pieces by hand doesn't scale. A **profiler** watches the program run and records every function call. Python ships with **`cProfile`**. You can wrap any call with `profiler.runcall(func, *args)` and then read the results with **`pstats`**:
+
+<CodeExample output={`best order: 9.6
+line  6: price_of     ncalls=700
+line  9: order_total  ncalls=300
+line 10: <genexpr>    ncalls=1000
+line 12: report       ncalls=1`}>
+
+```python
+import cProfile
+import pstats
+
+PRICES = {"tea": 2.5, "cake": 4.0, "bun": 3.2}
+
+def price_of(item):
+    return PRICES[item]
+
+def order_total(order):
+    return sum(price_of(item) for item in order)
+
+def report(orders):
+    totals = [order_total(order) for order in orders]
+    return round(max(totals), 2)
+
+orders = [["tea", "cake"], ["bun"] * 3, ["cake"] * 2] * 100
+
+profiler = cProfile.Profile()
+best = profiler.runcall(report, orders)
+print("best order:", best)
+
+profile = pstats.Stats(profiler).get_stats_profile()
+mine = [(name, fn) for name, fn in profile.func_profiles.items()
+        if fn.file_name != "~"]        # skip built-ins
+for name, fn in sorted(mine, key=lambda pair: pair[1].line_number):
+    print(f"line {fn.line_number:>2}: {name:<12} ncalls={fn.ncalls}")
+```
+
+</CodeExample>
+
+`get_stats_profile()` gives you the results as data: a dict from function name to a `FunctionProfile` with `ncalls`, `tottime`, `cumtime`, `file_name` and `line_number`. Built-in functions like `sum` have the file name `"~"`, which is why we skip them. The dict's order isn't meaningful, so we sort by line number.
+
+The counts are already useful: 300 orders, 700 items, so `price_of` ran 700 times. (A generator counts as "called" every time it resumes, which is why `<genexpr>` shows 1,000.) **Call counts that grow faster than your data** are the classic sign of an O(n²) bug.
+
+### Reading the profile table
+
+Most of the time you'll print the classic table instead, sorted by the column you care about. Press **Run** to profile a bigger version of the same program:
+
+<TryIt language="python" code={`import cProfile
+import pstats
+
+PRICES = {"tea": 2.5, "cake": 4.0, "bun": 3.2}
+
+def price_of(item):
+    return PRICES[item]
+
+def order_total(order):
+    return sum(price_of(item) for item in order)
+
+def report(orders):
+    totals = [order_total(order) for order in orders]
+    return round(max(totals), 2)
+
+orders = [["tea", "cake"], ["bun"] * 3, ["cake"] * 2] * 2_000
+
+profiler = cProfile.Profile()
+profiler.runcall(report, orders)
+
+stats = pstats.Stats(profiler)
+stats.sort_stats("cumulative").print_stats(6)
+# try sort_stats("tottime") as well
+`}
+/>
+
+You'll see something like this (your numbers will differ):
+
+```text
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.002    0.002    0.023    0.023 <lesson>:12(report)
+     6000    0.004    0.000    0.021    0.000 <lesson>:9(order_total)
+     6000    0.007    0.000    0.018    0.000 {built-in method builtins.sum}
+    20000    0.008    0.000    0.011    0.000 <lesson>:10(<genexpr>)
+    14000    0.003    0.000    0.003    0.000 <lesson>:6(price_of)
+```
+
+The columns:
+
+- **`ncalls`**: how many times the function was called. `51/1` means 51 calls in total, 1 of them not recursive.
+- **`tottime`**: time spent **inside this function itself**, not counting the functions it called. A high `tottime` means "the slow code is right here".
+- **`cumtime`**: **cumulative** time, including everything it called. `report` has the highest `cumtime` because everything happens inside it.
+- **`percall`**: the two `percall` columns are `tottime / ncalls` and `cumtime / ncalls`.
+
+How to read it: sort by **`cumtime`** to see which part of the program is slow (follow the chain from the top down), then sort by **`tottime`** to find the function where the work actually happens.
+
+For real programs you profile the whole script from the terminal, and many people like a visual view of the same data:
+
+```bash
+python -m cProfile -s cumtime app.py      # print sorted by cumtime
+python -m cProfile -o app.prof app.py     # save the results
+pip install snakeviz && snakeviz app.prof # explore them in a browser
+```
+
+<Callout type="warning" title="Profilers change what they measure">
+
+`cProfile` adds a little overhead to **every** call, so code with millions of tiny calls looks slower under the profiler than it is. Use it to find **where** the time goes, then confirm the fix with `timeit` or a plain timer without the profiler. For live production servers, use a **sampling profiler** such as `py-spy` (`py-spy top --pid 12345`), which peeks at the program a hundred times a second and barely slows it down.
+
+</Callout>
+
+## tracemalloc: where does the memory go?
+
+Slow is one problem; a server whose memory grows until it crashes is another. **`tracemalloc`** records which line allocated each block of memory. Take a **snapshot** before and after, and compare:
+
+<CodeExample output={`biggest growth at line 6
+new objects: True
+grew by more than 1 MB: True`}>
+
+```python
+import tracemalloc
+
+history = []
+
+def handle(request):
+    history.append(request * 100)    # never cleared!
+    return len(request)
+
+tracemalloc.start()
+before = tracemalloc.take_snapshot()
+for i in range(2_000):
+    handle(f"req-{i}")
+after = tracemalloc.take_snapshot()
+tracemalloc.stop()
+
+top = after.compare_to(before, "lineno")[0]
+frame = top.traceback[0]
+print("biggest growth at line", frame.lineno)
+print("new objects:", top.count_diff >= 2_000)
+print("grew by more than 1 MB:", top.size_diff > 1_000_000)
+```
+
+</CodeExample>
+
+`compare_to()` returns the differences sorted by size, biggest first, so `[0]` points straight at line 6: the `append` to a list that nobody ever empties. This is the most common "memory leak" in Python: not a real leak, just a list, dict or cache that keeps growing. Printing `top` itself shows a line like `app.py:6: size=1503 KiB (+1503 KiB), count=2001 (+2001)`.
+
+For a quick number, `tracemalloc.get_traced_memory()` returns `(current, peak)` in bytes. You'll use it in the next lesson to compare a list with a generator.
+
+## A profiling workflow
+
+Put together, this is how seniors approach "the app is slow":
+
+1. **Define slow.** "The report endpoint takes 4 s; it should take under 500 ms." Without a target you never know when to stop.
+2. **Reproduce with realistic data.** Ten test rows hide every O(n²) bug.
+3. **Profile, sort by `cumtime`**, and walk down to the hot spot. Check `ncalls`: is anything called far more often than you expected?
+4. **Fix the algorithm first** (a set instead of a list, a dict index instead of a search, one query instead of a query per row). That's where 10–1000× wins live. Micro-tricks give 10–30%.
+5. **Measure again** and keep the benchmark, ideally as a test, so the slowdown can't sneak back.
+
+<Quiz
+  question="In a cProfile table, the function load_page has cumtime 4.1 s but tottime 0.01 s. What does that tell you?"
+  options={[
+    "load_page itself is the slow code and should be rewritten",
+    "load_page is fast itself, almost all of its time is spent in the functions it calls",
+    "load_page was called 4.1 times per second",
+    "The profiler is broken, cumtime can never be bigger than tottime",
+  ]}
+  answer={1}
+  explanation="tottime only counts time spent in the function's own code, cumtime includes everything it calls. A big cumtime with a tiny tottime means you should look at what load_page calls, further down the chain."
+/>
+
+<Quiz
+  question="A function checks if name in banned for each of n new users, where banned is a list of n names. Roughly how much more work is it when n grows from 1,000 to 10,000?"
+  options={["The same", "About 10 times", "About 100 times", "About 1,000 times"]}
+  answer={2}
+  explanation="It's a hidden loop inside a loop: n checks, each scanning up to n names, so O(n squared). 10 times more data means about 100 times more work. Turning banned into a set makes each check O(1) and the whole thing O(n)."
+/>
+
+<Exercise
+  language="python"
+  title="Profile it, then fix it"
+  starter={`import cProfile
+import pstats
+
+def call_counts(func, *args):
+    """Run func(*args) under cProfile. Return a dict
+    {function name: ncalls} for your own functions only
+    (skip built-ins: their file_name is "~")."""
+    pass
+
+def normalise(email):
+    return email.strip().lower()
+
+def find_duplicates(emails):
+    """Each email that appears more than once (after
+    normalising), in the order the repeats are found."""
+    dupes = []
+    for i, email in enumerate(emails):
+        email = normalise(email)
+        earlier = [normalise(e) for e in emails[:i]]
+        if email in earlier and email not in dupes:
+            dupes.append(email)
+    return dupes
+
+emails = ["mei@panda.dev", "Bo@panda.dev", " MEI@panda.dev",
+          "kai@panda.dev", "bo@panda.dev "]
+print(find_duplicates(emails))
+print(call_counts(find_duplicates, emails))
+`}
+  tests={[
+    { name: "call_counts counts your functions", check: "call_counts(normalise, ' Hi ') == {'normalise': 1}" },
+    { name: "call_counts sees the outer function once", check: "call_counts(find_duplicates, ['a', 'b'])['find_duplicates'] == 1" },
+    { name: "Finds duplicates after normalising", check: "find_duplicates(['a@x.io', 'B@x.io', ' A@x.io', 'b@x.io ', 'c@x.io']) == ['a@x.io', 'b@x.io']" },
+    { name: "Keeps the order the repeats are found, each once", check: "find_duplicates(['z', 'y', 'y', 'z', 'z']) == ['y', 'z']" },
+    { name: "No duplicates gives an empty list", check: "find_duplicates(['solo@x.io']) == [] and find_duplicates([]) == []" },
+    { name: "normalise runs once per email (6 emails)", check: "call_counts(find_duplicates, ['q'] * 3 + ['r'] * 3)['normalise'] == 6" },
+    { name: "normalise runs once per email (40 emails)", check: "call_counts(find_duplicates, [f'u{i}' for i in range(40)])['normalise'] == 40" },
+    { name: "4,000 emails take well under 0.2 s", check: "__import__('timeit').timeit(lambda: find_duplicates([f'user{i % 3000}@x.io' for i in range(4_000)]), number=1) < 0.2" },
+  ]}
+>
+
+A sign-up import is far too slow on big files. Use the profiler to prove why, then fix it.
+
+1. Write **`call_counts(func, *args)`**: run `func(*args)` under `cProfile`, and return a dict `{function name: number of calls}` for your own functions (skip entries whose `file_name` is `"~"`). Return the counts as `int`s. For the five emails at the bottom, the starter version calls `normalise` 15 times for 5 emails!
+2. Rewrite **`find_duplicates`** so it's **O(n)**: `normalise` must run exactly once per email, and checking "have I seen this before?" must not scan a list. Keep the same results: each duplicated (normalised) email once, in the order the repeats are found.
+
+When it works, the bottom prints `['mei@panda.dev', 'bo@panda.dev']` and `{'normalise': 5, 'find_duplicates': 1}` (the order of the dict may differ).
+
+<Hint>
+
+For `call_counts`: `profiler = cProfile.Profile()`, `profiler.runcall(func, *args)`, then `pstats.Stats(profiler).get_stats_profile().func_profiles` is a dict of name → profile. Build `{name: int(fn.ncalls) for name, fn in ... .items() if fn.file_name != "~"}`.
+
+For `find_duplicates`: loop once. Normalise each email, then check a `seen` **set**. If it's already there and not reported yet, append it to `dupes` (keep a second set, `reported`, so each one is added only once). Then add it to `seen`.
+
+</Hint>
+
+<Solution>
+
+```python
+import cProfile
+import pstats
+
+def call_counts(func, *args):
+    """Run func(*args) under cProfile. Return a dict
+    {function name: ncalls} for your own functions only
+    (skip built-ins: their file_name is "~")."""
+    profiler = cProfile.Profile()
+    profiler.runcall(func, *args)
+    profile = pstats.Stats(profiler).get_stats_profile()
+    return {
+        name: int(fn.ncalls)
+        for name, fn in profile.func_profiles.items()
+        if fn.file_name != "~"
+    }
+
+def normalise(email):
+    return email.strip().lower()
+
+def find_duplicates(emails):
+    """Each email that appears more than once (after
+    normalising), in the order the repeats are found."""
+    seen = set()
+    reported = set()
+    dupes = []
+    for email in emails:
+        email = normalise(email)
+        if email in seen and email not in reported:
+            dupes.append(email)
+            reported.add(email)
+        seen.add(email)
+    return dupes
+
+emails = ["mei@panda.dev", "Bo@panda.dev", " MEI@panda.dev",
+          "kai@panda.dev", "bo@panda.dev "]
+print(find_duplicates(emails))
+print(call_counts(find_duplicates, emails))
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Measure, don't guess**: reproduce, measure, profile, fix the hot spot, measure again.
+- **`timeit.timeit()` / `timeit.repeat()`** time small snippets many times; take the minimum, and compare ratios, not absolute numbers.
+- **Big-O** describes how work grows: `in` on a list is O(n), on a set or dict O(1); a loop inside a loop is O(n²). Watch for hidden loops (`in`, slices, `.count()` on lists inside a loop).
+- **`cProfile`** + **`pstats`** show every function's **`ncalls`**, **`tottime`** (its own code) and **`cumtime`** (including callees). Sort by `cumtime` to find the slow area, by `tottime` to find the exact function.
+- **`tracemalloc`** snapshots and `compare_to()` point at the lines whose memory grows; most "leaks" are collections that never shrink.
+- Algorithm fixes beat micro-optimisations, and `py-spy` profiles production safely.

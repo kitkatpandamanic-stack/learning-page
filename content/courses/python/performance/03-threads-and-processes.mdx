@@ -1,0 +1,463 @@
+---
+title: Threads and Processes
+description: Concurrency vs parallelism, threads for I/O, race conditions and locks, processes for CPU work, the concurrent.futures API and how to choose between threads, processes and asyncio.
+duration: 25
+xp: 30
+---
+
+Two true stories. A team's API client called 200 partner endpoints one after another and took 40 seconds; ten threads brought it down to 2. Another team added threads to a nightly image-processing job and it got **no faster at all**: the work was pure computation, and the GIL let only one thread compute at a time. Switching to processes made it 7 times faster on an 8-core server. Same tool, opposite results. This lesson is about knowing which tool fits which job. 🧵
+
+<Callout type="note" title="This lesson's threads run on your machine">
+
+The in-browser runner has no threads or processes, so code that starts them is shown in plain blocks to try on your computer. The runnable examples use a trick from real test suites: an executor that runs jobs immediately. Because the `concurrent.futures` API is the same for all of them, the code you test here works unchanged with real threads and processes.
+
+</Callout>
+
+## Concurrency vs parallelism
+
+Two words that people mix up all the time:
+
+- **Concurrency** is *dealing with* many things at once: several jobs are in progress, and you switch between them while each one waits. A single chef with three pots on the stove is concurrent.
+- **Parallelism** is *doing* many things at the same instant, which needs several CPU cores. Three chefs, each stirring a pot, are parallel.
+
+Which one you need depends on what your code spends its time doing:
+
+- **I/O-bound** work mostly **waits**: for the network, a database, the disk. The CPU sits idle. Concurrency helps, because you can start other requests while one waits.
+- **CPU-bound** work keeps the processor busy: image resizing, parsing, maths, compression. Only parallelism helps, because there's no waiting to overlap.
+
+And then there's the **GIL** from the [memory and GIL lesson](/learn/python/memory-and-the-gil): in standard CPython only **one thread at a time** runs Python bytecode. But a thread **releases** the GIL while it waits for I/O (and inside many C libraries like numpy). So threads are great for I/O-bound work and nearly useless for CPU-bound pure Python. For CPU work, you use several **processes**, each with its own interpreter and its own GIL.
+
+## Threads for I/O
+
+The modern way to use threads is **`concurrent.futures.ThreadPoolExecutor`**: a pool of worker threads that run the jobs you hand them. On your machine:
+
+```python
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
+
+URLS = [f"https://httpbin.org/delay/1?page={i}" for i in range(10)]
+
+def fetch(url):
+    response = httpx.get(url, timeout=10)
+    return url, response.status_code
+
+start = time.perf_counter()
+with ThreadPoolExecutor(max_workers=10) as pool:
+    for url, status in pool.map(fetch, URLS):
+        print(status, url)
+print(f"{time.perf_counter() - start:.1f}s")  # ~1s, not ~10s
+```
+
+Each request waits about a second for the server. One after another, that's 10 seconds. With 10 threads, all ten wait **at the same time**, so the whole batch takes about one second. `pool.map` returns the results **in the order of the inputs**, just like `asyncio.gather`. The `with` block waits for all jobs to finish and then shuts the pool down.
+
+Underneath, the pool uses `threading.Thread`. You'll still see the low-level API in older code:
+
+```python
+import threading
+
+def greet(name):
+    print(f"hello from {name}")
+
+worker = threading.Thread(target=greet, args=("worker 1",))
+worker.start()   # runs greet in a new thread
+worker.join()    # wait for it to finish
+```
+
+Prefer the executor: it reuses threads, limits how many run at once, and hands you return values and exceptions, which a bare `Thread` simply loses.
+
+## Race conditions and locks
+
+Threads share memory, which is both their strength and their danger. The operating system can pause a thread **between any two bytecode instructions** and run another one. A line like `balance = balance - amount` is really three steps: read, subtract, write. If another thread sneaks in between, an update is lost. Let's play the operating system with two generators, pausing each "thread" after its read:
+
+<CodeExample output={`A reads 100
+B reads 100
+A writes 70
+B writes 50
+balance: 50 (should be 20)`}>
+
+```python
+balance = 100
+
+def withdraw(name, amount):
+    global balance
+    seen = balance                 # 1. read
+    yield f"{name} reads {seen}"
+    balance = seen - amount        # 2. write
+    yield f"{name} writes {balance}"
+
+# We play the operating system and switch "threads"
+# after every step: A, B, A, B.
+a = withdraw("A", 30)
+b = withdraw("B", 50)
+for thread in [a, b, a, b]:
+    print(next(thread))
+print("balance:", balance, "(should be 20)")
+```
+
+</CodeExample>
+
+Both withdrawals read 100, so A's withdrawal of 30 simply vanishes. This is a **race condition**: the result depends on the timing. With real threads it happens only now and then, maybe once in 10,000 runs, which makes it a nightmare to debug: the tests pass, and production loses money on a busy Friday. (Change the order to `[a, a, b, b]` and you get the right answer, 20.)
+
+The fix is a **lock** (a "mutex"): only one thread at a time can hold it, so the read and the write happen together. On your machine:
+
+```python
+import threading
+
+balance = 100
+lock = threading.Lock()
+
+def withdraw(amount):
+    global balance
+    with lock:                 # others wait here
+        if balance < amount:
+            return False
+        balance -= amount      # read + write, uninterrupted
+        return True
+```
+
+<Callout type="warning" title="The GIL does not protect your data">
+
+The GIL keeps Python's *own* internals safe, but it can switch threads between any two instructions of *your* code, so `counter += 1` from several threads can lose updates. And on the **free-threaded** build of Python 3.14 (`python3.14t`), threads truly run in parallel, so races become far more common. Any shared data that more than one thread **changes** needs a lock.
+
+</Callout>
+
+Locks bring their own bugs: forget one and you have a race; take two locks in different orders in two threads and they can wait for each other forever (a **deadlock**). So the best design is to **share nothing**: each job gets its inputs, **returns** its result, and only the main thread combines the results. When threads must hand work to each other, use **`queue.Queue`**, which does the locking for you.
+
+## Processes for CPU work
+
+For CPU-bound pure Python, use **`ProcessPoolExecutor`**: it starts worker **processes**, each a separate Python with its own GIL, so they really run in parallel on different cores. On your machine:
+
+```python
+import math
+from concurrent.futures import ProcessPoolExecutor
+
+def count_primes(start, stop):
+    return sum(
+        1 for n in range(max(start, 2), stop)
+        if all(n % d for d in range(2, math.isqrt(n) + 1))
+    )
+
+if __name__ == "__main__":
+    step = 250_000
+    starts = range(0, 2_000_000, step)
+    stops = range(step, 2_000_000 + step, step)
+    with ProcessPoolExecutor() as pool:     # one per CPU core
+        print(sum(pool.map(count_primes, starts, stops)))
+```
+
+Processes have rules that threads don't:
+
+- **The `if __name__ == "__main__":` guard is required.** On macOS and Windows (and by default on Linux since Python 3.14), each worker starts by importing your module. Without the guard, every worker would try to start its own pool.
+- **Everything sent to or from a worker is pickled** (turned into bytes and copied). Functions must be defined at module level (no lambdas or nested functions), and arguments and results must be picklable: no open files, database connections or locks.
+- **Overhead is real.** Starting a process takes tens of milliseconds, and copying data costs time too. Send a few **big chunks** of work, not a million tiny jobs: `pool.map(func, items, chunksize=1_000)` does the chunking for you. If each job takes microseconds, a pool makes things *slower*.
+- **No shared memory by default.** A global changed in a worker is changed only in that worker's copy. Return results instead.
+
+Two newer options are worth knowing. Python 3.14 added **`InterpreterPoolExecutor`**, which runs workers as **sub-interpreters**, each with its own GIL, inside one process: parallel like processes, but cheaper to start (not every C extension supports it yet). And the optional **free-threaded build** removes the GIL entirely, so plain threads can do CPU work in parallel. Both are promising; processes are still the safe default today.
+
+## The concurrent.futures API
+
+All the executors share one small API, and learning it once pays off everywhere:
+
+- **`executor.submit(fn, *args, **kwargs)`** schedules `fn(*args, **kwargs)` and immediately returns a **`Future`**: a placeholder for a result that will exist later.
+- **`future.result(timeout=None)`** waits for the result and returns it, or **re-raises** the exception the job raised. `future.exception()` returns the exception instead of raising it, `future.done()` says whether it has finished, and `future.cancel()` cancels a job that hasn't started.
+- **`executor.map(fn, items)`** is submit-for-each plus results in input order.
+- **`as_completed(futures)`** yields futures in the order they **finish**.
+
+`Executor` is an abstract base class: you only have to write `submit`, and you get `map` and the `with` statement for free. Here's a complete executor that runs each job immediately in the current thread. It's the same API, minus the threads:
+
+<CodeExample output={`True 49
+stored: ValueError("invalid literal for int() with base 10: 'panda'")
+result() raised ValueError
+[1, 4, 9, 16]`}>
+
+```python
+from concurrent.futures import Executor, Future
+
+class InlineExecutor(Executor):
+    """Runs each job right away, in the calling thread."""
+
+    def submit(self, fn, /, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as error:
+            future.set_exception(error)
+        return future
+
+def square(n):
+    return n * n
+
+with InlineExecutor() as pool:
+    job = pool.submit(square, 7)
+    print(job.done(), job.result())
+
+    bad = pool.submit(int, "panda")
+    print("stored:", repr(bad.exception()))
+    try:
+        bad.result()               # re-raises the error
+    except ValueError:
+        print("result() raised ValueError")
+
+    print(list(pool.map(square, [1, 2, 3, 4])))
+```
+
+</CodeExample>
+
+Notice that a failing job doesn't crash `submit`: the exception is **stored in the future** and raised only when you call `result()`. That's exactly how thread and process pools behave, and it's a classic bug source: if you never call `result()`, errors in background jobs disappear silently.
+
+### Inject the executor
+
+Here's the senior move: write your concurrent code so that it **receives** the executor as a parameter instead of creating one. Production passes a real pool; tests pass an `InlineExecutor`, so they're fast, deterministic and never flaky:
+
+<CodeExample output={`{'panda.dev': 9000, 'zoo.com': 7000}
+failed: ['broken.io']`}>
+
+```python
+from concurrent.futures import (Executor, Future,
+                                as_completed)
+
+class InlineExecutor(Executor):
+    def submit(self, fn, /, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as error:
+            future.set_exception(error)
+        return future
+
+def fetch_size(url):
+    """Pretend download: on your machine, real I/O."""
+    if "broken" in url:
+        raise ConnectionError(f"{url} is down")
+    return len(url) * 1_000
+
+def fetch_all(urls, executor):
+    futures = {executor.submit(fetch_size, url): url
+               for url in urls}
+    sizes, failed = {}, []
+    for future in as_completed(futures):
+        url = futures[future]
+        try:
+            sizes[url] = future.result()
+        except ConnectionError:
+            failed.append(url)
+    return sizes, failed
+
+urls = ["panda.dev", "broken.io", "zoo.com"]
+sizes, failed = fetch_all(urls, InlineExecutor())
+print(dict(sorted(sizes.items())))
+print("failed:", failed)
+```
+
+</CodeExample>
+
+The `{future: url}` dict is the standard idiom: `as_completed` hands you futures in finishing order, and the dict tells you which input each one belongs to. One failing URL doesn't stop the others. And in production, nothing changes but the argument:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor(max_workers=20) as pool:
+    sizes, failed = fetch_all(urls, pool)   # real threads
+```
+
+<Callout type="tip" title="Never test the finishing order">
+
+`as_completed` yields futures in whatever order they finish, and with real threads that changes from run to run. Even with `InlineExecutor`, where all futures are already done, the order isn't guaranteed. Collect results into a **dict keyed by input** (or sort them) so that your code and your tests don't depend on timing. That's why the example prints `dict(sorted(...))`.
+
+</Callout>
+
+Executors also connect to asyncio. Inside `async` code, **`await asyncio.to_thread(blocking_func, arg)`** runs a blocking call in a thread so the event loop stays responsive, and **`await loop.run_in_executor(process_pool, cpu_func, arg)`** sends CPU work to a process pool.
+
+## Threads, processes or asyncio?
+
+| Your situation | Reach for | Why |
+| --- | --- | --- |
+| Waiting on network/disk, up to a few hundred jobs, blocking libraries (requests, boto3, DB drivers) | `ThreadPoolExecutor` | Threads release the GIL while waiting; easy to add to existing code |
+| Thousands of connections, async libraries available (httpx, asyncpg, FastAPI) | `asyncio` | One thread, tasks are very cheap, explicit `await` points mean fewer races |
+| Heavy pure-Python computation | `ProcessPoolExecutor` (or `InterpreterPoolExecutor` on 3.14) | A separate GIL per worker, so all cores work |
+| Number crunching on arrays | numpy / pandas first | Vectorised C code is faster than any pool of Python loops |
+| An async app must call blocking code | `asyncio.to_thread` / `run_in_executor` | Keeps the event loop free |
+| Jobs that must survive restarts or run on other machines | A task queue (Celery, RQ, Arq) | Executors live and die with your process |
+
+And the rule above the table: **start sequential, measure, then add concurrency where the profile says you wait or compute**. Concurrent code is harder to read, test and debug, so it has to earn its place.
+
+<Quiz
+  question="A script resizes 10,000 photos with a pure-Python algorithm. It uses 100% of one CPU core on an 8-core laptop. What will most likely make it faster?"
+  options={[
+    "A ThreadPoolExecutor with 8 threads",
+    "A ProcessPoolExecutor, sending the photos in chunks",
+    "Rewriting it with asyncio and await",
+    "Adding a lock around the resize function",
+  ]}
+  answer={1}
+  explanation="The work is CPU-bound pure Python, so the GIL lets only one thread compute at a time and asyncio doesn't help either (there's no waiting to overlap). Separate processes each have their own GIL and can use all 8 cores. Sending chunks keeps the pickling overhead low."
+/>
+
+<Quiz
+  question="Four threads each run count += 1 a million times on a shared global, without a lock. What can the final value of count be?"
+  options={[
+    "Always exactly 4,000,000, because the GIL makes it safe",
+    "4,000,000 or sometimes less, because updates can be lost",
+    "Always exactly 1,000,000",
+    "It raises a RuntimeError",
+  ]}
+  answer={1}
+  explanation="count += 1 is a read, an add and a write. A thread can be paused between the read and the write, and another thread's update then gets overwritten. The GIL protects Python's internals, not your read-modify-write. Use a lock, or better, let each thread return its own count and add them up at the end."
+/>
+
+<Exercise
+  language="python"
+  title="A testable batch runner"
+  starter={`from concurrent.futures import Executor, Future, as_completed
+
+class InlineExecutor(Executor):
+    """Runs every job immediately. Perfect for tests."""
+
+    def __init__(self):
+        self.submitted = 0
+
+    def submit(self, fn, /, *args, **kwargs):
+        self.submitted += 1
+        # TODO: make a Future, run fn(*args, **kwargs),
+        # store the result OR the exception, return it.
+        pass
+
+def chunk_sum_squares(chunk):
+    """The CPU-heavy work for one chunk (don't change)."""
+    return sum(n * n for n in chunk)
+
+def sum_squares(numbers, executor, chunk_size):
+    """Split numbers into chunks of chunk_size, submit one
+    chunk_sum_squares job per chunk, add up the results."""
+    pass
+
+def run_batch(jobs, work, executor):
+    """Run work(job) for every job on the executor.
+    Return (results, errors), two dicts keyed by job:
+    results[job] = return value, errors[job] = str(error)."""
+    pass
+
+if __name__ == "__main__":
+    with InlineExecutor() as pool:
+        print(sum_squares(list(range(1, 6)), pool, 2))
+        results, errors = run_batch(["7", "x", "42"], int, pool)
+        print(sorted(results.items()))
+        print(errors)
+        print("jobs submitted:", pool.submitted)
+`}
+  tests={[
+    { name: "submit returns a Future with the result", check: "InlineExecutor().submit(pow, 2, 10).result() == 1024" },
+    { name: "submit passes keyword arguments", check: "InlineExecutor().submit(int, '101', base=2).result() == 5" },
+    { name: "Errors are stored in the Future, not raised", check: "[f := InlineExecutor().submit(int, 'panda'), f.done(), isinstance(f.exception(), ValueError)][1:] == [True, True]" },
+    { name: "map works through your submit", check: "list(InlineExecutor().map(abs, [-1, 2, -3])) == [1, 2, 3]" },
+    { name: "sum_squares adds up all chunks", check: "sum_squares(list(range(10)), InlineExecutor(), 3) == 285" },
+    { name: "sum_squares submits one job per chunk", check: "[ex := InlineExecutor(), sum_squares(list(range(10)), ex, 3), ex.submitted][2] == 4" },
+    { name: "sum_squares with bigger chunks", check: "[ex := InlineExecutor(), sum_squares(list(range(1, 101)), ex, 50), ex.submitted][1:] == [338350, 2]" },
+    { name: "sum_squares of nothing is 0", check: "sum_squares([], InlineExecutor(), 5) == 0" },
+    { name: "run_batch separates results and errors", check: `run_batch(['1', 'x', '3'], int, InlineExecutor()) == ({'1': 1, '3': 3}, {'x': "invalid literal for int() with base 10: 'x'"})` },
+    { name: "run_batch submits every job to the executor", check: "[ex := InlineExecutor(), run_batch(['a', 'b'], str.upper, ex), ex.submitted][1:] == [({'a': 'A', 'b': 'B'}, {}), 2]" },
+    { name: "run_batch with no jobs", check: "run_batch([], len, InlineExecutor()) == ({}, {})" },
+    { name: "The demo prints the expected lines", check: `__output[:2] == ['55', "[('42', 42), ('7', 7)]"] and __output[-1] == 'jobs submitted: 6'` },
+  ]}
+>
+
+Build a small batch runner that's tested here with an `InlineExecutor` and runs on real threads or processes in production.
+
+1. **`InlineExecutor.submit`**: create a `Future`, call `fn(*args, **kwargs)`, and store either its **result** (`set_result`) or the **exception** it raised (`set_exception`). Return the future. Keep the `self.submitted += 1` line: the checks use it to make sure your functions really go through the executor. (`map` and `with` then work automatically.)
+2. **`sum_squares(numbers, executor, chunk_size)`**: split `numbers` (a list) into chunks of `chunk_size`, **submit one `chunk_sum_squares` job per chunk**, and return the sum of all the results. This is how you'd feed a `ProcessPoolExecutor`: a few big jobs instead of one per number.
+3. **`run_batch(jobs, work, executor)`**: submit `work(job)` for every job and collect the outcome with `as_completed`. Return `(results, errors)`: `results[job]` is the return value of a job that worked, `errors[job]` is `str(exception)` for a job that raised. One failing job must not stop the others.
+
+When it works, the demo prints `55`, `[('42', 42), ('7', 7)]`, the error for `'x'` and `jobs submitted: 6`.
+
+<Hint>
+
+`submit`: `future = Future()`, then `try: future.set_result(fn(*args, **kwargs))` / `except Exception as error: future.set_exception(error)`, and `return future`.
+
+`sum_squares`: chunks are `numbers[i:i + chunk_size]` for `i in range(0, len(numbers), chunk_size)`. Submit each one with `executor.submit(chunk_sum_squares, chunk)`, keep the futures in a list and `return sum(f.result() for f in futures)`.
+
+`run_batch`: `futures = {executor.submit(work, job): job for job in jobs}`. Loop `for future in as_completed(futures):`, look up `job = futures[future]`, and put `future.result()` into `results[job]` inside a `try`, or `str(error)` into `errors[job]` in the `except Exception as error:` branch.
+
+</Hint>
+
+<Solution>
+
+```python
+from concurrent.futures import Executor, Future, as_completed
+
+class InlineExecutor(Executor):
+    """Runs every job immediately. Perfect for tests."""
+
+    def __init__(self):
+        self.submitted = 0
+
+    def submit(self, fn, /, *args, **kwargs):
+        self.submitted += 1
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as error:
+            future.set_exception(error)
+        return future
+
+def chunk_sum_squares(chunk):
+    """The CPU-heavy work for one chunk (don't change)."""
+    return sum(n * n for n in chunk)
+
+def sum_squares(numbers, executor, chunk_size):
+    """Split numbers into chunks of chunk_size, submit one
+    chunk_sum_squares job per chunk, add up the results."""
+    chunks = [numbers[i:i + chunk_size]
+              for i in range(0, len(numbers), chunk_size)]
+    futures = [executor.submit(chunk_sum_squares, chunk)
+               for chunk in chunks]
+    return sum(future.result() for future in futures)
+
+def run_batch(jobs, work, executor):
+    """Run work(job) for every job on the executor.
+    Return (results, errors), two dicts keyed by job:
+    results[job] = return value, errors[job] = str(error)."""
+    futures = {executor.submit(work, job): job for job in jobs}
+    results, errors = {}, {}
+    for future in as_completed(futures):
+        job = futures[future]
+        try:
+            results[job] = future.result()
+        except Exception as error:
+            errors[job] = str(error)
+    return results, errors
+
+if __name__ == "__main__":
+    with InlineExecutor() as pool:
+        print(sum_squares(list(range(1, 6)), pool, 2))
+        results, errors = run_batch(["7", "x", "42"], int, pool)
+        print(sorted(results.items()))
+        print(errors)
+        print("jobs submitted:", pool.submitted)
+```
+
+</Solution>
+
+</Exercise>
+
+On your machine, the same functions run in parallel by swapping the executor, with no other changes:
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+
+if __name__ == "__main__":
+    with ProcessPoolExecutor() as pool:
+        numbers = list(range(10_000_000))
+        print(sum_squares(numbers, pool, 1_000_000))
+```
+
+## Recap
+
+- **Concurrency** overlaps waiting; **parallelism** computes on several cores at once. First decide whether your work is **I/O-bound** or **CPU-bound**.
+- **Threads** (`ThreadPoolExecutor`) suit I/O: they release the GIL while waiting. They don't speed up CPU-bound pure Python.
+- Shared data that threads change needs a **`threading.Lock`**; better, share nothing: return results and combine them in one place, or use `queue.Queue`. The GIL doesn't prevent race conditions.
+- **Processes** (`ProcessPoolExecutor`) suit CPU work: one GIL each. They need the `__main__` guard, picklable module-level functions and data, and big chunks to beat the overhead. Python 3.14 adds `InterpreterPoolExecutor` and an optional free-threaded build.
+- **`concurrent.futures`**: `submit` → `Future` (`result()`, `exception()`, `done()`), `map` keeps input order, `as_completed` yields finishing order; errors stay in the future until you call `result()`.
+- **Inject the executor**: real pools in production, an `InlineExecutor` in tests for fast, deterministic checks.
+- Choose with the table: threads for blocking I/O, asyncio for many connections, processes for CPU, numpy for arrays, a task queue for durable jobs.

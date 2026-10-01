@@ -1,0 +1,415 @@
+---
+title: Тело запроса и валидация
+description: Принимайте JSON с помощью моделей Pydantic, задавайте правила через Field, возвращайте правильные коды ответа, вызывайте HTTPException(404) и управляйте ответами через response_model.
+duration: 18
+xp: 25
+---
+
+API — это дверь в вашу программу, и постучать в неё может кто угодно. Люди (и приложения с багами) пришлют количество `-5`, пустое имя, число там, где ожидается текст, или вовсе забудут какое-нибудь поле. Проверять всё это через `if` в каждом эндпоинте долго, скучно и легко ошибиться.
+
+FastAPI поручает эту работу **Pydantic**: вы описываете корректные данные в виде класса, и каждый запрос проверяется по этому описанию ещё до запуска вашего кода. На плохие данные автоматически приходит понятный ответ **422**. 🛡️
+
+## Модели Pydantic
+
+Модель Pydantic — это класс, который наследуется от `BaseModel` и перечисляет свои поля с аннотациями типов (type hints), во многом как `@dataclass`. Разница в том, что Pydantic **проверяет и преобразует** значения — это и есть **валидация (validation)**.
+
+<CodeExample output={`name='Mei' age=4 hungry=False
+5
+{'name': 'Mei', 'age': 4, 'hungry': False}
+1 ошибка
+Input should be a valid integer, unable to parse string as an integer`}>
+
+```python
+from pydantic import BaseModel, ValidationError
+
+class Panda(BaseModel):
+    name: str
+    age: int
+    hungry: bool = False
+
+mei = Panda(name="Mei", age="4")
+print(mei)
+print(mei.age + 1)
+print(mei.model_dump())
+
+try:
+    Panda(name="Bao", age="old")
+except ValidationError as error:
+    print(error.error_count(), "ошибка")
+    print(error.errors()[0]["msg"])
+```
+
+</CodeExample>
+
+Текст `"4"` превратился в целое число `4`, поэтому `mei.age + 1` работает. А `"old"` в число не превратить, поэтому Pydantic выбросил `ValidationError` с понятным (английским) сообщением. `model_dump()` превращает модель обратно в обычный словарь — это удобно, чтобы сохранить или вывести данные. Поля со значением по умолчанию (`hungry`) необязательны.
+
+## Тело запроса
+
+Если у эндпоинта есть параметр, тип которого — модель Pydantic, FastAPI читает его из **тела запроса (request body)**, то есть из JSON, который прислал клиент. В `TestClient` тело передаётся через `json=`:
+
+<CodeExample output={`200
+{'snack': 'бамбук', 'total': 6, 'note': None}`}>
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Order(BaseModel):
+    snack: str
+    quantity: int
+    note: str | None = None
+
+@app.post("/orders")
+def create_order(order: Order):
+    total = order.quantity * 2
+    return {"snack": order.snack, "total": total, "note": order.note}
+
+client = TestClient(app)
+response = client.post(
+    "/orders", json={"snack": "бамбук", "quantity": 3}
+)
+print(response.status_code)
+print(response.json())
+```
+
+</CodeExample>
+
+Внутри функции `order` — это настоящий объект `Order`: редактор подсказывает его поля, а `order.quantity` гарантированно имеет тип `int`. Теперь у FastAPI три источника данных:
+
+- имя в шаблоне пути (`{book_id}`) → **параметр пути**
+- простой тип (`int`, `str`, `bool`…), которого нет в пути → **параметр запроса**
+- модель Pydantic → **тело запроса**
+
+## Правила через Field
+
+Одних типов мало: количество `0` — корректный `int`, но некорректный заказ. `Field(...)` добавляет полю правила:
+
+<CodeExample output={`422
+['body', 'snack'] - String should have at least 2 characters
+['body', 'quantity'] - Input should be greater than 0
+{'detail': [{'type': 'missing', 'loc': ['body', 'snack'], 'msg': 'Field required', 'input': {'quantity': 3}}]}`}>
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+class Order(BaseModel):
+    snack: str = Field(min_length=2, max_length=30)
+    quantity: int = Field(gt=0, le=10)
+
+@app.post("/orders")
+def create_order(order: Order):
+    return order
+
+client = TestClient(app)
+response = client.post("/orders", json={"snack": "x", "quantity": 0})
+print(response.status_code)
+for error in response.json()["detail"]:
+    print(error["loc"], "-", error["msg"])
+
+response = client.post("/orders", json={"quantity": 3})
+print(response.json())
+```
+
+</CodeExample>
+
+Самые полезные правила:
+
+| Правило | Значение | Для чего |
+| --- | --- | --- |
+| `min_length=2`, `max_length=30` | ограничения длины | `str`, `list` |
+| `gt=0`, `ge=0` | больше / больше или равно | числа |
+| `lt=10`, `le=10` | меньше / меньше или равно | числа |
+| `default=...` | значение, если поле не передали | что угодно |
+
+Обратите внимание: возвращать можно и саму модель (`return order`), FastAPI превратит её в JSON.
+
+### Как читать ответ 422
+
+Посмотрите на последнюю строку вывода выше. В ответе 422 всегда есть список `detail` — **по одной записи на каждую проблему**, чтобы клиент мог показать все ошибки сразу:
+
+- `loc` говорит, **где** проблема: `['body', 'snack']` — это поле `snack` в теле запроса (для параметров вы увидите `'query'` или `'path'`).
+- `msg` — сообщение для человека, а `type` — короткий код (`missing`, `string_too_short`…), который удобно проверять в программе.
+- `input` показывает, что на самом деле пришло.
+
+<Callout type="tip" title="Не перепроверяйте то, что проверяет Pydantic">
+
+Новички часто добавляют внутри эндпоинта `if order.quantity <= 0:` «на всякий случай». Если правило записано в модели, ваша функция всегда получает только корректные данные, и такая проверка — мёртвый код. Держите правила в модели: они в одном месте, видны в `/docs` и действуют во всех эндпоинтах, которые используют эту модель.
+
+</Callout>
+
+## Коды ответа и HTTPException
+
+Для полноценного API не хватает ещё двух вещей: правильных кодов **успеха** и способа сказать **«не найдено»**.
+
+- `status_code=201` в декораторе: `POST`, который что-то создаёт, должен отвечать **201 Created**.
+- `status_code=204` для эндпоинта, который ничего не возвращает (типично для `DELETE`): у такого ответа нет тела.
+- `raise HTTPException(status_code=404, detail="...")` останавливает эндпоинт и отправляет клиенту эту ошибку.
+
+<CodeExample output={`201 {'id': 1, 'title': 'Дюна', 'pages': 412}
+{'id': 1, 'title': 'Дюна', 'pages': 412}
+204 ''
+404 {'detail': 'Book not found'}`}>
+
+```python
+from itertools import count
+
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+class BookIn(BaseModel):
+    title: str = Field(min_length=1)
+    pages: int = Field(gt=0)
+
+books = {}
+ids = count(1)   # 1, 2, 3, ...
+
+@app.post("/books", status_code=201)
+def create_book(book: BookIn):
+    book_id = next(ids)
+    books[book_id] = {"id": book_id, **book.model_dump()}
+    return books[book_id]
+
+@app.get("/books/{book_id}")
+def get_book(book_id: int):
+    if book_id not in books:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return books[book_id]
+
+@app.delete("/books/{book_id}", status_code=204)
+def delete_book(book_id: int):
+    if book_id not in books:
+        raise HTTPException(status_code=404, detail="Book not found")
+    del books[book_id]
+
+client = TestClient(app)
+response = client.post("/books", json={"title": "Дюна", "pages": 412})
+print(response.status_code, response.json())
+print(client.get("/books/1").json())
+
+response = client.delete("/books/1")
+print(response.status_code, repr(response.text))
+
+response = client.get("/books/1")
+print(response.status_code, response.json())
+```
+
+</CodeExample>
+
+`HTTPException` нужно **выбрасывать** (`raise`), а не возвращать. Выбросить её можно откуда угодно, даже из вспомогательной функции на несколько вызовов глубже, — этим вы воспользуетесь в следующем уроке. Обратите внимание и на `{"id": book_id, **book.model_dump()}`: `**` распаковывает словарь модели в новый словарь. Сообщения в `detail` мы пишем по-английски, как принято в большинстве API.
+
+<Callout type="warning" title="Не возвращайте 200 с ошибкой внутри">
+
+Типичный API новичка возвращает `{"error": "not found"}` с кодом **200**. Тогда клиентам приходится читать каждое тело, чтобы понять, получилось ли. Пользуйтесь кодами ответа: 404 — если чего-то нет, 422 — для плохих данных (это FastAPI сделает за вас), 201 — если создано, 204 — если удалено.
+
+</Callout>
+
+## response_model: что уходит наружу
+
+Валидация работает в обе стороны. `response_model=` сообщает FastAPI форму **ответа** и отфильтровывает всё остальное. Так вы гарантируете, что секреты никогда не утекут:
+
+<CodeExample output={`{'id': 1, 'username': 'mei'}
+{'id': 1, 'username': 'mei', 'password': 'bamboo123'}`}>
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+class UserIn(BaseModel):
+    username: str = Field(min_length=3)
+    password: str = Field(min_length=8)
+
+class UserOut(BaseModel):
+    id: int
+    username: str
+
+users = {}
+
+@app.post("/users", status_code=201, response_model=UserOut)
+def sign_up(user: UserIn):
+    user_id = len(users) + 1
+    users[user_id] = {"id": user_id, **user.model_dump()}
+    return users[user_id]   # здесь всё ещё есть пароль!
+
+client = TestClient(app)
+data = {"username": "mei", "password": "bamboo123"}
+print(client.post("/users", json=data).json())
+print(users[1])
+```
+
+</CodeExample>
+
+Функция вернула словарь **с** паролем, но клиент получил только `id` и `username`. Отдельные модели для **входа** и **выхода** (`UserIn` / `UserOut` или `TodoCreate` / `Todo`) — стандартный приём в реальных проектах на FastAPI. Модель ответа к тому же видна в `/docs`, так что клиенты точно знают, что получат.
+
+<Callout type="danger" title="Никогда не храните пароли открытым текстом">
+
+Чтобы пример был коротким, пароль здесь хранится как обычный текст. Настоящие приложения хранят только **хеш** пароля (с помощью библиотеки вроде `pwdlib` или `bcrypt`), так что даже утёкшая база данных его не раскроет.
+
+</Callout>
+
+## model_dump для частичных обновлений
+
+Ещё один трюк с `model_dump`, который понадобится для API списка дел. Чтобы изменить только **некоторые** поля (запрос `PATCH`), сделайте все поля необязательными, а затем выгрузите только те поля, которые клиент действительно прислал, с помощью `exclude_unset=True`:
+
+<CodeExample output={`{'title': None, 'done': True}
+{'done': True}
+{'id': 1, 'title': 'Купить бамбук', 'done': True}`}>
+
+```python
+from pydantic import BaseModel
+
+class TodoUpdate(BaseModel):
+    title: str | None = None
+    done: bool | None = None
+
+change = TodoUpdate(done=True)
+print(change.model_dump())
+print(change.model_dump(exclude_unset=True))
+
+todo = {"id": 1, "title": "Купить бамбук", "done": False}
+todo.update(change.model_dump(exclude_unset=True))
+print(todo)
+```
+
+</CodeExample>
+
+Без `exclude_unset=True` обновление затёрло бы название значением `None`. С ним меняется только `done`.
+
+<Quiz
+  question="Эндпоинт объявлен как def create(order: Order), где у Order есть quantity: int = Field(gt=0). Клиент присылает {'quantity': 0}. Что произойдёт?"
+  options={["Функция выполнится, и order.quantity будет равно 0", "FastAPI ответит 422, а функция так и не выполнится", "FastAPI ответит 400 Bad Request", "Сервер упадёт с ошибкой 500"]}
+  answer={1}
+  explanation="Правило gt=0 не выполняется, поэтому FastAPI отвечает 422 со списком detail, где описана проблема (loc ['body', 'quantity']). Ваша функция всегда видит только корректные данные."
+/>
+
+<Quiz
+  question="Эндпоинт возвращает словарь с id, username и password, а в декораторе указано response_model=UserOut, где у UserOut есть только id и username. Что получит клиент?"
+  options={["Все три поля", "Только id и username", "Ошибку 500, потому что в словаре лишний ключ", "Ошибку 422"]}
+  answer={1}
+  explanation="response_model отфильтровывает ответ до полей UserOut, поэтому пароль отбрасывается. Именно поэтому отдельные модели для входа и выхода — стандартный приём."
+/>
+
+<Exercise
+  language="python"
+  title="API регистрации"
+  starter={`from itertools import count
+
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+users = {}
+ids = count(1)
+
+class UserIn(BaseModel):
+    # TODO: добавьте правила через Field(...)
+    username: str
+    password: str
+    age: int
+
+class UserOut(BaseModel):
+    # TODO: поля, которые может видеть клиент
+    pass
+
+# TODO: POST /users -> 201 Created, ответ в виде UserOut
+
+# TODO: GET /users/{user_id} -> UserOut
+#       или 404 с detail "User not found"
+
+client = TestClient(app)
+data = {"username": "mei", "password": "bamboo123", "age": 14}
+response = client.post("/users", json=data)
+print(response.status_code, response.json())
+print(client.get("/users/42").json())
+`}
+  tests={[
+    { name: "Успешная регистрация возвращает 201 с id и username", check: "(r := TestClient(app).post('/users', json={'username': 'bao', 'password': 'secret-123', 'age': 20})).status_code == 201 and r.json()['username'] == 'bao' and isinstance(r.json()['id'], int)" },
+    { name: "В ответе никогда нет пароля", check: "set(TestClient(app).post('/users', json={'username': 'lin', 'password': 'secret-123', 'age': 30}).json()) == {'id', 'username'}" },
+    { name: "Каждый пользователь получает новый id", check: "TestClient(app).post('/users', json={'username': 'tao', 'password': 'secret-123', 'age': 30}).json()['id'] != TestClient(app).post('/users', json={'username': 'kai', 'password': 'secret-123', 'age': 30}).json()['id']" },
+    { name: "Длина username — от 3 до 20 символов", check: "TestClient(app).post('/users', json={'username': 'xy', 'password': 'secret-123', 'age': 20}).status_code == 422 and TestClient(app).post('/users', json={'username': 'x' * 21, 'password': 'secret-123', 'age': 20}).status_code == 422 and TestClient(app).post('/users', json={'username': 'x' * 20, 'password': 'secret-123', 'age': 20}).status_code == 201" },
+    { name: "Пароль — не короче 8 символов", check: "TestClient(app).post('/users', json={'username': 'ana', 'password': 'short12', 'age': 20}).status_code == 422" },
+    { name: "Возраст — не меньше 13", check: "TestClient(app).post('/users', json={'username': 'ana', 'password': 'secret-123', 'age': 12}).status_code == 422 and TestClient(app).post('/users', json={'username': 'ben', 'password': 'secret-123', 'age': 13}).status_code == 201" },
+    { name: "GET /users/{user_id} возвращает пользователя без пароля", check: "(c := TestClient(app)) and (u := c.post('/users', json={'username': 'zoe', 'password': 'secret-123', 'age': 16}).json()) and c.get('/users/' + str(u['id'])).json() == u" },
+    { name: "Неизвестный пользователь даёт 404 User not found", check: "(r := TestClient(app).get('/users/9999')).status_code == 404 and r.json() == {'detail': 'User not found'}" },
+  ]}
+>
+
+Создайте часть API, отвечающую за регистрацию. Пользователи хранятся в словаре `users` (id → словарь), а `next(ids)` выдаёт следующий id.
+
+- Правила `UserIn`: `username` — от 3 до 20 символов, `password` — не короче 8 символов, `age` — не меньше 13.
+- В `UserOut` есть только `id` (int) и `username` (str).
+- `POST /users` сохраняет пользователя с новым id и отвечает **201** с `UserOut` (никогда не с паролем!).
+- `GET /users/{user_id}` возвращает этого пользователя как `UserOut` или **404** с `detail` `"User not found"`.
+
+<Hint>
+
+Используйте `Field(min_length=3, max_length=20)`, `Field(min_length=8)` и `Field(ge=13)`. Добавьте `status_code=201, response_model=UserOut` в декоратор `@app.post` и `response_model=UserOut` в декоратор `@app.get`. Сохраняйте `{"id": user_id, **user.model_dump()}`. В эндпоинте GET проверьте `if user_id not in users:` и вызовите `raise HTTPException(status_code=404, detail="User not found")`.
+
+</Hint>
+
+<Solution>
+
+```python
+from itertools import count
+
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+users = {}
+ids = count(1)
+
+class UserIn(BaseModel):
+    username: str = Field(min_length=3, max_length=20)
+    password: str = Field(min_length=8)
+    age: int = Field(ge=13)
+
+class UserOut(BaseModel):
+    id: int
+    username: str
+
+@app.post("/users", status_code=201, response_model=UserOut)
+def sign_up(user: UserIn):
+    user_id = next(ids)
+    users[user_id] = {"id": user_id, **user.model_dump()}
+    return users[user_id]
+
+@app.get("/users/{user_id}", response_model=UserOut)
+def get_user(user_id: int):
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    return users[user_id]
+
+client = TestClient(app)
+data = {"username": "mei", "password": "bamboo123", "age": 14}
+response = client.post("/users", json=data)
+print(response.status_code, response.json())
+print(client.get("/users/42").json())
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Модель Pydantic** (`class X(BaseModel)`) описывает корректные данные: она преобразует значения и выбрасывает `ValidationError` для плохих. `model_dump()` возвращает обычный словарь.
+- Параметр эндпоинта с типом-моделью читается из **JSON-тела запроса**; отправляйте его через `client.post(url, json={...})`.
+- `Field(min_length=..., max_length=..., gt=..., ge=..., lt=..., le=...)` добавляет правила; на некорректные запросы приходит **422** со списком `detail` (`loc`, `msg`, `type`).
+- `status_code=201` — для создания, `status_code=204` — когда «возвращать нечего»; `raise HTTPException(status_code=404, detail=...)` — когда чего-то нет.
+- `response_model=` фильтрует и документирует ответ: используйте отдельные модели для входа и выхода, чтобы секреты не утекали.
+- `model_dump(exclude_unset=True)` оставляет только поля, которые прислал клиент, — идеально для обновлений через `PATCH`.

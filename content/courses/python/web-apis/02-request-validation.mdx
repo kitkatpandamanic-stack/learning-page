@@ -1,0 +1,415 @@
+---
+title: Request Bodies and Validation
+description: Receive JSON with Pydantic models, enforce rules with Field, return the right status codes, raise HTTPException(404) and control responses with response_model.
+duration: 18
+xp: 25
+---
+
+An API is a door to your program, and anyone can knock. People (and buggy apps) will send a quantity of `-5`, an empty name, a number where text should be, or forget a field completely. Checking all of that with `if` statements in every endpoint is long, boring and easy to get wrong.
+
+FastAPI hands the job to **Pydantic**: you describe what valid data looks like as a class, and every request is checked against it before your code runs. Bad data gets a clear **422** answer automatically. 🛡️
+
+## Pydantic models
+
+A Pydantic model is a class that inherits from `BaseModel` and lists its fields with type hints, a lot like a `@dataclass`. The difference: Pydantic **checks and converts** the values.
+
+<CodeExample output={`name='Mei' age=4 hungry=False
+5
+{'name': 'Mei', 'age': 4, 'hungry': False}
+1 error
+Input should be a valid integer, unable to parse string as an integer`}>
+
+```python
+from pydantic import BaseModel, ValidationError
+
+class Panda(BaseModel):
+    name: str
+    age: int
+    hungry: bool = False
+
+mei = Panda(name="Mei", age="4")
+print(mei)
+print(mei.age + 1)
+print(mei.model_dump())
+
+try:
+    Panda(name="Bao", age="old")
+except ValidationError as error:
+    print(error.error_count(), "error")
+    print(error.errors()[0]["msg"])
+```
+
+</CodeExample>
+
+The text `"4"` was converted to the integer `4`, so `mei.age + 1` works. `"old"` can't become an integer, so Pydantic raised a `ValidationError` with a readable message. `model_dump()` turns the model back into a plain dict, handy for storing or printing. Fields with a default (`hungry`) are optional.
+
+## Request bodies
+
+When an endpoint has a parameter whose type is a Pydantic model, FastAPI reads it from the **request body** (the JSON the client sends). With `TestClient`, pass the body as `json=`:
+
+<CodeExample output={`200
+{'snack': 'bamboo', 'total': 6, 'note': None}`}>
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Order(BaseModel):
+    snack: str
+    quantity: int
+    note: str | None = None
+
+@app.post("/orders")
+def create_order(order: Order):
+    total = order.quantity * 2
+    return {"snack": order.snack, "total": total, "note": order.note}
+
+client = TestClient(app)
+response = client.post(
+    "/orders", json={"snack": "bamboo", "quantity": 3}
+)
+print(response.status_code)
+print(response.json())
+```
+
+</CodeExample>
+
+Inside the function, `order` is a real `Order` object: you get autocompletion in your editor and `order.quantity` is guaranteed to be an `int`. So FastAPI now has three places to get data from:
+
+- in the path pattern (`{book_id}`) → **path parameter**
+- a simple type (`int`, `str`, `bool`…) not in the path → **query parameter**
+- a Pydantic model → **request body**
+
+## Rules with Field
+
+Types alone aren't enough: a quantity of `0` is a valid `int`, but not a valid order. `Field(...)` adds rules to a field:
+
+<CodeExample output={`422
+['body', 'snack'] - String should have at least 2 characters
+['body', 'quantity'] - Input should be greater than 0
+{'detail': [{'type': 'missing', 'loc': ['body', 'snack'], 'msg': 'Field required', 'input': {'quantity': 3}}]}`}>
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+class Order(BaseModel):
+    snack: str = Field(min_length=2, max_length=30)
+    quantity: int = Field(gt=0, le=10)
+
+@app.post("/orders")
+def create_order(order: Order):
+    return order
+
+client = TestClient(app)
+response = client.post("/orders", json={"snack": "x", "quantity": 0})
+print(response.status_code)
+for error in response.json()["detail"]:
+    print(error["loc"], "-", error["msg"])
+
+response = client.post("/orders", json={"quantity": 3})
+print(response.json())
+```
+
+</CodeExample>
+
+The most useful rules:
+
+| Rule | Meaning | Works on |
+| --- | --- | --- |
+| `min_length=2`, `max_length=30` | length limits | `str`, `list` |
+| `gt=0`, `ge=0` | greater than / greater or equal | numbers |
+| `lt=10`, `le=10` | less than / less or equal | numbers |
+| `default=...` | value when the field is missing | anything |
+
+Notice you can return a model (`return order`) and FastAPI turns it into JSON.
+
+### Reading a 422 response
+
+Look at the last line of the output above. A 422 response always has a `detail` list with **one entry per problem**, so a client can show every mistake at once:
+
+- `loc` says **where** the problem is: `['body', 'snack']` means the `snack` field of the body (you'd see `'query'` or `'path'` for parameters).
+- `msg` is a human-readable message, and `type` is a short code (`missing`, `string_too_short`…) that programs can check.
+- `input` shows what was actually received.
+
+<Callout type="tip" title="Don't re-check what Pydantic checks">
+
+Beginners often add `if order.quantity <= 0:` inside the endpoint "to be safe". If the rule is in the model, your function only ever runs with valid data, so the extra check is dead code. Put the rules in the model: they're in one place, they appear in `/docs`, and every endpoint using the model gets them.
+
+</Callout>
+
+## Status codes and HTTPException
+
+Two things are still missing for a proper API: the right **success** codes, and a way to say **"not found"**.
+
+- `status_code=201` on the decorator: a `POST` that creates something should answer **201 Created**.
+- `status_code=204` for an endpoint that returns nothing (typical for `DELETE`): the response has no body.
+- `raise HTTPException(status_code=404, detail="...")` stops the endpoint and sends that error to the client.
+
+<CodeExample output={`201 {'id': 1, 'title': 'Dune', 'pages': 412}
+{'id': 1, 'title': 'Dune', 'pages': 412}
+204 ''
+404 {'detail': 'Book not found'}`}>
+
+```python
+from itertools import count
+
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+class BookIn(BaseModel):
+    title: str = Field(min_length=1)
+    pages: int = Field(gt=0)
+
+books = {}
+ids = count(1)   # 1, 2, 3, ...
+
+@app.post("/books", status_code=201)
+def create_book(book: BookIn):
+    book_id = next(ids)
+    books[book_id] = {"id": book_id, **book.model_dump()}
+    return books[book_id]
+
+@app.get("/books/{book_id}")
+def get_book(book_id: int):
+    if book_id not in books:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return books[book_id]
+
+@app.delete("/books/{book_id}", status_code=204)
+def delete_book(book_id: int):
+    if book_id not in books:
+        raise HTTPException(status_code=404, detail="Book not found")
+    del books[book_id]
+
+client = TestClient(app)
+response = client.post("/books", json={"title": "Dune", "pages": 412})
+print(response.status_code, response.json())
+print(client.get("/books/1").json())
+
+response = client.delete("/books/1")
+print(response.status_code, repr(response.text))
+
+response = client.get("/books/1")
+print(response.status_code, response.json())
+```
+
+</CodeExample>
+
+You **raise** `HTTPException`, you don't return it. Raising works from anywhere, even from a helper function several calls deep, which you'll use in the next lesson. Also notice `{"id": book_id, **book.model_dump()}`: `**` unpacks the model's dict into the new one.
+
+<Callout type="warning" title="Don't return 200 with an error inside">
+
+A common beginner API returns `{"error": "not found"}` with status **200**. Clients then have to read every body to find out whether things worked. Use the status code: 404 for missing things, 422 for bad data (FastAPI does that one for you), 201 for created, 204 for deleted.
+
+</Callout>
+
+## response_model: control what goes out
+
+Validation works in both directions. `response_model=` tells FastAPI the shape of the **response**, and it filters out everything else. That's how you make sure secrets never leak:
+
+<CodeExample output={`{'id': 1, 'username': 'mei'}
+{'id': 1, 'username': 'mei', 'password': 'bamboo123'}`}>
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+class UserIn(BaseModel):
+    username: str = Field(min_length=3)
+    password: str = Field(min_length=8)
+
+class UserOut(BaseModel):
+    id: int
+    username: str
+
+users = {}
+
+@app.post("/users", status_code=201, response_model=UserOut)
+def sign_up(user: UserIn):
+    user_id = len(users) + 1
+    users[user_id] = {"id": user_id, **user.model_dump()}
+    return users[user_id]   # still contains the password!
+
+client = TestClient(app)
+data = {"username": "mei", "password": "bamboo123"}
+print(client.post("/users", json=data).json())
+print(users[1])
+```
+
+</CodeExample>
+
+The function returned a dict **with** the password, but the client only received `id` and `username`. Having separate **input** and **output** models (`UserIn` / `UserOut`, or `TodoCreate` / `Todo`) is a standard pattern in real FastAPI projects. The response model also shows up in `/docs`, so clients know exactly what they'll get back.
+
+<Callout type="danger" title="Never store plain passwords">
+
+This example keeps the password as plain text to stay short. Real apps store only a **hash** of the password (using a library such as `pwdlib` or `bcrypt`), so even a leaked database doesn't reveal it.
+
+</Callout>
+
+## model_dump for partial updates
+
+One more `model_dump` trick that you'll need for the To-do API. To change just **some** fields (a `PATCH` request), make every field optional, then dump only the fields the client actually sent with `exclude_unset=True`:
+
+<CodeExample output={`{'title': None, 'done': True}
+{'done': True}
+{'id': 1, 'title': 'Buy bamboo', 'done': True}`}>
+
+```python
+from pydantic import BaseModel
+
+class TodoUpdate(BaseModel):
+    title: str | None = None
+    done: bool | None = None
+
+change = TodoUpdate(done=True)
+print(change.model_dump())
+print(change.model_dump(exclude_unset=True))
+
+todo = {"id": 1, "title": "Buy bamboo", "done": False}
+todo.update(change.model_dump(exclude_unset=True))
+print(todo)
+```
+
+</CodeExample>
+
+Without `exclude_unset=True`, the update would wipe the title to `None`. With it, only `done` changes.
+
+<Quiz
+  question="An endpoint is def create(order: Order) where Order has quantity: int = Field(gt=0). A client sends {'quantity': 0}. What happens?"
+  options={["The function runs and order.quantity is 0", "FastAPI answers 422 and the function never runs", "FastAPI answers 400 Bad Request", "The server crashes with a 500 error"]}
+  answer={1}
+  explanation="The rule gt=0 fails, so FastAPI answers 422 with a detail list explaining the problem (loc ['body', 'quantity']). Your function only ever sees valid data."
+/>
+
+<Quiz
+  question="Your endpoint returns a dict with id, username and password, and the decorator has response_model=UserOut, where UserOut has only id and username. What does the client receive?"
+  options={["All three fields", "Only id and username", "A 500 error because the dict has an extra key", "A 422 error"]}
+  answer={1}
+  explanation="response_model filters the response down to the fields of UserOut, so the password is dropped. That's why separate input and output models are a standard pattern."
+/>
+
+<Exercise
+  language="python"
+  title="Sign-up API"
+  starter={`from itertools import count
+
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+users = {}
+ids = count(1)
+
+class UserIn(BaseModel):
+    # TODO: add rules with Field(...)
+    username: str
+    password: str
+    age: int
+
+class UserOut(BaseModel):
+    # TODO: the fields a client may see
+    pass
+
+# TODO: POST /users -> 201 Created, responds with UserOut
+
+# TODO: GET /users/{user_id} -> UserOut,
+#       or 404 with detail "User not found"
+
+client = TestClient(app)
+data = {"username": "mei", "password": "bamboo123", "age": 14}
+response = client.post("/users", json=data)
+print(response.status_code, response.json())
+print(client.get("/users/42").json())
+`}
+  tests={[
+    { name: "A valid sign-up returns 201 with id and username", check: "(r := TestClient(app).post('/users', json={'username': 'bao', 'password': 'secret-123', 'age': 20})).status_code == 201 and r.json()['username'] == 'bao' and isinstance(r.json()['id'], int)" },
+    { name: "The response never contains the password", check: "set(TestClient(app).post('/users', json={'username': 'lin', 'password': 'secret-123', 'age': 30}).json()) == {'id', 'username'}" },
+    { name: "Each user gets a new id", check: "TestClient(app).post('/users', json={'username': 'tao', 'password': 'secret-123', 'age': 30}).json()['id'] != TestClient(app).post('/users', json={'username': 'kai', 'password': 'secret-123', 'age': 30}).json()['id']" },
+    { name: "Username must be 3 to 20 characters", check: "TestClient(app).post('/users', json={'username': 'xy', 'password': 'secret-123', 'age': 20}).status_code == 422 and TestClient(app).post('/users', json={'username': 'x' * 21, 'password': 'secret-123', 'age': 20}).status_code == 422 and TestClient(app).post('/users', json={'username': 'x' * 20, 'password': 'secret-123', 'age': 20}).status_code == 201" },
+    { name: "Password must be at least 8 characters", check: "TestClient(app).post('/users', json={'username': 'ana', 'password': 'short12', 'age': 20}).status_code == 422" },
+    { name: "Age must be at least 13", check: "TestClient(app).post('/users', json={'username': 'ana', 'password': 'secret-123', 'age': 12}).status_code == 422 and TestClient(app).post('/users', json={'username': 'ben', 'password': 'secret-123', 'age': 13}).status_code == 201" },
+    { name: "GET /users/{user_id} returns the user without the password", check: "(c := TestClient(app)) and (u := c.post('/users', json={'username': 'zoe', 'password': 'secret-123', 'age': 16}).json()) and c.get('/users/' + str(u['id'])).json() == u" },
+    { name: "An unknown user gives 404 User not found", check: "(r := TestClient(app).get('/users/9999')).status_code == 404 and r.json() == {'detail': 'User not found'}" },
+  ]}
+>
+
+Build the sign-up part of an API. Users are stored in the `users` dict (id → dict), and `next(ids)` gives you the next id.
+
+- `UserIn` rules: `username` 3 to 20 characters, `password` at least 8 characters, `age` at least 13.
+- `UserOut` has only `id` (int) and `username` (str).
+- `POST /users` stores the user with a new id and answers **201** with a `UserOut` (never the password!).
+- `GET /users/{user_id}` answers with that user as a `UserOut`, or **404** with `detail` `"User not found"`.
+
+<Hint>
+
+Use `Field(min_length=3, max_length=20)`, `Field(min_length=8)` and `Field(ge=13)`. Put `status_code=201, response_model=UserOut` on the `@app.post` decorator and `response_model=UserOut` on the `@app.get` one. Store `{"id": user_id, **user.model_dump()}`. In the GET endpoint, check `if user_id not in users:` and `raise HTTPException(status_code=404, detail="User not found")`.
+
+</Hint>
+
+<Solution>
+
+```python
+from itertools import count
+
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+users = {}
+ids = count(1)
+
+class UserIn(BaseModel):
+    username: str = Field(min_length=3, max_length=20)
+    password: str = Field(min_length=8)
+    age: int = Field(ge=13)
+
+class UserOut(BaseModel):
+    id: int
+    username: str
+
+@app.post("/users", status_code=201, response_model=UserOut)
+def sign_up(user: UserIn):
+    user_id = next(ids)
+    users[user_id] = {"id": user_id, **user.model_dump()}
+    return users[user_id]
+
+@app.get("/users/{user_id}", response_model=UserOut)
+def get_user(user_id: int):
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    return users[user_id]
+
+client = TestClient(app)
+data = {"username": "mei", "password": "bamboo123", "age": 14}
+response = client.post("/users", json=data)
+print(response.status_code, response.json())
+print(client.get("/users/42").json())
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **Pydantic model** (`class X(BaseModel)`) describes valid data; it converts values and raises `ValidationError` for bad ones. `model_dump()` gives a plain dict.
+- An endpoint parameter typed as a model is read from the **JSON body**; send it with `client.post(url, json={...})`.
+- `Field(min_length=..., max_length=..., gt=..., ge=..., lt=..., le=...)` adds rules; invalid requests get **422** with a `detail` list (`loc`, `msg`, `type`).
+- `status_code=201` for creating, `status_code=204` for "nothing to return"; `raise HTTPException(status_code=404, detail=...)` for missing things.
+- `response_model=` filters and documents the response: use separate input and output models so secrets never leak.
+- `model_dump(exclude_unset=True)` keeps only the fields the client sent, perfect for `PATCH` updates.
