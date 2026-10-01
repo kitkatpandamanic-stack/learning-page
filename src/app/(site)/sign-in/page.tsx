@@ -8,7 +8,8 @@ import { Container } from "@/components/ui/container";
 import { GlassCard } from "@/components/ui/glass-card";
 import { GradientText } from "@/components/ui/gradient-text";
 import { enabledProviders } from "@/lib/auth-providers";
-import { getSession, safeReturnPath } from "@/lib/session";
+import { safeReturnPath } from "@/lib/return-path";
+import { getSession } from "@/lib/session";
 
 export const metadata: Metadata = {
   title: "Sign in",

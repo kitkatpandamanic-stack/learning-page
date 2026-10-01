@@ -23,8 +23,8 @@ languages = ["JavaScript", "Python", "TypeScript"]
 for language in languages:
     print(f"I'm learning {language}!")
 `,
-  typescript: `// TypeScript playground: type annotations are removed, then the code runs.
-// (Type errors are not reported yet.)
+  typescript: `// TypeScript playground: your code is type-checked, then it runs.
+// Try changing level to "zero" and press Run to see a type error.
 
 type Learner = { name: string; level: number };
 

@@ -17,17 +17,16 @@ import {
   type XpReason,
 } from "@/lib/gamification";
 import { languages } from "@/lib/languages";
+import { isValidTimeZone } from "@/lib/time-zone";
 
 // ---------------------------------------------------------------------------
 // Time zones: streaks and "today" use the learner's local day. The browser
 // stores its time zone in a cookie (see TimeZoneCookie).
 // ---------------------------------------------------------------------------
 
-const validZones = new Set(Intl.supportedValuesOf("timeZone"));
-
 export async function getTimeZone() {
   const tz = (await cookies()).get("tz")?.value;
-  return tz && validZones.has(tz) ? tz : "UTC";
+  return tz && isValidTimeZone(tz) ? tz : "UTC";
 }
 
 function todayIn(tz: string) {

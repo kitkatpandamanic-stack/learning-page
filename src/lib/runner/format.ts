@@ -37,8 +37,11 @@ function inspect(value: unknown, depth: number, seen: Set<unknown>): string {
   const obj = value as object;
   if (seen.has(obj)) return "[Circular]";
 
+  // V8 stacks start with "Name: message"; Firefox and Safari stacks don't.
   if (obj instanceof Error)
-    return obj.stack?.split("\n")[0] ?? `${obj.name}: ${obj.message}`;
+    return obj.stack?.startsWith(obj.name)
+      ? obj.stack.split("\n")[0]
+      : `${obj.name}: ${obj.message}`;
   if (obj instanceof Date)
     return Number.isNaN(obj.getTime()) ? "Invalid Date" : obj.toISOString();
   if (obj instanceof RegExp) return obj.toString();

@@ -14,6 +14,8 @@ export type RunResult = ExecuteResult & {
   durationMs: number;
   /** TypeScript only: type errors, for underlining in the editor */
   diagnostics?: TypeDiagnostic[];
+  /** Shown beside the output, e.g. when types couldn't be checked */
+  notice?: string;
 };
 
 export const RUN_TIMEOUT_MS = 3000;
@@ -72,14 +74,9 @@ function runTypeScript(code: string, options: RunOptions): Run {
           durationMs: performance.now() - started,
         });
       }
-      if (diagnostics === null) {
-        options.onLine?.(UNCHECKED_NOTICE);
-      }
       inner = runInWorker(code, options);
       return inner.result.then((r) =>
-        diagnostics === null
-          ? { ...r, output: [UNCHECKED_NOTICE, ...r.output] }
-          : r,
+        diagnostics === null ? { ...r, notice: UNCHECKED_NOTICE } : r,
       );
     },
   );
@@ -94,10 +91,8 @@ function runTypeScript(code: string, options: RunOptions): Run {
   };
 }
 
-const UNCHECKED_NOTICE: OutputLine = {
-  level: "info",
-  text: "(Couldn't load the TypeScript checker, so types weren't checked.)",
-};
+const UNCHECKED_NOTICE =
+  "Couldn't load the TypeScript checker, so types weren't checked this time.";
 
 function runInWorker(code: string, options: RunOptions): Run {
   const {

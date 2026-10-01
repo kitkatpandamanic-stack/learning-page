@@ -14,6 +14,8 @@ let failed = false;
 let nextId = 1;
 const pending = new Map<number, (message: TypeCheckMessage) => void>();
 const readyListeners = new Set<(ok: boolean) => void>();
+/** Ends every check still waiting on the current worker (used on restart). */
+const abortChecks = new Set<() => void>();
 
 function getWorker() {
   if (worker) return worker;
@@ -38,6 +40,10 @@ function restart() {
   worker?.terminate();
   worker = null;
   ready = false;
+  readyListeners.clear();
+  // Their worker is gone; without this, their own timers would later kill
+  // the next worker too.
+  for (const abort of [...abortChecks]) abort();
 }
 
 /** Start downloading TypeScript early, e.g. when a TypeScript editor appears. */
@@ -66,8 +72,11 @@ export function typecheck(
     const done = (value: TypeDiagnostic[] | null) => {
       clearTimeout(timer);
       pending.delete(id);
+      abortChecks.delete(abort);
       resolve(value);
     };
+    const abort = () => done(null);
+    abortChecks.add(abort);
     const timer = setTimeout(
       () => {
         restart();

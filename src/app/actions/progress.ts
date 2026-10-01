@@ -73,7 +73,8 @@ export async function recordActivity(
   if (!session) return { ok: false, reason: "signed-out" };
 
   const lesson = getAllLessons().find((l) => l.permalink === permalink);
-  const match = /^(exercise|quiz)-(\d+)$/.exec(activityId);
+  // No leading zeros: "exercise-01" must not count as a second "exercise-1".
+  const match = /^(exercise|quiz)-([1-9]\d{0,3})$/.exec(activityId);
   if (!lesson || !match) return { ok: false, reason: "invalid" };
 
   const kind = match[1] as "exercise" | "quiz";
@@ -87,7 +88,7 @@ export async function recordActivity(
   const awarded = await awardXp(
     userId,
     kind,
-    `${lesson.permalink}#${activityId}`,
+    `${lesson.permalink}#${kind}-${index}`,
     amount,
   );
   return finish(userId, awarded ? amount : 0);

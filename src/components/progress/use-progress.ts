@@ -50,6 +50,22 @@ function celebrate(result: AwardResult, label: string) {
   }
 }
 
+type ClientAwardResult = AwardResult | { ok: false; reason: "error" };
+
+/** Calls a server action; a network or server failure becomes a toast. */
+async function attempt(
+  action: () => Promise<AwardResult>,
+): Promise<ClientAwardResult> {
+  try {
+    return await action();
+  } catch {
+    toast.error("Couldn't reach the server, so this wasn't saved.", {
+      description: "Check your connection and try again.",
+    });
+    return { ok: false, reason: "error" };
+  }
+}
+
 /** Server actions that award XP, plus toasts and a progress refresh. */
 export function useAward(language: string) {
   const queryClient = useQueryClient();
@@ -58,7 +74,7 @@ export function useAward(language: string) {
 
   return {
     async completeLesson(slug: string) {
-      const result = await completeLesson(language, slug);
+      const result = await attempt(() => completeLesson(language, slug));
       if (result.ok) {
         celebrate(result, "Lesson complete!");
         await refresh();
@@ -68,7 +84,7 @@ export function useAward(language: string) {
       return result;
     },
     async recordActivity(permalink: string, activityId: string) {
-      const result = await recordActivity(permalink, activityId);
+      const result = await attempt(() => recordActivity(permalink, activityId));
       if (result.ok) {
         celebrate(
           result,

@@ -86,6 +86,29 @@ describe("execute", () => {
     expect(r.output.map((l) => l.text)).toEqual(["one", "two"]);
   });
 
+  it("explains a top-level return instead of hanging", async () => {
+    const r = await execute("return;", {
+      tests: [{ name: "t", check: "true" }],
+    });
+    expect(r.error).toBeUndefined();
+    expect(r.tests?.[0]).toMatchObject({ passed: false });
+    expect(r.tests?.[0].error).toMatch(/return/);
+  });
+
+  it("prints errors as Name: message, including custom error classes", async () => {
+    const r = await execute(`
+      class ValidationError extends Error {
+        constructor(message) { super(message); this.name = "ValidationError"; }
+      }
+      console.log(new ValidationError("too short"));
+      console.log([new RangeError("big")]);
+    `);
+    expect(texts(r)).toEqual([
+      "ValidationError: too short",
+      "[ RangeError: big ]",
+    ]);
+  });
+
   it("runs tests in the learner's scope", async () => {
     const r = await execute("function add(a, b) { return a + b; }", {
       tests: [

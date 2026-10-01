@@ -196,14 +196,16 @@ export async function execute(
   let error: RunError | undefined;
   try {
     const fn = new AsyncFunction(...params, body);
-    thunks = (await fn(
+    const returned: unknown = await fn(
       fakeConsole,
       timers.setTimeout,
       timers.clearTimeout,
       timers.setInterval,
       timers.clearInterval,
       texts,
-    )) as (() => unknown)[];
+    );
+    // A top-level `return` in the learner's code skips our list of tests.
+    thunks = Array.isArray(returned) ? (returned as (() => unknown)[]) : [];
   } catch (e) {
     error = toRunError(e, codeLines);
     push("error", [`${error.name}: ${error.message}`]);
@@ -226,7 +228,9 @@ export async function execute(
       results.push({
         name: test.name,
         passed: false,
-        error: "Fix the error in your code first.",
+        error: error
+          ? "Fix the error in your code first."
+          : "Your code stopped early (is there a `return` outside a function?).",
       });
       continue;
     }

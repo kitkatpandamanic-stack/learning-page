@@ -55,7 +55,7 @@ export function Exercise({
               tests={tests}
               expectedOutput={expectedOutput}
               html={html}
-              storageId={title}
+              storageId={activityId ?? title}
               activityId={activityId}
             />
           )}

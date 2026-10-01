@@ -369,6 +369,9 @@ export function CodeRunner({
               ↑ on line {result.error.line}
             </p>
           )}
+          {result?.notice && (
+            <p className="mt-1 text-xs text-amber-200/80">{result.notice}</p>
+          )}
         </div>
       </div>
 
