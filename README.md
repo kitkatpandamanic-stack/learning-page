@@ -60,14 +60,20 @@ xp: 10
 
 Lessons can use these components without importing them:
 
-| Component                                                        | Use                                            |
-| ---------------------------------------------------------------- | ---------------------------------------------- |
-| `<Callout type="note\|tip\|warning\|danger" title="…">`          | Highlighted box                                |
-| `<CodeExample output="…">` + a code block                        | Code with the output it prints                 |
-| `<Quiz question="…" options={[…]} answer={1} explanation="…" />` | Multiple-choice question (`answer` is 0-based) |
-| `<Exercise title="…">` with `<Hint>` and `<Solution>`            | Practice task with reveals                     |
+| Component                                                                                            | Use                                                    |
+| ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `<Callout type="note\|tip\|warning\|danger" title="…">`                                              | Highlighted box                                        |
+| `<CodeExample output="…">` + a code block                                                            | Code with the output it prints                         |
+| `<Quiz question="…" options={[…]} answer={1} explanation="…" />`                                     | Multiple-choice question (`answer` is 0-based)         |
+| `<Exercise title="…" starter={`…`} tests={[…]} expectedOutput={`…`}>` with `<Hint>` and `<Solution>` | Practice task with an in-browser editor, Run and Check |
 
 Code blocks support titles and highlighted lines: ` ```js title="app.js" {2} `.
+
+Interactive exercises run in a Web Worker in the learner's browser. Checks are either
+`expectedOutput` (exact printed lines) or `tests`, JavaScript expressions run after the
+learner's code in the same scope, e.g. `{ name: "adds", check: "add(2, 3) === 5" }`;
+`__output` holds the printed lines. Every exercise needs a `<Solution>` code block:
+`npm test` verifies each solution passes and each starter doesn't.
 
 The lesson URL is `/learn/<language>/<slug>` (the file name without its number).
 `npm run content` validates everything: unknown modules, missing number prefixes and

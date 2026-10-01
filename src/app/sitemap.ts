@@ -12,6 +12,11 @@ export default function sitemap(): MetadataRoute.Sitemap {
       changeFrequency: "weekly",
       priority: 0.9,
     },
+    {
+      url: `${siteUrl}/playground`,
+      changeFrequency: "monthly",
+      priority: 0.7,
+    },
     ...languages.map((l) => ({
       url: `${siteUrl}/languages/${l.slug}`,
       changeFrequency: "weekly" as const,

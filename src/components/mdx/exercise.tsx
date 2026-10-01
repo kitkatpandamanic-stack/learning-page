@@ -1,17 +1,36 @@
-import type { ReactNode } from "react";
+import { Children, isValidElement, type ReactNode } from "react";
 import { ChevronRight, Dumbbell, Eye, Lightbulb } from "lucide-react";
 
+import { LazyCodeRunner } from "@/components/code/lazy-code-runner";
+import type { RunLanguage, TestSpec } from "@/lib/runner/execute";
+
 /**
- * A practice task. Running and checking code in the browser arrives in Phase 6;
- * for now learners try it in their own editor and reveal hints and the solution.
+ * A practice task. With a `starter`, learners write and run code right here,
+ * and `tests` / `expectedOutput` let them check their answer automatically.
  */
 export function Exercise({
   title = "Your turn",
+  starter,
+  language = "javascript",
+  tests,
+  expectedOutput,
   children,
 }: {
   title?: string;
+  /** Starting code for the in-browser editor */
+  starter?: string;
+  language?: RunLanguage;
+  tests?: TestSpec[];
+  expectedOutput?: string;
   children: ReactNode;
 }) {
+  // Show the task first, then the editor, then the hint/solution reveals.
+  const items = Children.toArray(children);
+  const isReveal = (node: ReactNode) =>
+    isValidElement(node) && (node.type === Hint || node.type === Solution);
+  const task = items.filter((node) => !isReveal(node));
+  const reveals = items.filter(isReveal);
+
   return (
     <section className="not-prose my-8 rounded-2xl bg-gradient-to-r from-neon-violet/60 via-neon-pink/40 to-neon-cyan/60 p-px">
       <div className="rounded-[calc(1rem-1px)] bg-space-900/90 p-5 backdrop-blur-xl">
@@ -22,7 +41,17 @@ export function Exercise({
           {title}
         </p>
         <div className="exercise-body flex flex-col gap-3 text-[0.95rem] leading-relaxed text-white/85">
-          {children}
+          {task}
+          {starter !== undefined && (
+            <LazyCodeRunner
+              starter={starter}
+              language={language}
+              tests={tests}
+              expectedOutput={expectedOutput}
+              storageId={title}
+            />
+          )}
+          {reveals}
         </div>
       </div>
     </section>
