@@ -10,10 +10,14 @@ import {
   Sparkles,
   Trophy,
 } from "lucide-react";
+import { useFormatter, useTranslations } from "next-intl";
 import { cn } from "cn";
 
 import { LogoMark } from "@/components/brand/logo";
-import { ActivityChart } from "@/components/landing/activity-chart";
+import {
+  ActivityChart,
+  type ActivityPoint,
+} from "@/components/landing/activity-chart";
 import { Reveal } from "@/components/motion/reveal";
 import { Container } from "@/components/ui/container";
 import { GlassCard } from "@/components/ui/glass-card";
@@ -24,15 +28,9 @@ import { StatCard } from "@/components/ui/stat-card";
 import type { Tone } from "@/lib/tones";
 
 // Sample data: this section previews what a learner's dashboard looks like.
-const activity = [
-  { day: "Mon", xp: 120 },
-  { day: "Tue", xp: 210 },
-  { day: "Wed", xp: 160 },
-  { day: "Thu", xp: 320 },
-  { day: "Fri", xp: 280 },
-  { day: "Sat", xp: 450 },
-  { day: "Sun", xp: 390 },
-];
+// XP for Monday to Sunday; the weekday labels are formatted in the visitor's
+// language from a week that starts on Monday 1 January 2024.
+const weeklyXp = [120, 210, 160, 320, 280, 450, 390];
 
 const progress: { name: string; value: number; tone: Tone }[] = [
   { name: "JavaScript", value: 72, tone: "amber" },
@@ -42,28 +40,36 @@ const progress: { name: string; value: number; tone: Tone }[] = [
 ];
 
 const nav = [
-  { label: "Overview", icon: LayoutDashboard, active: true },
-  { label: "My languages", icon: Code2 },
-  { label: "Lessons", icon: BookOpen },
-  { label: "Roadmap", icon: MapIcon },
-  { label: "Achievements", icon: Trophy },
-  { label: "Settings", icon: Settings },
-];
+  { id: "overview", icon: LayoutDashboard, active: true },
+  { id: "myLanguages", icon: Code2 },
+  { id: "lessons", icon: BookOpen },
+  { id: "roadmap", icon: MapIcon },
+  { id: "achievements", icon: Trophy },
+  { id: "settings", icon: Settings },
+] as const;
 
 export function DashboardPreview() {
+  const t = useTranslations("home.dashboard");
+  const format = useFormatter();
+  const activity: ActivityPoint[] = weeklyXp.map((xp, i) => ({
+    day: format.dateTime(Date.UTC(2024, 0, 1 + i), {
+      weekday: "short",
+      timeZone: "UTC",
+    }),
+    xp,
+  }));
+  const thisWeek = (value: string) => t("stats.thisWeek", { value });
   return (
     <section className="py-16 sm:py-20">
       <Container>
         <Reveal>
           <SectionHeading
-            eyebrow="Track your progress"
+            eyebrow={t("eyebrow")}
             eyebrowTone="cyan"
-            title={
-              <>
-                See yourself <GradientText>level up</GradientText>
-              </>
-            }
-            description="Earn XP for every lesson, keep your streak alive and watch each language fill up as you go."
+            title={t.rich("title", {
+              gradient: (chunks) => <GradientText>{chunks}</GradientText>,
+            })}
+            description={t("description")}
           />
         </Reveal>
 
@@ -78,7 +84,7 @@ export function DashboardPreview() {
             padding="none"
             variant="strong"
             className="relative overflow-hidden"
-            aria-label="Example learner dashboard"
+            aria-label={t("ariaLabel")}
             role="img"
           >
             <div className="grid lg:grid-cols-[220px_1fr]">
@@ -90,24 +96,26 @@ export function DashboardPreview() {
                     Panda<span className="text-gradient">Dev</span>
                   </span>
                 </div>
-                {nav.map(({ label, icon: Icon, active }) => (
+                {nav.map(({ id, icon: Icon, ...item }) => (
                   <span
-                    key={label}
+                    key={id}
                     className={cn(
                       "flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm",
-                      active
+                      "active" in item
                         ? "bg-gradient-to-r from-neon-violet/30 to-neon-violet/5 text-white ring-1 ring-neon-violet/40"
                         : "text-white/60",
                     )}
                   >
                     <Icon className="size-4" />
-                    {label}
+                    {t(`nav.${id}`)}
                   </span>
                 ))}
                 <div className="mt-auto rounded-xl bg-gradient-to-br from-neon-violet/25 to-neon-pink/15 p-3 ring-1 ring-white/10">
-                  <p className="text-sm font-semibold text-white">Daily goal</p>
+                  <p className="text-sm font-semibold text-white">
+                    {t("dailyGoal")}
+                  </p>
                   <p className="text-xs text-muted-foreground">
-                    40 / 50 XP today
+                    {t("dailyGoalProgress", { done: 40, goal: 50 })}
                   </p>
                   <ProgressBar
                     value={80}
@@ -123,10 +131,10 @@ export function DashboardPreview() {
                 <div className="flex items-center justify-between gap-4">
                   <div>
                     <p className="text-lg font-bold text-white sm:text-xl">
-                      Good morning, Alex 👋
+                      {t("greeting", { name: t("sampleName") })}
                     </p>
                     <p className="text-sm text-muted-foreground">
-                      You&apos;re 2 lessons away from finishing Level 1.
+                      {t("lessonsAway", { count: 2, level: 1 })}
                     </p>
                   </div>
                   <div className="flex items-center gap-3">
@@ -134,37 +142,37 @@ export function DashboardPreview() {
                       <Bell className="size-4" />
                     </span>
                     <span className="flex size-9 items-center justify-center rounded-full bg-gradient-brand text-sm font-bold text-white">
-                      A
+                      {t("sampleInitial")}
                     </span>
                   </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
                   <StatCard
-                    label="Total XP"
-                    value="12,480"
-                    delta="+320 this week"
+                    label={t("stats.totalXp")}
+                    value={format.number(12480)}
+                    delta={thisWeek(format.number(320))}
                     icon={<Sparkles />}
                     tone="violet"
                   />
                   <StatCard
-                    label="Lessons done"
-                    value="86"
-                    delta="+9 this week"
+                    label={t("stats.lessonsDone")}
+                    value={format.number(86)}
+                    delta={thisWeek(format.number(9))}
                     icon={<BookOpen />}
                     tone="cyan"
                   />
                   <StatCard
-                    label="Day streak"
-                    value="14 🔥"
-                    delta="Personal best!"
+                    label={t("stats.dayStreak")}
+                    value={`${format.number(14)} 🔥`}
+                    delta={t("stats.personalBest")}
                     icon={<Flame />}
                     tone="pink"
                   />
                   <StatCard
-                    label="Time coding"
-                    value="42h"
-                    delta="+5h this week"
+                    label={t("stats.timeCoding")}
+                    value={t("stats.hours", { count: 42 })}
+                    delta={thisWeek(t("stats.hours", { count: 5 }))}
                     icon={<Clock />}
                     tone="lime"
                   />
@@ -174,10 +182,10 @@ export function DashboardPreview() {
                   <GlassCard padding="sm">
                     <div className="mb-2 flex items-center justify-between">
                       <p className="text-sm font-semibold text-white">
-                        Learning activity
+                        {t("activity")}
                       </p>
                       <span className="rounded-md bg-white/6 px-2 py-0.5 text-xs text-white/60">
-                        This week
+                        {t("thisWeek")}
                       </span>
                     </div>
                     <div className="h-52">
@@ -187,7 +195,7 @@ export function DashboardPreview() {
 
                   <GlassCard padding="sm" className="flex flex-col gap-4">
                     <p className="text-sm font-semibold text-white">
-                      Your languages
+                      {t("yourLanguages")}
                     </p>
                     {progress.map((p) => (
                       <ProgressBar

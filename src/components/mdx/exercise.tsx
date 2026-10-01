@@ -1,5 +1,6 @@
 import { Children, isValidElement, type ReactNode } from "react";
 import { ChevronRight, Dumbbell, Eye, Lightbulb } from "lucide-react";
+import { useTranslations } from "next-intl";
 
 import { LazyCodeRunner } from "@/components/code/lazy-code-runner";
 import type { RunLanguage, TestSpec } from "@/lib/runner/execute";
@@ -9,7 +10,7 @@ import type { RunLanguage, TestSpec } from "@/lib/runner/execute";
  * and `tests` / `expectedOutput` let them check their answer automatically.
  */
 export function Exercise({
-  title = "Your turn",
+  title,
   starter,
   language = "javascript",
   tests,
@@ -30,6 +31,7 @@ export function Exercise({
   activityId?: string;
   children: ReactNode;
 }) {
+  const t = useTranslations("lesson");
   // Show the task first, then the editor, then the hint/solution reveals.
   const items = Children.toArray(children);
   const isReveal = (node: ReactNode) =>
@@ -44,7 +46,7 @@ export function Exercise({
           <span className="flex size-8 items-center justify-center rounded-lg bg-neon-violet/20 text-violet-300">
             <Dumbbell className="size-4" />
           </span>
-          {title}
+          {title ?? t("yourTurn")}
         </p>
         <div className="exercise-body flex flex-col gap-3 text-[0.95rem] leading-relaxed text-white/85">
           {task}
@@ -55,7 +57,7 @@ export function Exercise({
               tests={tests}
               expectedOutput={expectedOutput}
               html={html}
-              storageId={activityId ?? title}
+              storageId={activityId ?? title ?? "exercise"}
               activityId={activityId}
             />
           )}
@@ -88,18 +90,23 @@ function Reveal({
 }
 
 export function Hint({ children }: { children: ReactNode }) {
+  const t = useTranslations("lesson");
   return (
-    <Reveal icon={<Lightbulb className="size-4 text-amber-300" />} label="Hint">
+    <Reveal
+      icon={<Lightbulb className="size-4 text-amber-300" />}
+      label={t("hint")}
+    >
       {children}
     </Reveal>
   );
 }
 
 export function Solution({ children }: { children: ReactNode }) {
+  const t = useTranslations("lesson");
   return (
     <Reveal
       icon={<Eye className="size-4 text-lime-300" />}
-      label="Show solution"
+      label={t("showSolution")}
     >
       {children}
     </Reveal>

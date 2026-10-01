@@ -7,46 +7,47 @@ export const siteUrl = process.env.NEXT_PUBLIC_SITE_URL
 
 export const siteConfig = {
   name: "PandaDev",
-  tagline: "Learn programming from Zero to Senior.",
   githubUrl: "https://github.com/kitkatpandamanic-stack/learning-page",
   /** Where people can reach us: GitHub Issues on the public repo */
   contactUrl: "https://github.com/kitkatpandamanic-stack/learning-page/issues",
 };
 
+/** `label` is a key in the "nav" translations. */
 export type NavLink = { label: string; href: string };
 
 export const mainNav: NavLink[] = [
-  { label: "Languages", href: "/languages" },
-  { label: "Roadmap", href: "/#roadmap" },
-  { label: "Playground", href: "/playground" },
-  { label: "Pricing", href: "/pricing" },
+  { label: "languages", href: "/languages" },
+  { label: "roadmap", href: "/#roadmap" },
+  { label: "playground", href: "/playground" },
+  { label: "pricing", href: "/pricing" },
 ];
 
+/** Group titles and labels are keys in the "footer" and "nav" translations. */
 export const footerNav: { title: string; links: NavLink[] }[] = [
   {
-    title: "Learn",
+    title: "learn",
     links: [
-      { label: "JavaScript", href: "/languages/javascript" },
-      { label: "Python", href: "/languages/python" },
-      { label: "TypeScript", href: "/languages/typescript" },
-      { label: "All languages", href: "/languages" },
+      { label: "javascript", href: "/languages/javascript" },
+      { label: "python", href: "/languages/python" },
+      { label: "typescript", href: "/languages/typescript" },
+      { label: "allLanguages", href: "/languages" },
     ],
   },
   {
-    title: "Platform",
+    title: "platform",
     links: [
-      { label: "Roadmap", href: "/#roadmap" },
-      { label: "Playground", href: "/playground" },
-      { label: "Dashboard", href: "/dashboard" },
-      { label: "Pricing", href: "/pricing" },
+      { label: "roadmap", href: "/#roadmap" },
+      { label: "playground", href: "/playground" },
+      { label: "dashboard", href: "/dashboard" },
+      { label: "pricing", href: "/pricing" },
     ],
   },
   {
-    title: "Company",
+    title: "company",
     links: [
-      { label: "About", href: "/about" },
+      { label: "about", href: "/about" },
       {
-        label: "Contact",
+        label: "contact",
         href: "https://github.com/kitkatpandamanic-stack/learning-page/issues",
       },
     ],

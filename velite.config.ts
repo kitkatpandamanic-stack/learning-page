@@ -13,7 +13,21 @@ import { languages } from "./src/lib/languages";
  *
  *   content/courses/<language>/course.yml            levels → modules outline
  *   content/courses/<language>/<module>/<NN-slug>.mdx lessons, ordered by NN
+ *
+ * Translations sit next to the English file with the locale before the
+ * extension: course.ru.yml, NN-slug.ru.mdx. A translation shares its lesson's
+ * slug and permalink, so progress and XP are the same in every language.
  */
+
+const LOCALES = ["en", "ru"] as const;
+
+/** "01-hello-world.ru" → { base: "01-hello-world", locale: "ru" } */
+function splitLocale(name: string) {
+  const match = /^(.*)\.([a-z]{2})$/.exec(name);
+  return match && (LOCALES as readonly string[]).includes(match[2])
+    ? { base: match[1], locale: match[2] }
+    : { base: name, locale: "en" };
+}
 
 // Tokyo Night with brighter comments: its default #51597d is too faint to read
 // on our dark background, and lessons explain a lot in code comments.
@@ -150,7 +164,7 @@ const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 const courses = defineCollection({
   name: "Course",
-  pattern: "courses/*/course.yml",
+  pattern: "courses/*/course*.yml",
   schema: s
     .object({
       path: s.path(),
@@ -193,6 +207,7 @@ const courses = defineCollection({
     .transform(({ path, ...data }) => ({
       ...data,
       language: path.split("/")[1],
+      locale: splitLocale(path.split("/")[2]).locale,
     })),
 });
 
@@ -211,13 +226,15 @@ const lessons = defineCollection({
       raw: s.raw(),
     })
     .transform(({ path, raw, ...data }) => {
-      const [, language, module, file] = path.split("/");
+      const [, language, module, name] = path.split("/");
+      const { base: file, locale } = splitLocale(name);
       const match = /^(\d+)-(.+)$/.exec(file);
       return {
         ...data,
         language,
         module,
         file,
+        locale,
         order: match ? Number(match[1]) : -1,
         slug: match ? match[2] : file,
         permalink: `/learn/${language}/${match ? match[2] : file}`,
@@ -248,7 +265,29 @@ export default defineConfig({
     const problems: string[] = [];
     const known = new Set(languages.map((l) => l.slug));
 
+    const english = courses.filter((c) => c.locale === "en");
+    const outline = (c: (typeof courses)[number]) =>
+      c.levels
+        .map(
+          (l) =>
+            `${l.level}:${l.capstone.slug ?? ""}:${l.modules.map((m) => m.slug).join(",")}`,
+        )
+        .join("|");
+
     for (const course of courses) {
+      if (course.locale !== "en") {
+        const original = english.find((c) => c.language === course.language);
+        if (!original) {
+          problems.push(
+            `courses/${course.language}/course.${course.locale}.yml: no English course.yml`,
+          );
+        } else if (outline(original) !== outline(course)) {
+          problems.push(
+            `courses/${course.language}/course.${course.locale}.yml: levels, modules and capstone slugs must match course.yml exactly`,
+          );
+        }
+        continue;
+      }
       if (!known.has(course.language)) {
         problems.push(
           `courses/${course.language}: unknown language (add it to src/lib/languages.ts)`,
@@ -274,8 +313,9 @@ export default defineConfig({
 
     const seen = new Map<string, string>();
     for (const lesson of lessons) {
-      const where = `courses/${lesson.language}/${lesson.module}/${lesson.file}.mdx`;
-      const course = courses.find((c) => c.language === lesson.language);
+      const suffix = lesson.locale === "en" ? "" : `.${lesson.locale}`;
+      const where = `courses/${lesson.language}/${lesson.module}/${lesson.file}${suffix}.mdx`;
+      const course = english.find((c) => c.language === lesson.language);
       if (!course) {
         problems.push(`${where}: no course.yml for "${lesson.language}"`);
         continue;
@@ -296,7 +336,33 @@ export default defineConfig({
           `${where}: file name must start with a number, e.g. 01-${lesson.file}.mdx`,
         );
       }
-      const key = `${lesson.language}/${lesson.slug}`;
+      if (lesson.locale !== "en") {
+        // A translation must match its original wherever progress depends on it.
+        const original = lessons.find(
+          (l) =>
+            l.locale === "en" &&
+            l.language === lesson.language &&
+            l.module === lesson.module &&
+            l.file === lesson.file,
+        );
+        if (!original) {
+          problems.push(`${where}: no English lesson ${lesson.file}.mdx`);
+        } else {
+          for (const field of [
+            "exerciseCount",
+            "quizCount",
+            "xp",
+            "duration",
+          ] as const) {
+            if (original[field] !== lesson[field]) {
+              problems.push(
+                `${where}: ${field} is ${lesson[field]} but the English lesson has ${original[field]}`,
+              );
+            }
+          }
+        }
+      }
+      const key = `${lesson.language}/${lesson.slug}/${lesson.locale}`;
       if (seen.has(key)) {
         problems.push(
           `${where}: lesson slug "${lesson.slug}" is already used by ${seen.get(key)}`,

@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useTranslations } from "next-intl";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "sonner";
 
@@ -16,6 +17,7 @@ function TimeZoneCookie() {
 }
 
 export function Providers({ children }: { children: React.ReactNode }) {
+  const t = useTranslations("progress");
   const [queryClient] = React.useState(
     () =>
       new QueryClient({
@@ -29,6 +31,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
       <TimeZoneCookie />
       <Toaster
         position="bottom-right"
+        containerAriaLabel={t("notifications")}
         theme="dark"
         toastOptions={{
           classNames: {

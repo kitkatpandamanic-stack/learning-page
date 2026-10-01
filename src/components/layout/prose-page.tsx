@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useFormatter, useTranslations } from "next-intl";
 
 import { Container } from "@/components/ui/container";
 import { GlassCard } from "@/components/ui/glass-card";
@@ -18,10 +19,12 @@ export function ProsePage({
   eyebrowTone?: Tone;
   title: ReactNode;
   description?: ReactNode;
-  /** "Last updated" date shown under the heading */
-  updated?: string;
+  /** "Last updated" date shown under the heading (a calendar day, read as UTC) */
+  updated?: Date;
   children: ReactNode;
 }) {
+  const t = useTranslations("pages.prose");
+  const format = useFormatter();
   return (
     <Container className="flex max-w-3xl flex-col gap-10 py-12 sm:py-16">
       <SectionHeading
@@ -34,7 +37,12 @@ export function ProsePage({
             {description}
             {updated && (
               <span className="mt-2 block text-sm text-white/45">
-                Last updated: {updated}
+                {t("lastUpdated", {
+                  date: format.dateTime(updated, {
+                    dateStyle: "long",
+                    timeZone: "UTC",
+                  }),
+                })}
               </span>
             )}
           </>

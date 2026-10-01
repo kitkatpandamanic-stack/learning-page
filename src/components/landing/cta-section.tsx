@@ -1,5 +1,6 @@
-import Link from "next/link";
+import { Link } from "@/i18n/navigation";
 import { ArrowRight, Check } from "lucide-react";
+import { useTranslations } from "next-intl";
 
 import { LogoMark } from "@/components/brand/logo";
 import { Reveal } from "@/components/motion/reveal";
@@ -7,13 +8,10 @@ import { Button } from "@/components/ui/button";
 import { Container } from "@/components/ui/container";
 import { GradientText } from "@/components/ui/gradient-text";
 
-const points = [
-  "Free Beginner track",
-  "Code right in your browser",
-  "Track XP, streaks and progress",
-];
+const points = ["free", "browser", "track"] as const;
 
 export function CtaSection() {
+  const t = useTranslations("home.cta");
   return (
     <section className="py-16 sm:py-20">
       <Container>
@@ -36,8 +34,9 @@ export function CtaSection() {
 
               <div className="relative text-center lg:text-left">
                 <h2 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">
-                  Ready to write your{" "}
-                  <GradientText>first line of code?</GradientText>
+                  {t.rich("title", {
+                    gradient: (chunks) => <GradientText>{chunks}</GradientText>,
+                  })}
                 </h2>
                 <ul className="mt-5 flex flex-col items-center gap-2 sm:flex-row sm:justify-center sm:gap-6 lg:justify-start">
                   {points.map((point) => (
@@ -48,7 +47,7 @@ export function CtaSection() {
                       <span className="flex size-5 items-center justify-center rounded-full bg-neon-lime/20 text-lime-300">
                         <Check className="size-3" />
                       </span>
-                      {point}
+                      {t(`points.${point}`)}
                     </li>
                   ))}
                 </ul>
@@ -61,7 +60,7 @@ export function CtaSection() {
                 className="relative mx-auto lg:mx-0"
               >
                 <Link href="/languages">
-                  Start learning free <ArrowRight />
+                  {t("button")} <ArrowRight />
                 </Link>
               </Button>
             </div>

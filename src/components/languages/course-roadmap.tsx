@@ -1,7 +1,8 @@
-import Link from "next/link";
+import { useTranslations } from "next-intl";
 import { Clock, Hammer, PenLine, Trophy } from "lucide-react";
 import { cn } from "cn";
 
+import { Link } from "@/i18n/navigation";
 import { LessonNumber } from "@/components/progress/lesson-status";
 import { Badge } from "@/components/ui/badge";
 import { GlassCard } from "@/components/ui/glass-card";
@@ -10,6 +11,8 @@ import { toneClasses, type Tone } from "@/lib/tones";
 
 function ModuleCard({ module, tone }: { module: CourseModule; tone: Tone }) {
   const t = toneClasses[tone];
+  const tr = useTranslations("course.roadmap");
+  const common = useTranslations("common");
 
   return (
     <GlassCard className="flex flex-col gap-4">
@@ -17,12 +20,11 @@ function ModuleCard({ module, tone }: { module: CourseModule; tone: Tone }) {
         <span
           className={cn("font-mono text-xs tracking-wider uppercase", t.text)}
         >
-          Module {module.number}
+          {tr("module", { number: module.number })}
         </span>
         {module.lessons.length > 0 && (
           <Badge tone="neutral">
-            {module.lessons.length}{" "}
-            {module.lessons.length === 1 ? "lesson" : "lessons"}
+            {common("lessons", { count: module.lessons.length })}
           </Badge>
         )}
       </div>
@@ -51,9 +53,9 @@ function ModuleCard({ module, tone }: { module: CourseModule; tone: Tone }) {
                 <span className="flex-1 text-sm text-white/85 group-hover:text-white">
                   {lesson.title}
                 </span>
-                <span className="flex items-center gap-1 text-xs text-white/45">
+                <span className="flex shrink-0 items-center gap-1 text-xs text-white/45">
                   <Clock className="size-3" />
-                  {lesson.duration} min
+                  {common("minutes", { count: lesson.duration })}
                 </span>
               </Link>
             </li>
@@ -61,7 +63,7 @@ function ModuleCard({ module, tone }: { module: CourseModule; tone: Tone }) {
         </ol>
       ) : (
         <p className="flex items-center gap-2 rounded-xl border border-dashed border-white/15 px-3 py-2.5 text-sm text-white/50">
-          <PenLine className="size-4" /> Lessons are being written
+          <PenLine className="size-4" /> {tr("lessonsBeingWritten")}
         </p>
       )}
 
@@ -69,7 +71,7 @@ function ModuleCard({ module, tone }: { module: CourseModule; tone: Tone }) {
         <p className="mt-auto flex items-center gap-2 border-t border-white/10 pt-3 text-sm text-white/75">
           <Hammer className={cn("size-4", t.text)} />
           <span>
-            <span className="text-white/50">Mini-project:</span>{" "}
+            <span className="text-white/50">{tr("miniProject")}</span>{" "}
             {module.project}
           </span>
         </p>
@@ -79,6 +81,10 @@ function ModuleCard({ module, tone }: { module: CourseModule; tone: Tone }) {
 }
 
 export function CourseRoadmap({ levels }: { levels: CourseLevel[] }) {
+  const tr = useTranslations("course.roadmap");
+  const tl = useTranslations("levels");
+  const common = useTranslations("common");
+
   return (
     <div className="flex flex-col">
       {levels.map((level, index) => {
@@ -122,15 +128,15 @@ export function CourseRoadmap({ levels }: { levels: CourseLevel[] }) {
                   t.text,
                 )}
               >
-                Level {level.level}
+                {tl("level", { level: level.level })}
               </p>
               <h2
                 id={`level-${level.level}-title`}
                 className="text-2xl font-bold text-white sm:text-3xl"
               >
-                {level.name}{" "}
+                {tl(`${level.level}.name`)}{" "}
                 <span className="text-lg font-medium text-white/50">
-                  · {level.tagline}
+                  · {tl(`${level.level}.tagline`)}
                 </span>
               </h2>
               <p className="max-w-2xl text-muted-foreground">{level.summary}</p>
@@ -165,18 +171,17 @@ export function CourseRoadmap({ levels }: { levels: CourseLevel[] }) {
                   >
                     <Trophy className="size-5" />
                   </span>
-                  <div className="flex-1">
+                  <div className="min-w-0 flex-1">
                     <p className="text-xs text-white/55">
-                      Level {level.level} capstone project
+                      {tr("capstone", { level: level.level })}
                     </p>
                     <h3 className="font-semibold text-white">
                       {level.capstone}
                     </h3>
                   </div>
                   {capstone && capstone.lessons.length > 0 && (
-                    <Badge tone="neutral">
-                      {capstone.lessons.length}{" "}
-                      {capstone.lessons.length === 1 ? "part" : "parts"}
+                    <Badge tone="neutral" className="shrink-0">
+                      {common("parts", { count: capstone.lessons.length })}
                     </Badge>
                   )}
                 </div>
@@ -202,9 +207,9 @@ export function CourseRoadmap({ levels }: { levels: CourseLevel[] }) {
                           <span className="flex-1 text-sm text-white/85 group-hover:text-white">
                             {lesson.title}
                           </span>
-                          <span className="flex items-center gap-1 text-xs text-white/45">
+                          <span className="flex shrink-0 items-center gap-1 text-xs text-white/45">
                             <Clock className="size-3" />
-                            {lesson.duration} min
+                            {common("minutes", { count: lesson.duration })}
                           </span>
                         </Link>
                       </li>

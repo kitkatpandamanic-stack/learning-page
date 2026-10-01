@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslations } from "next-intl";
 import { CheckCircle2, Circle, CircleDot } from "lucide-react";
 import { cn } from "cn";
 
@@ -17,11 +18,12 @@ export function LessonStatusIcon({
   active: boolean;
   activeClassName: string;
 }) {
+  const t = useTranslations("progress");
   const { data } = useProgress(language);
   if (data?.completed.includes(slug)) {
     return (
       <CheckCircle2
-        aria-label="Completed"
+        aria-label={t("completed")}
         className="size-3.5 shrink-0 text-lime-300"
       />
     );
@@ -45,6 +47,7 @@ export function LessonNumber({
   number: number;
   className: string;
 }) {
+  const t = useTranslations("progress");
   const { data } = useProgress(language);
   const done = data?.completed.includes(slug);
   return (
@@ -55,7 +58,7 @@ export function LessonNumber({
       )}
     >
       {done ? (
-        <CheckCircle2 aria-label="Completed" className="size-4" />
+        <CheckCircle2 aria-label={t("completed")} className="size-4" />
       ) : (
         number
       )}
@@ -71,6 +74,7 @@ export function CourseProgress({
   language: string;
   slugs: string[];
 }) {
+  const t = useTranslations("progress");
   const { data } = useProgress(language);
   if (!data?.signedIn || slugs.length === 0) return null;
   const done = slugs.filter((s) => data.completed.includes(s)).length;
@@ -78,10 +82,10 @@ export function CourseProgress({
 
   return (
     <div className="flex w-full max-w-sm flex-col gap-1.5">
-      <div className="flex justify-between text-xs text-white/70">
-        <span>Your progress</span>
+      <div className="flex justify-between gap-3 text-xs text-white/70">
+        <span>{t("yourProgress")}</span>
         <span className="font-mono text-lime-300">
-          {done} / {slugs.length} lessons
+          {t("lessonsDone", { done, total: slugs.length })}
         </span>
       </div>
       <div
@@ -89,7 +93,7 @@ export function CourseProgress({
         aria-valuemin={0}
         aria-valuemax={slugs.length}
         aria-valuenow={done}
-        aria-label="Course progress"
+        aria-label={t("courseProgress")}
         className="h-2 overflow-hidden rounded-full bg-white/8"
       >
         <div

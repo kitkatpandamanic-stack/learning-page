@@ -1,5 +1,6 @@
-import Link from "next/link";
+import { Link } from "@/i18n/navigation";
 import { ArrowLeft, ChevronRight, Trophy } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { cn } from "cn";
 
 import { LessonStatusIcon } from "@/components/progress/lesson-status";
@@ -19,13 +20,19 @@ export function LessonSidebar({
   currentLevel: number;
   currentSlug: string;
 }) {
+  const tr = useTranslations("lesson");
+  const levelNames = useTranslations("levels");
   return (
-    <nav aria-label={`${language.name} course`} className="flex flex-col gap-4">
+    <nav
+      aria-label={tr("courseLabel", { language: language.name })}
+      className="flex flex-col gap-4"
+    >
       <Link
         href={`/languages/${language.slug}`}
         className="flex items-center gap-2 text-sm text-white/60 transition hover:text-white"
       >
-        <ArrowLeft className="size-4" /> {language.name} roadmap
+        <ArrowLeft className="size-4" />{" "}
+        {tr("roadmapLink", { language: language.name })}
       </Link>
 
       <div className="flex flex-col gap-2">
@@ -46,7 +53,7 @@ export function LessonSidebar({
               <summary className="flex cursor-pointer list-none items-center gap-2 rounded-xl px-2 py-2 text-sm font-semibold text-white/85 select-none hover:bg-white/5 [&::-webkit-details-marker]:hidden">
                 <Icon className={cn("size-4", t.text)} />
                 <span className="flex-1">
-                  {level.level} · {level.name}
+                  {level.level} · {levelNames(`${level.level}.name`)}
                 </span>
                 <span className="text-xs font-normal text-white/40">
                   {lessonCount}
@@ -92,7 +99,7 @@ export function LessonSidebar({
                       </ul>
                     ) : (
                       <p className="px-2 text-xs text-white/55 italic">
-                        Coming soon
+                        {tr("comingSoon")}
                       </p>
                     )}
                   </div>

@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ImageResponse } from "next/og";
 
 export const ogSize = { width: 1200, height: 630 };
@@ -6,8 +8,31 @@ export const ogSize = { width: 1200, height: 630 };
 const pandaSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><defs><linearGradient id="e" x1="0" y1="0" x2="40" y2="40"><stop offset="0%" stop-color="#8b5cf6"/><stop offset="100%" stop-color="#f472b6"/></linearGradient></defs><circle cx="10" cy="11" r="6.5" fill="url(#e)"/><circle cx="30" cy="11" r="6.5" fill="url(#e)"/><ellipse cx="20" cy="22.5" rx="14" ry="13" fill="#f5f3ff"/><ellipse cx="14" cy="21.5" rx="4" ry="5" transform="rotate(-28 14 21.5)" fill="#1a1640"/><ellipse cx="26" cy="21.5" rx="4" ry="5" transform="rotate(28 26 21.5)" fill="#1a1640"/><circle cx="14.6" cy="21" r="1.6" fill="#22d3ee"/><circle cx="25.4" cy="21" r="1.6" fill="#22d3ee"/><ellipse cx="20" cy="28" rx="2.2" ry="1.5" fill="#1a1640"/></svg>`;
 export const pandaDataUri = `data:image/svg+xml;base64,${Buffer.from(pandaSvg).toString("base64")}`;
 
+// Onest has Latin and Cyrillic letters, so English and Russian share images
+// look the same. Files come from @fontsource/onest; images are built at
+// build time, when node_modules is available.
+const fontDir = join(process.cwd(), "node_modules/@fontsource/onest/files");
+let fonts: Promise<ConstructorParameters<typeof ImageResponse>[1]> | null =
+  null;
+
+function loadFonts() {
+  fonts ??= Promise.all(
+    (["latin", "cyrillic"] as const).flatMap((subset) =>
+      ([400, 700] as const).map(async (weight) => ({
+        name: subset === "latin" ? "Onest" : "Onest Cyrillic",
+        weight,
+        style: "normal" as const,
+        data: await readFile(
+          join(fontDir, `onest-${subset}-${weight}-normal.woff`),
+        ),
+      })),
+    ),
+  ).then((list) => ({ ...ogSize, fonts: list }));
+  return fonts;
+}
+
 /** Branded share image: dark space background, glow, panda, big title. */
-export function renderOgImage({
+export async function renderOgImage({
   eyebrow,
   title,
   subtitle,
@@ -30,7 +55,7 @@ export function renderOgImage({
         backgroundColor: "#070814",
         backgroundImage: `radial-gradient(circle at 15% 0%, ${accent}aa 0%, transparent 45%), radial-gradient(circle at 100% 100%, #22d3ee66 0%, transparent 45%), radial-gradient(circle at 85% 10%, #f472b655 0%, transparent 35%)`,
         color: "white",
-        fontFamily: "sans-serif",
+        fontFamily: "Onest, Onest Cyrillic",
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
@@ -92,6 +117,6 @@ export function renderOgImage({
         }}
       />
     </div>,
-    ogSize,
+    await loadFonts(),
   );
 }

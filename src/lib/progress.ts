@@ -6,6 +6,7 @@ import { and, count, desc, eq, sql, sum } from "drizzle-orm";
 import { db } from "@/db";
 import { account, lessonProgress, userAchievement, xpEvent } from "@/db/schema";
 import { getAllLessons, getCourse } from "@/lib/content";
+import { defaultLocale, type Locale } from "@/lib/i18n";
 import {
   achievements,
   computeStreaks,
@@ -207,25 +208,50 @@ export async function getLanguageProgress(userId: string, language: string) {
   };
 }
 
-const lessonByPermalink = () =>
-  new Map(getAllLessons().map((l) => [l.permalink, l]));
+/** Lesson titles by permalink, in the learner's language where translated. */
+function lessonTitles(locale: Locale) {
+  const titles = new Map(getAllLessons().map((l) => [l.permalink, l.title]));
+  if (locale !== defaultLocale) {
+    for (const language of languages) {
+      const course = getCourse(language.slug, locale);
+      const translated = (course?.levels ?? []).flatMap((level) =>
+        level.modules.flatMap((m) => m.lessons),
+      );
+      for (const lesson of translated) {
+        titles.set(lesson.permalink, lesson.title);
+      }
+    }
+  }
+  return titles;
+}
 
+export type RecentReason = "lesson" | "exercise" | "quiz" | "other";
+
+/** What an XP event was for; the dashboard turns this into a sentence. */
 function describeEvent(
   reason: string,
   ref: string | null,
-  lessons: ReturnType<typeof lessonByPermalink>,
+  titles: ReturnType<typeof lessonTitles>,
 ) {
   const [permalink] = (ref ?? "").split("#");
-  const lesson = lessons.get(permalink);
-  const title = lesson?.title ?? "a lesson";
-  if (reason === "lesson") return `Completed “${title}”`;
-  if (reason === "exercise") return `Solved the exercise in “${title}”`;
-  if (reason === "quiz") return `Aced a quiz in “${title}”`;
-  return "Earned XP";
+  return {
+    reason: (reason === "lesson" || reason === "exercise" || reason === "quiz"
+      ? reason
+      : "other") as RecentReason,
+    /** null when the lesson no longer exists */
+    lessonTitle: titles.get(permalink) ?? null,
+  };
 }
 
-/** Everything the dashboard shows. */
-export async function getDashboard(userId: string, tz: string) {
+/**
+ * Everything the dashboard shows. Lesson titles come in `locale`; days are
+ * "YYYY-MM-DD" strings for the page to format.
+ */
+export async function getDashboard(
+  userId: string,
+  tz: string,
+  locale: Locale = defaultLocale,
+) {
   const data = await loadUserData(userId, tz);
   const { stats, streak, today, xpByDay, done } = data;
 
@@ -243,19 +269,13 @@ export async function getDashboard(userId: string, tz: string) {
 
   const week = Array.from({ length: 7 }, (_, i) => {
     const d = addDays(today, i - 6);
-    return {
-      day: new Date(`${d}T12:00:00Z`).toLocaleDateString("en", {
-        weekday: "short",
-        timeZone: "UTC",
-      }),
-      xp: xpByDay.get(d) ?? 0,
-    };
+    return { date: d, xp: xpByDay.get(d) ?? 0 };
   });
 
   // Per-language progress and the next lesson to continue with.
   const courses = languages
     .map((language) => {
-      const course = getCourse(language.slug);
+      const course = getCourse(language.slug, locale);
       if (!course || course.stats.lessons === 0) return null;
       const ordered = course.levels.flatMap((l) =>
         l.modules.flatMap((m) => m.lessons),
@@ -281,7 +301,7 @@ export async function getDashboard(userId: string, tz: string) {
     null;
 
   const unlockedAt = new Map(data.unlocked.map((u) => [u.id, u.unlockedAt]));
-  const lessons = lessonByPermalink();
+  const titles = lessonTitles(locale);
 
   return {
     stats,
@@ -297,7 +317,7 @@ export async function getDashboard(userId: string, tz: string) {
       unlockedAt: unlockedAt.get(a.id) ?? null,
     })),
     recent: recent.map((e) => ({
-      label: describeEvent(e.reason, e.ref, lessons),
+      ...describeEvent(e.reason, e.ref, titles),
       amount: e.amount,
       at: e.createdAt,
     })),

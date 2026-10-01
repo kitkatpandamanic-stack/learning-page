@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
+import { useTranslations } from "next-intl";
 import {
   ArrowRight,
   CheckCircle2,
@@ -13,6 +13,7 @@ import {
 import { useAward, useProgress } from "@/components/progress/use-progress";
 import { Button } from "@/components/ui/button";
 import { GlassCard } from "@/components/ui/glass-card";
+import { Link } from "@/i18n/navigation";
 
 /** End-of-lesson card: complete the lesson for XP, then move on. */
 export function CompleteLesson({
@@ -28,6 +29,8 @@ export function CompleteLesson({
   xp: number;
   next?: { title: string; href: string };
 }) {
+  const t = useTranslations("progress");
+  const tCommon = useTranslations("common");
   const { data, isPending } = useProgress(language);
   const award = useAward(language);
   const [saving, setSaving] = React.useState(false);
@@ -40,14 +43,14 @@ export function CompleteLesson({
     return (
       <GlassCard className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <p className="font-semibold text-white">Finished this lesson?</p>
+          <p className="font-semibold text-white">{t("finished")}</p>
           <p className="text-sm text-muted-foreground">
-            Sign in to save your progress and earn {xp} XP.
+            {t("signInToSave", { xp })}
           </p>
         </div>
         <Button asChild variant="glass" size="lg" className="shrink-0 px-5">
-          <Link href={`/sign-in?next=${encodeURIComponent(permalink)}`}>
-            <LogIn /> Sign in
+          <Link href={{ pathname: "/sign-in", query: { next: permalink } }}>
+            <LogIn /> {tCommon("signIn")}
           </Link>
         </Button>
       </GlassCard>
@@ -63,7 +66,7 @@ export function CompleteLesson({
         className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between"
       >
         <p className="flex items-center gap-2 font-semibold text-lime-200">
-          <CheckCircle2 className="size-5" /> Lesson complete
+          <CheckCircle2 className="size-5" /> {t("done")}
         </p>
         {next && (
           <Button
@@ -73,7 +76,7 @@ export function CompleteLesson({
             className="shrink-0 px-5"
           >
             <Link href={next.href}>
-              Next: {next.title} <ArrowRight />
+              {t("next", { title: next.title })} <ArrowRight />
             </Link>
           </Button>
         )}
@@ -87,10 +90,8 @@ export function CompleteLesson({
       className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between"
     >
       <div>
-        <p className="font-semibold text-white">Finished this lesson?</p>
-        <p className="text-sm text-muted-foreground">
-          Mark it complete to save your progress.
-        </p>
+        <p className="font-semibold text-white">{t("finished")}</p>
+        <p className="text-sm text-muted-foreground">{t("markComplete")}</p>
       </div>
       <Button
         variant="gradient"
@@ -104,7 +105,7 @@ export function CompleteLesson({
         }}
       >
         {saving ? <Loader2 className="animate-spin" /> : <Sparkles />}
-        Complete lesson · +{xp} XP
+        {t("completeButton", { xp })}
       </Button>
     </GlassCard>
   );

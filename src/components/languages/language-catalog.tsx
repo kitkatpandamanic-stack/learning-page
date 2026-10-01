@@ -1,18 +1,22 @@
 "use client";
 
 import * as React from "react";
+import { useTranslations } from "next-intl";
 import { Search } from "lucide-react";
 import { cn } from "cn";
 
-import { LanguageCard } from "@/components/languages/language-card";
+import {
+  LanguageCard,
+  type LanguageSlug,
+} from "@/components/languages/language-card";
 import { Input } from "@/components/ui/input";
 import type { CourseStats } from "@/lib/content";
 import type { Language } from "@/lib/languages";
 
 const filters = [
-  { value: "all", label: "All" },
-  { value: "available", label: "Available" },
-  { value: "coming-soon", label: "Coming soon" },
+  { value: "all", labelKey: "all" },
+  { value: "available", labelKey: "available" },
+  { value: "coming-soon", labelKey: "comingSoon" },
 ] as const;
 
 type Filter = (typeof filters)[number]["value"];
@@ -22,17 +26,25 @@ export function LanguageCatalog({
 }: {
   items: { language: Language; stats?: CourseStats }[];
 }) {
+  const t = useTranslations("languages");
+  const info = useTranslations("languageInfo");
   const [query, setQuery] = React.useState("");
   const [filter, setFilter] = React.useState<Filter>("all");
 
   const q = query.trim().toLowerCase();
   const visible = items.filter(({ language }) => {
     const matchesFilter = filter === "all" || language.status === filter;
+    const slug = language.slug as LanguageSlug;
+    // Match the English text too, so "web" finds JavaScript in any language.
     const matchesQuery =
       !q ||
-      [language.name, language.description, ...language.usedFor].some((text) =>
-        text.toLowerCase().includes(q),
-      );
+      [
+        language.name,
+        language.description,
+        ...language.usedFor,
+        info(`${slug}.description`),
+        ...(info.raw(`${slug}.usedFor`) as string[]),
+      ].some((text) => text.toLowerCase().includes(q));
     return matchesFilter && matchesQuery;
   });
 
@@ -41,8 +53,8 @@ export function LanguageCatalog({
       <div className="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div
           role="group"
-          aria-label="Filter languages"
-          className="inline-flex self-start rounded-full p-1 glass"
+          aria-label={t("filters.label")}
+          className="inline-flex flex-wrap self-start rounded-full p-1 glass"
         >
           {filters.map((f) => (
             <button
@@ -56,7 +68,7 @@ export function LanguageCatalog({
                   "bg-gradient-brand text-white shadow-glow-violet",
               )}
             >
-              {f.label}
+              {t(`filters.${f.labelKey}`)}
             </button>
           ))}
         </div>
@@ -64,14 +76,14 @@ export function LanguageCatalog({
         <div className="relative sm:w-72">
           <Search className="pointer-events-none absolute top-1/2 left-3.5 size-4 -translate-y-1/2 text-white/40" />
           <label htmlFor="language-search" className="sr-only">
-            Search languages
+            {t("search.label")}
           </label>
           <Input
             id="language-search"
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search: web, games, data…"
+            placeholder={t("search.placeholder")}
             className="h-10 rounded-full bg-white/5 pl-10"
           />
         </div>
@@ -90,8 +102,7 @@ export function LanguageCatalog({
         </div>
       ) : (
         <p className="rounded-2xl p-10 text-center text-muted-foreground glass">
-          No languages match &ldquo;{query}&rdquo;. Try &ldquo;web&rdquo; or
-          &ldquo;data&rdquo;.
+          {t("noResults", { query: query.trim() })}
         </p>
       )}
     </div>

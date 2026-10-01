@@ -1,13 +1,27 @@
 "use client";
 
 import * as React from "react";
+import { useLocale, useTranslations } from "next-intl";
 import { cn } from "cn";
 
 import { LazyCodeRunner } from "@/components/code/lazy-code-runner";
 import type { RunLanguage } from "@/lib/runner/execute";
 
-const starters: Record<RunLanguage, string> = {
-  javascript: `// Welcome to the PandaDev playground! 🐼
+/** Starter programs; comments and printed text follow the page language. */
+function starters(locale: string): Record<RunLanguage, string> {
+  const ru = locale === "ru";
+  return {
+    javascript: ru
+      ? `// Добро пожаловать в песочницу PandaDev! 🐼
+// Напишите код на JavaScript и нажмите «Запустить» (или Ctrl/⌘ + Enter).
+
+const languages = ["JavaScript", "Python", "TypeScript"];
+
+for (const language of languages) {
+  console.log(\`Я изучаю \${language}!\`);
+}
+`
+      : `// Welcome to the PandaDev playground! 🐼
 // Write some JavaScript and press Run (or Ctrl/⌘ + Enter).
 
 const languages = ["JavaScript", "Python", "TypeScript"];
@@ -16,14 +30,36 @@ for (const language of languages) {
   console.log(\`I'm learning \${language}!\`);
 }
 `,
-  python: `# Python playground: real Python 3, running in your browser. 🐍
+    python: ru
+      ? `# Песочница Python: настоящий Python 3 прямо в браузере. 🐍
+
+languages = ["JavaScript", "Python", "TypeScript"]
+
+for language in languages:
+    print(f"Я изучаю {language}!")
+`
+      : `# Python playground: real Python 3, running in your browser. 🐍
 
 languages = ["JavaScript", "Python", "TypeScript"]
 
 for language in languages:
     print(f"I'm learning {language}!")
 `,
-  typescript: `// TypeScript playground: your code is type-checked, then it runs.
+    typescript: ru
+      ? `// Песочница TypeScript: сначала код проверяется на ошибки типов, потом запускается.
+// Замените level на "zero" и нажмите «Запустить», чтобы увидеть ошибку типов.
+
+type Learner = { name: string; level: number };
+
+const panda: Learner = { name: "Панда", level: 0 };
+
+function levelUp(learner: Learner): Learner {
+  return { ...learner, level: learner.level + 1 };
+}
+
+console.log(levelUp(panda));
+`
+      : `// TypeScript playground: your code is type-checked, then it runs.
 // Try changing level to "zero" and press Run to see a type error.
 
 type Learner = { name: string; level: number };
@@ -36,16 +72,19 @@ function levelUp(learner: Learner): Learner {
 
 console.log(levelUp(panda));
 `,
-};
+  };
+}
 
 export function Playground() {
   const [language, setLanguage] = React.useState<RunLanguage>("javascript");
+  const locale = useLocale();
+  const t = useTranslations("playground");
 
   return (
     <div className="flex flex-col gap-4">
       <div
         role="group"
-        aria-label="Language"
+        aria-label={t("language")}
         className="inline-flex self-start rounded-full p-1 glass"
       >
         {(["javascript", "python", "typescript"] as const).map((lang) => (
@@ -73,15 +112,12 @@ export function Playground() {
       {/* Remount per language so each keeps its own saved code */}
       <LazyCodeRunner
         key={language}
-        starter={starters[language]}
+        starter={starters(locale)[language]}
         language={language}
         storageId={`playground-${language}`}
         minHeight="360px"
       />
-      <p className="text-sm text-white/45">
-        Your code is saved in this browser. Python (Pyodide) and the TypeScript
-        type checker load the first time you run them.
-      </p>
+      <p className="text-sm text-white/45">{t("note")}</p>
     </div>
   );
 }

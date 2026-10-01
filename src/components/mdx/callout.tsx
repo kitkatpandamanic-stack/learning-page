@@ -6,6 +6,7 @@ import {
   OctagonAlert,
   type LucideIcon,
 } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { cn } from "cn";
 
 const variants: Record<
@@ -14,25 +15,25 @@ const variants: Record<
 > = {
   note: {
     icon: Info,
-    label: "Note",
+    label: "note",
     className: "border-neon-cyan/35 bg-neon-cyan/8",
     iconClass: "text-cyan-300",
   },
   tip: {
     icon: Lightbulb,
-    label: "Tip",
+    label: "tip",
     className: "border-neon-lime/35 bg-neon-lime/8",
     iconClass: "text-lime-300",
   },
   warning: {
     icon: AlertTriangle,
-    label: "Watch out",
+    label: "warning",
     className: "border-neon-amber/35 bg-neon-amber/8",
     iconClass: "text-amber-300",
   },
   danger: {
     icon: OctagonAlert,
-    label: "Danger",
+    label: "danger",
     className: "border-rose-400/40 bg-rose-400/10",
     iconClass: "text-rose-300",
   },
@@ -48,6 +49,7 @@ export function Callout({
   children: ReactNode;
 }) {
   const v = variants[type];
+  const t = useTranslations("lesson.callout");
   const Icon = v.icon;
 
   return (
@@ -59,7 +61,9 @@ export function Callout({
     >
       <Icon className={cn("mt-0.5 size-5 shrink-0", v.iconClass)} />
       <div className="min-w-0 text-[0.95rem] leading-relaxed text-white/85 [&_code]:rounded [&_code]:bg-white/10 [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.85em] [&_p]:my-1">
-        <p className={cn("font-semibold", v.iconClass)}>{title ?? v.label}</p>
+        <p className={cn("font-semibold", v.iconClass)}>
+          {title ?? t(v.label as keyof typeof variants)}
+        </p>
         {children}
       </div>
     </aside>

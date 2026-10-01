@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Terminal } from "lucide-react";
+import { useTranslations } from "next-intl";
 
 /** A code block followed by the output it prints. */
 export function CodeExample({
@@ -10,12 +11,13 @@ export function CodeExample({
   output: string;
   children: ReactNode;
 }) {
+  const t = useTranslations("lesson");
   return (
     <div className="code-example my-6">
       {children}
       <div className="not-prose -mt-2 rounded-b-2xl border border-t-0 border-white/10 bg-black/40 px-4 pt-4 pb-3">
         <p className="mb-1.5 flex items-center gap-1.5 font-mono text-[11px] tracking-wider text-white/65 uppercase">
-          <Terminal className="size-3.5" /> Output
+          <Terminal className="size-3.5" /> {t("output")}
         </p>
         <pre className="font-mono text-sm whitespace-pre-wrap text-amber-200">
           {output}

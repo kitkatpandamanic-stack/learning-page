@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslations } from "next-intl";
 import * as React from "react";
 import { cn } from "cn";
 
@@ -17,6 +18,7 @@ function flatten(
 
 /** "On this page" list that highlights the heading currently in view. */
 export function TableOfContents({ toc }: { toc: TocEntry[] }) {
+  const t = useTranslations("lesson");
   const items = React.useMemo(() => flatten(toc), [toc]);
   const [active, setActive] = React.useState<string | null>(null);
 
@@ -41,9 +43,9 @@ export function TableOfContents({ toc }: { toc: TocEntry[] }) {
   if (items.length === 0) return null;
 
   return (
-    <nav aria-label="On this page">
+    <nav aria-label={t("onThisPage")}>
       <p className="mb-3 text-xs font-semibold tracking-wider text-white/50 uppercase">
-        On this page
+        {t("onThisPage")}
       </p>
       <ul className="flex flex-col gap-1 border-l border-white/10">
         {items.map((item) => (

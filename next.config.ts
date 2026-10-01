@@ -1,6 +1,10 @@
 import type { NextConfig } from "next";
 import { PHASE_DEVELOPMENT_SERVER } from "next/constants";
 import { withSentryConfig } from "@sentry/nextjs/config";
+import createNextIntlPlugin from "next-intl/plugin";
+
+// Translations: messages are loaded by src/i18n/request.ts.
+const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
 const nextConfig: NextConfig = {};
 
@@ -12,7 +16,7 @@ async function config(phase: string): Promise<NextConfig> {
     const { build } = await import("velite");
     await build({ watch: true, clean: false });
   }
-  return nextConfig;
+  return withNextIntl(nextConfig);
 }
 
 // Sentry error reporting (see src/instrumentation*.ts). With SENTRY_AUTH_TOKEN,

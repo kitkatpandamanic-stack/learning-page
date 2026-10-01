@@ -10,15 +10,19 @@ import {
   YAxis,
   type TooltipContentProps,
 } from "recharts";
+import { useTranslations } from "next-intl";
 
 export type ActivityPoint = { day: string; xp: number };
 
 function ChartTooltip({ active, payload, label }: TooltipContentProps) {
+  const t = useTranslations("common");
   if (!active || !payload?.length) return null;
   return (
     <div className="rounded-lg px-3 py-2 text-xs glass-strong">
       <p className="text-muted-foreground">{label}</p>
-      <p className="font-semibold text-white">{payload[0].value} XP</p>
+      <p className="font-semibold text-white">
+        {t("xp", { count: Number(payload[0].value) })}
+      </p>
     </div>
   );
 }
@@ -58,7 +62,7 @@ export function ActivityChart({ data }: { data: ActivityPoint[] }) {
           tick={{ fill: "rgb(226 232 255 / 0.5)", fontSize: 11 }}
         />
         <Tooltip
-          content={ChartTooltip}
+          content={(props) => <ChartTooltip {...props} />}
           cursor={{ stroke: "rgb(255 255 255 / 0.2)" }}
         />
         <Area

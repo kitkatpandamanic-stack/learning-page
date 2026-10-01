@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { usePathname } from "next/navigation";
+import { usePathname } from "@/i18n/navigation";
 import {
   AppWindow,
   CheckCircle2,
@@ -13,9 +13,11 @@ import {
   Terminal,
   XCircle,
 } from "lucide-react";
+import { useLocale, useTranslations } from "next-intl";
 import { cn } from "cn";
 
 import { CodeEditor } from "@/components/code/code-editor";
+import { localizeRunnerText } from "@/components/code/runner-messages";
 import { languageFromPath, useAward } from "@/components/progress/use-progress";
 import { Button } from "@/components/ui/button";
 import {
@@ -97,10 +99,13 @@ export function CodeRunner({
   autoRun?: boolean;
 }) {
   const pathname = usePathname();
+  const locale = useLocale();
+  const t = useTranslations("runner");
   const award = useAward(languageFromPath(pathname));
   const [reward, setReward] = React.useState<string | null>(null);
+  // Each language keeps its own saved code (starters' comments differ).
   const storageKey = storageId
-    ? `pandadev:code:${pathname}:${storageId}`
+    ? `pandadev:code:${pathname}:${storageId}${locale === "en" ? "" : `:${locale}`}`
     : null;
   const [code, setCode] = React.useState(
     () => readSaved(storageKey) ?? starter,
@@ -214,11 +219,11 @@ export function CodeRunner({
         setReward(
           !result.ok
             ? result.reason === "signed-out"
-              ? "Sign in to earn XP for exercises."
+              ? t("signInForXp")
               : null
             : result.xpAwarded > 0
               ? `+${result.xpAwarded} XP`
-              : "XP already earned for this one.",
+              : t("xpAlreadyEarned"),
         );
       }
     }
@@ -291,9 +296,9 @@ export function CodeRunner({
             size="sm"
             onClick={reset}
             className="text-white/60"
-            title="Reset to the starting code"
+            title={t("resetTitle")}
           >
-            <RotateCcw /> Reset
+            <RotateCcw /> {t("reset")}
           </Button>
           {running ? (
             <Button
@@ -302,7 +307,7 @@ export function CodeRunner({
               className="px-3"
               onClick={() => cancelRef.current?.()}
             >
-              <Square /> Stop
+              <Square /> {t("stop")}
             </Button>
           ) : (
             <Button
@@ -310,9 +315,9 @@ export function CodeRunner({
               size="sm"
               className="px-3"
               onClick={() => run(false)}
-              title="Run (Ctrl/⌘ + Enter)"
+              title={t("runTitle")}
             >
-              <Play /> Run
+              <Play /> {t("run")}
             </Button>
           )}
           {canCheck && (
@@ -323,7 +328,7 @@ export function CodeRunner({
               disabled={running}
               onClick={() => run(true)}
             >
-              <CircleCheckBig /> Check
+              <CircleCheckBig /> {t("check")}
             </Button>
           )}
         </div>
@@ -336,12 +341,13 @@ export function CodeRunner({
         onRun={() => run(canCheck)}
         minHeight={minHeight}
         diagnostics={result?.diagnostics}
+        label={t("editorLabel")}
       />
 
       {hasPreview && (
         <div className="border-t border-white/10">
           <p className="flex items-center gap-1.5 bg-white/3 px-4 py-1.5 font-mono text-[11px] tracking-wider text-white/65 uppercase">
-            <AppWindow className="size-3.5" /> Preview
+            <AppWindow className="size-3.5" /> {t("preview")}
           </p>
           <div
             ref={previewRef}
@@ -354,14 +360,14 @@ export function CodeRunner({
       <div className="border-t border-white/10 bg-black/35 px-4 py-3">
         <div className="mb-1.5 flex items-center justify-between font-mono text-[11px] tracking-wider text-white/65 uppercase">
           <span className="flex items-center gap-1.5">
-            <Terminal className="size-3.5" /> Output
+            <Terminal className="size-3.5" /> {t("output")}
           </span>
           {running ? (
             <span className="flex items-center gap-1.5 normal-case">
               <Loader2 className="size-3 animate-spin" />{" "}
               {status === "loading"
-                ? `Loading ${languageLabel[language]}… (first time takes a few seconds)`
-                : "Running…"}
+                ? t("loading", { language: languageLabel[language] })
+                : t("running")}
             </span>
           ) : (
             result && (
@@ -382,23 +388,23 @@ export function CodeRunner({
                 key={i}
                 className={cn("whitespace-pre-wrap", lineStyle[line.level])}
               >
-                {line.text}
+                {localizeRunnerText(line.text, t)}
               </pre>
             ))
           ) : (
             <p className="text-white/55">
-              {result
-                ? "(no output)"
-                : "Press Run, or Ctrl/⌘ + Enter, to see what your code prints."}
+              {result ? t("noOutput") : t("pressRun")}
             </p>
           )}
           {result?.error?.line && (
             <p className="mt-1 text-xs text-rose-300/80">
-              ↑ on line {result.error.line}
+              {t("onLine", { line: result.error.line })}
             </p>
           )}
           {result?.notice && (
-            <p className="mt-1 text-xs text-amber-200/80">{result.notice}</p>
+            <p className="mt-1 text-xs text-amber-200/80">
+              {localizeRunnerText(result.notice, t)}
+            </p>
           )}
         </div>
       </div>
@@ -408,7 +414,7 @@ export function CodeRunner({
         <div className="flex flex-col gap-2 border-t border-white/10 px-4 py-3">
           {check.solved ? (
             <p className="flex items-center gap-2 rounded-xl bg-neon-lime/12 px-3 py-2.5 font-semibold text-lime-200 ring-1 ring-neon-lime/40">
-              <CheckCircle2 className="size-5" /> Solved! Great work 🎉
+              <CheckCircle2 className="size-5" /> {t("solved")}
               {reward && (
                 <span className="ml-auto text-sm font-medium text-amber-200">
                   {reward}
@@ -417,40 +423,39 @@ export function CodeRunner({
             </p>
           ) : (
             <p className="flex items-center gap-2 font-semibold text-rose-200">
-              <XCircle className="size-5" /> Not quite yet, check the details
-              below.
+              <XCircle className="size-5" /> {t("notYet")}
             </p>
           )}
           {check.output && !check.output.passed && (
             <div className="rounded-xl bg-white/5 px-3 py-2 font-mono text-xs">
               <p className="mb-1 text-white/55">
-                Output line {check.output.line} doesn&apos;t match:
+                {t("outputMismatch", { line: check.output.line })}
               </p>
               <p className="text-lime-200">
-                expected: {check.output.expected ?? "(nothing more)"}
+                {t("expected")}: {check.output.expected ?? t("nothingMore")}
               </p>
               <p className="text-rose-200">
-                got: {check.output.got ?? "(nothing)"}
+                {t("got")}: {check.output.got ?? t("nothing")}
               </p>
             </div>
           )}
           {check.tests && check.tests.length > 0 && (
             <ul className="flex flex-col gap-1">
-              {check.tests.map((t) => (
+              {check.tests.map((test) => (
                 <li
-                  key={t.name}
+                  key={test.name}
                   className="flex items-start gap-2 text-sm text-white/80"
                 >
-                  {t.passed ? (
+                  {test.passed ? (
                     <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-lime-300" />
                   ) : (
                     <XCircle className="mt-0.5 size-4 shrink-0 text-rose-300" />
                   )}
                   <span>
-                    {t.name}
-                    {t.error && (
+                    {test.name}
+                    {test.error && (
                       <span className="block text-xs text-white/45">
-                        {t.error}
+                        {localizeRunnerText(test.error, t)}
                       </span>
                     )}
                   </span>

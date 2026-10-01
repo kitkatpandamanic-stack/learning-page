@@ -1,6 +1,7 @@
 "use client";
 
 import { motion } from "motion/react";
+import { useTranslations } from "next-intl";
 import { cn } from "cn";
 
 import { Reveal } from "@/components/motion/reveal";
@@ -12,20 +13,22 @@ import { levels } from "@/lib/levels";
 import { toneClasses } from "@/lib/tones";
 
 export function RoadmapSection() {
+  const t = useTranslations("home.roadmap");
+  const tLevels = useTranslations("levels");
   return (
     <section id="roadmap" className="scroll-mt-28 py-16 sm:py-20">
       <Container>
         <Reveal>
           <SectionHeading
-            eyebrow="The path"
+            eyebrow={t("eyebrow")}
             eyebrowTone="pink"
-            title={
-              <>
-                From <GradientText>Zero</GradientText> to{" "}
-                <GradientText variant="cool">Senior</GradientText>
-              </>
-            }
-            description="Four levels for every language. Each one ends with a capstone project, so you finish with a portfolio, not just notes."
+            title={t.rich("title", {
+              gradient: (chunks) => <GradientText>{chunks}</GradientText>,
+              cool: (chunks) => (
+                <GradientText variant="cool">{chunks}</GradientText>
+              ),
+            })}
+            description={t("description")}
           />
         </Reveal>
 
@@ -50,10 +53,11 @@ export function RoadmapSection() {
 
           <ol className="relative grid gap-8 lg:grid-cols-4 lg:gap-5">
             {levels.map((item, i) => {
-              const t = toneClasses[item.tone];
+              const tone = toneClasses[item.tone];
+              const topics = tLevels.raw(`${item.level}.topics`) as string[];
               const Icon = item.icon;
               return (
-                <li key={item.name}>
+                <li key={item.level}>
                   <Reveal
                     delay={i * 0.15}
                     className="flex gap-5 lg:flex-col lg:items-center lg:gap-6"
@@ -61,9 +65,9 @@ export function RoadmapSection() {
                     <span
                       className={cn(
                         "relative z-10 flex size-14 shrink-0 items-center justify-center rounded-2xl border bg-space-900 [&_svg]:size-6",
-                        t.border,
-                        t.text,
-                        t.glow,
+                        tone.border,
+                        tone.text,
+                        tone.glow,
                       )}
                     >
                       <Icon />
@@ -72,25 +76,25 @@ export function RoadmapSection() {
                       <p
                         className={cn(
                           "font-mono text-xs tracking-wider uppercase",
-                          t.text,
+                          tone.text,
                         )}
                       >
-                        Level {item.level}
+                        {tLevels("level", { level: item.level })}
                       </p>
                       <h3 className="mt-1 text-xl font-bold text-white">
-                        {item.name}
+                        {tLevels(`${item.level}.name`)}
                       </h3>
                       <p className="text-sm text-muted-foreground">
-                        {item.tagline}
+                        {tLevels(`${item.level}.tagline`)}
                       </p>
                       <ul className="mt-4 flex flex-col gap-2">
-                        {item.topics.map((topic) => (
+                        {topics.map((topic) => (
                           <li
                             key={topic}
                             className="flex items-center gap-2 text-sm text-white/80"
                           >
                             <span
-                              className={cn("size-1.5 rounded-full", t.fill)}
+                              className={cn("size-1.5 rounded-full", tone.fill)}
                             />
                             {topic}
                           </li>

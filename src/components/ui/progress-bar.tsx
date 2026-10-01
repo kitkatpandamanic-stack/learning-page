@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useTranslations } from "next-intl";
 import { cn } from "cn";
 
 import { toneClasses, type Tone } from "@/lib/tones";
@@ -28,6 +29,7 @@ function ProgressBar({
   showValue?: boolean;
 }) {
   const t = toneClasses[tone];
+  const common = useTranslations("common");
   const percent = Math.min(100, Math.max(0, (value / max) * 100));
 
   return (
@@ -52,7 +54,7 @@ function ProgressBar({
         aria-valuemax={max}
         aria-valuenow={value}
         aria-label={
-          ariaLabel ?? (typeof label === "string" ? label : "Progress")
+          ariaLabel ?? (typeof label === "string" ? label : common("progress"))
         }
         className={cn(
           "w-full overflow-hidden rounded-full bg-white/8 ring-1 ring-white/5 ring-inset",

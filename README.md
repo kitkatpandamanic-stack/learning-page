@@ -109,6 +109,27 @@ The lesson URL is `/learn/<language>/<slug>` (the file name without its number).
 duplicate slugs fail the build with a clear message. New languages must also be added to
 `src/lib/languages.ts`.
 
+## Languages of the site (English + Russian)
+
+The site is bilingual with [next-intl](https://next-intl.dev): English at the plain URLs
+(`/learn/python/variables`), Russian under `/ru` (`/ru/learn/python/variables`). Visitors
+switch with the EN | RU toggle in the navbar; we don't redirect based on browser language.
+
+- **Pages** live in `src/app/[locale]/…`. `src/proxy.ts` maps URLs to locales; links use
+  `Link` from `@/i18n/navigation`, which adds `/ru` automatically.
+- **Interface text** is in `messages/<locale>/<area>.json` (areas listed in
+  `src/i18n/namespaces.ts`). Keys are type-checked against English, and `npm test` fails if
+  the Russian files are missing a key or a `{placeholder}`. Russian plurals use ICU
+  (`{count, plural, one {# урок} few {# урока} many {# уроков} other {# урока}}`).
+- **Lessons**: a translation sits next to the English file as `NN-slug.ru.mdx`, and course
+  outlines as `course.ru.yml`. A translation shares the lesson's slug, permalink and XP, so
+  progress is the same in every language. The build fails if a translation's exercise/quiz
+  counts, XP or duration differ from the English lesson, and `npm test` runs every
+  translated example and exercise just like the English ones. Lessons without a
+  translation fall back to English with a note.
+- Keep code identifiers in English; translate comments, prose and printed text. Real error
+  messages from JavaScript, Python and the TypeScript compiler stay in English.
+
 ## Deployment
 
 The site is hosted on [Vercel](https://vercel.com) and connected to this GitHub repo:

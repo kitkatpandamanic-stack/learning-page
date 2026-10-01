@@ -1,5 +1,7 @@
 import type { ComponentProps } from "react";
-import Link from "next/link";
+import { useTranslations } from "next-intl";
+
+import { Link } from "@/i18n/navigation";
 
 import { Logo } from "@/components/brand/logo";
 import { Container } from "@/components/ui/container";
@@ -14,6 +16,8 @@ function GitHubIcon(props: ComponentProps<"svg">) {
 }
 
 export function Footer() {
+  const t = useTranslations("footer");
+  const nav = useTranslations("nav");
   return (
     <footer className="mt-24 px-4 pb-6">
       <Container className="rounded-3xl px-6 py-12 glass sm:px-10">
@@ -21,15 +25,14 @@ export function Footer() {
           <div className="flex flex-col gap-4">
             <Logo />
             <p className="max-w-xs text-sm text-muted-foreground">
-              {siteConfig.tagline} Interactive lessons, real projects and a
-              clear path to your first developer job and beyond.
+              {t("tagline")}
             </p>
           </div>
 
           {footerNav.map((group) => (
             <div key={group.title}>
               <h2 className="mb-4 text-sm font-semibold text-white">
-                {group.title}
+                {t(group.title as Parameters<typeof t>[0])}
               </h2>
               <ul className="flex flex-col gap-2.5">
                 {group.links.map((link) => (
@@ -38,7 +41,7 @@ export function Footer() {
                       href={link.href}
                       className="text-sm text-muted-foreground transition-colors hover:text-white"
                     >
-                      {link.label}
+                      {nav(link.label as Parameters<typeof nav>[0])}
                     </Link>
                   </li>
                 ))}
@@ -48,39 +51,39 @@ export function Footer() {
 
           <div className="flex flex-col gap-3">
             <h2 className="text-sm font-semibold text-white">
-              Stay in the loop
+              {t("stayInTheLoop")}
             </h2>
-            <p className="text-sm text-muted-foreground">
-              New lessons and languages land on GitHub first. Star or watch the
-              project to follow along.
-            </p>
+            <p className="text-sm text-muted-foreground">{t("followText")}</p>
             <a
               href={siteConfig.githubUrl}
               target="_blank"
               rel="noreferrer"
               className="inline-flex w-fit items-center gap-2 rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/12 transition hover:bg-white/12"
             >
-              <GitHubIcon className="size-4" /> Follow on GitHub
+              <GitHubIcon className="size-4" /> {t("followOnGitHub")}
             </a>
           </div>
         </div>
 
         <div className="mt-12 flex flex-col-reverse items-center justify-between gap-4 border-t border-white/10 pt-6 text-sm text-muted-foreground sm:flex-row">
           <p>
-            © {new Date().getFullYear()} {siteConfig.name}. All rights reserved.
+            {t("copyright", {
+              year: new Date().getFullYear(),
+              name: siteConfig.name,
+            })}
           </p>
           <div className="flex items-center gap-5">
             <Link href="/privacy" className="hover:text-white">
-              Privacy
+              {t("privacy")}
             </Link>
             <Link href="/terms" className="hover:text-white">
-              Terms
+              {t("terms")}
             </Link>
             <a
               href={siteConfig.githubUrl}
               target="_blank"
               rel="noopener noreferrer"
-              aria-label="PandaDev on GitHub"
+              aria-label={t("onGitHub")}
               className="hover:text-white"
             >
               <GitHubIcon className="size-5" />

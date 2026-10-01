@@ -1,4 +1,5 @@
-import Link from "next/link";
+import { useTranslations } from "next-intl";
+import { Link } from "@/i18n/navigation";
 import { ArrowLeft, ArrowRight, Flag } from "lucide-react";
 
 import type { Lesson } from "#site/content";
@@ -14,13 +15,17 @@ export function LessonNav({
   next?: Lesson;
   roadmapHref: string;
 }) {
+  const t = useTranslations("lesson");
   return (
-    <nav aria-label="Lesson navigation" className="grid gap-3 sm:grid-cols-2">
+    <nav
+      aria-label={t("lessonNavigation")}
+      className="grid gap-3 sm:grid-cols-2"
+    >
       {prev ? (
         <GlassCard asChild interactive padding="sm">
           <Link href={prev.permalink} className="flex flex-col gap-1">
             <span className="flex items-center gap-1.5 text-xs text-white/50">
-              <ArrowLeft className="size-3.5" /> Previous
+              <ArrowLeft className="size-3.5" /> {t("previous")}
             </span>
             <span className="font-semibold text-white">{prev.title}</span>
           </Link>
@@ -36,7 +41,7 @@ export function LessonNav({
             className="flex flex-col gap-1 text-right"
           >
             <span className="flex items-center justify-end gap-1.5 text-xs text-violet-300">
-              Up next <ArrowRight className="size-3.5" />
+              {t("upNext")} <ArrowRight className="size-3.5" />
             </span>
             <span className="font-semibold text-white">{next.title}</span>
           </Link>
@@ -45,10 +50,10 @@ export function LessonNav({
         <GlassCard asChild interactive padding="sm">
           <Link href={roadmapHref} className="flex flex-col gap-1 text-right">
             <span className="flex items-center justify-end gap-1.5 text-xs text-lime-300">
-              <Flag className="size-3.5" /> You&apos;re all caught up
+              <Flag className="size-3.5" /> {t("allCaughtUp")}
             </span>
             <span className="font-semibold text-white">
-              Back to the roadmap
+              {t("backToRoadmap")}
             </span>
           </Link>
         </GlassCard>

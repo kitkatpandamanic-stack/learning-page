@@ -1,7 +1,8 @@
 "use client";
 
-import Link from "next/link";
+import { Link } from "@/i18n/navigation";
 import { motion } from "motion/react";
+import { useTranslations } from "next-intl";
 import {
   ArrowRight,
   CheckCircle2,
@@ -26,9 +27,11 @@ const fadeUp = (delay: number) => ({
   transition: { duration: 0.7, delay, ease },
 });
 
-const perks = ["Free to start", "Code in your browser", "Beginner → Senior"];
+const perks = ["free", "browser", "path"] as const;
 
 function CodeCard() {
+  const t = useTranslations("home.hero.code");
+  const greeting = t("greeting");
   return (
     <div className="w-56 rounded-2xl p-3 font-mono text-[11px] leading-relaxed glass-strong sm:w-64 sm:text-xs">
       <div className="mb-2 flex items-center gap-1.5">
@@ -44,29 +47,32 @@ function CodeCard() {
       </p>
       <p className="pl-4">
         <span className="text-pink-300">return</span>{" "}
-        <span className="text-lime-300">f&quot;Hello, {"{name}"}!&quot;</span>
+        <span className="text-lime-300">
+          f&quot;{greeting}, {"{name}"}!&quot;
+        </span>
       </p>
       <p>
         <span className="text-cyan-300">print</span>
         <span className="text-white/80">(greet(</span>
-        <span className="text-lime-300">&quot;Panda&quot;</span>
+        <span className="text-lime-300">&quot;{t("name")}&quot;</span>
         <span className="text-white/80">))</span>
       </p>
       <p className="mt-2 border-t border-white/10 pt-2 text-amber-300">
-        &gt; Hello, Panda!
+        &gt; {greeting}, {t("name")}!
       </p>
     </div>
   );
 }
 
 export function Hero() {
+  const t = useTranslations("home.hero");
   return (
     <section className="relative pt-12 pb-8 sm:pt-20 sm:pb-20 lg:pb-28">
       <Container className="grid items-center gap-12 lg:grid-cols-[1.05fr_1fr] lg:gap-6">
         <div className="flex flex-col items-center text-center lg:items-start lg:text-left">
           <motion.div {...fadeUp(0)}>
             <Badge tone="cyan" dot>
-              <Sparkles className="size-3.5" /> Learn to code the fun way
+              <Sparkles className="size-3.5" /> {t("badge")}
             </Badge>
           </motion.div>
 
@@ -74,18 +80,16 @@ export function Hero() {
             {...fadeUp(0.1)}
             className="mt-6 text-5xl leading-[1.05] font-extrabold tracking-tight text-white sm:text-6xl lg:text-7xl"
           >
-            Learn to code.
+            {t("titleLine1")}
             <br />
-            <GradientText>From Zero to Senior.</GradientText>
+            <GradientText>{t("titleLine2")}</GradientText>
           </motion.h1>
 
           <motion.p
             {...fadeUp(0.2)}
             className="mt-6 max-w-xl text-lg text-pretty text-muted-foreground sm:text-xl"
           >
-            Master JavaScript, Python, TypeScript and more with bite-sized
-            lessons, real coding exercises and projects. One clear path from
-            your very first line of code to senior developer.
+            {t("description")}
           </motion.p>
 
           <motion.div
@@ -94,12 +98,12 @@ export function Hero() {
           >
             <Button asChild variant="gradient" size="xl">
               <Link href="/languages">
-                Start learning free <ArrowRight />
+                {t("startFree")} <ArrowRight />
               </Link>
             </Button>
             <Button asChild variant="glass" size="xl">
               <Link href="#roadmap">
-                <MapIcon /> See the roadmap
+                <MapIcon /> {t("seeRoadmap")}
               </Link>
             </Button>
           </motion.div>
@@ -111,7 +115,7 @@ export function Hero() {
             {perks.map((perk) => (
               <li key={perk} className="flex items-center gap-2">
                 <CheckCircle2 className="size-4 text-lime-300" />
-                {perk}
+                {t(`perks.${perk}`)}
               </li>
             ))}
           </motion.ul>
@@ -133,8 +137,8 @@ export function Hero() {
             <Chip
               icon={<CheckCircle2 />}
               tone="lime"
-              label="Lesson 12 completed"
-              sublabel="Python · Loops"
+              label={t("chips.lessonCompleted", { number: 12 })}
+              sublabel={t("chips.lessonTopic")}
               className="motion-safe:animate-float"
             />
           </motion.div>
@@ -142,8 +146,8 @@ export function Hero() {
             <Chip
               icon={<Zap />}
               tone="amber"
-              label="+50 XP"
-              sublabel="Daily goal reached"
+              label={t("chips.xpGain", { count: 50 })}
+              sublabel={t("chips.dailyGoal")}
               className="[animation-delay:-2s] motion-safe:animate-float"
             />
           </motion.div>
@@ -154,8 +158,8 @@ export function Hero() {
             <Chip
               icon={<Flame />}
               tone="pink"
-              label="7-day streak"
-              sublabel="Keep it going!"
+              label={t("chips.streak", { count: 7 })}
+              sublabel={t("chips.keepGoing")}
               className="[animation-delay:-4s] motion-safe:animate-float"
             />
           </motion.div>

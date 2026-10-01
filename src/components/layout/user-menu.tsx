@@ -1,7 +1,8 @@
 "use client";
 
-import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useTranslations } from "next-intl";
+
+import { Link, useRouter } from "@/i18n/navigation";
 import { LayoutDashboard, LogOut, UserRound } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -59,12 +60,13 @@ export function useSignOut() {
 }
 
 export function UserMenu({ user }: { user: MenuUser }) {
+  const t = useTranslations("auth.menu");
   const handleSignOut = useSignOut();
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        aria-label="Account menu"
+        aria-label={t("label")}
         className="rounded-full ring-2 ring-neon-violet/50 transition outline-none hover:ring-neon-pink/70 focus-visible:ring-neon-cyan"
       >
         <UserAvatar user={user} className="size-9" />
@@ -83,12 +85,12 @@ export function UserMenu({ user }: { user: MenuUser }) {
         <DropdownMenuSeparator className="bg-white/10" />
         <DropdownMenuItem asChild className="rounded-lg">
           <Link href="/dashboard">
-            <LayoutDashboard /> Dashboard
+            <LayoutDashboard /> {t("dashboard")}
           </Link>
         </DropdownMenuItem>
         <DropdownMenuItem asChild className="rounded-lg">
           <Link href="/profile">
-            <UserRound /> Profile
+            <UserRound /> {t("profile")}
           </Link>
         </DropdownMenuItem>
         <DropdownMenuSeparator className="bg-white/10" />
@@ -96,7 +98,7 @@ export function UserMenu({ user }: { user: MenuUser }) {
           onSelect={handleSignOut}
           className="rounded-lg text-rose-300 focus:text-rose-200"
         >
-          <LogOut /> Sign out
+          <LogOut /> {t("signOut")}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

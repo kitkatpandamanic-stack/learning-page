@@ -2,9 +2,10 @@
 
 import * as React from "react";
 import { CheckCircle2, HelpCircle, RotateCcw, XCircle } from "lucide-react";
+import { useTranslations } from "next-intl";
 import { cn } from "cn";
 
-import { usePathname } from "next/navigation";
+import { usePathname } from "@/i18n/navigation";
 
 import { languageFromPath, useAward } from "@/components/progress/use-progress";
 import { Button } from "@/components/ui/button";
@@ -26,6 +27,7 @@ export function Quiz({
 }) {
   const pathname = usePathname();
   const award = useAward(languageFromPath(pathname));
+  const t = useTranslations("lesson.quiz");
   const attempts = React.useRef(0);
   const id = React.useId();
   const [selected, setSelected] = React.useState<number | null>(null);
@@ -34,7 +36,7 @@ export function Quiz({
 
   return (
     <fieldset className="not-prose my-8 rounded-2xl p-5 glass">
-      <legend className="sr-only">Quiz</legend>
+      <legend className="sr-only">{t("label")}</legend>
       <p className="flex items-start gap-2 font-semibold text-white">
         <HelpCircle className="mt-0.5 size-5 shrink-0 text-cyan-300" />
         {question}
@@ -93,7 +95,7 @@ export function Quiz({
               }
             }}
           >
-            Check answer
+            {t("check")}
           </Button>
         ) : (
           <Button
@@ -105,17 +107,15 @@ export function Quiz({
               setSelected(null);
             }}
           >
-            <RotateCcw /> Try again
+            <RotateCcw /> {t("tryAgain")}
           </Button>
         )}
         <p aria-live="polite" className="text-sm font-medium">
           {checked &&
             (correct ? (
-              <span className="text-lime-300">Correct! 🎉</span>
+              <span className="text-lime-300">{t("correct")}</span>
             ) : (
-              <span className="text-rose-300">
-                Not quite, have another look.
-              </span>
+              <span className="text-rose-300">{t("wrong")}</span>
             ))}
         </p>
       </div>

@@ -1,11 +1,13 @@
 "use client";
 
 import * as React from "react";
+import { useLocale, useTranslations } from "next-intl";
 import { Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import type { SocialProvider } from "@/lib/auth-providers";
 import { signIn } from "@/lib/auth-client";
+import { localizedPath } from "@/lib/i18n";
 
 function GitHubIcon() {
   return (
@@ -40,10 +42,10 @@ function GoogleIcon() {
 
 const providerInfo: Record<
   SocialProvider,
-  { label: string; icon: React.ReactNode }
+  { name: string; icon: React.ReactNode }
 > = {
-  github: { label: "Continue with GitHub", icon: <GitHubIcon /> },
-  google: { label: "Continue with Google", icon: <GoogleIcon /> },
+  github: { name: "GitHub", icon: <GitHubIcon /> },
+  google: { name: "Google", icon: <GoogleIcon /> },
 };
 
 export function SignInButtons({
@@ -53,20 +55,23 @@ export function SignInButtons({
   providers: SocialProvider[];
   returnTo: string;
 }) {
+  const t = useTranslations("auth.signIn");
+  const locale = useLocale();
   const [pending, setPending] = React.useState<SocialProvider | null>(null);
-  const [error, setError] = React.useState<string | null>(null);
+  const [error, setError] = React.useState(false);
 
   async function handleSignIn(provider: SocialProvider) {
     setPending(provider);
-    setError(null);
+    setError(false);
     const { error } = await signIn.social({
       provider,
       callbackURL: returnTo,
-      errorCallbackURL: "/sign-in",
+      errorCallbackURL: localizedPath("/sign-in", locale),
     });
     // On success the browser is redirected to the provider, so we only get here on failure.
+    // The auth library's messages are English, so show our own translated one.
     if (error) {
-      setError(error.message ?? "Something went wrong. Please try again.");
+      setError(true);
       setPending(null);
     }
   }
@@ -87,12 +92,12 @@ export function SignInButtons({
           ) : (
             providerInfo[provider].icon
           )}
-          {providerInfo[provider].label}
+          {t("continueWith", { provider: providerInfo[provider].name })}
         </Button>
       ))}
       {error && (
         <p role="alert" className="text-center text-sm text-rose-300">
-          {error}
+          {t("failed")}
         </p>
       )}
     </div>

@@ -1,3 +1,5 @@
+import { useTranslations } from "next-intl";
+
 import { Reveal } from "@/components/motion/reveal";
 import { LanguageCard } from "@/components/languages/language-card";
 import { Container } from "@/components/ui/container";
@@ -6,18 +8,17 @@ import { SectionHeading } from "@/components/ui/section-heading";
 import { languages } from "@/lib/languages";
 
 export function LanguagesSection() {
+  const t = useTranslations("home.languages");
   return (
     <section id="languages" className="scroll-mt-28 py-16 sm:py-20">
       <Container>
         <Reveal>
           <SectionHeading
-            eyebrow="Languages"
-            title={
-              <>
-                Pick a language. <GradientText>Start today.</GradientText>
-              </>
-            }
-            description="Every language follows the same four-level path, so you always know what to learn next."
+            eyebrow={t("eyebrow")}
+            title={t.rich("title", {
+              gradient: (chunks) => <GradientText>{chunks}</GradientText>,
+            })}
+            description={t("description")}
           />
         </Reveal>
 

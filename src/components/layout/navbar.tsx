@@ -1,8 +1,7 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { useTranslations } from "next-intl";
 import { cn } from "cn";
 import {
   ArrowRight,
@@ -13,6 +12,7 @@ import {
 } from "lucide-react";
 
 import { Logo } from "@/components/brand/logo";
+import { LanguageSwitcher } from "@/components/layout/language-switcher";
 import {
   UserAvatar,
   UserMenu,
@@ -26,11 +26,13 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet";
+import { Link, usePathname } from "@/i18n/navigation";
 import { useSession } from "@/lib/auth-client";
 import { mainNav } from "@/lib/site";
 
 export function Navbar() {
   const pathname = usePathname();
+  const t = useTranslations("nav");
   const { data: session, isPending } = useSession();
   const user = session?.user;
   const handleSignOut = useSignOut();
@@ -50,7 +52,7 @@ export function Navbar() {
   return (
     <header className="sticky top-0 z-40 px-4 pt-4">
       <nav
-        aria-label="Main"
+        aria-label={t("main")}
         className={cn(
           "mx-auto flex h-16 max-w-6xl items-center justify-between gap-4 rounded-2xl px-4 transition-all duration-300 sm:px-5",
           scrolled ? "glass-strong" : "glass",
@@ -58,7 +60,7 @@ export function Navbar() {
       >
         <Link
           href="/"
-          aria-label="PandaDev home"
+          aria-label={t("home")}
           className="rounded-lg focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
         >
           <Logo />
@@ -75,13 +77,14 @@ export function Navbar() {
                   "aria-[current=page]:bg-white/10 aria-[current=page]:text-white",
                 )}
               >
-                {link.label}
+                {t(link.label as Parameters<typeof t>[0])}
               </Link>
             </li>
           ))}
         </ul>
 
         <div className="hidden items-center gap-3 md:flex">
+          <LanguageSwitcher />
           {isPending ? (
             <span
               aria-hidden
@@ -91,7 +94,7 @@ export function Navbar() {
             <>
               <Button asChild variant="gradient" size="lg" className="px-5">
                 <Link href="/dashboard">
-                  Continue learning <ArrowRight />
+                  {t("continueLearning")} <ArrowRight />
                 </Link>
               </Button>
               <UserMenu user={user} />
@@ -103,11 +106,11 @@ export function Navbar() {
                 variant="ghost"
                 className="rounded-full px-4 text-white/80"
               >
-                <Link href="/sign-in">Sign in</Link>
+                <Link href="/sign-in">{t("signIn")}</Link>
               </Button>
               <Button asChild variant="gradient" size="lg" className="px-5">
                 <Link href="/languages">
-                  Start learning <ArrowRight />
+                  {t("startLearning")} <ArrowRight />
                 </Link>
               </Button>
             </>
@@ -120,7 +123,7 @@ export function Navbar() {
               variant="glass"
               size="icon-lg"
               className="md:hidden"
-              aria-label="Open menu"
+              aria-label={t("openMenu")}
             >
               <Menu />
             </Button>
@@ -143,13 +146,14 @@ export function Navbar() {
                       aria-current={isActive(link.href) ? "page" : undefined}
                       className="block rounded-xl px-4 py-3 text-base font-medium text-white/80 hover:bg-white/8 hover:text-white aria-[current=page]:bg-white/10 aria-[current=page]:text-white"
                     >
-                      {link.label}
+                      {t(link.label as Parameters<typeof t>[0])}
                     </Link>
                   </SheetClose>
                 </li>
               ))}
             </ul>
             <div className="mt-auto flex flex-col gap-3">
+              <LanguageSwitcher className="self-start text-sm" />
               {user ? (
                 <>
                   <div className="flex items-center gap-3 rounded-xl bg-white/5 p-3">
@@ -167,14 +171,14 @@ export function Navbar() {
                     <SheetClose asChild>
                       <Button asChild variant="glass" size="xl">
                         <Link href="/dashboard">
-                          <LayoutDashboard /> Dashboard
+                          <LayoutDashboard /> {t("dashboard")}
                         </Link>
                       </Button>
                     </SheetClose>
                     <SheetClose asChild>
                       <Button asChild variant="glass" size="xl">
                         <Link href="/profile">
-                          <UserRound /> Profile
+                          <UserRound /> {t("profile")}
                         </Link>
                       </Button>
                     </SheetClose>
@@ -186,7 +190,7 @@ export function Navbar() {
                       className="rounded-full text-rose-300"
                       onClick={handleSignOut}
                     >
-                      <LogOut /> Sign out
+                      <LogOut /> {t("signOut")}
                     </Button>
                   </SheetClose>
                 </>
@@ -194,13 +198,13 @@ export function Navbar() {
                 <>
                   <SheetClose asChild>
                     <Button asChild variant="glass" size="xl">
-                      <Link href="/sign-in">Sign in</Link>
+                      <Link href="/sign-in">{t("signIn")}</Link>
                     </Button>
                   </SheetClose>
                   <SheetClose asChild>
                     <Button asChild variant="gradient" size="xl">
                       <Link href="/languages">
-                        Start learning <ArrowRight />
+                        {t("startLearning")} <ArrowRight />
                       </Link>
                     </Button>
                   </SheetClose>
