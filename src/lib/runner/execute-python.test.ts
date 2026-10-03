@@ -1,7 +1,7 @@
 import { loadPyodide, type PyodideInterface } from "pyodide";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { executePython } from "./execute-python";
+import { executePython, withImpliedImports } from "./execute-python";
 
 let py: PyodideInterface;
 beforeAll(async () => {
@@ -375,5 +375,31 @@ describe("HTTP clients and the practice API", () => {
     );
     expect(r.error).toBeUndefined();
     expect(texts(r)).toEqual(["Why the Sky Is Blue $11.00", "/shop?page=3"]);
+  }, 60_000);
+});
+
+describe("packages for checks and charts", () => {
+  it("installs packages that only the checks import", () => {
+    expect(
+      withImpliedImports("x = 1", [
+        "__import__('scipy.stats').norm.cdf(0) == 0.5",
+        "x == 1",
+      ]),
+    ).toBe("x = 1\nimport scipy.stats");
+    expect(withImpliedImports("from zoneinfo import ZoneInfo")).toBe(
+      "from zoneinfo import ZoneInfo\nimport tzdata",
+    );
+  });
+
+  it("starts every run with default chart styles", async () => {
+    await executePython(
+      py,
+      'import matplotlib.pyplot as plt\nplt.style.use("dark_background")',
+    );
+    const r = await executePython(
+      py,
+      'import matplotlib.pyplot as plt\nprint(plt.rcParams["axes.facecolor"], plt.get_backend())',
+    );
+    expect(texts(r)).toEqual(["white agg"]);
   }, 60_000);
 });

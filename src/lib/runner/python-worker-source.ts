@@ -39,7 +39,7 @@ onmessage = async (event) => {
   // Install the packages the code imports (pandas, pytest…), once per page.
   // Pyodide lists every dependency; name just the ones the code imports.
   try {
-    await pyodide.loadPackagesFromImports(withImpliedImports(code), {
+    await pyodide.loadPackagesFromImports(withImpliedImports(code, checks), {
       messageCallback: (message) => {
         const match = /^Loading (.+)$/.exec(String(message).trim());
         if (!match) return;
@@ -55,7 +55,7 @@ onmessage = async (event) => {
   }
   const prepare = pyodide.globals.get("_panda_prepare");
   try {
-    prepare(code);
+    prepare(withImpliedImports(code, checks));
   } finally {
     prepare.destroy();
   }

@@ -452,6 +452,11 @@ def _panda_run(code, checks, emit, api=None):
     old_out, old_err, old_input, old_cwd = sys.stdout, sys.stderr, builtins.input, os.getcwd()
     sys.stdout, sys.stderr, builtins.input = out, err, _panda_no_input
     os.chdir(_PANDA_DIR)
+    if "matplotlib" in sys.modules:
+        # Charts and styles (plt.style.use, rcParams) from an earlier run.
+        import matplotlib, matplotlib.pyplot as plt
+        plt.close("all")
+        matplotlib.rcdefaults()
     namespace = {"__name__": "__main__", "__file__": _PANDA_FILE, "__output": output}
     result = {"error": None, "tests": None}
     try:
@@ -522,13 +527,20 @@ export function parsePythonResult(
 }
 
 /**
- * The code plus imports Pyodide can't see in it: zoneinfo finds its time
- * zones in the tzdata package. Used to pick the packages to install.
+ * The code plus imports Pyodide can't see in it, to pick the packages to
+ * install: checks that import with __import__("scipy.stats"), and zoneinfo,
+ * which finds its time zones in the tzdata package.
  */
-export function withImpliedImports(code: string) {
-  return /^\s*(?:import|from)\s+zoneinfo\b/m.test(code)
-    ? `${code}\nimport tzdata`
-    : code;
+export function withImpliedImports(code: string, checks: string[] = []) {
+  const fromChecks = checks.flatMap((check) =>
+    [...check.matchAll(/__import__\(\s*["']([\w.]+)["']/g)].map(
+      (m) => `import ${m[1]}`,
+    ),
+  );
+  const source = [code, ...fromChecks].join("\n");
+  return /^\s*(?:import|from)\s+zoneinfo\b/m.test(source)
+    ? `${source}\nimport tzdata`
+    : source;
 }
 
 /**
@@ -557,12 +569,16 @@ export async function executePython(
     pyodide.runPython(PYTHON_DRIVER);
     driverLoaded.add(pyodide);
   }
-  await pyodide.loadPackagesFromImports(withImpliedImports(code), {
+  const imports = withImpliedImports(
+    code,
+    tests.map((t) => t.check),
+  );
+  await pyodide.loadPackagesFromImports(imports, {
     messageCallback: () => {},
   });
   const prepare = pyodide.globals.get("_panda_prepare");
   try {
-    prepare(code);
+    prepare(imports);
   } finally {
     prepare.destroy();
   }
