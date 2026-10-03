@@ -1,4 +1,4 @@
-import type { TypeDiagnostic } from "./typecheck";
+import type { TypeDiagnostic, TypeEnv } from "./typecheck";
 import type { TypeCheckMessage, TypeCheckRequest } from "./typecheck.worker";
 
 const LOAD_TIMEOUT_MS = 60_000;
@@ -6,14 +6,14 @@ const CHECK_TIMEOUT_MS = 10_000;
 
 /**
  * One long-lived type-checking worker for the whole page: TypeScript is a
- * large download, so it's fetched once, on the first TypeScript run.
+ * large download, so it's fetched once, on the first TypeScript run. Each
+ * environment (worker, page, React) loads its own type libraries on first use.
  */
 let worker: Worker | null = null;
-let ready = false;
-let failed = false;
 let nextId = 1;
 const pending = new Map<number, (message: TypeCheckMessage) => void>();
-const readyListeners = new Set<(ok: boolean) => void>();
+/** Environments whose libraries have loaded. */
+const readyEnvs = new Set<TypeEnv>();
 /** Ends every check still waiting on the current worker (used on restart). */
 const abortChecks = new Set<() => void>();
 
@@ -23,15 +23,7 @@ function getWorker() {
     type: "module",
   });
   worker.onmessage = (event: MessageEvent<TypeCheckMessage>) => {
-    const message = event.data;
-    if (message.type === "result") {
-      pending.get(message.id)?.(message);
-    } else {
-      ready = message.type === "ready";
-      failed = !ready;
-      readyListeners.forEach((fn) => fn(ready));
-      readyListeners.clear();
-    }
+    pending.get(event.data.id)?.(event.data);
   };
   return worker;
 }
@@ -39,32 +31,32 @@ function getWorker() {
 function restart() {
   worker?.terminate();
   worker = null;
-  ready = false;
-  readyListeners.clear();
+  readyEnvs.clear();
   // Their worker is gone; without this, their own timers would later kill
   // the next worker too.
   for (const abort of [...abortChecks]) abort();
 }
 
 /** Start downloading TypeScript early, e.g. when a TypeScript editor appears. */
-export function preloadTypeScript() {
-  if (!failed) getWorker();
+export function preloadTypeScript(env: TypeEnv = "worker") {
+  if (!readyEnvs.has(env)) void typecheck("", { env });
 }
 
-export function isTypeScriptReady() {
-  return ready;
+export function isTypeScriptReady(env: TypeEnv = "worker") {
+  return readyEnvs.has(env);
 }
 
 /**
  * Type-checks learner code. Resolves to null when the checker isn't available
- * (offline, CDN blocked, or too slow), so the caller can run the code anyway.
+ * (offline, or too slow), so the caller can run the code anyway.
  */
 export function typecheck(
   code: string,
-  onLoading?: () => void,
+  options: { env?: TypeEnv; onLoading?: () => void } = {},
 ): Promise<TypeDiagnostic[] | null> {
-  if (failed) return Promise.resolve(null);
+  const { env = "worker", onLoading } = options;
   const w = getWorker();
+  const ready = readyEnvs.has(env);
   if (!ready) onLoading?.();
   const id = nextId++;
 
@@ -84,10 +76,14 @@ export function typecheck(
       },
       ready ? CHECK_TIMEOUT_MS : LOAD_TIMEOUT_MS,
     );
-    if (!ready) readyListeners.add((ok) => ok || done(null));
     pending.set(id, (message) => {
-      if (message.type === "result") done(message.diagnostics);
+      if (message.type === "result") {
+        readyEnvs.add(env);
+        done(message.diagnostics);
+      } else {
+        done(null);
+      }
     });
-    w.postMessage({ id, code } satisfies TypeCheckRequest);
+    w.postMessage({ id, code, env } satisfies TypeCheckRequest);
   });
 }

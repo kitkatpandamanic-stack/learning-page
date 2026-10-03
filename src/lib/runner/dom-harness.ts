@@ -392,15 +392,17 @@ export const REACT_HTML = '<div id="root"></div>';
 const MODULE_SYNTAX = /^\s*(import\s*[\w{*'"]|export\s)/m;
 
 /**
- * Learner code as the preview runs it: strict, with loop guards. React code
- * has its JSX turned into React.createElement calls, and imports into
- * require() calls the page answers; line numbers stay the same.
+ * Learner code as the preview runs it: strict, with loop guards. TypeScript
+ * loses its types, React code has its JSX turned into React.createElement
+ * calls, and imports become require() calls the page answers; line numbers
+ * stay the same.
  */
 export function prepareDomCode(
   code: string,
-  options: { react?: boolean } = {},
+  options: { react?: boolean; typescript?: boolean } = {},
 ) {
   const transforms: Transform[] = [];
+  if (options.typescript) transforms.push("typescript");
   if (options.react) transforms.push("jsx");
   if (MODULE_SYNTAX.test(code)) transforms.push("imports");
   if (transforms.length) {

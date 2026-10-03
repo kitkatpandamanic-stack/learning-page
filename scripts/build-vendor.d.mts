@@ -4,3 +4,5 @@ export function buildReactVendor(options?: { force?: boolean }): string;
 export const typescriptVersion: string;
 export const typescriptVendorDir: string;
 export function buildTypeScriptVendor(options?: { force?: boolean }): string;
+export const reactTypesVendorDir: string;
+export function buildReactTypesVendor(options?: { force?: boolean }): string;

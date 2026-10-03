@@ -24,13 +24,20 @@ import {
   type TestSpec,
 } from "@/lib/runner/execute";
 import { REACT_HTML } from "@/lib/runner/dom-harness";
-import { runCode, type RunResult, type RunStatus } from "@/lib/runner/run-code";
+import {
+  runCode,
+  UNCHECKED_NOTICE,
+  type RunResult,
+  type RunStatus,
+} from "@/lib/runner/run-code";
+import { typeErrorResult, type TypeEnv } from "@/lib/runner/typecheck";
 import { runDom, type DomRun } from "@/lib/runner/run-dom";
 import { whenIdle } from "@/lib/idle";
 import { isPythonReady, preloadPython } from "@/lib/runner/run-python";
 import {
   isTypeScriptReady,
   preloadTypeScript,
+  typecheck,
 } from "@/lib/runner/run-typecheck";
 
 const lineStyle: Record<OutputLine["level"], string> = {
@@ -92,8 +99,15 @@ export function CodeRunner({
   autoRun?: boolean;
 }) {
   // React code always runs in the preview, on an empty page by default.
-  const react = language === "react";
+  const react = language === "react" || language === "tsx";
   const html = page ?? (react ? REACT_HTML : undefined);
+  // TypeScript is type-checked for where it runs: a worker, a page or React.
+  const typed = language === "typescript" || language === "tsx";
+  const typeEnv: TypeEnv = react
+    ? "react"
+    : html !== undefined
+      ? "page"
+      : "worker";
   const pathname = usePathname();
   const locale = useLocale();
   const t = useTranslations("runner");
@@ -162,6 +176,7 @@ export function CodeRunner({
       storage: readPageStorage(),
       onStorage: savePageStorage,
       react,
+      typescript: typed,
     });
     previewRun.current = preview;
     return () => preview.dispose();
@@ -173,10 +188,9 @@ export function CodeRunner({
   // first time; start early, but after the page has finished loading so
   // the download doesn't slow the lesson itself down.
   React.useEffect(() => {
-    if (language !== "python" && language !== "typescript") return;
-    const preload = language === "python" ? preloadPython : preloadTypeScript;
-    return whenIdle(preload);
-  }, [language]);
+    if (language === "python") return whenIdle(preloadPython);
+    if (typed) return whenIdle(() => preloadTypeScript(typeEnv));
+  }, [language, typed, typeEnv]);
 
   function updateCode(value: string) {
     setCode(value);
@@ -191,7 +205,7 @@ export function CodeRunner({
     setCheck(null);
     setStatus(
       (language === "python" && !isPythonReady()) ||
-        (language === "typescript" && !isTypeScriptReady())
+        (typed && !isTypeScriptReady(typeEnv))
         ? "loading"
         : null,
     );
@@ -251,6 +265,26 @@ export function CodeRunner({
    * copy of the page, so they can click around without changing the preview.
    */
   async function runPreview(page: string, withChecks: boolean) {
+    // Like the compiler: code with type errors doesn't run.
+    let notice: string | undefined;
+    if (typed) {
+      const started = performance.now();
+      const diagnostics = await typecheck(code, {
+        env: typeEnv,
+        onLoading: () => setStatus("loading"),
+      });
+      setStatus("running");
+      if (diagnostics?.length) {
+        const res: RunResult = {
+          ...typeErrorResult(diagnostics, withChecks ? tests : undefined),
+          diagnostics,
+          timedOut: false,
+          durationMs: performance.now() - started,
+        };
+        return { res, checked: res };
+      }
+      if (diagnostics === null) notice = UNCHECKED_NOTICE;
+    }
     previewRun.current?.dispose();
     const visible = runDom(code, {
       html: page,
@@ -259,18 +293,23 @@ export function CodeRunner({
       storage: readPageStorage(),
       onStorage: savePageStorage,
       react,
+      typescript: typed,
     });
     previewRun.current = visible;
     const hidden =
       withChecks && canCheck
-        ? runDom(code, { html: page, tests, react })
+        ? runDom(code, { html: page, tests, react, typescript: typed })
         : null;
     cancelRef.current = () => {
       visible.cancel();
       hidden?.cancel();
     };
-    const [res, checked] = await Promise.all([visible.result, hidden?.result]);
+    const [shown, checked] = await Promise.all([
+      visible.result,
+      hidden?.result,
+    ]);
     cancelRef.current = null;
+    const res = notice ? { ...shown, notice } : shown;
     return { res, checked: checked ?? res };
   }
 

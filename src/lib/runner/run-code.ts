@@ -67,24 +67,24 @@ function runTypeScript(code: string, options: RunOptions): Run {
       });
   });
 
-  const checked = typecheck(code, () => options.onStatus?.("loading")).then(
-    (diagnostics: TypeDiagnostic[] | null): Promise<RunResult> => {
-      if (cancelled) return cancelledResult;
-      options.onStatus?.("running");
-      if (diagnostics?.length) {
-        return Promise.resolve({
-          ...typeErrorResult(diagnostics, options.tests),
-          diagnostics,
-          timedOut: false,
-          durationMs: performance.now() - started,
-        });
-      }
-      inner = runInWorker(code, options);
-      return inner.result.then((r) =>
-        diagnostics === null ? { ...r, notice: UNCHECKED_NOTICE } : r,
-      );
-    },
-  );
+  const checked = typecheck(code, {
+    onLoading: () => options.onStatus?.("loading"),
+  }).then((diagnostics: TypeDiagnostic[] | null): Promise<RunResult> => {
+    if (cancelled) return cancelledResult;
+    options.onStatus?.("running");
+    if (diagnostics?.length) {
+      return Promise.resolve({
+        ...typeErrorResult(diagnostics, options.tests),
+        diagnostics,
+        timedOut: false,
+        durationMs: performance.now() - started,
+      });
+    }
+    inner = runInWorker(code, options);
+    return inner.result.then((r) =>
+      diagnostics === null ? { ...r, notice: UNCHECKED_NOTICE } : r,
+    );
+  });
 
   return {
     result: Promise.race([checked, cancelledResult]),
@@ -96,7 +96,7 @@ function runTypeScript(code: string, options: RunOptions): Run {
   };
 }
 
-const UNCHECKED_NOTICE =
+export const UNCHECKED_NOTICE =
   "Couldn't load the TypeScript checker, so types weren't checked this time.";
 
 function runInWorker(code: string, options: RunOptions): Run {

@@ -37,7 +37,9 @@ function EditorPlaceholder(props: RunnerProps) {
       >
         {t("loadingEditor")}
       </div>
-      {(html !== undefined || language === "react") && <RunnerPreview />}
+      {(html !== undefined || language === "react" || language === "tsx") && (
+        <RunnerPreview />
+      )}
       <OutputPanel>
         <EmptyOutput>{t("pressRun")}</EmptyOutput>
       </OutputPanel>

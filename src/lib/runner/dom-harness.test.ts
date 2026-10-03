@@ -123,6 +123,40 @@ describe("preview harness", () => {
     expect(r.tests?.[3].error).toMatch(/ReferenceError/);
   });
 
+  it("runs TypeScript and TSX with their types stripped", async () => {
+    const page = await runDomInNode(
+      `const button = document.querySelector<HTMLButtonElement>("#add")!;
+let clicks: number = 0;
+button.addEventListener("click", (event: MouseEvent) => {
+  clicks += 1;
+  button.textContent = \`Clicked \${clicks}\`;
+});`,
+      '<button id="add">Add</button>',
+      [{ name: "click", check: '(add.click(), add.textContent === "Clicked 1")' }],
+      undefined,
+      { typescript: true },
+    );
+    expect(page.error).toBeUndefined();
+    expect(page.tests?.[0].passed).toBe(true);
+
+    const react = await runDomInNode(
+      `import { useState } from "react";
+import { createRoot } from "react-dom/client";
+type Props = { label: string };
+function Hello<T extends Props>({ label }: T) {
+  const [n] = useState<number>(1);
+  return <p>{label} {n}</p>;
+}
+createRoot(document.getElementById("root")!).render(<Hello label="Hi" />);`,
+      '<div id="root"></div>',
+      [{ name: "renders", check: 'document.body.textContent === "Hi 1"' }],
+      undefined,
+      { react: true, typescript: true },
+    );
+    expect(react.error).toBeUndefined();
+    expect(react.tests?.[0].passed).toBe(true);
+  });
+
   it("reports errors and fails the checks", async () => {
     const r = await runDomInNode(
       'const el = document.querySelector("#nope");\nel.textContent = "x";',

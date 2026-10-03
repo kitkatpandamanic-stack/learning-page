@@ -18,7 +18,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildSync, transformSync } from "esbuild";
 
-import { reactVendorName, reactVersion } from "./vendor-name.mjs";
+import {
+  reactTypePackages,
+  reactTypesVendorName,
+  reactVendorName,
+  reactVersion,
+} from "./vendor-name.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -111,7 +116,33 @@ export function buildTypeScriptVendor({ force = false } = {}) {
   return typescriptVendorDir;
 }
 
+/**
+ * React's type declarations (@types/react, @types/react-dom and csstype),
+ * which the browser's type checker loads for TSX lessons. Same paths as
+ * REACT_TYPE_FILES in src/lib/runner/typecheck.ts.
+ */
+export const reactTypesVendorDir = join(
+  root,
+  "public",
+  "vendor",
+  reactTypesVendorName,
+);
+
+export function buildReactTypesVendor({ force = false } = {}) {
+  if (!force && existsSync(reactTypesVendorDir)) return reactTypesVendorDir;
+  for (const [name, dir] of Object.entries(reactTypePackages)) {
+    mkdirSync(join(reactTypesVendorDir, name), { recursive: true });
+    for (const file of readdirSync(dir)) {
+      if (file.endsWith(".d.ts")) {
+        copyFileSync(join(dir, file), join(reactTypesVendorDir, name, file));
+      }
+    }
+  }
+  return reactTypesVendorDir;
+}
+
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   console.log(`Built ${buildReactVendor({ force: true })}`);
   console.log(`Built ${buildTypeScriptVendor({ force: true })}`);
+  console.log(`Built ${buildReactTypesVendor({ force: true })}`);
 }
