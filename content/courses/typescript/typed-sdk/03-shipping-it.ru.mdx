@@ -1,0 +1,2102 @@
+---
+title: "Часть 3: Выпускаем SDK"
+description: "Отшлифуйте публичный API SDK: значения по умолчанию, перегрузки и JSDoc; закрепите его тестами типов, затем упакуйте с exports и файлами объявлений, задайте версию, настройте CI и опубликуйте в npm."
+duration: 25
+xp: 30
+---
+
+`@pandadev/sdk` работает: одно описание, типизированные методы, проверенные ответы, типизированные ошибки, повторы, пагинация и хуки, и всё покрыто тестами. Но «работает в моём репозитории» — не то же самое, что «готово для других людей». Как только пакет попадает в npm, его публичный API становится обещанием незнакомым людям: каждое экспортированное имя, каждый тип и даже каждое значение по умолчанию — это то, от чего зависит их код, и забрать это обратно без мажорной версии нельзя. 📦
+
+В этой последней части мы готовим SDK к этому: **публичный API**, в котором частый случай занимает одну строку, **перегрузки** (overloads) там, где тип возврата зависит от ввода, **JSDoc**, который появляется в редакторах пользователей, **тесты типов** для всей поверхности, а затем и сам пакет: `exports`, файлы объявлений, версионирование, журнал изменений, CI и `npm publish`. Здесь уроки [Дизайн API и миграции](/learn/typescript/api-design-and-migrations), [Сборка и публикация пакетов](/learn/typescript/building-and-publishing-packages) и [Тестирование типов](/learn/typescript/testing-types) встречаются с настоящим проектом.
+
+## Публичная поверхность
+
+Начнём с вопроса, на который каждый автор библиотеки должен ответить явно: **что пользователи могут импортировать?** Всё, что вы экспортируете, поддерживается всё время жизни мажорной версии, так что экспортируйте то, что нужно пользователям, и ничего больше. Единственная точка входа пакета, `src/index.ts`, перечисляет это:
+
+```ts title="src/index.ts"
+export { ValidationError } from "./schema.js";
+export type { Result, ApiError } from "./describe.js";
+export { MovieId, TodoId, UserId, PostId } from "./api.js";
+export type { Movie, Todo, User, Post, Page } from "./api.js";
+export type { SdkRequest } from "./request.js";
+export {
+  createPandaClient,
+  paginate,
+  unwrap,
+  ApiFailure,
+  SDK_VERSION,
+} from "./client.js";
+export type {
+  PandaClient,
+  ClientOptions,
+  RetryOptions,
+  Hooks,
+  ResponseInfo,
+} from "./client.js";
+```
+
+- **Экспортируется каждый тип, который встречается в публичной сигнатуре**, чтобы пользователи могли написать `function show(error: ApiError)` или хранить свои настройки в `const options: ClientOptions`, а не выкапывать типы через `Parameters<typeof createPandaClient>[0]`.
+- **Начинайте с малого.** Добавить экспорт потом — минорный релиз, удалить — мажорный. `createClient` и `defineApi` так и хочется экспортировать (пользователи смогут описывать собственные API!), но тогда публичными становятся и построители схем, а это второй продукт, который надо документировать и поддерживать. В 1.0 они остаются внутренними, вместе с `buildRequest`, `RawInput`, `isRetryable` и `backoff`. Тесты импортируют их из исходных файлов, а не из пакета.
+- **Здесь barrel-файл уместен.** Урок [Проектирование типов для больших кодовых баз](/learn/typescript/designing-types-for-large-codebases) предостерегал от barrel-файлов `index.ts` внутри приложения. Точка входа пакета — единственное место, где barrel-файлу самое место: он **и есть** публичный API, а `exports` в `package.json` гарантирует, что ничего другого импортировать нельзя.
+- **Относительные импорты заканчиваются на `.js`** — расширение **выходного** файла, потому что библиотека собирается с `"module": "nodenext"`, как в уроке [Сборка и публикация пакетов](/learn/typescript/building-and-publishing-packages).
+
+### Частый случай в одну строку
+
+Пользователям нужен клиент для API PandaDev, а не клиент для «любого описания», поэтому публичная точка входа — `createPandaClient(options?)`: одна строка без аргументов, и у каждой настройки есть значение по умолчанию. Она просто вызывает внутренний `createClient(pandaApi, options)`. Если однажды `createClient` станет публичным, он останется **отдельной** функцией, а не перегрузкой `createClient(options?)` **или** `createClient(api, options?)`: одной функции пришлось бы во время выполнения угадывать, что у неё первый аргумент — описание или объект настроек, а ведь оба — обычные объекты. Как сказано в уроке [Дизайн API и миграции](/learn/typescript/api-design-and-migrations), две понятные функции лучше одной хитрой.
+
+`createPandaClient` возвращает **именованный** тип `PandaClient`, который просто равен `Client<PandaApi>`. Тогда подсказки и сообщения об ошибках говорят `PandaClient`, а не расписывают сопоставленный тип целиком, и пользователи могут типизировать им собственные переменные.
+
+### Настройки, которые могут расти
+
+Объекты настроек — самая стабильная часть API: добавление необязательного свойства никогда не ломает вызывающий код. Часть 3 добавляет в `retry` ещё один вариант: приложения, которые сами повторяют запросы, могут выключить повторы SDK через `retry: false`. Ровно это и говорит **объединение** в типе настроек:
+
+```ts
+interface ClientOptions {
+  /**
+   * Повторы для GET, PUT и DELETE. По умолчанию: 3 попытки,
+   * 200 мс с удвоением до 2000 мс. `false` выключает их.
+   */
+  retry?: Partial<RetryOptions> | false;
+  // ...остальные настройки как раньше
+}
+```
+
+Внутри `createClient` значение `false` означает одну попытку, а всё остальное по-прежнему накладывается поверх `DEFAULT_RETRY`, так что пользователи упоминают только то, что хотят поменять:
+
+<CodeExample output={`{ attempts: 3, baseDelayMs: 200, maxDelayMs: 2000 }
+{ attempts: 5, baseDelayMs: 200, maxDelayMs: 2000 }
+{ attempts: 1, baseDelayMs: 200, maxDelayMs: 2000 }`}>
+
+```ts
+interface RetryOptions {
+  attempts: number; // всего, включая первую
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+const DEFAULT_RETRY: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 200,
+  maxDelayMs: 2_000,
+};
+
+// Partial: меняем одну настройку, остальные остаются. false: без повторов
+function retrySettings(
+  retry?: Partial<RetryOptions> | false,
+): RetryOptions {
+  if (retry === false) return { ...DEFAULT_RETRY, attempts: 1 };
+  return { ...DEFAULT_RETRY, ...retry };
+}
+
+console.log(retrySettings());
+console.log(retrySettings({ attempts: 5 }));
+console.log(retrySettings(false));
+```
+
+</CodeExample>
+
+`true` не допускается, потому что на вопрос «повторять, но как?» нет хорошего ответа:
+
+```ts
+createPandaClient({ retry: true });
+// ❌ Error: Type 'true' is not assignable to type 'false | Partial<RetryOptions> | undefined'.
+```
+
+### Представляемся
+
+Теперь каждый запрос несёт заголовок `X-Panda-SDK: 1.0.0` (из `SDK_VERSION`), добавленный до запуска хука `onRequest`, чтобы хук его видел. Этот один заголовок удивительно ценен для команды API: она видит, какие версии SDK ещё используются, а когда захочет удалить старый эндпоинт, точно знает, у кого он сломается. SDK Stripe и AWS шлют похожие заголовки по той же причине. Браузеры не позволяют `fetch` менять `User-Agent`, поэтому это собственный заголовок; а раз он собственный, браузер сначала спрашивает правила CORS у API (preflight-запрос из урока [CSRF, CORS и секреты](/learn/javascript/csrf-cors-and-secrets)), поэтому API должен перечислить `X-Panda-SDK` в `Access-Control-Allow-Headers`. О таких деталях команда SDK договаривается с командой API **до** выхода 1.0.
+
+## Перегрузки там, где тип возврата зависит от ввода
+
+`Result` — правильный выбор по умолчанию, но в скриптах, тестах и быстрых экспериментах проверять `ok` у каждого вызова утомительно. `unwrap` отдаёт значение успешного `Result` или бросает `ApiFailure`. Он принимает результат **или** промис с ним, так что `await unwrap(panda.listTodos())` читается естественно. Его тип возврата зависит от того, что он получил: `T` для результата, `Promise<T>` для промиса. Несколько отдельных случаев с разными типами возврата — именно для этого и существуют перегрузки ([Брендированные типы и типобезопасные API](/learn/typescript/branded-types-and-type-safe-apis)):
+
+<CodeExample output={`THE BAMBOO HEIST
+true The Bamboo Heist
+ApiFailure: 404 Movie not found`}>
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+class ApiFailure extends Error {
+  readonly error: ApiError;
+  constructor(error: ApiError) {
+    super(error.message);
+    this.name = "ApiFailure";
+    this.error = error;
+  }
+}
+
+/** Значение успешного результата; иначе бросает ApiFailure. */
+function unwrap<T>(result: Result<T, ApiError>): T;
+/** Сначала дожидается результата: `await unwrap(panda.listTodos())` */
+function unwrap<T>(result: Promise<Result<T, ApiError>>): Promise<T>;
+function unwrap<T>(
+  result: Result<T, ApiError> | Promise<Result<T, ApiError>>,
+): T | Promise<T> {
+  if (result instanceof Promise) {
+    return result.then((settled) => unwrap(settled));
+  }
+  if (!result.ok) throw new ApiFailure(result.error);
+  return result.value;
+}
+
+const found: Result<string, ApiError> = {
+  ok: true,
+  value: "The Bamboo Heist",
+};
+const missing: Result<string, ApiError> = {
+  ok: false,
+  error: { kind: "http", status: 404, message: "Movie not found" },
+};
+
+const title = unwrap(found); // string
+const later = unwrap(Promise.resolve(found)); // Promise<string>
+console.log(title.toUpperCase());
+console.log(later instanceof Promise, await later);
+
+try {
+  unwrap(missing);
+} catch (error) {
+  if (error instanceof ApiFailure && error.error.kind === "http") {
+    const { status } = error.error;
+    console.log(`${error.name}: ${status} ${error.message}`);
+  }
+}
+
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<typeof title, string>>,
+  Expect<Equal<typeof later, Promise<string>>>,
+];
+```
+
+</CodeExample>
+
+Вызывающие видят только две сигнатуры перегрузок, у каждой свой JSDoc, а тесты типов внизу закрепляют оба типа возврата. Всё остальное отклоняется:
+
+```ts
+unwrap({ title: "Nap" });
+// ❌ Error: No overload matches this call.
+```
+
+Известная слабость перегрузок тоже никуда не делась: значение типа `Result<T, ApiError> | Promise<Result<T, ApiError>>` не подходит **ни под одну** сигнатуру. На практике такие значения никто не держит, поэтому третью перегрузку ради них мы не добавляем. Если пользователям это когда-нибудь понадобится, добавить её позже — минорный релиз.
+
+<Callout type="tip" title="Пусть безопасный путь будет путём по умолчанию">
+
+`unwrap` существует для удобства, а удобство может свести на нет весь дизайн: если бы первый пример в README везде использовал `unwrap`, каждое приложение, построенное по нему, падало бы на первом же 404. Поэтому README сначала показывает `Result`, а `unwrap` — в разделе «для скриптов и тестов». То, что вы покажете в первом примере, большинство пользователей и скопирует.
+
+</Callout>
+
+## Документация, которая путешествует: JSDoc
+
+Для SDK JSDoc-комментарии — не украшение: они копируются в файлы объявлений и показываются в редакторах пользователей при каждом наведении курсора и автодополнении, а именно там люди на самом деле читают документацию. Документируйте каждый экспорт, каждую настройку с её значением по умолчанию и дайте главной точке входа пример:
+
+```ts
+/**
+ * Клиент для учебного API PandaDev.
+ *
+ * @example
+ * const panda = createPandaClient();
+ * const id = MovieId.parse(1);
+ * const movie = await panda.getMovie({ params: { id } });
+ * if (movie.ok) console.log(movie.value.title);
+ */
+function createPandaClient(options: ClientOptions = {}): PandaClient {
+  return createClient(pandaApi, options);
+}
+```
+
+Методы клиента создаются сопоставленным типом — откуда же берутся **их** описания? Из самого описания API. `Client<A>` проходит по `keyof A`, а гомоморфные сопоставленные типы сохраняют объявление каждого свойства, включая JSDoc. Поэтому комментарий у записи описания появляется, когда пользователь наводит курсор на `panda.getMovie`. То же касается `@deprecated`, который даёт SDK плавный путь для переименования метода в минорном релизе — ровно те три шага из урока [Дизайн API и миграции](/learn/typescript/api-design-and-migrations):
+
+```ts
+const pandaApi = defineApi({
+  /** Один фильм по его id. Нет фильма — ошибка http 404. */
+  getMovie: { /* ... */ },
+  /** Фильмы, по странице за раз. Все сразу — через paginate(). */
+  listMovies: { /* ... */ },
+  /** @deprecated Переименован в listMovies. Будет удалён в 2.0. */
+  searchMovies: { /* ... */ },
+});
+
+panda.searchMovies(); // редакторы зачёркивают его и показывают пометку
+```
+
+Правило `no-deprecated` из typescript-eslint затем превращает эти зачёркивания в ошибки линтера в проектах пользователей — когда **они** решат завершить переезд.
+
+## Тесты типов для всей поверхности
+
+В части 1 тесты типов проверяли выведенные типы. Перед релизом у них задача побольше: закрепить **всё, что видит пользователь**, чтобы никакой рефакторинг не изменил публичный API случайно. Такие тесты лежат в репозитории рядом с тестами времени выполнения:
+
+```ts
+// Публичная поверхность, закреплённая: изменение здесь — новая версия
+type _surface = [
+  Expect<Equal<Parameters<typeof createPandaClient>,
+    [options?: ClientOptions]>>,
+  Expect<Equal<ReturnType<typeof createPandaClient>, PandaClient>>,
+  Expect<Equal<ClientOptions["retry"],
+    Partial<RetryOptions> | false | undefined>>,
+  Expect<Equal<Awaited<ReturnType<PandaClient["getMovie"]>>,
+    Result<Movie, ApiError>>>,
+];
+```
+
+Представьте, что коллега «прибирается» и превращает `createPandaClient(options: ClientOptions = {})` в `createPandaClient(options: ClientOptions)`. Реализация по-прежнему работает, и каждый тест, который передаёт настройки, по-прежнему проходит. Но у каждого пользователя, написавшего `createPandaClient()`, теперь сломана сборка, и об этом говорит первая строка тестов типов: `Type 'false' does not satisfy the constraint 'true'.` Исправление — не всегда откатить изменение: иногда изменение правильное. Задача теста — сделать его **решением** (и мажорной версией), а не случайностью.
+
+В настоящем репозитории тесты типов живут в собственных файлах, например `test/types.test-d.ts`, и их проверяют, а не запускают: `tsc --noEmit` по папке с тестами или `vitest --typecheck` из Vitest, который понимает ещё и `expectTypeOf(...)`. Команды с большим числом пользователей добавляют **API Extractor**: он записывает всю публичную поверхность в отчёт, который коммитится, так что любое её изменение видно на код-ревью.
+
+## Что видит TypeScript пользователей
+
+При сборке `tsc` пишет `.d.ts` рядом с каждым файлом `.js`, а компиляторы пользователей читают **только** их. Вот часть настоящих объявлений нашего SDK:
+
+```ts title="dist/index.d.ts (фрагменты)"
+declare const pandaApi: {
+    readonly getMovie: {
+        readonly method: "GET";
+        readonly path: "/movies/:id";
+        readonly params: {
+            readonly id: Schema<Brand<number, "MovieId">>;
+        };
+        // ...ещё больше 100 строк: каждый эндпоинт целиком
+// ...
+/**
+ * Каждый элемент каждой страницы, страницы загружаются по одной:
+ * `for await (const movie of paginate(panda.searchMovies))`.
+ * Бросает ApiFailure, если страницу не удалось загрузить.
+ */
+declare function paginate<Q extends {
+    page?: number;
+}, T>(method: (input: {
+    query?: Q;
+}) => Promise<Result<Page<T>, ApiError>>, query?: NoInfer<Q>): AsyncGenerator<T, void, undefined>;
+declare const SDK_VERSION = "1.0.0";
+/** Клиент для учебного API PandaDev. */
+type PandaClient = Client<PandaApi>;
+```
+
+Читать собственный `.d.ts` перед релизом — полезная привычка, потому что он показывает три вещи, которые прячет исходный код:
+
+- **JSDoc добрался.** Хорошо.
+- **В нём есть `NoInfer`.** Он существует только с TypeScript 5.4, так что пользователь на 5.3 получит ошибку внутри нашего пакета или, со `skipLibCheck`, молча более свободные типы. Поддерживаемые версии TypeScript — часть вашего API: напишите минимальную в README, проверяйте её в CI и считайте её повышение ломающим изменением, как говорила таблица в уроке [Дизайн API и миграции](/learn/typescript/api-design-and-migrations).
+- **Выведенные типы расписаны целиком.** `pandaApi` даже не экспортируется, но `PandaClient` нужен его тип, так что он весь здесь — больше 100 строк, и их читает компилятор каждого пользователя. Для 8 эндпоинтов это нормально; для 300 это замедлило бы каждый проект, который устанавливает SDK, — та самая цена из урока [Ускоряем проверку типов](/learn/typescript/faster-type-checking). Большие SDK для API вместо этого генерируют явный именованный тип для каждого эндпоинта.
+
+Обратите внимание и на `fetch?: typeof fetch` в `ClientOptions`: нашим объявлениям нужен тип `fetch` в проекте пользователя. В браузерных проектах он есть из библиотеки DOM, в проектах на Node — из `@types/node`, так что всё в порядке, но это ровно то, что проверяет «Are the types wrong?».
+
+## Пакет
+
+Репозиторий устроен как библиотека только на tsc из прошлого модуля:
+
+```text
+pandadev-sdk/
+├── src/
+│   ├── schema.ts       схемы, brandedId, ValidationError
+│   ├── describe.ts     defineApi, Input, Client, Result...
+│   ├── api.ts          модели и pandaApi
+│   ├── request.ts      buildRequest
+│   ├── client.ts       createClient, paginate, unwrap...
+│   └── index.ts        публичный API: единственная точка входа
+├── test/
+│   ├── request.test.ts
+│   ├── client.test.ts
+│   ├── contract.test.ts  на живом API, по расписанию
+│   └── types.test-d.ts   тесты типов: проверяются, не запускаются
+├── .changeset/
+├── package.json
+├── tsconfig.json         редактор и tsc --noEmit (src + test)
+└── tsconfig.build.json   только dist/ (src)
+```
+
+```json title="package.json"
+{
+  "name": "@pandadev/sdk",
+  "version": "1.0.0",
+  "description": "A type-safe client for the PandaDev practice API",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "src"],
+  "sideEffects": false,
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check:package": "publint && attw --pack . --profile esm-only",
+    "prepublishOnly": "npm run build"
+  }
+}
+```
+
+- **Только ESM**, и `"types"` первым среди условий, как учил урок [Сборка и публикация пакетов](/learn/typescript/building-and-publishing-packages): никакой опасности двойного пакета (dual-package hazard), в которую мог бы угодить `instanceof ApiFailure`.
+- **Никаких `dependencies`.** Каждая зависимость SDK становится зависимостью каждого приложения, которое его устанавливает, со своими обновлениями и предупреждениями о безопасности. Ноль — это фича, которую можно написать в README.
+- **`engines`** указывает Node 20, и это не произвольно: `buildRequest` использует `URLSearchParams.size`, которого нет в более старых версиях. API среды выполнения, которыми вы пользуетесь, — тоже часть вашего обещания совместимости.
+- **`src` поставляется вместе с `dist`**, так что карты объявлений (declaration maps) позволяют «Go to Definition» открывать наш настоящий исходный код.
+
+## Версии, журнал изменений и CI
+
+Семантическое версионирование для SDK означает решить для каждого вида изменений, какое число растёт. Большинство правил взяты из уже знакомой вам таблицы semver для типов; несколько специфичны для SDK:
+
+| Изменение в `@pandadev/sdk` | Релиз |
+| --- | --- |
+| Добавить эндпоинт в `pandaApi` | минорный |
+| Добавить необязательную настройку, например `timeoutMs` | минорный |
+| API добавляет поле, и схема его выучивает | минорный: типы вывода только растут (но скажите об этом: тестовым данным с типом `Movie` нужно это поле) |
+| Сделать поле ответа необязательным | **мажорный**: `movie.rating.toFixed()` перестаёт компилироваться |
+| Сделать поле query обязательным | **мажорный** |
+| Переименовать метод | минорный с псевдонимом `@deprecated`, **мажорный**, чтобы его удалить |
+| Изменить значение по умолчанию, например 3 повтора на 4 | минорный, со строкой в журнале изменений |
+| Требовать более новый TypeScript или Node | **мажорный** |
+| Добавить вид в `ApiError` | **мажорный**, по нашей политике (ниже) |
+
+Последняя строка требует решения. Добавить `{ kind: "timeout" }` для нас — «просто новая фича», но пользователи, которые обрабатывают ошибки так, как учил этот курс, — исчерпывающим `switch`, который заканчивается `assertNever`, — получат ошибку компиляции:
+
+```ts
+    default:
+      return assertNever(error);
+      // ❌ Error: Argument of type '{ kind: "timeout"; ms: number; }' is not assignable to parameter of type 'never'.
+```
+
+Некоторые библиотеки говорят: «новые виды могут появляться в минорных версиях; всегда обрабатывайте неизвестные». Мы предпочитаем поощрять пользователей за исчерпывающий код, поэтому наш README обещает: **новые виды ошибок — только в мажорных версиях.** Годится любая политика; не годится её отсутствие.
+
+**Changesets** помогает вести честный журнал изменений. Каждый пулл-реквест, который меняет поведение, добавляет маленький файл, где сказано, какое число растёт и почему:
+
+```md title=".changeset/brave-pandas-sing.md"
+---
+"@pandadev/sdk": minor
+---
+
+Добавлены `getRecipe` и `searchRecipes`.
+```
+
+При релизе `changeset version` суммирует эти файлы, поднимает версию в `package.json` и пишет `CHANGELOG.md`. CI прогоняет всё на каждый пуш, на каждой поддерживаемой версии Node, и публикует из `main` с **provenance** — подписанной записью о том, какой репозиторий и какой workflow собрали пакет:
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck # source, tests AND type tests
+      - run: npx -p typescript@5.4 tsc --noEmit # oldest TS we support
+      - run: npm test
+      - run: npm run build
+      - run: npm run check:package # publint + attw
+
+  release:
+    needs: check
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write # lets npm sign the provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - uses: changesets/action@v1
+        with:
+          publish: npx changeset publish --provenance
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+Задача `release` публикует не на каждый пуш. Пока есть ожидающие changeset-файлы, action Changesets поддерживает в актуальном состоянии пулл-реквест «Version Packages»; слить **этот** пулл-реквест и значит решить выпустить релиз.
+
+## Публикация в npm
+
+Самый первый релиз стоит сделать вручную, не спеша, разглядывая всё:
+
+```bash
+npm run build
+npm pack --dry-run        # какие именно файлы будут опубликованы
+npx publint               # ошибки в package.json и exports
+npx @arethetypeswrong/cli --pack . --profile esm-only
+npm login
+npm publish --access public   # пакеты со scope по умолчанию приватные
+```
+
+После этого релизы выходят из CI. И помните правило, которое не меняется никогда: опубликованную версию нельзя изменить или использовать повторно. Ошибка в 1.0.0 исправляется в 1.0.1.
+
+## README
+
+README — это главная страница SDK, и по большей части это набросок места вызова из дизайн-документа части 1, который теперь стал правдой:
+
+```md title="README.md"
+# @pandadev/sdk
+
+Типобезопасный клиент для учебного API PandaDev: типизированные
+методы, проверенные ответы, типизированные ошибки, повторы и
+пагинация. Без зависимостей.
+
+## Установка
+
+    npm install @pandadev/sdk
+
+## Быстрый старт
+
+    import { createPandaClient, MovieId } from "@pandadev/sdk";
+
+    const panda = createPandaClient();
+    const id = MovieId.parse(1);
+    const movie = await panda.getMovie({ params: { id } });
+    if (movie.ok) console.log(movie.value.title);
+    else console.error(movie.error.kind, movie.error.message);
+
+## Ошибки
+
+Каждый метод возвращает `Result`. Сбои — это значения с полем
+`kind`: `"network"`, `"http"` (со `status`) или
+`"invalid-response"`. Плохой ввод бросает `ValidationError`.
+В скриптах и тестах `await unwrap(...)` возвращает значение
+или бросает `ApiFailure`.
+
+## Повторы, страницы и хуки
+
+GET, PUT и DELETE повторяются при сетевых ошибках, 429 и
+5xx (3 попытки, экспоненциальный backoff с джиттером; `retry:
+false` их выключает). `paginate(panda.searchMovies)` обходит
+все страницы. `hooks.onRequest` и `hooks.onResponse` добавляют
+заголовки и видят каждую попытку.
+
+## Совместимость
+
+Node 20+, современные браузеры, TypeScript 5.4+. Только ESM.
+Семантическое версионирование, включая типы: новые виды ошибок —
+только в мажорных версиях.
+```
+
+<Quiz
+  question="Версия 1.4 SDK добавляет { kind: 'timeout' } в ApiError. У каких пользователей код перестанет компилироваться после обновления?"
+  options={[
+    "Ни у кого: добавление члена объединения никогда никого не ломает",
+    "У тех, кто исчерпывающе делает switch по error.kind, например заканчивая assertNever(error) или обходясь без default в функции, которая обязана что-то вернуть",
+    "У тех, кто никогда не смотрит на error.kind",
+    "Только у пользователей JavaScript",
+  ]}
+  answer={1}
+  explanation="Исчерпывающий switch доказывает, что обработал каждый вид, поэтому новый вид ломает доказательство: assertNever получает значение, которое не never, или функции не хватает завершающего return. Код, который проверяет только result.ok или использует ветку default, продолжает компилироваться. Поэтому политика SDK — добавлять виды только в мажорных версиях."
+/>
+
+<Exercise
+  title="Соберите: готовый SDK"
+  language="typescript"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ---------- схемы: библиотека из Уровня 2, повзрослевшая ----------
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = {
+  parse: (value: unknown, path?: string) => T;
+  optional?: true;
+};
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+// 204 No Content: клиент читает это как null
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function optional<T>(
+  schema: Schema<T>,
+): Schema<T | undefined> & { optional: true } {
+  return {
+    optional: true,
+    parse: (value, path) =>
+      value === undefined ? undefined : schema.parse(value, path),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+// Ключи, чья схема — optional(...)
+type OptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K] extends { optional: true } ? K : never;
+}[keyof S];
+type ObjectOf<S extends Shape> = Simplify<
+  { [K in Exclude<keyof S, OptionalKeys<S>>]: Infer<S[K]> } & {
+    [K in OptionalKeys<S>]?: Infer<S[K]>;
+  }
+>;
+
+function object<S extends Shape>(shape: S): Schema<ObjectOf<S>> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        const parsed = shape[key].parse(value[key], where);
+        if (parsed !== undefined) result[key] = parsed;
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as ObjectOf<S>;
+    },
+  };
+}
+
+// ---------- брендированные id ----------
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+// Схема для id и единственный способ его создать
+function brandedId<Name extends string>(
+  name: Name,
+): Schema<Brand<number, Name>> {
+  return primitive(
+    \`a \${name}\`,
+    (v): v is Brand<number, Name> =>
+      typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+  );
+}
+
+// ---------- данные учебного API ----------
+const MovieId = brandedId("MovieId");
+type MovieId = Infer<typeof MovieId>;
+const TodoId = brandedId("TodoId");
+type TodoId = Infer<typeof TodoId>;
+const UserId = brandedId("UserId");
+type UserId = Infer<typeof UserId>;
+const PostId = brandedId("PostId");
+type PostId = Infer<typeof PostId>;
+
+const Movie = object({
+  id: MovieId,
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof Movie>;
+
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+function page<T>(item: Schema<T>): Schema<Page<T>> {
+  return object({
+    page: number(),
+    totalPages: number(),
+    total: number(),
+    results: array(item),
+  });
+}
+
+const User = object({
+  id: UserId,
+  name: string(),
+  username: string(),
+  email: string(),
+});
+type User = Infer<typeof User>;
+
+const Post = object({
+  id: PostId,
+  userId: UserId,
+  title: string(),
+  likes: number(),
+});
+type Post = Infer<typeof Post>;
+
+const Todo = object({ id: TodoId, title: string(), done: boolean() });
+type Todo = Infer<typeof Todo>;
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+const TodoPatch = object({
+  title: optional(string()),
+  done: optional(boolean()),
+});
+
+// ---------- описание API ----------
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface Endpoint {
+  method: Method;
+  path: \`/\${string}\`;
+  params?: Shape;
+  query?: Schema<object>;
+  body?: Schema<unknown>;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// "/users/:userId/posts/:postId" -> "userId" | "postId"
+type ParamNames<P extends string> =
+  P extends \`\${string}:\${infer Name}/\${infer Rest}\`
+    ? Name | ParamNames<Rest>
+    : P extends \`\${string}:\${infer Name}\`
+      ? Name
+      : never;
+
+// Путь с :params требует по схеме на каждый параметр
+type ParamsFor<P extends string> = [ParamNames<P>] extends [never]
+  ? {}
+  : { params: Record<ParamNames<P>, Schema<string | number>> };
+
+type CheckParams<A extends ApiDescription> = {
+  [K in keyof A]: ParamsFor<A[K]["path"]>;
+};
+
+function defineApi<const A extends ApiDescription>(
+  api: A & CheckParams<A>,
+): A {
+  return api;
+}
+
+const pandaApi = defineApi({
+  getMovie: {
+    method: "GET",
+    path: "/movies/:id",
+    params: { id: MovieId },
+    response: Movie,
+  },
+  searchMovies: {
+    method: "GET",
+    path: "/movies",
+    query: object({
+      search: optional(string()),
+      genre: optional(string()),
+      page: optional(number()),
+      limit: optional(number()),
+    }),
+    response: page(Movie),
+  },
+  getUser: {
+    method: "GET",
+    path: "/users/:id",
+    params: { id: UserId },
+    response: User,
+  },
+  listPosts: {
+    method: "GET",
+    path: "/posts",
+    query: object({ userId: optional(UserId) }),
+    response: array(Post),
+  },
+  listTodos: {
+    method: "GET",
+    path: "/todos",
+    response: array(Todo),
+  },
+  createTodo: {
+    method: "POST",
+    path: "/todos",
+    body: NewTodo,
+    response: Todo,
+  },
+  updateTodo: {
+    method: "PATCH",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    body: TodoPatch,
+    response: Todo,
+  },
+  deleteTodo: {
+    method: "DELETE",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    response: nothing(),
+  },
+});
+type PandaApi = typeof pandaApi;
+
+// ---------- типы, выведенные из описания ----------
+type ParamsInput<E> = E extends { params: infer P extends Shape }
+  ? { params: ObjectOf<P> }
+  : {};
+type QueryInput<E> = E extends { query: infer Q extends Schema<object> }
+  ? {} extends Infer<Q>
+    ? { query?: Infer<Q> } // все поля query необязательные
+    : { query: Infer<Q> }
+  : {};
+type BodyInput<E> = E extends { body: infer B extends Schema<unknown> }
+  ? { body: Infer<B> }
+  : {};
+
+type Input<E extends Endpoint> = Simplify<
+  ParamsInput<E> & QueryInput<E> & BodyInput<E>
+>;
+type Output<E extends Endpoint> = Infer<E["response"]>;
+// Нет обязательного ввода: аргумент можно не передавать
+type InputArgs<E extends Endpoint> = {} extends Input<E>
+  ? [input?: Input<E>]
+  : [input: Input<E>];
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: (
+    ...input: InputArgs<A[K]>
+  ) => Promise<Result<Output<A[K]>, ApiError>>;
+};
+
+// ---------- от ввода к запросу ----------
+interface SdkRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+// Внутри SDK ввод типизирован свободно (и проверяется в рантайме)
+type RawInput = {
+  params?: Record<string, unknown>;
+  query?: unknown;
+  body?: unknown;
+};
+
+function buildRequest(
+  baseUrl: string,
+  endpoint: Endpoint,
+  input: RawInput = {},
+): SdkRequest {
+  const path = endpoint.path.replace(/:(\\w+)/g, (_, name: string) => {
+    const schema = endpoint.params?.[name];
+    if (!schema) throw new Error(\`Нет схемы для :\${name}\`);
+    const value = schema.parse(input.params?.[name], \`params.\${name}\`);
+    return encodeURIComponent(String(value));
+  });
+  let url = baseUrl.replace(/\\/+$/, "") + path;
+  if (endpoint.query) {
+    const query = endpoint.query.parse(input.query ?? {}, "query");
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      search.set(key, String(value));
+    }
+    if (search.size > 0) url += \`?\${search}\`;
+  }
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  const request: SdkRequest = { method: endpoint.method, url, headers };
+  if (endpoint.body) {
+    const body = endpoint.body.parse(input.body, "body");
+    request.body = JSON.stringify(body);
+    headers["Content-Type"] = "application/json";
+  }
+  return request;
+}
+
+// ---------- клиент: настройки ----------
+interface RetryOptions {
+  attempts: number; // всего, включая первую
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+interface ResponseInfo {
+  request: SdkRequest;
+  attempt: number;
+  status: number | null; // null: на запрос так и не ответили
+  ms: number;
+}
+
+interface Hooks {
+  /** Изменить запрос перед отправкой, например добавить заголовок. */
+  onRequest?: (request: SdkRequest) => SdkRequest;
+  /** Видеть каждую попытку, например для логов и метрик. */
+  onResponse?: (info: ResponseInfo) => void;
+}
+
+interface ClientOptions {
+  /** По умолчанию: "https://api.pandadev.test" */
+  baseUrl?: string;
+  /** По умолчанию: глобальный fetch. Для тестов передайте свой. */
+  fetch?: typeof fetch;
+  /**
+   * Повторы для GET, PUT и DELETE. По умолчанию: 3 попытки,
+   * 200 мс с удвоением до 2000 мс. \`false\` выключает их.
+   */
+  // TODO: принимать ещё и false
+  retry?: Partial<RetryOptions>;
+  hooks?: Hooks;
+  /** Как ждать между попытками. По умолчанию: setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Для джиттера в backoff. По умолчанию: Math.random. */
+  random?: () => number;
+  /** Засекает время каждой попытки для onResponse. По умолчанию: Date.now. */
+  now?: () => number;
+}
+
+const DEFAULT_RETRY: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 200,
+  maxDelayMs: 2_000,
+};
+
+// Повторная отправка этих методов безвредна, их можно повторять
+const IDEMPOTENT = new Set<Method>(["GET", "PUT", "DELETE"]);
+
+function fail(error: ApiError): Result<never, ApiError> {
+  return { ok: false, error };
+}
+
+function apiMessage(body: unknown): string | undefined {
+  return isRecord(body) && typeof body.error === "string"
+    ? body.error
+    : undefined;
+}
+
+// ---------- повторы ----------
+function isRetryable(error: ApiError): boolean {
+  switch (error.kind) {
+    case "network":
+      return true;
+    case "http":
+      return error.status === 429 || error.status >= 500;
+    case "invalid-response":
+      return false;
+  }
+}
+
+// Экспонента с потолком и «equal jitter»: половина фиксирована, половина случайна
+function backoff(
+  attempt: number,
+  retry: RetryOptions,
+  random: () => number,
+): number {
+  const exp = Math.min(
+    retry.maxDelayMs,
+    retry.baseDelayMs * 2 ** (attempt - 1),
+  );
+  return Math.round(exp / 2 + (exp / 2) * random());
+}
+
+// ---------- клиент ----------
+/**
+ * Типизированный клиент для любого описания API: по методу
+ * на эндпоинт. Большинству нужен createPandaClient().
+ */
+function createClient<A extends ApiDescription>(
+  api: A,
+  options: ClientOptions = {},
+): Client<A> {
+  const {
+    baseUrl = "https://api.pandadev.test",
+    fetch: fetchFn = fetch,
+    hooks = {},
+    sleep = (ms: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    random = Math.random,
+    now = Date.now,
+  } = options;
+  // TODO: retry: false означает только одну попытку
+  const retry: RetryOptions = { ...DEFAULT_RETRY, ...options.retry };
+
+  // Одна попытка: fetch, прочитать тело и сообщить, как всё прошло
+  async function attemptOnce(
+    request: SdkRequest,
+    attempt: number,
+  ): Promise<Result<unknown, ApiError>> {
+    const started = now();
+    const report = (status: number | null) => {
+      const ms = now() - started;
+      hooks.onResponse?.({ request, attempt, status, ms });
+    };
+    let res: Response;
+    try {
+      res = await fetchFn(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      });
+    } catch (error) {
+      report(null);
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return fail({ kind: "network", message });
+    }
+    const body: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    report(res.status);
+    if (!res.ok) {
+      const message = apiMessage(body) ?? \`HTTP \${res.status}\`;
+      return fail({ kind: "http", status: res.status, message });
+    }
+    return { ok: true, value: body };
+  }
+
+  // Собрать запрос, отправить (повторно), проверить ответ
+  async function send(
+    endpoint: Endpoint,
+    input: RawInput,
+  ): Promise<Result<unknown, ApiError>> {
+    let request = buildRequest(baseUrl, endpoint, input);
+    // TODO: добавьте заголовок X-Panda-SDK (до запуска onRequest)
+    if (hooks.onRequest) request = hooks.onRequest(request);
+    const attempts = IDEMPOTENT.has(endpoint.method)
+      ? retry.attempts
+      : 1;
+    for (let attempt = 1; ; attempt++) {
+      const result = await attemptOnce(request, attempt);
+      if (!result.ok) {
+        if (attempt < attempts && isRetryable(result.error)) {
+          await sleep(backoff(attempt, retry, random));
+          continue;
+        }
+        return result;
+      }
+      try {
+        const value = endpoint.response.parse(result.value);
+        return { ok: true, value };
+      } catch (error) {
+        if (!(error instanceof ValidationError)) throw error;
+        const { message } = error;
+        return fail({ kind: "invalid-response", message });
+      }
+    }
+  }
+
+  // По методу на эндпоинт: Client<A> — это обещание, цикл его
+  // выполняет, а приведение говорит об этом ровно в одном месте
+  const client: Record<string, (input?: RawInput) => unknown> = {};
+  for (const name of Object.keys(api)) {
+    const endpoint = api[name];
+    client[name] = (input = {}) => send(endpoint, input);
+  }
+  return client as Client<A>;
+}
+
+// ---------- пагинация ----------
+// Для API без канала Result, например асинхронной итерации
+class ApiFailure extends Error {
+  readonly error: ApiError;
+  constructor(error: ApiError) {
+    super(error.message);
+    this.name = "ApiFailure";
+    this.error = error;
+  }
+}
+
+/**
+ * Каждый элемент каждой страницы, страницы загружаются по одной:
+ * \`for await (const movie of paginate(panda.searchMovies))\`.
+ * Бросает ApiFailure, если страницу не удалось загрузить.
+ */
+async function* paginate<Q extends { page?: number }, T>(
+  method: (input: { query?: Q }) => Promise<Result<Page<T>, ApiError>>,
+  query?: NoInfer<Q>,
+): AsyncGenerator<T, void, undefined> {
+  for (let page = query?.page ?? 1; ; page++) {
+    const result = await method({ query: { ...query, page } as Q });
+    if (!result.ok) throw new ApiFailure(result.error);
+    yield* result.value.results;
+    if (page >= result.value.totalPages) return;
+  }
+}
+
+// ---------- публичный API ----------
+const SDK_VERSION = "1.0.0";
+
+// TODO: type PandaClient: тип клиента для pandaApi
+
+// TODO: createPandaClient(options?): PandaClient для учебного
+// API, с JSDoc и @example
+
+// TODO: unwrap с двумя перегрузками: Result даёт своё значение
+// (или бросает ApiFailure); Promise с Result даёт Promise
+
+// ---------- тесты ----------
+// Тесты частей 1 и 2 живут в своих тестовых файлах
+// (build-request.test.ts, client.test.ts); здесь тесты части 3.
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep = async (ms: number) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+function fakeFetch(...answers: (Response | Error)[]) {
+  return vi.fn<typeof fetch>(async () => {
+    const next = answers.shift();
+    if (next === undefined) throw new Error("Ответы закончились");
+    if (next instanceof Error) throw next;
+    return next;
+  });
+}
+
+const busy = () => Response.json({ error: "busy" }, { status: 503 });
+
+describe("публичный API", () => {
+  it("createPandaClient общается с учебным API", async () => {
+    const panda = createPandaClient();
+    const id = UserId.parse(2);
+    const user = await panda.getUser({ params: { id } });
+    expect(user).toEqual({
+      ok: true,
+      value: {
+        id: 2,
+        name: "Sam Ortiz",
+        username: "sam",
+        email: "sam@pandadev.test",
+      },
+    });
+  });
+
+  it("сообщает, какая версия SDK отправила каждый запрос", async () => {
+    const fetch = fakeFetch(Response.json([]));
+    await createPandaClient({ fetch }).listTodos();
+    const init = fetch.mock.calls[0][1];
+    expect(init?.headers).toEqual({
+      Accept: "application/json",
+      "X-Panda-SDK": "1.0.0",
+    });
+  });
+
+  it("умеет выключать повторы", async () => {
+    const { sleep, waits } = fakeSleep();
+    const fetch = fakeFetch(busy(), busy());
+    const panda = createPandaClient({ fetch, sleep, retry: false });
+    const result = await panda.listTodos();
+    expect(result.ok).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(waits).toEqual([]);
+  });
+
+  it("unwrap отдаёт значение или бросает ApiFailure", async () => {
+    const fetch = fakeFetch(
+      Response.json([{ id: 1, title: "Nap", done: false }]),
+      Response.json({ error: "Not found" }, { status: 404 }),
+    );
+    const panda = createPandaClient({ fetch });
+    const todos = await unwrap(panda.listTodos());
+    expect(todos[0].title).toBe("Nap");
+    const missing = await panda.getMovie({
+      params: { id: MovieId.parse(99) },
+    });
+    expect(() => unwrap(missing)).toThrow(ApiFailure);
+    expect(() => unwrap(missing)).toThrow("Not found");
+  });
+});
+
+// ---------- тесты типов: не меняйте их ----------
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamNames<"/users/:userId/posts/:postId">,
+    "userId" | "postId">>,
+  Expect<Equal<ParamNames<"/todos">, never>>,
+  Expect<Equal<Input<PandaApi["getMovie"]>,
+    { params: { id: MovieId } }>>,
+  Expect<Equal<Input<PandaApi["listPosts"]>,
+    { query?: { userId?: UserId } }>>,
+  Expect<Equal<Input<PandaApi["updateTodo"]>, {
+    params: { id: TodoId };
+    body: { title?: string; done?: boolean };
+  }>>,
+  Expect<Equal<Input<PandaApi["listTodos"]>, {}>>,
+  Expect<Equal<Output<PandaApi["getUser"]>, User>>,
+  Expect<Equal<Output<PandaApi["deleteTodo"]>, null>>,
+];
+
+async function typeTests(
+  panda: Client<PandaApi>,
+  todo: Todo,
+  post: Post,
+) {
+  await panda.listTodos(); // ничего не обязательно, поэтому без аргумента
+  await panda.getUser({ params: { id: post.userId } });
+  await panda.createTodo({ body: { title: "Nap" } });
+  // @ts-expect-error: TodoId — это не MovieId
+  await panda.getMovie({ params: { id: todo.id } });
+  // @ts-expect-error: простое число — не проверенный id
+  await panda.getMovie({ params: { id: 1 } });
+  // @ts-expect-error: getMovie нужны его params
+  await panda.getMovie();
+  // @ts-expect-error: limit — это число
+  await panda.searchMovies({ query: { limit: "5" } });
+  // @ts-expect-error: новой задаче нужен title
+  await panda.createTodo({ body: { done: true } });
+  const id = MovieId.parse(1);
+  const movie = await panda.getMovie({ params: { id } });
+  // @ts-expect-error: проверьте ok, прежде чем читать value
+  movie.value;
+}
+
+async function typeTests2(panda: Client<PandaApi>) {
+  const client: Client<PandaApi> = createClient(pandaApi);
+  for await (const movie of paginate(panda.searchMovies)) {
+    const title: string = movie.title;
+  }
+  // @ts-expect-error: getMovie не возвращает страницы
+  paginate(panda.getMovie);
+  // @ts-expect-error: в query фильмов нет "genr"
+  paginate(panda.searchMovies, { genr: "drama" });
+}
+
+// Публичная поверхность, закреплённая: изменение здесь — новая версия
+type _surface = [
+  Expect<Equal<Parameters<typeof createPandaClient>,
+    [options?: ClientOptions]>>,
+  Expect<Equal<ReturnType<typeof createPandaClient>, PandaClient>>,
+  Expect<Equal<ClientOptions["retry"],
+    Partial<RetryOptions> | false | undefined>>,
+  Expect<Equal<Awaited<ReturnType<PandaClient["getMovie"]>>,
+    Result<Movie, ApiError>>>,
+  Expect<Equal<Parameters<PandaClient["listPosts"]>,
+    [input?: { query?: { userId?: UserId } }]>>,
+];
+
+async function surfaceTests(
+  panda: PandaClient,
+  result: Result<Movie, ApiError>,
+) {
+  const movie: Movie = unwrap(result);
+  const todos: Todo[] = await unwrap(panda.listTodos());
+  // @ts-expect-error: unwrap(promise) нужно дождаться через await
+  const notYet: Todo[] = unwrap(panda.listTodos());
+  // @ts-expect-error: unwrap принимает только результаты
+  unwrap({ title: "Nap" });
+  createPandaClient({ retry: false });
+  createPandaClient({ retry: { attempts: 5 } });
+  // @ts-expect-error: true — не настройка повторов
+  createPandaClient({ retry: true });
+}
+
+// ---------- попробуйте: пример из README ----------
+const panda = createPandaClient();
+
+const id = MovieId.parse(1);
+const movie = await panda.getMovie({ params: { id } });
+if (movie.ok) {
+  console.log(\`\${movie.value.title} (\${movie.value.year})\`);
+} else {
+  console.log(\`Не удалось загрузить фильм: \${movie.error.message}\`);
+}
+
+const dramas = paginate(panda.searchMovies, { genre: "drama" });
+for await (const drama of dramas) {
+  console.log(\`- \${drama.title}\`);
+}
+
+const userId = UserId.parse(3);
+const posts = await unwrap(panda.listPosts({ query: { userId } }));
+console.log(posts.map((post) => post.title));`}
+  tests={[
+    { name: "Код компилируется, включая тесты типов для всей поверхности", check: "true" },
+    { name: "Все тесты проходят", check: "__vitest.failed === 0 && __vitest.passed >= 4" },
+    { name: "createPandaClient() работает с учебным API и шлёт заголовок версии", check: "await (async () => { const before = __requests.length; const r = await createPandaClient().getUser({ params: { id: 3 } }); const sent = __requests.slice(before); return r.ok === true && r.value.username === 'ada' && sent.length === 1 && sent[0].url === 'https://api.pandadev.test/users/3' && sent[0].headers['x-panda-sdk'] === '1.0.0'; })()" },
+    { name: "createPandaClient передаёт настройки дальше (fetch, sleep, retry, hooks, baseUrl)", check: "await (async () => { const urls = []; const waits = []; const seen = []; let n = 0; const c = createPandaClient({ baseUrl: 'https://staging.pandadev.test/v2/', fetch: async (url) => { urls.push(url); n++; return n < 2 ? Response.json({ error: 'busy' }, { status: 503 }) : Response.json([]); }, sleep: async (ms) => { waits.push(ms); }, random: () => 1, retry: { baseDelayMs: 30 }, hooks: { onResponse: (info) => seen.push(info.status) } }); const r = await c.listTodos(); return r.ok === true && urls.join() === 'https://staging.pandadev.test/v2/todos,https://staging.pandadev.test/v2/todos' && waits.join() === '30' && seen.join() === '503,200'; })()" },
+    { name: "Каждая попытка несёт X-Panda-SDK: 1.0.0, и onRequest его видит", check: "await (async () => { const sent = []; let n = 0; let seen; const c = createClient(pandaApi, { fetch: async (url, init) => { sent.push(init.headers); n++; return n < 3 ? Response.json({ error: 'busy' }, { status: 502 }) : Response.json([]); }, sleep: async () => {}, hooks: { onRequest: (req) => { seen = req.headers['X-Panda-SDK']; return { ...req, headers: { ...req.headers, 'X-App': 'notes' } }; } } }); const r = await c.listTodos(); return r.ok === true && SDK_VERSION === '1.0.0' && seen === '1.0.0' && sent.length === 3 && sent.every((h) => h['X-Panda-SDK'] === '1.0.0' && h['X-App'] === 'notes' && h.Accept === 'application/json'); })()" },
+    { name: "retry: false — одна попытка; другие настройки retry по-прежнему смешиваются со значениями по умолчанию", check: "await (async () => { const count = async (retry) => { let n = 0; const waits = []; const c = createPandaClient({ retry, fetch: async () => { n++; return Response.json({ error: 'busy' }, { status: 503 }); }, sleep: async (ms) => { waits.push(ms); }, random: () => 1 }); await c.searchMovies(); return n + ':' + waits.join('/'); }; return await count(false) === '1:' && await count({ attempts: 2 }) === '2:200' && await count({ maxDelayMs: 300 }) === '3:200/300' && await count(undefined) === '3:200/400'; })()" },
+    { name: "unwrap возвращает значения, бросает ApiFailure и работает с промисами", check: "await (async () => { const err = { kind: 'http', status: 418, message: 'teapot' }; let thrown; try { unwrap({ ok: false, error: err }); } catch (e) { thrown = e; } let rejected; try { await unwrap(Promise.resolve({ ok: false, error: err })); } catch (e) { rejected = e; } const later = unwrap(Promise.resolve({ ok: true, value: 7 })); return unwrap({ ok: true, value: 'x' }) === 'x' && thrown instanceof ApiFailure && thrown.error === err && thrown.message === 'teapot' && later instanceof Promise && await later === 7 && rejected instanceof ApiFailure && rejected.error.status === 418; })()" },
+  ]}
+>
+
+Пора закончить `@pandadev/sdk` 1.0. Стартовый код — это SDK из части 2 с добавленными JSDoc-комментариями. Тесты Vitest из частей 1 и 2 теперь живут в собственных тестовых файлах, так что в этом файле — тесты части 3, тесты типов для **всей поверхности** и пример из README внизу. Пока он не компилируется: тесты типов ждут вас.
+
+1. **`retry: false`**: пусть `ClientOptions.retry` может быть ещё и `false`, и пусть `false` означает одну попытку. Частичные настройки по-прежнему смешиваются с `DEFAULT_RETRY`.
+2. **`X-Panda-SDK`**: каждый запрос несёт заголовок `X-Panda-SDK` со значением `SDK_VERSION`, добавленный до запуска `hooks.onRequest` (чтобы хуки его видели и могли изменить).
+3. **`PandaClient`** (тип клиента для `pandaApi`) и **`createPandaClient(options?)`**, который его возвращает и передаёт дальше все настройки. Дайте ему JSDoc с `@example`.
+4. **`unwrap`** с двумя перегрузками: `Result` отдаёт своё значение или бросает `ApiFailure` с ошибкой; `Promise` с `Result` отдаёт `Promise` со значением (который отклоняется с `ApiFailure`).
+
+Когда код скомпилируется, тесты, проверки и пример из README покажут, как всё прошло.
+
+<Hint>
+
+**`retry`**: тип настройки становится `Partial<RetryOptions> | false`, а в `createClient`: `options.retry === false ? { ...DEFAULT_RETRY, attempts: 1 } : { ...DEFAULT_RETRY, ...options.retry }`.
+
+**Заголовок**: в `send`, сразу после `buildRequest(...)`: `request.headers["X-Panda-SDK"] = SDK_VERSION;`.
+
+**`createPandaClient`**: `type PandaClient = Client<PandaApi>;` и `function createPandaClient(options: ClientOptions = {}): PandaClient { return createClient(pandaApi, options); }`. Значение по умолчанию важно: тесты типов ожидают `[options?: ClientOptions]`.
+
+**`unwrap`**: две сигнатуры без тела, затем `function unwrap<T>(result: Result<T, ApiError> | Promise<Result<T, ApiError>>): T | Promise<T>`. Если `result instanceof Promise`, верните `result.then((settled) => unwrap(settled))`; иначе бросьте `new ApiFailure(result.error)`, если результат не ok, и верните `result.value`, если ok.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+// ---------- схемы: библиотека из Уровня 2, повзрослевшая ----------
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = {
+  parse: (value: unknown, path?: string) => T;
+  optional?: true;
+};
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+// 204 No Content: клиент читает это как null
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function optional<T>(
+  schema: Schema<T>,
+): Schema<T | undefined> & { optional: true } {
+  return {
+    optional: true,
+    parse: (value, path) =>
+      value === undefined ? undefined : schema.parse(value, path),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+// Ключи, чья схема — optional(...)
+type OptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K] extends { optional: true } ? K : never;
+}[keyof S];
+type ObjectOf<S extends Shape> = Simplify<
+  { [K in Exclude<keyof S, OptionalKeys<S>>]: Infer<S[K]> } & {
+    [K in OptionalKeys<S>]?: Infer<S[K]>;
+  }
+>;
+
+function object<S extends Shape>(shape: S): Schema<ObjectOf<S>> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        const parsed = shape[key].parse(value[key], where);
+        if (parsed !== undefined) result[key] = parsed;
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as ObjectOf<S>;
+    },
+  };
+}
+
+// ---------- брендированные id ----------
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+// Схема для id и единственный способ его создать
+function brandedId<Name extends string>(
+  name: Name,
+): Schema<Brand<number, Name>> {
+  return primitive(
+    `a ${name}`,
+    (v): v is Brand<number, Name> =>
+      typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+  );
+}
+
+// ---------- данные учебного API ----------
+const MovieId = brandedId("MovieId");
+type MovieId = Infer<typeof MovieId>;
+const TodoId = brandedId("TodoId");
+type TodoId = Infer<typeof TodoId>;
+const UserId = brandedId("UserId");
+type UserId = Infer<typeof UserId>;
+const PostId = brandedId("PostId");
+type PostId = Infer<typeof PostId>;
+
+const Movie = object({
+  id: MovieId,
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof Movie>;
+
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+function page<T>(item: Schema<T>): Schema<Page<T>> {
+  return object({
+    page: number(),
+    totalPages: number(),
+    total: number(),
+    results: array(item),
+  });
+}
+
+const User = object({
+  id: UserId,
+  name: string(),
+  username: string(),
+  email: string(),
+});
+type User = Infer<typeof User>;
+
+const Post = object({
+  id: PostId,
+  userId: UserId,
+  title: string(),
+  likes: number(),
+});
+type Post = Infer<typeof Post>;
+
+const Todo = object({ id: TodoId, title: string(), done: boolean() });
+type Todo = Infer<typeof Todo>;
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+const TodoPatch = object({
+  title: optional(string()),
+  done: optional(boolean()),
+});
+
+// ---------- описание API ----------
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface Endpoint {
+  method: Method;
+  path: `/${string}`;
+  params?: Shape;
+  query?: Schema<object>;
+  body?: Schema<unknown>;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// "/users/:userId/posts/:postId" -> "userId" | "postId"
+type ParamNames<P extends string> =
+  P extends `${string}:${infer Name}/${infer Rest}`
+    ? Name | ParamNames<Rest>
+    : P extends `${string}:${infer Name}`
+      ? Name
+      : never;
+
+// Путь с :params требует по схеме на каждый параметр
+type ParamsFor<P extends string> = [ParamNames<P>] extends [never]
+  ? {}
+  : { params: Record<ParamNames<P>, Schema<string | number>> };
+
+type CheckParams<A extends ApiDescription> = {
+  [K in keyof A]: ParamsFor<A[K]["path"]>;
+};
+
+function defineApi<const A extends ApiDescription>(
+  api: A & CheckParams<A>,
+): A {
+  return api;
+}
+
+const pandaApi = defineApi({
+  getMovie: {
+    method: "GET",
+    path: "/movies/:id",
+    params: { id: MovieId },
+    response: Movie,
+  },
+  searchMovies: {
+    method: "GET",
+    path: "/movies",
+    query: object({
+      search: optional(string()),
+      genre: optional(string()),
+      page: optional(number()),
+      limit: optional(number()),
+    }),
+    response: page(Movie),
+  },
+  getUser: {
+    method: "GET",
+    path: "/users/:id",
+    params: { id: UserId },
+    response: User,
+  },
+  listPosts: {
+    method: "GET",
+    path: "/posts",
+    query: object({ userId: optional(UserId) }),
+    response: array(Post),
+  },
+  listTodos: {
+    method: "GET",
+    path: "/todos",
+    response: array(Todo),
+  },
+  createTodo: {
+    method: "POST",
+    path: "/todos",
+    body: NewTodo,
+    response: Todo,
+  },
+  updateTodo: {
+    method: "PATCH",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    body: TodoPatch,
+    response: Todo,
+  },
+  deleteTodo: {
+    method: "DELETE",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    response: nothing(),
+  },
+});
+type PandaApi = typeof pandaApi;
+
+// ---------- типы, выведенные из описания ----------
+type ParamsInput<E> = E extends { params: infer P extends Shape }
+  ? { params: ObjectOf<P> }
+  : {};
+type QueryInput<E> = E extends { query: infer Q extends Schema<object> }
+  ? {} extends Infer<Q>
+    ? { query?: Infer<Q> } // все поля query необязательные
+    : { query: Infer<Q> }
+  : {};
+type BodyInput<E> = E extends { body: infer B extends Schema<unknown> }
+  ? { body: Infer<B> }
+  : {};
+
+type Input<E extends Endpoint> = Simplify<
+  ParamsInput<E> & QueryInput<E> & BodyInput<E>
+>;
+type Output<E extends Endpoint> = Infer<E["response"]>;
+// Нет обязательного ввода: аргумент можно не передавать
+type InputArgs<E extends Endpoint> = {} extends Input<E>
+  ? [input?: Input<E>]
+  : [input: Input<E>];
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: (
+    ...input: InputArgs<A[K]>
+  ) => Promise<Result<Output<A[K]>, ApiError>>;
+};
+
+// ---------- от ввода к запросу ----------
+interface SdkRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+// Внутри SDK ввод типизирован свободно (и проверяется в рантайме)
+type RawInput = {
+  params?: Record<string, unknown>;
+  query?: unknown;
+  body?: unknown;
+};
+
+function buildRequest(
+  baseUrl: string,
+  endpoint: Endpoint,
+  input: RawInput = {},
+): SdkRequest {
+  const path = endpoint.path.replace(/:(\w+)/g, (_, name: string) => {
+    const schema = endpoint.params?.[name];
+    if (!schema) throw new Error(`Нет схемы для :${name}`);
+    const value = schema.parse(input.params?.[name], `params.${name}`);
+    return encodeURIComponent(String(value));
+  });
+  let url = baseUrl.replace(/\/+$/, "") + path;
+  if (endpoint.query) {
+    const query = endpoint.query.parse(input.query ?? {}, "query");
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      search.set(key, String(value));
+    }
+    if (search.size > 0) url += `?${search}`;
+  }
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  const request: SdkRequest = { method: endpoint.method, url, headers };
+  if (endpoint.body) {
+    const body = endpoint.body.parse(input.body, "body");
+    request.body = JSON.stringify(body);
+    headers["Content-Type"] = "application/json";
+  }
+  return request;
+}
+
+// ---------- клиент: настройки ----------
+interface RetryOptions {
+  attempts: number; // всего, включая первую
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+interface ResponseInfo {
+  request: SdkRequest;
+  attempt: number;
+  status: number | null; // null: на запрос так и не ответили
+  ms: number;
+}
+
+interface Hooks {
+  /** Изменить запрос перед отправкой, например добавить заголовок. */
+  onRequest?: (request: SdkRequest) => SdkRequest;
+  /** Видеть каждую попытку, например для логов и метрик. */
+  onResponse?: (info: ResponseInfo) => void;
+}
+
+interface ClientOptions {
+  /** По умолчанию: "https://api.pandadev.test" */
+  baseUrl?: string;
+  /** По умолчанию: глобальный fetch. Для тестов передайте свой. */
+  fetch?: typeof fetch;
+  /**
+   * Повторы для GET, PUT и DELETE. По умолчанию: 3 попытки,
+   * 200 мс с удвоением до 2000 мс. `false` выключает их.
+   */
+  retry?: Partial<RetryOptions> | false;
+  hooks?: Hooks;
+  /** Как ждать между попытками. По умолчанию: setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Для джиттера в backoff. По умолчанию: Math.random. */
+  random?: () => number;
+  /** Засекает время каждой попытки для onResponse. По умолчанию: Date.now. */
+  now?: () => number;
+}
+
+const DEFAULT_RETRY: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 200,
+  maxDelayMs: 2_000,
+};
+
+// Повторная отправка этих методов безвредна, их можно повторять
+const IDEMPOTENT = new Set<Method>(["GET", "PUT", "DELETE"]);
+
+function fail(error: ApiError): Result<never, ApiError> {
+  return { ok: false, error };
+}
+
+function apiMessage(body: unknown): string | undefined {
+  return isRecord(body) && typeof body.error === "string"
+    ? body.error
+    : undefined;
+}
+
+// ---------- повторы ----------
+function isRetryable(error: ApiError): boolean {
+  switch (error.kind) {
+    case "network":
+      return true;
+    case "http":
+      return error.status === 429 || error.status >= 500;
+    case "invalid-response":
+      return false;
+  }
+}
+
+// Экспонента с потолком и «equal jitter»: половина фиксирована, половина случайна
+function backoff(
+  attempt: number,
+  retry: RetryOptions,
+  random: () => number,
+): number {
+  const exp = Math.min(
+    retry.maxDelayMs,
+    retry.baseDelayMs * 2 ** (attempt - 1),
+  );
+  return Math.round(exp / 2 + (exp / 2) * random());
+}
+
+// ---------- клиент ----------
+/**
+ * Типизированный клиент для любого описания API: по методу
+ * на эндпоинт. Большинству нужен createPandaClient().
+ */
+function createClient<A extends ApiDescription>(
+  api: A,
+  options: ClientOptions = {},
+): Client<A> {
+  const {
+    baseUrl = "https://api.pandadev.test",
+    fetch: fetchFn = fetch,
+    hooks = {},
+    sleep = (ms: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    random = Math.random,
+    now = Date.now,
+  } = options;
+  const retry: RetryOptions =
+    options.retry === false
+      ? { ...DEFAULT_RETRY, attempts: 1 }
+      : { ...DEFAULT_RETRY, ...options.retry };
+
+  // Одна попытка: fetch, прочитать тело и сообщить, как всё прошло
+  async function attemptOnce(
+    request: SdkRequest,
+    attempt: number,
+  ): Promise<Result<unknown, ApiError>> {
+    const started = now();
+    const report = (status: number | null) => {
+      const ms = now() - started;
+      hooks.onResponse?.({ request, attempt, status, ms });
+    };
+    let res: Response;
+    try {
+      res = await fetchFn(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      });
+    } catch (error) {
+      report(null);
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return fail({ kind: "network", message });
+    }
+    const body: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    report(res.status);
+    if (!res.ok) {
+      const message = apiMessage(body) ?? `HTTP ${res.status}`;
+      return fail({ kind: "http", status: res.status, message });
+    }
+    return { ok: true, value: body };
+  }
+
+  // Собрать запрос, отправить (повторно), проверить ответ
+  async function send(
+    endpoint: Endpoint,
+    input: RawInput,
+  ): Promise<Result<unknown, ApiError>> {
+    let request = buildRequest(baseUrl, endpoint, input);
+    request.headers["X-Panda-SDK"] = SDK_VERSION;
+    if (hooks.onRequest) request = hooks.onRequest(request);
+    const attempts = IDEMPOTENT.has(endpoint.method)
+      ? retry.attempts
+      : 1;
+    for (let attempt = 1; ; attempt++) {
+      const result = await attemptOnce(request, attempt);
+      if (!result.ok) {
+        if (attempt < attempts && isRetryable(result.error)) {
+          await sleep(backoff(attempt, retry, random));
+          continue;
+        }
+        return result;
+      }
+      try {
+        const value = endpoint.response.parse(result.value);
+        return { ok: true, value };
+      } catch (error) {
+        if (!(error instanceof ValidationError)) throw error;
+        const { message } = error;
+        return fail({ kind: "invalid-response", message });
+      }
+    }
+  }
+
+  // По методу на эндпоинт: Client<A> — это обещание, цикл его
+  // выполняет, а приведение говорит об этом ровно в одном месте
+  const client: Record<string, (input?: RawInput) => unknown> = {};
+  for (const name of Object.keys(api)) {
+    const endpoint = api[name];
+    client[name] = (input = {}) => send(endpoint, input);
+  }
+  return client as Client<A>;
+}
+
+// ---------- пагинация ----------
+// Для API без канала Result, например асинхронной итерации
+class ApiFailure extends Error {
+  readonly error: ApiError;
+  constructor(error: ApiError) {
+    super(error.message);
+    this.name = "ApiFailure";
+    this.error = error;
+  }
+}
+
+/**
+ * Каждый элемент каждой страницы, страницы загружаются по одной:
+ * `for await (const movie of paginate(panda.searchMovies))`.
+ * Бросает ApiFailure, если страницу не удалось загрузить.
+ */
+async function* paginate<Q extends { page?: number }, T>(
+  method: (input: { query?: Q }) => Promise<Result<Page<T>, ApiError>>,
+  query?: NoInfer<Q>,
+): AsyncGenerator<T, void, undefined> {
+  for (let page = query?.page ?? 1; ; page++) {
+    const result = await method({ query: { ...query, page } as Q });
+    if (!result.ok) throw new ApiFailure(result.error);
+    yield* result.value.results;
+    if (page >= result.value.totalPages) return;
+  }
+}
+
+// ---------- публичный API ----------
+const SDK_VERSION = "1.0.0";
+
+/** Клиент для учебного API PandaDev. */
+type PandaClient = Client<PandaApi>;
+
+/**
+ * Клиент для учебного API PandaDev.
+ *
+ * @example
+ * const panda = createPandaClient();
+ * const id = MovieId.parse(1);
+ * const movie = await panda.getMovie({ params: { id } });
+ * if (movie.ok) console.log(movie.value.title);
+ */
+function createPandaClient(options: ClientOptions = {}): PandaClient {
+  return createClient(pandaApi, options);
+}
+
+/** Значение успешного результата; иначе бросает ApiFailure. */
+function unwrap<T>(result: Result<T, ApiError>): T;
+/** Сначала дожидается результата: `await unwrap(panda.listTodos())` */
+function unwrap<T>(result: Promise<Result<T, ApiError>>): Promise<T>;
+function unwrap<T>(
+  result: Result<T, ApiError> | Promise<Result<T, ApiError>>,
+): T | Promise<T> {
+  if (result instanceof Promise) {
+    return result.then((settled) => unwrap(settled));
+  }
+  if (!result.ok) throw new ApiFailure(result.error);
+  return result.value;
+}
+
+// ---------- тесты ----------
+// Тесты частей 1 и 2 живут в своих тестовых файлах
+// (build-request.test.ts, client.test.ts); здесь тесты части 3.
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep = async (ms: number) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+function fakeFetch(...answers: (Response | Error)[]) {
+  return vi.fn<typeof fetch>(async () => {
+    const next = answers.shift();
+    if (next === undefined) throw new Error("Ответы закончились");
+    if (next instanceof Error) throw next;
+    return next;
+  });
+}
+
+const busy = () => Response.json({ error: "busy" }, { status: 503 });
+
+describe("публичный API", () => {
+  it("createPandaClient общается с учебным API", async () => {
+    const panda = createPandaClient();
+    const id = UserId.parse(2);
+    const user = await panda.getUser({ params: { id } });
+    expect(user).toEqual({
+      ok: true,
+      value: {
+        id: 2,
+        name: "Sam Ortiz",
+        username: "sam",
+        email: "sam@pandadev.test",
+      },
+    });
+  });
+
+  it("сообщает, какая версия SDK отправила каждый запрос", async () => {
+    const fetch = fakeFetch(Response.json([]));
+    await createPandaClient({ fetch }).listTodos();
+    const init = fetch.mock.calls[0][1];
+    expect(init?.headers).toEqual({
+      Accept: "application/json",
+      "X-Panda-SDK": "1.0.0",
+    });
+  });
+
+  it("умеет выключать повторы", async () => {
+    const { sleep, waits } = fakeSleep();
+    const fetch = fakeFetch(busy(), busy());
+    const panda = createPandaClient({ fetch, sleep, retry: false });
+    const result = await panda.listTodos();
+    expect(result.ok).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(waits).toEqual([]);
+  });
+
+  it("unwrap отдаёт значение или бросает ApiFailure", async () => {
+    const fetch = fakeFetch(
+      Response.json([{ id: 1, title: "Nap", done: false }]),
+      Response.json({ error: "Not found" }, { status: 404 }),
+    );
+    const panda = createPandaClient({ fetch });
+    const todos = await unwrap(panda.listTodos());
+    expect(todos[0].title).toBe("Nap");
+    const missing = await panda.getMovie({
+      params: { id: MovieId.parse(99) },
+    });
+    expect(() => unwrap(missing)).toThrow(ApiFailure);
+    expect(() => unwrap(missing)).toThrow("Not found");
+  });
+});
+
+// ---------- тесты типов: не меняйте их ----------
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamNames<"/users/:userId/posts/:postId">,
+    "userId" | "postId">>,
+  Expect<Equal<ParamNames<"/todos">, never>>,
+  Expect<Equal<Input<PandaApi["getMovie"]>,
+    { params: { id: MovieId } }>>,
+  Expect<Equal<Input<PandaApi["listPosts"]>,
+    { query?: { userId?: UserId } }>>,
+  Expect<Equal<Input<PandaApi["updateTodo"]>, {
+    params: { id: TodoId };
+    body: { title?: string; done?: boolean };
+  }>>,
+  Expect<Equal<Input<PandaApi["listTodos"]>, {}>>,
+  Expect<Equal<Output<PandaApi["getUser"]>, User>>,
+  Expect<Equal<Output<PandaApi["deleteTodo"]>, null>>,
+];
+
+async function typeTests(
+  panda: Client<PandaApi>,
+  todo: Todo,
+  post: Post,
+) {
+  await panda.listTodos(); // ничего не обязательно, поэтому без аргумента
+  await panda.getUser({ params: { id: post.userId } });
+  await panda.createTodo({ body: { title: "Nap" } });
+  // @ts-expect-error: TodoId — это не MovieId
+  await panda.getMovie({ params: { id: todo.id } });
+  // @ts-expect-error: простое число — не проверенный id
+  await panda.getMovie({ params: { id: 1 } });
+  // @ts-expect-error: getMovie нужны его params
+  await panda.getMovie();
+  // @ts-expect-error: limit — это число
+  await panda.searchMovies({ query: { limit: "5" } });
+  // @ts-expect-error: новой задаче нужен title
+  await panda.createTodo({ body: { done: true } });
+  const id = MovieId.parse(1);
+  const movie = await panda.getMovie({ params: { id } });
+  // @ts-expect-error: проверьте ok, прежде чем читать value
+  movie.value;
+}
+
+async function typeTests2(panda: Client<PandaApi>) {
+  const client: Client<PandaApi> = createClient(pandaApi);
+  for await (const movie of paginate(panda.searchMovies)) {
+    const title: string = movie.title;
+  }
+  // @ts-expect-error: getMovie не возвращает страницы
+  paginate(panda.getMovie);
+  // @ts-expect-error: в query фильмов нет "genr"
+  paginate(panda.searchMovies, { genr: "drama" });
+}
+
+// Публичная поверхность, закреплённая: изменение здесь — новая версия
+type _surface = [
+  Expect<Equal<Parameters<typeof createPandaClient>,
+    [options?: ClientOptions]>>,
+  Expect<Equal<ReturnType<typeof createPandaClient>, PandaClient>>,
+  Expect<Equal<ClientOptions["retry"],
+    Partial<RetryOptions> | false | undefined>>,
+  Expect<Equal<Awaited<ReturnType<PandaClient["getMovie"]>>,
+    Result<Movie, ApiError>>>,
+  Expect<Equal<Parameters<PandaClient["listPosts"]>,
+    [input?: { query?: { userId?: UserId } }]>>,
+];
+
+async function surfaceTests(
+  panda: PandaClient,
+  result: Result<Movie, ApiError>,
+) {
+  const movie: Movie = unwrap(result);
+  const todos: Todo[] = await unwrap(panda.listTodos());
+  // @ts-expect-error: unwrap(promise) нужно дождаться через await
+  const notYet: Todo[] = unwrap(panda.listTodos());
+  // @ts-expect-error: unwrap принимает только результаты
+  unwrap({ title: "Nap" });
+  createPandaClient({ retry: false });
+  createPandaClient({ retry: { attempts: 5 } });
+  // @ts-expect-error: true — не настройка повторов
+  createPandaClient({ retry: true });
+}
+
+// ---------- попробуйте: пример из README ----------
+const panda = createPandaClient();
+
+const id = MovieId.parse(1);
+const movie = await panda.getMovie({ params: { id } });
+if (movie.ok) {
+  console.log(`${movie.value.title} (${movie.value.year})`);
+} else {
+  console.log(`Не удалось загрузить фильм: ${movie.error.message}`);
+}
+
+const dramas = paginate(panda.searchMovies, { genre: "drama" });
+for await (const drama of dramas) {
+  console.log(`- ${drama.title}`);
+}
+
+const userId = UserId.parse(3);
+const posts = await unwrap(panda.listPosts({ query: { userId } }));
+console.log(posts.map((post) => post.title));
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- Продуманную, небольшую **публичную поверхность**: одна точка входа, экспортирован каждый тип из публичных сигнатур, внутренности (даже `createClient`) остаются закрытыми, а для частого случая есть `createPandaClient` с именованным типом `PandaClient`.
+- **Настройки, которые могут расти** (`retry: false`), заголовок **`X-Panda-SDK`**, чтобы команда API знала, кто к ней обращается, и **`unwrap`** с перегрузками для скриптов и тестов.
+- **JSDoc**, который попадает в редакторы пользователей, в том числе через сопоставленный тип `Client`, и путь через `@deprecated` для переименования методов.
+- **Тесты типов для всей поверхности**, так что публичный API меняется, только когда кто-то так решил.
+- **Пакет**: только ESM, `exports` с типами на первом месте, никаких зависимостей, внимательный взгляд на файлы объявлений, политика semver (включая виды ошибок), Changesets, CI на каждой поддерживаемой версии Node и публикация с provenance.
+
+И готовый SDK: одно описание API, каждый тип выведен из него, каждый ответ проверен, каждый сбой типизирован, повторы не усугубляют сбои, пагинация работает через `for await`, а обещание пользователям записано, протестировано и версионировано.
+
+## Что дальше
+
+1. **Тайм-ауты**: добавьте настройку `timeoutMs` с помощью `AbortSignal.timeout(ms)` и протестируйте её на эндпоинте учебного API `/delay/:ms`. Затем примите настоящее решение: тайм-аут — это новый `{ kind: "timeout" }` (мажорный релиз, по нашей политике) или ошибка `network` (минорный)?
+2. **Учитывайте `Retry-After`**: когда 429 или 503 приходит с заголовком `Retry-After: 2`, ждите столько (в секундах, с потолком `maxDelayMs`) вместо backoff и покажите этот заголовок в `onResponse`.
+3. **Рецепты**: добавьте в описание `getRecipe` и `searchRecipes` со схемами, контрактными тестами на учебном API и changeset-файлом — полноценный минорный релиз.
+4. **Свои схемы**: принимайте в описаниях любую **Standard Schema** (общий интерфейс, который реализуют zod, valibot и ArkType), а затем сделайте `createClient` и `defineApi` публичными в минорном релизе, чтобы пользователи могли описывать свои API той библиотекой, которой уже пользуются.
+5. **Ключи идемпотентности**: пусть `createTodo` отправляет заголовок `Idempotency-Key` со значением `crypto.randomUUID()`, а `POST` с таким ключом повторяются. (Учебный API игнорирует этот заголовок, так что тестируйте на фейковом сервере, который запоминает ключи.)
+
+## Поздравляем! 🎉🐼
+
+Вы прошли **весь курс TypeScript на PandaDev**, все четыре уровня! Вспомните Уровень 0: первые аннотации типов, `string` и `number`, сужение типа через `typeof`, типизированные функции и игру-викторину. На Уровне 1 вы моделировали данные объединениями и размеченными объединениями, писали классы и дженерики, типизировали DOM и собрали трекер привычек. На Уровне 2 вы типизировали `fetch`, валидировали данные во время выполнения, тестировали типизированный код и собирали приложения на React и API на Express с общим контрактом. А на Уровне 3 вы погрузились глубоко: условные, сопоставленные и шаблонные литеральные типы, собственные утилитные типы, вариантность и вывод типов, брендированные типы, архитектура больших кодовых баз, компилятор и его производительность, публикация пакетов и руководство TypeScript в команде — а в финале SDK, чьи типы выводятся из единого описания API.
+
+Это уже не набор инструментов новичка: это инструменты Senior-инженера на TypeScript. Самые важные навыки дальше — те, которые никакой курс не доведёт до конца за вас: читать типы библиотек, которыми вы пользуетесь, выбирать простой тип, когда он полезнее команде, чем хитрый, проводить код-ревью доброжелательно и часто выпускать небольшие вещи. Опубликуйте что-нибудь в npm, добавьте типы в любимую библиотеку, помогите коллеге разобраться с его первым условным типом — и продолжайте. Мы гордимся вами. 💙
