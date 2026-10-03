@@ -11,12 +11,18 @@ import { visit } from "unist-util-visit";
 import { defineCollection, defineConfig, s } from "velite";
 
 import { languages } from "./src/lib/languages";
+import {
+  difficulties,
+  PRACTICE_XP,
+  practiceTopics,
+} from "./src/lib/practice-meta";
 
 /**
  * Content layout
  *
  *   content/courses/<language>/course.yml            levels → modules outline
  *   content/courses/<language>/<module>/<NN-slug>.mdx lessons, ordered by NN
+ *   content/practice/<language>/<NN-slug>.mdx         practice problems
  *
  * Translations sit next to the English file with the locale before the
  * extension: course.ru.yml, NN-slug.ru.mdx. A translation shares its lesson's
@@ -263,6 +269,44 @@ const lessons = defineCollection({
     }),
 });
 
+/** A standalone practice problem: a short task with one exercise. */
+const problems = defineCollection({
+  name: "Problem",
+  pattern: "practice/*/*.mdx",
+  schema: s
+    .object({
+      title: s.string().max(80),
+      description: s.string().max(200),
+      difficulty: s.enum(difficulties),
+      topic: s.enum(practiceTopics),
+      /** A lesson to revisit first, e.g. /learn/python/dictionaries */
+      lesson: s
+        .string()
+        .regex(/^\/learn\/[a-z]+\/[a-z0-9-]+$/)
+        .optional(),
+      path: s.path(),
+      body: s.mdx(),
+      raw: s.raw(),
+    })
+    .transform(({ path, raw, ...data }) => {
+      const [, language, name] = path.split("/");
+      const { base: file, locale } = splitLocale(name);
+      const match = /^(\d+)-(.+)$/.exec(file);
+      const slug = match ? match[2] : file;
+      return {
+        ...data,
+        language,
+        file,
+        locale,
+        order: match ? Number(match[1]) : -1,
+        slug,
+        permalink: `/practice/${language}/${slug}`,
+        xp: PRACTICE_XP[data.difficulty],
+        exerciseCount: countTags(raw, "Exercise"),
+      };
+    }),
+});
+
 export default defineConfig({
   root: "content",
   strict: true,
@@ -274,7 +318,7 @@ export default defineConfig({
     // `npm run dev` keeps the last output while it rebuilds (scripts/dev.mjs).
     clean: !process.env.VELITE_KEEP_OUTPUT,
   },
-  collections: { courses, lessons },
+  collections: { courses, lessons, problems },
   mdx: {
     // Minified with short lines instead (see compactBody below).
     minify: false,
@@ -282,7 +326,7 @@ export default defineConfig({
     rehypePlugins: [rehypeSlug, [rehypePrettyCode, prettyCode]],
   },
   // Cross-file checks that a single schema can't express. Any problem fails the build.
-  prepare: ({ courses, lessons }) => {
+  prepare: ({ courses, lessons, problems: practice }) => {
     const problems: string[] = [];
     const known = new Set(languages.map((l) => l.slug));
 
@@ -392,6 +436,57 @@ export default defineConfig({
       seen.set(key, where);
     }
 
+    const seenProblems = new Map<string, string>();
+    for (const problem of practice) {
+      const suffix = problem.locale === "en" ? "" : `.${problem.locale}`;
+      const where = `practice/${problem.language}/${problem.file}${suffix}.mdx`;
+      if (!known.has(problem.language)) {
+        problems.push(`${where}: unknown language "${problem.language}"`);
+      }
+      if (problem.order < 0) {
+        problems.push(
+          `${where}: file name must start with a number, e.g. 01-${problem.file}.mdx`,
+        );
+      }
+      if (problem.exerciseCount !== 1) {
+        problems.push(`${where}: a problem needs exactly one <Exercise>`);
+      }
+      if (
+        problem.lesson &&
+        !lessons.some(
+          (l) => l.locale === "en" && l.permalink === problem.lesson,
+        )
+      ) {
+        problems.push(`${where}: lesson ${problem.lesson} doesn't exist`);
+      }
+      if (problem.locale !== "en") {
+        const original = practice.find(
+          (p) =>
+            p.locale === "en" &&
+            p.language === problem.language &&
+            p.file === problem.file,
+        );
+        if (!original) {
+          problems.push(`${where}: no English problem ${problem.file}.mdx`);
+        } else {
+          for (const field of ["difficulty", "topic", "lesson"] as const) {
+            if (problem[field] !== original[field]) {
+              problems.push(
+                `${where}: ${field} is ${problem[field]} but the English problem has ${original[field]}`,
+              );
+            }
+          }
+        }
+      }
+      const key = `${problem.language}/${problem.slug}/${problem.locale}`;
+      if (seenProblems.has(key)) {
+        problems.push(
+          `${where}: problem slug "${problem.slug}" is already used by ${seenProblems.get(key)}`,
+        );
+      }
+      seenProblems.set(key, where);
+    }
+
     if (problems.length) {
       throw new Error(`Content problems:\n  - ${problems.join("\n  - ")}`);
     }
@@ -408,6 +503,14 @@ export default defineConfig({
         JSON.stringify(compactBody(lesson.body)),
       );
       delete (lesson as { body?: string }).body;
+    }
+    for (const problem of practice) {
+      if (typeof problem.body !== "string") continue;
+      writeIfChanged(
+        bodyFile({ ...problem, language: `practice/${problem.language}` }),
+        JSON.stringify(compactBody(problem.body)),
+      );
+      delete (problem as { body?: string }).body;
     }
   },
 });

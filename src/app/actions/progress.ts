@@ -1,6 +1,7 @@
 "use server";
 
 import { getAllLessons } from "@/lib/content";
+import { getAllProblems } from "@/lib/practice";
 import {
   EXERCISE_XP,
   levelFromXp,
@@ -80,23 +81,37 @@ export async function recordActivity(
   if (!allowAward(session.user.id))
     return { ok: false, reason: "rate-limited" };
 
+  // A lesson's exercises and quizzes, or a practice problem's one exercise.
   const lesson = getAllLessons().find((l) => l.permalink === permalink);
+  const problem = lesson
+    ? undefined
+    : getAllProblems().find((p) => p.permalink === permalink);
   // No leading zeros: "exercise-01" must not count as a second "exercise-1".
   const match = /^(exercise|quiz)-([1-9]\d{0,3})$/.exec(activityId);
-  if (!lesson || !match) return { ok: false, reason: "invalid" };
+  if (!(lesson || problem) || !match) return { ok: false, reason: "invalid" };
 
   const kind = match[1] as "exercise" | "quiz";
   const index = Number(match[2]);
-  const available =
-    kind === "exercise" ? lesson.exerciseCount : lesson.quizCount;
+  const available = problem
+    ? kind === "exercise"
+      ? problem.exerciseCount
+      : 0
+    : kind === "exercise"
+      ? lesson!.exerciseCount
+      : lesson!.quizCount;
   if (index < 1 || index > available) return { ok: false, reason: "invalid" };
 
   const userId = session.user.id;
-  const amount = kind === "exercise" ? EXERCISE_XP : QUIZ_XP;
+  // Problems pay by difficulty, lesson activities a fixed amount.
+  const amount = problem
+    ? problem.xp
+    : kind === "exercise"
+      ? EXERCISE_XP
+      : QUIZ_XP;
   const awarded = await awardXp(
     userId,
     kind,
-    `${lesson.permalink}#${kind}-${index}`,
+    `${permalink}#${kind}-${index}`,
     amount,
   );
   return finish(userId, awarded ? amount : 0);

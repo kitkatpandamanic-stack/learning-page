@@ -29,7 +29,11 @@ const chrome =
   ].find(existsSync);
 if (!chrome) throw new Error("Chrome not found: set CHROME_PATH");
 
-const lessons = JSON.parse(readFileSync(".velite/lessons.json", "utf8"))
+// Lessons and practice problems: both pages solve their exercises the same way.
+const lessons = [
+  ...JSON.parse(readFileSync(".velite/lessons.json", "utf8")),
+  ...JSON.parse(readFileSync(".velite/problems.json", "utf8")),
+]
   .filter((l) => l.exerciseCount > 0)
   .filter((l) => !only || only.includes(l.language))
   .filter((_, index) => index % shards === shard - 1)

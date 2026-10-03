@@ -1,0 +1,523 @@
+---
+title: "Мини-проект: крошечная языковая модель"
+description: Соберите посимвольную языковую модель на NumPy — от словаря и кодирования до нейронной биграммы, обученной на перекрёстной энтропии, сравненной с подсчётом и сэмплированной с температурой.
+duration: 25
+xp: 35
+---
+
+Пора собрать весь модуль воедино. Вы построите **языковую модель (language model)**, которая пишет текст символ за символом: тот же рецепт, что и у LLM, только с самой маленькой работающей моделью. Она выучит, какой символ обычно идёт за каким, обучится градиентным спуском на перекрёстной энтропии, а затем будет генерировать новый текст с помощью генератора случайных чисел с зерном (seed) и ручки температуры. 🐼✍️
+
+Стихов она писать не будет. Но у каждой её части — словаря, кодирования, softmax по словарю, цикла обучения и сэмплирования — есть точный аналог в настоящей LLM, а в конце вы увидите, что нужно изменить, чтобы подняться отсюда к GPT.
+
+## План
+
+1. **Словарь (vocabulary)**: множество символов текста, у каждого свой id. **Кодировать (encode)** текст в id и **декодировать (decode)** обратно.
+2. **Обучающие пары**: для каждой позиции текущий символ — это вход, а следующий — цель.
+3. **Базовая модель (baseline)**: модель на **подсчёте**, как биграммная модель слов из урока [Как работают LLM](/learn/python/how-llms-work), но для символов.
+4. **Нейронная модель**: матрица весов, softmax и перекрёстная энтропия, обучение градиентным спуском.
+5. **Генерация**: сэмплируем по одному символу за раз, с **температурой**.
+
+## Словарь, кодирование и декодирование
+
+Наш обучающий текст — несколько предложений о пандах. Словарь посимвольной модели — это просто все различные символы текста, отсортированные, чтобы id всегда были одинаковыми:
+
+<CodeExample output={`символов в тексте: 323 | в словаре: 26
+['\\n', ' ', ',', '.', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'k', 'l', 'm', 'n', 'o', 'p', 'r', 's', 't', 'u', 'v', 'w', 'y']
+[21, 11, 8, 1, 18, 4, 16, 7, 4]
+the panda
+True`}>
+
+```python
+text = """the panda sat in the bamboo and ate the bamboo all day.
+the little panda climbed a tall tree and fell asleep.
+when the rain came, the pandas hid under the old tree.
+a red panda is not a bear, but it likes bamboo too.
+the panda keeper brings fresh bamboo every morning.
+pandas sleep, eat and play, then they eat a bit more.
+"""
+
+vocab = sorted(set(text))
+stoi = {ch: i for i, ch in enumerate(vocab)}   # строка -> id
+print("символов в тексте:", len(text), "| в словаре:", len(vocab))
+print(vocab)
+
+def encode(s):
+    return [stoi[ch] for ch in s]
+
+def decode(ids):
+    return "".join(vocab[i] for i in ids)
+
+ids = encode("the panda")
+print(ids)
+print(decode(ids))
+print(decode(encode(text)) == text)
+```
+
+</CodeExample>
+
+26 токенов: встречающиеся буквы плюс пробел, запятая, точка и перевод строки `'\n'`. `stoi` сопоставляет символу его id, а сам список `vocab` сопоставляет id обратно символ. Если закодировать текст и затем декодировать, получится ровно исходный текст — это первое, что стоит проверить в любом токенизаторе.
+
+## Обучающие пары
+
+Биграммная модель предсказывает следующий символ по текущему. Поэтому входы — все символы, кроме последнего, а цели — тот же текст, сдвинутый на один:
+
+<CodeExample output={`обучающих пар: 322
+'t' -> 'h'
+'h' -> 'e'
+'e' -> ' '
+' ' -> 'p'
+'p' -> 'a'
+'a' -> 'n'`}>
+
+```python
+import numpy as np
+
+text = """the panda sat in the bamboo and ate the bamboo all day.
+the little panda climbed a tall tree and fell asleep.
+when the rain came, the pandas hid under the old tree.
+a red panda is not a bear, but it likes bamboo too.
+the panda keeper brings fresh bamboo every morning.
+pandas sleep, eat and play, then they eat a bit more.
+"""
+vocab = sorted(set(text))
+stoi = {ch: i for i, ch in enumerate(vocab)}
+ids = np.array([stoi[ch] for ch in text])
+
+x, y = ids[:-1], ids[1:]       # вход и символ после него
+print("обучающих пар:", len(x))
+for i in range(6):
+    print(repr(vocab[x[i]]), "->", repr(vocab[y[i]]))
+```
+
+</CodeExample>
+
+Каждая из 322 позиций — обучающий пример, и никому не пришлось ничего размечать: текст размечает сам себя. Именно так предобучают LLM, только в масштабе триллионов токенов.
+
+## Базовая модель: подсчёт
+
+Самая простая модель считает, как часто каждый символ следует за каждым другим, в таблице 26 × 26. **`np.add.at`** прибавляет 1 в каждой позиции `(x, y)`, в том числе в повторяющихся. Если разделить каждую строку на её сумму, получатся вероятности следующего символа:
+
+<CodeExample output={`после 't': [('h', 0.42), (' ', 0.29), ('r', 0.08)]
+потери модели подсчёта: 1.6476
+равномерное угадывание: 3.2581`}>
+
+```python
+import numpy as np
+
+text = """the panda sat in the bamboo and ate the bamboo all day.
+the little panda climbed a tall tree and fell asleep.
+when the rain came, the pandas hid under the old tree.
+a red panda is not a bear, but it likes bamboo too.
+the panda keeper brings fresh bamboo every morning.
+pandas sleep, eat and play, then they eat a bit more.
+"""
+vocab = sorted(set(text))
+stoi = {ch: i for i, ch in enumerate(vocab)}
+ids = np.array([stoi[ch] for ch in text])
+x, y = ids[:-1], ids[1:]
+V = len(vocab)
+
+counts = np.zeros((V, V))
+np.add.at(counts, (x, y), 1)          # counts[x, y] += 1
+P = counts / counts.sum(axis=1, keepdims=True)
+
+row = P[stoi["t"]]
+top = np.argsort(row)[::-1][:3]
+print("после 't':", [(vocab[i], float(row[i].round(2))) for i in top])
+
+loss = -np.mean(np.log(P[x, y]))
+print("потери модели подсчёта:", round(loss, 4))
+print("равномерное угадывание:", round(np.log(V), 4))
+```
+
+</CodeExample>
+
+После `t` модель чаще всего ожидает `h` — спасибо всем этим «the». Чтобы оценить всю модель одним числом, используем **среднее отрицательное логарифмическое правдоподобие (average negative log-likelihood)** верных следующих символов — это функция потерь перекрёстной энтропии из урока [Нейроны и градиентный спуск](/learn/python/neurons-and-gradient-descent). Модель, которая ничего не знает (все символы равновероятны), получает `log(26) = 3.258`; модель подсчёта — **1.65**.
+
+Для биграммной модели подсчёт — наилучшее возможное приближение обучающего текста: ни одна биграммная модель не получит на нём меньших потерь. Поэтому это идеальная точка отсчёта для нейронной версии.
+
+<Callout type="warning" title="Нулевые счётчики — бесконечные потери">
+
+У подсчёта есть подвох. Любая пара, которая ни разу не встретилась, скажем `"q"` после `"z"`, получает вероятность 0, а `-log(0)` — бесконечность: одна невиданная пара в новом тексте, и потери равны `inf`. Классическое решение — **сглаживание (smoothing)**: прибавить 1 к каждому счётчику перед делением (`counts + 1`), чтобы ничто не было невозможным. У нейронной модели та же проблема в более мягкой форме, и роль сглаживания играет **регуляризация**.
+
+</Callout>
+
+## Нейронная биграммная модель
+
+Теперь нейронная версия. Модель — это одна матрица весов `W` формы `(26, 26)`. Чтобы предсказать символ после символа `i`:
+
+1. Превратите `i` в вектор **one-hot**: 26 нулей и 1 на позиции `i`.
+2. Умножьте его на `W`. Получится 26 оценок — **логиты (logits)**.
+3. **Softmax** превращает логиты в вероятности следующего символа.
+
+Умножение вектора one-hot на матрицу просто выбирает одну строку матрицы, так что шаги 1 и 2 на самом деле означают «взять строку `i`»:
+
+<CodeExample output={`[0. 0. 1. 0. 0.]
+[-0.6  0.  -2.3 -0.2 -1.2]
+[-0.6  0.  -2.3 -0.2 -1.2]`}>
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+W = rng.normal(size=(5, 5)).round(1)
+one_hot = np.eye(5)[2]          # токен 2 в виде вектора one-hot
+print(one_hot)
+print(one_hot @ W)
+print(W[2])                     # та же строка, без вычислений
+```
+
+</CodeExample>
+
+Это в точности **таблица эмбеддингов (embedding table)**: матрица, строки которой выбирают по id токена. Настоящие фреймворки делают выборку и пропускают умножение; мы оставим версию с one-hot, потому что с ней градиент легче читать.
+
+Цикл обучения — тот же, что и в первых двух уроках. Если `X` — входы one-hot (по строке на обучающую пару), а `Y` — цели one-hot, то градиент softmax + перекрёстной энтропии по логитам равен `(P - Y) / n`, а градиент по `W` — `X.T @ (P - Y) / n`:
+
+<CodeExample output={`step   loss
+   0  3.2581
+  50  1.6897
+ 100  1.6668
+ 150  1.6600
+ 200  1.6567
+ 250  1.6548
+ 300  1.6536
+P('h' после 't'): 0.416`}>
+
+```python
+import numpy as np
+
+text = """the panda sat in the bamboo and ate the bamboo all day.
+the little panda climbed a tall tree and fell asleep.
+when the rain came, the pandas hid under the old tree.
+a red panda is not a bear, but it likes bamboo too.
+the panda keeper brings fresh bamboo every morning.
+pandas sleep, eat and play, then they eat a bit more.
+"""
+vocab = sorted(set(text))
+stoi = {ch: i for i, ch in enumerate(vocab)}
+ids = np.array([stoi[ch] for ch in text])
+x, y = ids[:-1], ids[1:]
+V, n = len(vocab), len(x)
+
+X = np.eye(V)[x]                 # (322, 26) входы one-hot
+Y = np.eye(V)[y]                 # (322, 26) цели one-hot
+W = np.zeros((V, V))             # начинаем, ничего не зная
+
+def softmax(z):
+    e = np.exp(z - z.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
+
+print("step   loss")
+for step in range(301):
+    P = softmax(X @ W)                           # прямой проход
+    if step % 50 == 0:
+        loss = -np.mean(np.log(P[np.arange(n), y]))
+        print(f"{step:>4}  {loss:.4f}")
+    W -= 50 * X.T @ (P - Y) / n                  # обратный проход + шаг
+
+after_t = softmax(W[stoi["t"]][None, :])[0]
+print("P('h' после 't'):", round(after_t[stoi["h"]], 3))
+```
+
+</CodeExample>
+
+Потери начинаются с 3.2581, а это `log(26)`: когда `W` состоит из одних нулей, все символы получают одинаковую вероятность. Затем они быстро падают к **1.65** — результату модели подсчёта, — и ниже опуститься никогда не смогут. Нейросеть заново открыла счётчики: после обучения softmax каждой строки `W` приближается к строкам таблицы подсчёта (а сама `W` приближается к **логарифму** счётчиков с точностью до константы в каждой строке).
+
+Скорость обучения 50 выглядит огромной по сравнению с 0.01 из первого урока, но градиент здесь крошечный: каждая строка `W` получает только ту долю градиента, которая приходится на пары, начинающиеся с её символа, делённую на все 322 пары. Если заметно уменьшить скорость, обучение поползёт; если заметно увеличить — шаги начнут перескакивать, как в первом уроке.
+
+Зачем же тогда нейросеть, если подсчёт даёт тот же ответ? Потому что подсчёт работает **только** для этой крошечной модели. Таблицы счётчиков для более длинных контекстов взрываются: при 3 предыдущих символах получается 26³ = 17 576 контекстов, и большинство из них никогда не встречались. Нейросеть может принимать на вход длинный контекст, переносить выученное между похожими контекстами и продолжать расти. Масштабируется градиентный спуск, а не подсчёт.
+
+## Генерация текста
+
+Чтобы генерировать, начните с символа, вычислите вероятности следующего, **сэмплируйте** из них, добавьте результат и повторите. **Температура** делит логиты перед softmax, как в прошлом уроке:
+
+<CodeExample output={`T=0.3: the andandan t t the a the the the the. / the banda the a and a
+T=1.0: the aslithit t r, ld a pandfrelin palery mbo. / whe ther d it a
+T=1.5: the atrepay. / was thed areldwveng. / theesldalimbs n slat e it a`}>
+
+```python
+import numpy as np
+
+text = """the panda sat in the bamboo and ate the bamboo all day.
+the little panda climbed a tall tree and fell asleep.
+when the rain came, the pandas hid under the old tree.
+a red panda is not a bear, but it likes bamboo too.
+the panda keeper brings fresh bamboo every morning.
+pandas sleep, eat and play, then they eat a bit more.
+"""
+vocab = sorted(set(text))
+stoi = {ch: i for i, ch in enumerate(vocab)}
+ids = np.array([stoi[ch] for ch in text])
+x, y = ids[:-1], ids[1:]
+V, n = len(vocab), len(x)
+X, Y = np.eye(V)[x], np.eye(V)[y]
+
+def softmax(z):
+    e = np.exp(z - z.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+W = np.zeros((V, V))
+for step in range(300):
+    W -= 50 * X.T @ (softmax(X @ W) - Y) / n
+
+def generate(start, length, rng, temperature=1.0):
+    i, out = stoi[start], start
+    for _ in range(length):
+        p = softmax(W[i] / temperature)
+        i = rng.choice(V, p=p)
+        out += vocab[i]
+    return out.replace("\n", " / ")
+
+for t in [0.3, 1.0, 1.5]:
+    rng = np.random.default_rng(0)
+    print(f"T={t}: {generate('t', 60, rng, t)}")
+```
+
+</CodeExample>
+
+- При **T = 0.3** модель почти всегда берёт самый вероятный следующий символ, поэтому застревает на повторении «the» и «and»: почти жадный текст скучен.
+- При **T = 1.0** она сэмплирует из того, что выучила. Получаются псевдослова с правильным «звучанием» (`pandfrelin`, `palery`, пробелы и точки на разумных местах), но без смысла: модель видит всего **один** символ контекста.
+- При **T = 1.5** маловероятные символы получают больше шансов, и текст рассыпается в шум.
+
+Поскольку у генератора есть зерно, одно и то же зерно каждый раз даёт один и тот же текст — именно это делает сгенерированный вывод тестируемым.
+
+Нажмите **«Запустить»**, чтобы увидеть, что выучила модель, в виде картинки: каждая строка — текущий символ, каждый столбец — следующий символ, а чем темнее клетка, тем вероятнее переход. Найдите сильные переходы `t → h` и `h → e`:
+
+<TryIt language="python" code={`import numpy as np
+import matplotlib.pyplot as plt
+
+text = """the panda sat in the bamboo and ate the bamboo all day.
+the little panda climbed a tall tree and fell asleep.
+when the rain came, the pandas hid under the old tree.
+a red panda is not a bear, but it likes bamboo too.
+the panda keeper brings fresh bamboo every morning.
+pandas sleep, eat and play, then they eat a bit more.
+"""
+vocab = sorted(set(text))
+stoi = {ch: i for i, ch in enumerate(vocab)}
+ids = np.array([stoi[ch] for ch in text])
+X, Y = np.eye(len(vocab))[ids[:-1]], np.eye(len(vocab))[ids[1:]]
+
+def softmax(z):
+    e = np.exp(z - z.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+W = np.zeros((len(vocab), len(vocab)))
+for step in range(300):
+    W -= 50 * X.T @ (softmax(X @ W) - Y) / len(X)
+
+labels = [repr(ch)[1:-1] for ch in vocab]   # показываем '\\n' и ' '
+fig, ax = plt.subplots(figsize=(7, 7))
+ax.imshow(softmax(W), cmap="Purples")
+ax.set_xticks(range(len(vocab)), labels)
+ax.set_yticks(range(len(vocab)), labels)
+ax.set_xlabel("следующий символ")
+ax.set_ylabel("текущий символ")
+ax.set_title("Что выучила биграммная модель")
+plt.show()`}
+/>
+
+## Отсюда — к GPT
+
+Ваша модель и настоящая LLM отличаются **масштабом** и тем, **сколько контекста** видит модель, а не сутью. Вот путь от одной к другой, где каждый шаг — известная веха:
+
+1. **Больше контекста.** Подавайте на вход несколько последних символов (или токенов) вместо одного: возьмите **эмбеддинг** для каждого, соедините их и пропустите через MLP со скрытым слоем — сеть из урока [Нейросеть с нуля](/learn/python/a-neural-network-from-scratch). Это классическая нейронная языковая модель Бенджио и коллег 2003 года.
+2. **Внимание.** Замените фиксированное окно каузальным **самовниманием (self-attention)** по всему контексту, обёрнутым в **блоки трансформера** (внимание, MLP, остаточные связи, нормализация слоя), как в уроке [Как работают LLM](/learn/python/how-llms-work).
+3. **Подсловные токены** с BPE вместо символов.
+4. **Масштаб**: миллиарды весов, триллионы обучающих токенов, тысячи GPU, а затем обучение на инструкциях и на предпочтениях.
+
+Цикл обучения на всём пути остаётся тем же: предсказать следующий токен, перекрёстная энтропия, обратное распространение, шаг. Если хотите сами пройти шаги 1 и 2, бесплатный видеокурс Андрея Карпатого «Neural Networks: Zero to Hero» и его небольшие открытые проекты **makemore** и **nanoGPT** проходят ровно этот путь на PyTorch.
+
+На вашем компьютере нейронная биграммная модель на PyTorch совсем крошечная. `nn.Embedding(V, V)` — это ваша `W`, используемая как таблица для выборки:
+
+```python
+# На вашем компьютере: PyTorch
+import torch
+from torch import nn
+
+model = nn.Embedding(V, V)            # строка i = логиты после токена i
+optimizer = torch.optim.SGD(model.parameters(), lr=50)
+x_t, y_t = torch.tensor(x), torch.tensor(y)
+
+for step in range(300):
+    logits = model(x_t)                          # (n, V)
+    loss = nn.functional.cross_entropy(logits, y_t)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+probs = torch.softmax(model.weight[stoi["t"]] / 0.8, dim=0)
+next_id = torch.multinomial(probs, 1)            # сэмплирование
+```
+
+<Quiz
+  question="Необученная посимвольная модель со словарём из 50 символов даёт всем символам одинаковую вероятность. Чему равны её потери перекрёстной энтропии?"
+  options={["0", "примерно 0.02 (1 / 50)", "примерно 3.91 (log 50)", "50"]}
+  answer={2}
+  explanation="Каждый верный следующий символ получает вероятность 1/50, а потери — это среднее -log(1/50) = log(50), примерно 3.91. Это стартовая точка, которую нужно превзойти; наша модель с 26 символами начинала с log(26) = 3.258."
+/>
+
+<Exercise
+  language="python"
+  title="Мини-проект: крошечная языковая модель"
+  starter={`import numpy as np
+
+STORY = """once upon a time a small panda lived by the river.
+every morning she walked to the water to drink and look at the fish.
+one day a fish said hello, and the panda said hello back.
+they talked until the sun went down, then the panda went home to sleep.
+"""
+
+def build_vocab(text):
+    # Отсортированный список различных символов text
+    pass
+
+def encode(text, vocab):
+    # Список id (позиций в vocab), по одному на символ
+    pass
+
+def decode(ids, vocab):
+    # Обратно в строку
+    pass
+
+def counting_loss(ids, vocab_size):
+    # Среднее -log P(next | current) биграммной модели подсчёта
+    # (без сглаживания) на тех же ids
+    pass
+
+def train_bigram(ids, vocab_size, steps, learning_rate):
+    # Нейронная биграмма: W начинается с нулей (vocab_size x vocab_size).
+    # Каждый шаг: softmax(one_hot(x) @ W), записать потери,
+    # затем W -= learning_rate * gradient.
+    # Верните (W, losses) с одним значением потерь на шаг.
+    pass
+
+def next_char_probs(W, idx, temperature=1.0):
+    # Вероятности следующего символа после id idx
+    pass
+
+def generate(W, vocab, start, length, seed, temperature=1.0):
+    # Начните с символа start и добавьте \`length\` сэмплированных
+    # символов, используя np.random.default_rng(seed)
+    pass
+
+vocab = build_vocab(STORY)
+ids = encode(STORY, vocab)
+W, losses = train_bigram(ids, len(vocab), 300, 50)
+print("словарь:", len(vocab))
+print("потери:", round(losses[0], 3), "->", round(losses[-1], 3))
+print("подсчёт:", round(counting_loss(ids, len(vocab)), 3))
+print(generate(W, vocab, "t", 50, seed=1, temperature=0.8))
+`}
+  tests={[
+    { name: "build_vocab отсортирован и без повторов", check: "build_vocab('banana band') == [' ', 'a', 'b', 'd', 'n']" },
+    { name: "encode и decode переводят туда и обратно на другом тексте", check: "(lambda t: (lambda v: decode(encode(t, v), v) == t and encode('lol', v) == [v.index('l'), v.index('o'), v.index('l')] and all(isinstance(i, (int, np.integer)) for i in encode(t, v)))(build_vocab(t)))('Hello, World! 123')" },
+    { name: "counting_loss — это среднее -log P биграммной модели", check: "abs(counting_loss([0, 1, 0, 1, 0, 1], 2)) < 1e-9 and np.isclose(counting_loss([0, 0, 1, 0], 2), 2 * np.log(2) / 3)" },
+    { name: "train_bigram начинает с log(V), и потери падают", check: "(lambda r: r[0].shape == (4, 4) and len(r[1]) == 100 and np.isclose(r[1][0], np.log(4)) and r[1][-1] < r[1][0] - 0.5 and all(a >= b - 1e-9 for a, b in zip(r[1], r[1][1:])))(train_bigram([0, 1, 2, 3, 0, 1, 2, 3, 0, 2, 1, 3], 4, 100, 5))" },
+    { name: "обученная модель приближается к модели подсчёта", check: "losses[-1] - counting_loss(ids, len(vocab)) < 0.05 and losses[-1] >= counting_loss(ids, len(vocab)) - 1e-6" },
+    { name: "next_char_probs выдаёт вероятности, которые низкая температура заостряет", check: "(lambda p, q: np.isclose(p.sum(), 1) and np.all(p >= 0) and np.isclose(q.sum(), 1) and q.max() > p.max())(next_char_probs(W, vocab.index('t')), next_char_probs(W, vocab.index('t'), 0.5))" },
+    { name: "next_char_probs — это softmax строки W", check: "np.allclose(next_char_probs(np.array([[0.0, np.log(3.0)], [1.0, 1.0]]), 0), [0.25, 0.75]) and np.allclose(next_char_probs(np.array([[0.0, np.log(3.0)], [1.0, 1.0]]), 1), [0.5, 0.5])" },
+    { name: "generate зависит от зерна и использует только символы словаря", check: "(lambda a, b: a == b and len(a) == 41 and a[0] == 'o' and set(a) <= set(vocab))(generate(W, vocab, 'o', 40, seed=3), generate(W, vocab, 'o', 40, seed=3))" },
+    { name: "generate выучивает и другой текст", check: "(lambda v: (lambda W2: generate(W2, v, 'a', 10, seed=0, temperature=0.5) == 'abababababa')(train_bigram(encode('ab' * 30, v), 2, 200, 20)[0]))(['a', 'b'])" },
+  ]}
+>
+
+Соберите всю крошечную языковую модель в виде протестированных функций и обучите её на другой истории. 🐼📖
+
+1. `build_vocab(text)` возвращает **отсортированный** список различных символов.
+2. `encode(text, vocab)` возвращает список id (позицию каждого символа в `vocab`), а `decode(ids, vocab)` превращает id обратно в строку.
+3. `counting_loss(ids, vocab_size)` строит биграммную модель подсчёта (без сглаживания) по `ids` и возвращает её среднее отрицательное логарифмическое правдоподобие на тех же самых id.
+4. `train_bigram(ids, vocab_size, steps, learning_rate)` обучает нейронную биграммную модель: `W` начинается с нулей, и на каждом шаге вычисляется `softmax(one_hot(x) @ W)`, записываются потери (**до** обновления) и делается шаг градиентного спуска. Верните `(W, losses)`.
+5. `next_char_probs(W, idx, temperature=1.0)` возвращает вероятности следующего символа после id `idx`: softmax строки `idx` матрицы `W`, делённой на температуру.
+6. `generate(W, vocab, start, length, seed, temperature=1.0)` начинает с символа `start` и добавляет `length` символов, каждый из которых сэмплирован из `next_char_probs` с помощью `np.random.default_rng(seed)`. Верните всю строку (`length + 1` символов).
+
+Проверки вызывают ваши функции на другом тексте, сравнивают потери обученной модели с вашей моделью подсчёта и убеждаются, что генерация с зерном воспроизводима.
+
+<Hint>
+
+Словарь — это `sorted(set(text))`; в `encode` сначала постройте `{ch: i for i, ch in enumerate(vocab)}`. Для счётчиков: `ids = np.array(ids)`, `x, y = ids[:-1], ids[1:]`, `np.add.at(counts, (x, y), 1)`, разделите каждую строку на её сумму и усредните `-np.log(P[x, y])`. В `train_bigram`: `X = np.eye(vocab_size)[x]`, `Y = np.eye(vocab_size)[y]`, а на каждом шаге — `P = softmax(X @ W)`, `losses.append(-np.mean(np.log(P[np.arange(len(y)), y])))`, `W -= learning_rate * X.T @ (P - Y) / len(y)`. Для `next_char_probs`: `z = W[idx] / temperature`, затем `np.exp(z - z.max())`, делённое на свою сумму. В `generate` храните текущий id и выбирайте следующий через `rng.choice(len(vocab), p=probs)`.
+
+</Hint>
+
+<Solution>
+
+```python
+import numpy as np
+
+STORY = """once upon a time a small panda lived by the river.
+every morning she walked to the water to drink and look at the fish.
+one day a fish said hello, and the panda said hello back.
+they talked until the sun went down, then the panda went home to sleep.
+"""
+
+def build_vocab(text):
+    return sorted(set(text))
+
+def encode(text, vocab):
+    stoi = {ch: i for i, ch in enumerate(vocab)}
+    return [stoi[ch] for ch in text]
+
+def decode(ids, vocab):
+    return "".join(vocab[i] for i in ids)
+
+def counting_loss(ids, vocab_size):
+    ids = np.array(ids)
+    x, y = ids[:-1], ids[1:]
+    counts = np.zeros((vocab_size, vocab_size))
+    np.add.at(counts, (x, y), 1)
+    totals = counts.sum(axis=1, keepdims=True)
+    P = counts / np.maximum(totals, 1)     # неиспользуемые строки остаются 0
+    return -np.mean(np.log(P[x, y]))
+
+def softmax(z):
+    e = np.exp(z - z.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+def train_bigram(ids, vocab_size, steps, learning_rate):
+    ids = np.array(ids)
+    x, y = ids[:-1], ids[1:]
+    X = np.eye(vocab_size)[x]
+    Y = np.eye(vocab_size)[y]
+    W = np.zeros((vocab_size, vocab_size))
+    losses = []
+    for _ in range(steps):
+        P = softmax(X @ W)
+        losses.append(-np.mean(np.log(P[np.arange(len(y)), y])))
+        W -= learning_rate * X.T @ (P - Y) / len(y)
+    return W, losses
+
+def next_char_probs(W, idx, temperature=1.0):
+    return softmax(W[idx] / temperature)
+
+def generate(W, vocab, start, length, seed, temperature=1.0):
+    rng = np.random.default_rng(seed)
+    idx = vocab.index(start)
+    out = start
+    for _ in range(length):
+        probs = next_char_probs(W, idx, temperature)
+        idx = rng.choice(len(vocab), p=probs)
+        out += vocab[idx]
+    return out
+
+vocab = build_vocab(STORY)
+ids = encode(STORY, vocab)
+W, losses = train_bigram(ids, len(vocab), 300, 50)
+print("словарь:", len(vocab))
+print("потери:", round(losses[0], 3), "->", round(losses[-1], 3))
+print("подсчёт:", round(counting_loss(ids, len(vocab)), 3))
+print(generate(W, vocab, "t", 50, seed=1, temperature=0.8))
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Посимвольной языковой модели нужны **словарь** (отсортированные различные символы), **кодирование** и **декодирование**, а также обучающие пары, полученные сдвигом текста на один символ: текст размечает сам себя.
+- Биграммная модель **подсчёта** (`np.add.at` в таблицу, строки делятся на свои суммы) — наилучшее биграммное приближение; её среднее отрицательное логарифмическое правдоподобие — точка отсчёта. Невиданным парам нужно **сглаживание**.
+- **Нейронная** биграммная модель — это одна матрица `W`: `one_hot(x) @ W` (выбор строки, как в **эмбеддинге**) даёт логиты, softmax — вероятности, а градиентный спуск по перекрёстной энтропии с градиентом `X.T @ (P - Y) / n` доводит её до потерь модели подсчёта.
+- **Генерация** сэмплирует по одному токену за раз из вероятностей модели; генератор с зерном делает её воспроизводимой, а **температура** балансирует между скукой и хаосом.
+- Настоящая LLM — это тот же цикл с большим контекстом (эмбеддинги, затем внимание в блоках трансформера), подсловными токенами и огромным масштабом.
+
+Поздравляем: вы с нуля собрали нейроны, нейросеть и языковую модель и знаете, что находится внутри LLM, которыми пользуетесь каждый день. 🎉 Дальше естественные шаги — туториалы PyTorch и курс Карпатого «Zero to Hero», и теперь в них для вас не осталось никакой магии.

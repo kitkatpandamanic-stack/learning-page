@@ -1,0 +1,550 @@
+---
+title: "Mini-project: Data Report Generator"
+description: Combine everything from this module. Collect data from an API and a web shop, clean and aggregate it, and write a Markdown report and a CSV file with pathlib.
+duration: 20
+xp: 30
+---
+
+Time to put the whole module together. Your mission: a **report generator**, the kind of script teams run every morning to answer questions like "how are our prices compared with the competition?" or "what did the weather do to sales?". It **collects** data from an API and from web pages, **cleans and aggregates** it, and **writes** a Markdown report for people and a CSV file for spreadsheets. 📊
+
+Your report will cover the practice API's movies and the Panda Books shop. Along the way you'll see the patterns that keep scripts like this reliable and easy to change.
+
+## The plan: a pipeline of small functions
+
+A report generator is a **pipeline**. Each stage gets the previous stage's output and knows nothing about the others:
+
+```text
+collect            clean & aggregate          write
+───────            ─────────────────          ─────
+API (JSON)  ──┐
+              ├──▶  lists of dicts  ──▶  summaries  ──▶  report.md
+Shop (HTML) ──┘                                     └──▶  books.csv
+```
+
+In code, each stage is a few small functions:
+
+- **Collecting** functions take a `session` and a `base_url` and return plain Python lists of dicts. They're the only ones that touch the network.
+- **Aggregating** functions take lists and return summaries. They're **pure**: no network, no files, the same input always gives the same output. That makes them trivial to test.
+- **Writing** functions take summaries and a folder and produce files.
+
+Why `base_url` as a parameter? So the same code can run against a test server, a staging copy or production, and tests can point it anywhere. In a real project the stages would live in separate modules (`collect.py`, `analyse.py`, `report.py`) with a short `main.py` that wires them together.
+
+## Collecting from an API
+
+You've written pagination loops and API helpers in this module. Here's one more collector, for the weather, with one new detail: **expected** problems, like a city the API doesn't know, are collected and reported instead of crashing the whole run:
+
+<CodeExample output={`{'city': 'London', 'temperature': 14, 'condition': 'Cloudy'}
+{'city': 'Paris', 'temperature': 17, 'condition': 'Sunny'}
+{'city': 'Cairo', 'temperature': 31, 'condition': 'Sunny'}
+{'city': 'Moscow', 'temperature': 6, 'condition': 'Snow'}
+Not found: ['Atlantis']`}>
+
+```python
+import requests
+
+BASE = "https://api.pandadev.test"
+
+def fetch_weather(session, base_url, cities):
+    """Current weather for each city; unknown cities are skipped."""
+    found, missing = [], []
+    for city in cities:
+        r = session.get(f"{base_url}/weather",
+                        params={"city": city}, timeout=5)
+        if r.status_code == 404:
+            missing.append(city)
+            continue
+        r.raise_for_status()
+        data = r.json()
+        found.append({
+            "city": data["city"],
+            "temperature": data["temperature"],
+            "condition": data["condition"],
+        })
+    return found, missing
+
+cities = ["London", "Paris", "Atlantis", "Cairo", "Moscow"]
+with requests.Session() as session:
+    weather, missing = fetch_weather(session, BASE, cities)
+for row in weather:
+    print(row)
+print("Not found:", missing)
+```
+
+</CodeExample>
+
+The collector also **keeps only the fields it needs** and gives them your own names. If the API adds or renames fields one day, only this function changes, not the whole report.
+
+A 404 for an unknown city is expected, so it's handled. Anything else (a 500, a timeout) still raises: a report built on half the data, without anybody noticing, is worse than no report.
+
+## Collecting from the shop
+
+The shop's list pages don't say which category a book belongs to, but the shop **is** organised by category: each category has its own list (`/shop?category=kids`). Instead of typing the four categories into your code, discover them from the page's navigation, so a new category appears in your report automatically:
+
+<CodeExample output={`fiction      https://api.pandadev.test/shop?category=fiction
+science      https://api.pandadev.test/shop?category=science
+programming  https://api.pandadev.test/shop?category=programming
+kids         https://api.pandadev.test/shop?category=kids`}>
+
+```python
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+BASE = "https://api.pandadev.test"
+
+def category_links(session, base_url):
+    shop_url = base_url + "/shop"
+    r = session.get(shop_url, timeout=5)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    return {
+        a.get_text(strip=True).lower(): urljoin(shop_url, a["href"])
+        for a in soup.select("nav.categories a")
+    }
+
+with requests.Session() as session:
+    for name, url in category_links(session, BASE).items():
+        print(f"{name:12} {url}")
+```
+
+</CodeExample>
+
+Crawl each of those URLs (following `rel="next"` links, in case a category grows past one page), add the category to every book, and you have the whole shop with categories in 5 requests. The other way would be to visit all 18 detail pages and read the category from their table: correct too, but more than three times the requests.
+
+## Aggregating with plain Python
+
+Once the data is a list of dicts, the standard library has everything for a summary: `statistics.mean`, `max`/`sorted` with a `key`, `collections.Counter` for counting and `defaultdict` for grouping:
+
+<CodeExample output={`Average: 17
+Warmest: Cairo
+[('Sunny', 2), ('Cloudy', 1)]
+{'Cloudy': ['London'], 'Snow': ['Moscow'], 'Sunny': ['Paris', 'Cairo']}
+['Moscow', 'London']`}>
+
+```python
+from collections import Counter, defaultdict
+from statistics import mean
+
+weather = [
+    {"city": "London", "temperature": 14, "condition": "Cloudy"},
+    {"city": "Paris", "temperature": 17, "condition": "Sunny"},
+    {"city": "Cairo", "temperature": 31, "condition": "Sunny"},
+    {"city": "Moscow", "temperature": 6, "condition": "Snow"},
+]
+
+average = mean(row["temperature"] for row in weather)
+print("Average:", round(average, 1))
+
+warmest = max(weather, key=lambda row: row["temperature"])
+print("Warmest:", warmest["city"])
+
+conditions = Counter(row["condition"] for row in weather)
+print(conditions.most_common(2))
+
+by_condition = defaultdict(list)
+for row in weather:
+    by_condition[row["condition"]].append(row["city"])
+print(dict(sorted(by_condition.items())))
+
+coldest_first = sorted(weather, key=lambda row: row["temperature"])
+print([row["city"] for row in coldest_first[:2]])
+```
+
+</CodeExample>
+
+Notice the data is typed straight into the code here, with no requests at all. That's the beauty of pure aggregating functions: you can try them out (and test them) with five hand-made rows. In the next module, [Data Analysis with pandas](/learn/python/dataframes), you'll learn a library that does grouping and averaging on millions of rows in one line each.
+
+When you sort, think about **ties**. Two movies with the same rating should always come out in the same order, or your report changes from run to run for no reason. Sort by a tuple: `key=lambda m: (-m["rating"], m["title"])` means "highest rating first, then by title".
+
+## Writing Markdown
+
+**Markdown** is plain text with light formatting (`# Heading`, `**bold**`, `- lists`), and GitHub, GitLab, Slack, Notion and most wikis display it nicely. Tables are rows of cells between `|` characters, with a `---` line under the header. A small function builds one from any headers and rows:
+
+<CodeExample output={`| City | °C | Condition |
+| --- | --- | --- |
+| Cairo | 31 | Sunny |
+| Paris | 17 | Sunny |
+| London | 14 | Cloudy |`}>
+
+```python
+def markdown_table(headers, rows):
+    lines = [
+        "| " + " | ".join(str(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\n".join(lines)
+
+rows = [["Cairo", 31, "Sunny"], ["Paris", 17, "Sunny"],
+        ["London", 14, "Cloudy"]]
+print(markdown_table(["City", "°C", "Condition"], rows))
+```
+
+</CodeExample>
+
+Format numbers **before** they go into the table: `f"{price:.2f}"` turns `22.7` into `22.70`, so a column of prices lines up and reads like money.
+
+## Writing the files with pathlib
+
+`pathlib.Path` handles folders and files neatly: `/` joins path parts, `mkdir(parents=True, exist_ok=True)` creates a folder (and its parents) unless it's already there, and `write_text` writes a whole file in one call. For the CSV, use `csv.DictWriter` from [CSV and JSON](/learn/python/csv-and-json):
+
+<CodeExample output={`# Weather report
+
+- **London**: 14 °C
+- **Cairo**: 31 °C
+['city,temperature,condition', 'London,14,Cloudy', 'Cairo,31,Sunny']
+['report.md', 'weather.csv']`}>
+
+```python
+import csv
+from pathlib import Path
+
+weather = [
+    {"city": "London", "temperature": 14, "condition": "Cloudy"},
+    {"city": "Cairo", "temperature": 31, "condition": "Sunny"},
+]
+
+folder = Path("weather-report")
+folder.mkdir(parents=True, exist_ok=True)
+
+report = folder / "report.md"
+lines = ["# Weather report", ""]
+lines += [f"- **{w['city']}**: {w['temperature']} °C"
+          for w in weather]
+report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+table = folder / "weather.csv"
+with table.open("w", newline="", encoding="utf-8") as file:
+    writer = csv.DictWriter(
+        file, fieldnames=["city", "temperature", "condition"])
+    writer.writeheader()
+    writer.writerows(weather)
+
+print(report.read_text(encoding="utf-8"), end="")
+print(table.read_text(encoding="utf-8").splitlines())
+print(sorted(p.name for p in folder.iterdir()))
+```
+
+</CodeExample>
+
+- Build the report as a **list of lines** and join them once at the end. It's easier to read than one giant f-string, and easy to add sections.
+- Always pass `encoding="utf-8"`, or `°C` and `★` may come out garbled on some computers.
+- `DictWriter(..., extrasaction="ignore")` lets you pass dicts that have **more** keys than the CSV columns (like a `url` you don't want in the file).
+
+<Callout type="tip" title="Running it every morning">
+
+A report is most useful when it runs by itself. On a Linux server, a **cron** line runs it every weekday at 7:00:
+
+```bash
+0 7 * * 1-5  cd /home/mei/report && .venv/bin/python main.py
+```
+
+Many teams use **GitHub Actions** with a `schedule:` trigger instead, and commit the new `report.md` or post it to a chat channel. Either way: tokens come from environment variables (or the platform's secrets settings), the script exits with an error when collecting fails so someone gets notified, and it logs what it did.
+
+</Callout>
+
+<Quiz
+  question="Why do the collecting functions take base_url as a parameter instead of using the BASE constant inside?"
+  options={[
+    "Because requests can't read global variables",
+    "So the same code can run against a test server, staging or production, and tests can point it somewhere else",
+    "Because f-strings only work with parameters",
+    "It makes the requests faster",
+  ]}
+  answer={1}
+  explanation="A parameter is a seam: callers decide where the data comes from. Tests, a staging environment or a new API address need no change to the function itself."
+/>
+
+<Quiz
+  question="Your report sorts movies with key=lambda m: -m['rating'] and two movies both have rating 7.0. What can go wrong, and what fixes it?"
+  options={[
+    "Nothing, sorted() always puts equal items in alphabetical order",
+    "Python raises an error for equal keys; use reverse=True instead",
+    "Their order depends on the order the API returned them in, so the report can change between runs; sort by a tuple like (-m['rating'], m['title'])",
+    "The minus sign doesn't work on floats",
+  ]}
+  answer={2}
+  explanation="sorted() is stable: equal items keep the order they arrived in, which depends on the API. Adding a tie-breaker (the title) to the key makes the order fully defined."
+/>
+
+<Exercise
+  language="python"
+  title="Mini-project: Data report generator"
+  starter={`import csv
+from pathlib import Path
+from statistics import mean
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+BASE = "https://api.pandadev.test"
+
+# --- helpers you already know (ready to use) ----------------
+
+def get_soup(session, url):
+    r = session.get(url, timeout=5)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
+
+def crawl_books(session, url):
+    """Every book on a shop list page and the pages after it."""
+    books = []
+    while url:
+        soup = get_soup(session, url)
+        for li in soup.select("li.book"):
+            price = li.select_one(".price").get_text(strip=True)
+            books.append({
+                "id": int(li["data-id"]),
+                "title": li.select_one(".title a").get_text(strip=True),
+                "price": float(price.removeprefix("$")),
+                "stars": int(li.select_one(".rating")["data-stars"]),
+                "in_stock": "in-stock" in li.select_one(".stock")["class"],
+            })
+        next_link = soup.select_one('a[rel="next"]')
+        url = urljoin(url, next_link["href"]) if next_link else None
+    return books
+
+def markdown_table(headers, rows):
+    lines = [
+        "| " + " | ".join(str(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\\n".join(lines)
+
+# --- your part ----------------------------------------------
+
+def fetch_all_movies(session, base_url):
+    # Every movie from GET /movies, page by page, until the last page
+    return []
+
+def fetch_all_books(session, base_url):
+    # Every book in the shop, each with a "category" key
+    # ("fiction", "kids", ...), using the category links in the
+    # shop's nav.categories and crawl_books
+    return []
+
+def summarise_books(books):
+    # {category: {"books": count, "avg_price": average rounded
+    #  to 2 decimals, "in_stock": count}}, categories A to Z
+    return {}
+
+def top_movies(movies, n=3):
+    # The n best-rated movies (ties: by title, A to Z)
+    return []
+
+def write_report(folder, movies, books):
+    # Write report.md and books.csv into folder (create it),
+    # then return the path of report.md
+    pass
+
+with requests.Session() as session:
+    session.headers["User-Agent"] = "panda-report/1.0"
+    movies = fetch_all_movies(session, BASE)
+    books = fetch_all_books(session, BASE)
+report = write_report(Path("panda-report"), movies, books)
+if report:
+    print(report.read_text(encoding="utf-8"), end="")
+`}
+  tests={[
+    { name: "The program prints the full report", check: "__output[0] == '# Panda Data Report' and '12 movies, average rating 7.21.' in __output and '| The Quiet Algorithm | 2024 | 8.4 |' in __output and '18 books, 15 in stock.' in __output and '| fiction | 5 | 10.55 | 5 |' in __output and '| kids | 4 | 6.68 | 3 |' in __output" },
+    { name: "fetch_all_movies gets all 12 movies, page after page", check: "[n := len(_panda_requests), m := fetch_all_movies(requests.Session(), BASE), qs := [__import__('urllib.parse').parse.parse_qs(__import__('urllib.parse').parse.urlsplit(r['url']).query) for r in _panda_requests[n:]]] and sorted(x['id'] for x in m) == list(range(1, 13)) and all(r['url'].startswith(BASE + '/movies') for r in _panda_requests[n:]) and [int(q.get('page', ['1'])[0]) for q in qs] == list(range(1, len(qs) + 1))" },
+    { name: "fetch_all_movies follows totalPages (even with 1 movie per page)", check: "[S := type('S', (requests.Session,), {'request': lambda self, method, url, params=None, **kw: requests.Session.request(self, method, url, params={**(params or {}), 'limit': 1}, **kw)}), m := fetch_all_movies(S(), BASE)] and sorted(x['id'] for x in m) == list(range(1, 13))" },
+    { name: "fetch_all_books gets all 18 books with their category", check: "[n := len(_panda_requests), b := fetch_all_books(requests.Session(), BASE)] and sorted(x['id'] for x in b) == list(range(1, 19)) and all(x['category'] == ['kids', 'programming', 'fiction', 'science'][x['id'] % 4] for x in b) and all(type(x['price']) is float for x in b) and sum('category=' in r['url'] for r in _panda_requests[n:]) == 4" },
+    { name: "summarise_books counts, averages and sorts the categories", check: "summarise_books([{'category': 'zoo', 'price': 2.0, 'in_stock': True}, {'category': 'art', 'price': 1.0, 'in_stock': False}, {'category': 'zoo', 'price': 3.5, 'in_stock': False}, {'category': 'zoo', 'price': 4.0, 'in_stock': True}]) == {'art': {'books': 1, 'avg_price': 1.0, 'in_stock': 0}, 'zoo': {'books': 3, 'avg_price': 3.17, 'in_stock': 2}} and list(summarise_books([{'category': 'zoo', 'price': 2.0, 'in_stock': True}, {'category': 'art', 'price': 1.0, 'in_stock': False}])) == ['art', 'zoo']" },
+    { name: "top_movies picks the best n, ties by title", check: "[mv := [{'title': 'B', 'rating': 7.0, 'year': 1}, {'title': 'A', 'rating': 7.0, 'year': 2}, {'title': 'C', 'rating': 9.1, 'year': 3}, {'title': 'D', 'rating': 2.0, 'year': 4}]] and [x['title'] for x in top_movies(mv)] == ['C', 'A', 'B'] and [x['title'] for x in top_movies(mv, 2)] == ['C', 'A'] and len(top_movies(mv, 10)) == 4" },
+    { name: "write_report writes report.md with both tables (other data)", check: "[mv := [{'title': 'X', 'year': 2001, 'rating': 5.5}, {'title': 'Y', 'year': 2002, 'rating': 9.0}], bk := [{'id': 2, 'title': 'Two', 'category': 'zoo', 'price': 4.0, 'stars': 3, 'in_stock': True}, {'id': 1, 'title': 'One', 'category': 'art', 'price': 2.5, 'stars': 5, 'in_stock': False}], p := write_report(Path('pd-check-report/a'), mv, bk), text := Path(p).read_text(encoding='utf-8')] and Path(p) == Path('pd-check-report/a/report.md') and text.startswith('# Panda Data Report') and '2 movies, average rating 7.25.' in text and '2 books, 1 in stock.' in text and markdown_table(['Title', 'Year', 'Rating'], [['Y', 2002, 9.0], ['X', 2001, 5.5]]) in text and markdown_table(['Category', 'Books', 'Average price', 'In stock'], [['art', 1, '2.50', 0], ['zoo', 1, '4.00', 1]]) in text" },
+    { name: "write_report writes books.csv sorted by id", check: "[mv := [{'title': 'X', 'year': 2001, 'rating': 5.5}], bk := [{'id': 2, 'title': 'Two', 'category': 'zoo', 'price': 4.0, 'stars': 3, 'in_stock': True, 'url': 'u2'}, {'id': 1, 'title': 'One', 'category': 'art', 'price': 2.5, 'stars': 5, 'in_stock': False, 'url': 'u1'}], write_report(Path('pd-check-report/b'), mv, bk)] and Path('pd-check-report/b/books.csv').read_text(encoding='utf-8').splitlines() == ['id,title,category,price,stars,in_stock', '1,One,art,2.5,5,False', '2,Two,zoo,4.0,3,True']" },
+  ]}
+>
+
+Build the report generator. The helpers `get_soup`, `crawl_books` (a crawler like yours from the last lesson) and `markdown_table` are ready; you write the five functions below. Pass `timeout=5` to every request.
+
+1. `fetch_all_movies(session, base_url)` returns every movie from `GET /movies`. Request page 1, 2, 3... with `params=` (use a `page` parameter, and `limit` if you like) and stop when `page` reaches `totalPages`. Don't hard-code the number of pages.
+2. `fetch_all_books(session, base_url)` returns every book in the shop, each with an extra `"category"` key in lower case (`"fiction"`, `"kids"`...). Get the category links from `nav.categories a` on the `/shop` page, turn each `href` into a full URL with `urljoin`, crawl it with `crawl_books` and add the category to its books.
+3. `summarise_books(books)` returns a dict with one entry per category, **in alphabetical order**: `{"books": <count>, "avg_price": <average price rounded to 2 decimals>, "in_stock": <how many are in stock>}`.
+4. `top_movies(movies, n=3)` returns the `n` movies with the highest `rating`; equal ratings are ordered by `title` (A to Z).
+5. `write_report(folder, movies, books)` creates the folder (with any parents) and writes two files into it, then returns the `Path` of `report.md`:
+   - `report.md`, exactly in this shape (the tables come from `markdown_table`; the movie table lists `top_movies(movies)`, average prices use 2 decimals, the average rating too):
+
+     ```text
+     # Panda Data Report
+
+     ## Movies
+
+     12 movies, average rating 7.21.
+
+     | Title | Year | Rating |
+     | --- | --- | --- |
+     | The Quiet Algorithm | 2024 | 8.4 |
+     ...
+
+     ## Books
+
+     18 books, 15 in stock.
+
+     | Category | Books | Average price | In stock |
+     | --- | --- | --- | --- |
+     | fiction | 5 | 10.55 | 5 |
+     ...
+     ```
+
+   - `books.csv` with the columns `id,title,category,price,stars,in_stock`, one row per book, **sorted by id**.
+
+<Hint>
+
+`fetch_all_movies`: a `while True:` loop with `page = 1`, `session.get(f"{base_url}/movies", params={"page": page, "limit": 5}, timeout=5)`, `movies += data["results"]`, and `return movies` when `page >= data["totalPages"]`. `fetch_all_books`: `shop_url = base_url + "/shop"`; for each `a` in `get_soup(session, shop_url).select("nav.categories a")`, take `a.get_text(strip=True).lower()` and add `{**book, "category": category}` for every book of `crawl_books(session, urljoin(shop_url, a["href"]))`. `summarise_books`: loop over `sorted({b["category"] for b in books})`. `top_movies`: `sorted(movies, key=lambda m: (-m["rating"], m["title"]))[:n]`. `write_report`: build a list of lines, `"\n".join(lines)`, `write_text`, and a `csv.DictWriter(file, fieldnames=[...], extrasaction="ignore")`.
+
+</Hint>
+
+<Solution>
+
+```python
+import csv
+from pathlib import Path
+from statistics import mean
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+BASE = "https://api.pandadev.test"
+
+# --- helpers you already know (ready to use) ----------------
+
+def get_soup(session, url):
+    r = session.get(url, timeout=5)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
+
+def crawl_books(session, url):
+    """Every book on a shop list page and the pages after it."""
+    books = []
+    while url:
+        soup = get_soup(session, url)
+        for li in soup.select("li.book"):
+            price = li.select_one(".price").get_text(strip=True)
+            books.append({
+                "id": int(li["data-id"]),
+                "title": li.select_one(".title a").get_text(strip=True),
+                "price": float(price.removeprefix("$")),
+                "stars": int(li.select_one(".rating")["data-stars"]),
+                "in_stock": "in-stock" in li.select_one(".stock")["class"],
+            })
+        next_link = soup.select_one('a[rel="next"]')
+        url = urljoin(url, next_link["href"]) if next_link else None
+    return books
+
+def markdown_table(headers, rows):
+    lines = [
+        "| " + " | ".join(str(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\n".join(lines)
+
+# --- your part ----------------------------------------------
+
+def fetch_all_movies(session, base_url):
+    movies = []
+    page = 1
+    while True:
+        r = session.get(f"{base_url}/movies",
+                        params={"page": page, "limit": 5}, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        movies += data["results"]
+        if page >= data["totalPages"]:
+            return movies
+        page += 1
+
+def fetch_all_books(session, base_url):
+    shop_url = base_url + "/shop"
+    books = []
+    for a in get_soup(session, shop_url).select("nav.categories a"):
+        category = a.get_text(strip=True).lower()
+        for book in crawl_books(session, urljoin(shop_url, a["href"])):
+            books.append({**book, "category": category})
+    return books
+
+def summarise_books(books):
+    summary = {}
+    for category in sorted({book["category"] for book in books}):
+        group = [b for b in books if b["category"] == category]
+        summary[category] = {
+            "books": len(group),
+            "avg_price": round(mean(b["price"] for b in group), 2),
+            "in_stock": sum(b["in_stock"] for b in group),
+        }
+    return summary
+
+def top_movies(movies, n=3):
+    ranked = sorted(movies, key=lambda m: (-m["rating"], m["title"]))
+    return ranked[:n]
+
+def write_report(folder, movies, books):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    average = mean(m["rating"] for m in movies)
+    in_stock = sum(b["in_stock"] for b in books)
+    lines = [
+        "# Panda Data Report",
+        "",
+        "## Movies",
+        "",
+        f"{len(movies)} movies, average rating {average:.2f}.",
+        "",
+        markdown_table(
+            ["Title", "Year", "Rating"],
+            [[m["title"], m["year"], m["rating"]]
+             for m in top_movies(movies)],
+        ),
+        "",
+        "## Books",
+        "",
+        f"{len(books)} books, {in_stock} in stock.",
+        "",
+        markdown_table(
+            ["Category", "Books", "Average price", "In stock"],
+            [[c, s["books"], f"{s['avg_price']:.2f}", s["in_stock"]]
+             for c, s in summarise_books(books).items()],
+        ),
+    ]
+    report = folder / "report.md"
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    fields = ["id", "title", "category", "price", "stars", "in_stock"]
+    with (folder / "books.csv").open("w", newline="",
+                                     encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields,
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(sorted(books, key=lambda b: b["id"]))
+    return report
+
+with requests.Session() as session:
+    session.headers["User-Agent"] = "panda-report/1.0"
+    movies = fetch_all_movies(session, BASE)
+    books = fetch_all_books(session, BASE)
+report = write_report(Path("panda-report"), movies, books)
+if report:
+    print(report.read_text(encoding="utf-8"), end="")
+```
+
+</Solution>
+
+</Exercise>
+
+Ideas to take it further on your own computer: add the weather for a list of cities as a third section, keep yesterday's CSV and show what changed (new books, price drops), retry with backoff from [Robust API Clients](/learn/python/robust-api-clients), or collect the movies concurrently with `httpx.AsyncClient`.
+
+## Recap
+
+- Structure a report generator as a **pipeline**: collect → clean & aggregate → write, each stage a few small functions.
+- **Collectors** take a `session` and a `base_url`, keep only the fields they need, handle **expected** problems (like a 404 for an unknown city) and let real failures raise.
+- Follow the data's own structure: **paginate** until `totalPages`, and **discover** categories and next pages from the HTML instead of hard-coding them.
+- **Aggregating** functions are pure (lists in, summaries out), so they're easy to test; `mean`, `sorted` with a tuple key (tie-breakers!), `Counter` and `defaultdict` cover most needs.
+- Write **Markdown** for people (headings, tables, formatted numbers) and **CSV** for spreadsheets, with `pathlib` (`mkdir(parents=True, exist_ok=True)`, `/`, `write_text`) and `encoding="utf-8"`.
+- Run it on a **schedule** (cron, GitHub Actions) with secrets in environment variables and loud failures.
