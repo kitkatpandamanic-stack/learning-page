@@ -88,6 +88,20 @@ describe("executePython", () => {
 
 // These install real packages (pytest, FastAPI, pandas…), like lessons do.
 describe("executePython with packages", () => {
+  it("has time zones for zoneinfo", async () => {
+    const r = await executePython(
+      py,
+      [
+        "from datetime import datetime",
+        "from zoneinfo import ZoneInfo",
+        'meet = datetime(2026, 3, 14, 9, 30, tzinfo=ZoneInfo("Europe/London"))',
+        'print(meet.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%H:%M"))',
+      ].join("\n"),
+    );
+    expect(r.error).toBeUndefined();
+    expect(r.output.map((l) => l.text)).toEqual(["18:30"]);
+  });
+
   it("runs asyncio.run without threads", async () => {
     const r = await executePython(
       py,

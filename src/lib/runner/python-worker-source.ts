@@ -1,4 +1,4 @@
-import { PYTHON_DRIVER } from "./execute-python";
+import { PYTHON_DRIVER, withImpliedImports } from "./execute-python";
 
 export const PYODIDE_VERSION = "314.0.7"; // keep in sync with the pyodide devDependency
 export const PYODIDE_INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
@@ -13,6 +13,7 @@ export function pythonWorkerSource() {
   return `
 const indexURL = ${JSON.stringify(PYODIDE_INDEX_URL)};
 const DRIVER = ${JSON.stringify(PYTHON_DRIVER)};
+const withImpliedImports = ${withImpliedImports.toString()};
 
 const ready = (async () => {
   const { loadPyodide } = await import(indexURL + "pyodide.mjs");
@@ -36,7 +37,7 @@ onmessage = async (event) => {
   // Install the packages the code imports (pandas, pytest…), once per page.
   // Pyodide lists every dependency; name just the ones the code imports.
   try {
-    await pyodide.loadPackagesFromImports(code, {
+    await pyodide.loadPackagesFromImports(withImpliedImports(code), {
       messageCallback: (message) => {
         const match = /^Loading (.+)$/.exec(String(message).trim());
         if (!match) return;

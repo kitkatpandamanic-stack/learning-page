@@ -391,6 +391,16 @@ export function parsePythonResult(
   return { output, error, tests: tests.length ? results : undefined };
 }
 
+/**
+ * The code plus imports Pyodide can't see in it: zoneinfo finds its time
+ * zones in the tzdata package. Used to pick the packages to install.
+ */
+export function withImpliedImports(code: string) {
+  return /^\s*(?:import|from)\s+zoneinfo\b/m.test(code)
+    ? `${code}\nimport tzdata`
+    : code;
+}
+
 const driverLoaded = new WeakSet<PyodideInterface>();
 
 /**
@@ -407,7 +417,9 @@ export async function executePython(
     pyodide.runPython(PYTHON_DRIVER);
     driverLoaded.add(pyodide);
   }
-  await pyodide.loadPackagesFromImports(code, { messageCallback: () => {} });
+  await pyodide.loadPackagesFromImports(withImpliedImports(code), {
+    messageCallback: () => {},
+  });
   const prepare = pyodide.globals.get("_panda_prepare");
   try {
     prepare(code);
