@@ -1,5 +1,4 @@
 import type { NextConfig } from "next";
-import { PHASE_DEVELOPMENT_SERVER } from "next/constants";
 import { withSentryConfig } from "@sentry/nextjs/config";
 import createNextIntlPlugin from "next-intl/plugin";
 
@@ -14,23 +13,19 @@ const reactVendor = `/vendor/${reactVendorName}`;
 
 const nextConfig: NextConfig = {
   env: { NEXT_PUBLIC_REACT_VENDOR: reactVendor },
+  // Lesson bodies are read from disk (src/lib/lesson-body.ts).
+  outputFileTracingIncludes: {
+    "/[locale]/learn/[lang]/[lesson]": ["./.velite/bodies/**/*"],
+  },
 };
 
-async function config(phase: string): Promise<NextConfig> {
-  // In dev, run Velite in watch mode alongside Next so content edits show up live.
-  // Production builds run `velite build` first via the npm "build" script.
-  if (phase === PHASE_DEVELOPMENT_SERVER && !process.env.VELITE_STARTED) {
-    process.env.VELITE_STARTED = "1";
-    const { build } = await import("velite");
-    await build({ watch: true, clean: false });
-  }
-  return withNextIntl(nextConfig);
-}
+// Lesson content comes from Velite: `npm run dev` runs it in watch mode in
+// its own process (scripts/dev.mjs); builds run `velite build` first.
 
 // Sentry error reporting (see src/instrumentation*.ts). With SENTRY_AUTH_TOKEN,
 // SENTRY_ORG and SENTRY_PROJECT set, builds upload source maps so errors
 // point at real code lines; without them nothing is uploaded.
-export default withSentryConfig(config, {
+export default withSentryConfig(withNextIntl(nextConfig), {
   org: process.env.SENTRY_ORG,
   project: process.env.SENTRY_PROJECT,
   authToken: process.env.SENTRY_AUTH_TOKEN,

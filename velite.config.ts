@@ -1,3 +1,7 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
+import { transformSync } from "esbuild";
 import tokyoNight from "@shikijs/themes/tokyo-night";
 import { parse as parseJs } from "acorn";
 import rehypePrettyCode, { type Options, type Theme } from "rehype-pretty-code";
@@ -253,10 +257,13 @@ export default defineConfig({
     assets: "public/static",
     base: "/static/",
     name: "[name]-[hash:6].[ext]",
-    clean: true,
+    // `npm run dev` keeps the last output while it rebuilds (scripts/dev.mjs).
+    clean: !process.env.VELITE_KEEP_OUTPUT,
   },
   collections: { courses, lessons },
   mdx: {
+    // Minified with short lines instead (see compactBody below).
+    minify: false,
     remarkPlugins: [remarkKeepAttributeIndentation, remarkActivityIds],
     rehypePlugins: [rehypeSlug, [rehypePrettyCode, prettyCode]],
   },
@@ -374,5 +381,54 @@ export default defineConfig({
     if (problems.length) {
       throw new Error(`Content problems:\n  - ${problems.join("\n  - ")}`);
     }
+
+    // Lesson bodies are 90% of all content (tens of MB). Each goes in its own
+    // file, which only that lesson's page loads (src/lib/lesson-body.ts);
+    // lessons.json keeps the light metadata every other page needs.
+    for (const lesson of lessons) {
+      writeIfChanged(
+        bodyFile(lesson),
+        JSON.stringify(compactBody(lesson.body)),
+      );
+      delete (lesson as { body?: string }).body;
+    }
   },
 });
+
+/**
+ * Minifies a compiled lesson into lines of at most ~500 characters. Velite's
+ * own minifier puts a lesson on one line of up to 470,000 characters; in
+ * development React builds a fake stack frame for each component, padded with
+ * as many spaces as its column, which cost ~100 MB of memory per page view
+ * (the dev server then ran out of memory and restarted).
+ */
+function compactBody(body: string) {
+  const { code } = transformSync(`var __mdx=function(){${body}\n};`, {
+    minify: true,
+    lineLimit: 500,
+    legalComments: "none",
+  });
+  // "var __mdx=function(){…};" → the function body again
+  return code.slice(code.indexOf("{") + 1, code.lastIndexOf("}"));
+}
+
+/** .velite/bodies/<language>/<slug>.<locale>.json */
+function bodyFile(lesson: { language: string; slug: string; locale: string }) {
+  return join(
+    ".velite",
+    "bodies",
+    lesson.language,
+    `${lesson.slug}.${lesson.locale}.json`,
+  );
+}
+
+/** Unchanged files stay untouched, so the dev server only reloads edited lessons. */
+function writeIfChanged(file: string, text: string) {
+  try {
+    if (readFileSync(file, "utf8") === text) return;
+  } catch {
+    // not written yet
+  }
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, text);
+}

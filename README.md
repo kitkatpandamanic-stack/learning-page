@@ -189,16 +189,16 @@ saved progress.
 
 ## Scripts
 
-| Command                | What it does                           |
-| ---------------------- | -------------------------------------- |
-| `npm run dev`          | Start the dev server                   |
-| `npm run build`        | Production build                       |
-| `npm run start`        | Serve the production build             |
-| `npm run lint`         | ESLint                                 |
-| `npm run typecheck`    | TypeScript type check                  |
-| `npm run format`       | Format all files with Prettier         |
-| `npm run format:check` | Check formatting                       |
-| `npm run content`      | Build and validate course content      |
-| `npm run db:generate`  | Create a migration from schema changes |
-| `npm run db:migrate`   | Apply migrations to the database       |
-| `npm run db:studio`    | Browse the database in Drizzle Studio  |
+| Command                | What it does                                                        |
+| ---------------------- | ------------------------------------------------------------------- |
+| `npm run dev`          | Start the dev server (and Velite in watch mode, in its own process) |
+| `npm run build`        | Production build                                                    |
+| `npm run start`        | Serve the production build                                          |
+| `npm run lint`         | ESLint                                                              |
+| `npm run typecheck`    | TypeScript type check                                               |
+| `npm run format`       | Format all files with Prettier                                      |
+| `npm run format:check` | Check formatting                                                    |
+| `npm run content`      | Build and validate course content                                   |
+| `npm run db:generate`  | Create a migration from schema changes                              |
+| `npm run db:migrate`   | Apply migrations to the database                                    |
+| `npm run db:studio`    | Browse the database in Drizzle Studio                               |
