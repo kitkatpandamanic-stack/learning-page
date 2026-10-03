@@ -102,6 +102,17 @@ createRoot(document.getElementById("root")!).render(<Counter step={STEP} />);`;
     );
   });
 
+  it("adds the compiler's hints, like a missing await", () => {
+    const [error] = check(
+      "async function load() { return { name: 'Mei' }; }\n" +
+        "async function main() { console.log(load().name); }",
+    );
+    expect(error.message).toBe(
+      "Property 'name' does not exist on type 'Promise<{ name: string; }>'.\n" +
+        "  Did you forget to use 'await'?",
+    );
+  });
+
   it("only reports syntax errors when the code doesn't parse", () => {
     const diagnostics = check("const x: number = ;\nconst y: string = 1;");
     expect(diagnostics).toHaveLength(1);

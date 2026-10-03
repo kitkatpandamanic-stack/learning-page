@@ -176,12 +176,28 @@ export function createTypeChecker(
         column: character + 1,
         start: d.file === source ? start : 0,
         length: d.file === source ? (d.length ?? 0) : 0,
-        message: ts.flattenDiagnosticMessageText(d.messageText, "\n"),
+        message: withHints(ts, d),
         code: d.code,
       };
     });
   };
 }
+
+/**
+ * The message, plus hints the compiler attaches separately that an editor
+ * shows with it, like "Did you forget to use 'await'?".
+ */
+function withHints(ts: typeof TS, d: TS.Diagnostic) {
+  const hints = (d.relatedInformation ?? [])
+    .filter((info) => HINT_CODES.has(info.code))
+    .map((info) => ts.flattenDiagnosticMessageText(info.messageText, "\n"));
+  return [ts.flattenDiagnosticMessageText(d.messageText, "\n"), ...hints].join(
+    "\n  ",
+  );
+}
+
+/** "Did you forget to use 'await'?" */
+const HINT_CODES = new Set([2773]);
 
 export function formatTypeError(d: TypeDiagnostic) {
   return `Line ${d.line}: ${d.message}`;

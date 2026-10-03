@@ -377,9 +377,9 @@ declare module "vitest" {
   export function afterEach(fn: () => Awaitable<unknown>): void;
 
   interface Matchers<R> {
-    toBe(expected: unknown): R;
-    toEqual(expected: unknown): R;
-    toStrictEqual(expected: unknown): R;
+    toBe<E>(expected: E): R;
+    toEqual<E>(expected: E): R;
+    toStrictEqual<E>(expected: E): R;
     toBeTruthy(): R;
     toBeFalsy(): R;
     toBeNull(): R;
@@ -400,7 +400,7 @@ declare module "vitest" {
     toHaveLength(length: number): R;
     toHaveProperty(path: string | readonly string[], value?: unknown): R;
     toMatch(pattern: RegExp | string): R;
-    toMatchObject(expected: object): R;
+    toMatchObject<E extends object>(expected: E): R;
     toThrow(expected?: string | RegExp | (abstract new (...args: any[]) => Error) | Error): R;
     toThrowError(expected?: string | RegExp | (abstract new (...args: any[]) => Error) | Error): R;
     toHaveBeenCalled(): R;

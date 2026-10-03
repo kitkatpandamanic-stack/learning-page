@@ -132,7 +132,12 @@ button.addEventListener("click", (event: MouseEvent) => {
   button.textContent = \`Clicked \${clicks}\`;
 });`,
       '<button id="add">Add</button>',
-      [{ name: "click", check: '(add.click(), add.textContent === "Clicked 1")' }],
+      [
+        {
+          name: "click",
+          check: '(add.click(), add.textContent === "Clicked 1")',
+        },
+      ],
       undefined,
       { typescript: true },
     );
