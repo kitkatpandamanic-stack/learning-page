@@ -80,6 +80,7 @@ const nextConfig: NextConfig = {
   // Lesson bodies are read from disk (src/lib/lesson-body.ts).
   outputFileTracingIncludes: {
     "/[locale]/learn/[lang]/[lesson]": ["./.velite/bodies/**/*"],
+    "/[locale]/practice/[lang]/[problem]": ["./.velite/bodies/practice/**/*"],
   },
 };
 

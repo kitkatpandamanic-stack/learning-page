@@ -280,3 +280,100 @@ describe("executePython with packages", () => {
     expect(texts(again)).toEqual(["second"]);
   });
 });
+
+describe("HTTP clients and the practice API", () => {
+  it("answers requests from https://api.pandadev.test", async () => {
+    const r = await executePython(
+      py,
+      [
+        "import requests",
+        'BASE = "https://api.pandadev.test"',
+        'r = requests.get(f"{BASE}/movies", params={"genre": "comedy", "limit": 2}, timeout=5)',
+        'print(r.status_code, r.headers["Content-Type"], r.json()["results"][0]["title"])',
+        'r = requests.post(f"{BASE}/todos", json={"title": "Scrape"}, timeout=5)',
+        "print(r.status_code, r.json())",
+        'r = requests.get(f"{BASE}/status/404")',
+        "try:",
+        "    r.raise_for_status()",
+        "except requests.HTTPError as e:",
+        "    print(e)",
+        "try:",
+        '    requests.get(f"{BASE}/offline", timeout=2)',
+        "except requests.ConnectionError as e:",
+        '    print("offline:", type(e).__name__)',
+        "try:",
+        '    requests.get(f"{BASE}/delay/400", timeout=0.1)',
+        "except requests.Timeout as e:",
+        "    print(e)",
+      ].join("\n"),
+      {
+        tests: [
+          { name: "logged", check: "len(_panda_requests) == 5" },
+          {
+            name: "body",
+            check: "_panda_requests[1]['body'] == {'title': 'Scrape'}",
+          },
+        ],
+      },
+    );
+    expect(r.error).toBeUndefined();
+    expect(texts(r)).toEqual([
+      "200 application/json; charset=utf-8 The Bamboo Heist",
+      "201 {'id': 4, 'title': 'Scrape', 'done': False}",
+      "404 Client Error: Not Found for url: https://api.pandadev.test/status/404",
+      "offline: ConnectionError",
+      "HTTPSConnectionPool(host='api.pandadev.test', port=443): Read timed out. (read timeout=0.1)",
+    ]);
+    expect(r.tests?.every((t) => t.passed)).toBe(true);
+  }, 60_000);
+
+  it("starts every run with fresh data", async () => {
+    const code = [
+      "import requests",
+      'print(requests.post("https://api.pandadev.test/todos", json={"title": "x"}).json()["id"])',
+    ].join("\n");
+    expect(texts(await executePython(py, code))).toEqual(["4"]);
+    expect(texts(await executePython(py, code))).toEqual(["4"]);
+  }, 60_000);
+
+  it("works with httpx, sync and async", async () => {
+    const r = await executePython(
+      py,
+      [
+        "import asyncio, httpx",
+        'BASE = "https://api.pandadev.test"',
+        "with httpx.Client(base_url=BASE, timeout=5) as client:",
+        '    r = client.get("/weather", params={"city": "Tokyo"})',
+        '    print(r.status_code, r.reason_phrase, r.json()["condition"])',
+        "async def main():",
+        "    async with httpx.AsyncClient(base_url=BASE) as client:",
+        '        rs = await asyncio.gather(*(client.get(f"/movies/{i}") for i in (1, 2)))',
+        '        print([r.json()["id"] for r in rs])',
+        "asyncio.run(main())",
+        "try:",
+        '    httpx.get(f"{BASE}/delay/400", timeout=0.1)',
+        "except httpx.TimeoutException as e:",
+        "    print(type(e).__name__)",
+      ].join("\n"),
+    );
+    expect(r.error).toBeUndefined();
+    expect(texts(r)).toEqual(["200 OK Rain", "[1, 2]", "ReadTimeout"]);
+  }, 60_000);
+
+  it("scrapes the practice shop with Beautiful Soup", async () => {
+    const r = await executePython(
+      py,
+      [
+        "import requests",
+        "from bs4 import BeautifulSoup",
+        'html = requests.get("https://api.pandadev.test/shop?page=2").text',
+        'soup = BeautifulSoup(html, "html.parser")',
+        'book = soup.select_one("li.book")',
+        'print(book.select_one(".title").get_text(strip=True), book.select_one(".price").text)',
+        'print(soup.select_one(\'a[rel="next"]\')["href"])',
+      ].join("\n"),
+    );
+    expect(r.error).toBeUndefined();
+    expect(texts(r)).toEqual(["Why the Sky Is Blue $11.00", "/shop?page=3"]);
+  }, 60_000);
+});

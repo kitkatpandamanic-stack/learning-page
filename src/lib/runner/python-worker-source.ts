@@ -1,4 +1,5 @@
 import { PYTHON_DRIVER, withImpliedImports } from "./execute-python";
+import { createFakeApi } from "./fake-api";
 
 export const PYODIDE_VERSION = "314.0.7"; // keep in sync with the pyodide devDependency
 export const PYODIDE_INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
@@ -14,6 +15,7 @@ export function pythonWorkerSource() {
 const indexURL = ${JSON.stringify(PYODIDE_INDEX_URL)};
 const DRIVER = ${JSON.stringify(PYTHON_DRIVER)};
 const withImpliedImports = ${withImpliedImports.toString()};
+const createFakeApi = ${createFakeApi.toString()};
 
 const ready = (async () => {
   const { loadPyodide } = await import(indexURL + "pyodide.mjs");
@@ -61,8 +63,13 @@ onmessage = async (event) => {
   const run = pyodide.globals.get("_panda_run");
   const pyChecks = pyodide.toPy(checks);
   try {
-    const raw = run(code, pyChecks, (level, text) =>
-      postMessage({ type: "line", id, level, text }),
+    // Each run gets a fresh practice API (https://api.pandadev.test).
+    const api = createFakeApi();
+    const raw = run(
+      code,
+      pyChecks,
+      (level, text) => postMessage({ type: "line", id, level, text }),
+      (request) => JSON.stringify(api.handle(JSON.parse(request))),
     );
     postMessage({ type: "done", id, raw });
   } finally {

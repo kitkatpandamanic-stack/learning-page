@@ -66,7 +66,8 @@ async function runAnywhere(
   });
 }
 
-const ROOT = join(__dirname, "..", "content", "courses");
+/** Lessons in courses/<language>/…, practice problems in practice/<language>/… */
+const ROOT = join(__dirname, "..", "content");
 
 function lessonFiles(dir = ROOT): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -186,7 +187,7 @@ const allFiles = lessonFiles();
 const only = process.env.CONTENT_LANGUAGES?.split(",").filter(Boolean);
 const files = only
   ? allFiles.filter((file) =>
-      only.includes(file.slice(ROOT.length + 1).split("/")[0]),
+      only.includes(file.slice(ROOT.length + 1).split("/")[1]),
     )
   : allFiles;
 const exercises = files.flatMap(exercisesIn);
@@ -297,20 +298,28 @@ describe("TryIt live previews", () => {
 
 describe("links between lessons", () => {
   const slugs = new Set(
-    allFiles.map((file) => {
-      const [language, , name] = file.slice(ROOT.length + 1).split("/");
-      return `/learn/${language}/${name.replace(/^\d+-/, "").replace(/\.mdx$/, "")}`;
+    allFiles.flatMap((file) => {
+      const [kind, language, ...rest] = file.slice(ROOT.length + 1).split("/");
+      const slug = rest
+        .at(-1)!
+        .replace(/^\d+-/, "")
+        .replace(/(\.[a-z]{2})?\.mdx$/, "");
+      return kind === "courses"
+        ? [`/learn/${language}/${slug}`]
+        : [`/practice/${language}/${slug}`];
     }),
   );
   const links = files.flatMap((file) =>
-    [...readFileSync(file, "utf8").matchAll(/\]\((\/learn\/[^)#\s]+)/g)].map(
-      (m) => [file.slice(ROOT.length + 1), m[1]] as const,
-    ),
+    [
+      ...readFileSync(file, "utf8").matchAll(
+        /\]\((\/(?:learn|practice)\/[^)#\s]+)/g,
+      ),
+    ].map((m) => [file.slice(ROOT.length + 1), m[1]] as const),
   );
 
   // CI tests one language at a time; some have none of these.
   if (links.length === 0) it.skip("none in these lessons", () => {});
   it.each(links)("%s links to %s", (_file, href) => {
-    expect(slugs.has(href), `${href} is not a lesson`).toBe(true);
+    expect(slugs.has(href), `${href} is not a lesson or problem`).toBe(true);
   });
 });

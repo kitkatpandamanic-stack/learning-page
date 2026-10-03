@@ -9,6 +9,7 @@ import {
   type TestResult,
   type TestSpec,
 } from "./execute";
+import { createFakeApi, type FakeRequest } from "./fake-api";
 
 /**
  * Python side of the runner. Runs learner code in a fresh namespace, streams
@@ -22,6 +23,10 @@ import {
  *
  * The code is also saved as `lesson.py`, so `pytest.main([__file__])` can
  * collect the tests in it.
+ *
+ * `requests` and `httpx` answer https://api.pandadev.test from the practice
+ * API (fake-api.ts), which the caller passes in as a function from request
+ * JSON to response JSON. Checks can read `_panda_requests`.
  */
 export const PYTHON_DRIVER = `
 import asyncio, builtins, contextlib, io, json, os, re, selectors, sys, time, traceback
@@ -252,6 +257,12 @@ def _panda_patch():
         warnings.filterwarnings("ignore", category=matplotlib.MatplotlibDeprecationWarning)
         plt.show = _panda_show
         _panda_patched.add("matplotlib")
+    if "requests" in sys.modules and "requests" not in _panda_patched:
+        _panda_patch_requests()
+        _panda_patched.add("requests")
+    if "httpx" in sys.modules and "httpx" not in _panda_patched:
+        _panda_patch_httpx()
+        _panda_patched.add("httpx")
     if "pytest" in sys.modules and "pytest" not in _panda_patched:
         import pytest
         real_main = pytest.main
@@ -287,6 +298,108 @@ def _panda_prepare(code):
             pass
     _panda_patch()
 
+# --- the practice API (https://api.pandadev.test) -----------------------
+
+_PANDA_API_ORIGIN = "https://api.pandadev.test"
+_panda_api = None  # this run's API: takes a request as JSON, answers with JSON
+_panda_requests = []  # every request the code made, for exercise checks
+
+def _panda_is_practice(url):
+    url = str(url)
+    return url == _PANDA_API_ORIGIN or url.startswith(_PANDA_API_ORIGIN + "/")
+
+def _panda_wait(seconds):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        pass
+
+def _panda_fetch(method, url, headers, body, timeout):
+    """Answers a request from the practice API: (status, reason, headers, content).
+    Raises TimeoutError or ConnectionError for the HTTP library to translate."""
+    if _panda_api is None:
+        raise ConnectionError("the practice API isn't available here")
+    if isinstance(body, (bytes, bytearray)):
+        body = bytes(body).decode("utf-8", "replace")
+    try:
+        parsed = json.loads(body) if body else None
+    except ValueError:
+        parsed = body
+    headers = {str(k).lower(): str(v) for k, v in headers.items()}
+    _panda_requests.append(
+        {"method": method.upper(), "url": str(url), "headers": headers, "body": parsed}
+    )
+    answer = json.loads(_panda_api(json.dumps(
+        {"method": method.upper(), "url": str(url), "headers": headers, "body": body or None}
+    )))
+    # Ordinary requests answer at once; /delay/… really waits, and can time out.
+    delay = answer["delayMs"] / 1000
+    if delay > 0.1:
+        if timeout is not None and delay > timeout:
+            _panda_wait(timeout)
+            raise TimeoutError(f"Read timed out. (read timeout={timeout})")
+        _panda_wait(delay)
+    if answer.get("networkError"):
+        raise ConnectionError("Failed to establish a new connection")
+    content = (answer["body"] or "").encode("utf-8")
+    return answer["status"], answer["statusText"], answer["headers"], content
+
+def _panda_patch_requests():
+    import requests, requests.adapters, requests.structures, requests.utils
+    real_send = requests.adapters.HTTPAdapter.send
+    where = "HTTPSConnectionPool(host='api.pandadev.test', port=443)"
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        if not _panda_is_practice(request.url):
+            return real_send(self, request, stream=stream, timeout=timeout,
+                             verify=verify, cert=cert, proxies=proxies)
+        read_timeout = timeout[1] if isinstance(timeout, tuple) else timeout
+        try:
+            status, reason, headers, content = _panda_fetch(
+                request.method, request.url, request.headers, request.body, read_timeout)
+        except TimeoutError as exc:
+            raise requests.exceptions.ReadTimeout(f"{where}: {exc}", request=request) from None
+        except ConnectionError as exc:
+            raise requests.exceptions.ConnectionError(f"{where}: {exc}", request=request) from None
+        response = requests.Response()
+        response.status_code = status
+        response.reason = reason
+        response.headers = requests.structures.CaseInsensitiveDict(headers)
+        response._content = content
+        response._content_consumed = True  # iter_content() reads _content
+        response.encoding = requests.utils.get_encoding_from_headers(response.headers)
+        response.url = request.url
+        response.request = request
+        response.connection = self
+        return response
+    requests.adapters.HTTPAdapter.send = send
+
+def _panda_patch_httpx():
+    import httpx
+    def answer(request):
+        timeout = (request.extensions.get("timeout") or {}).get("read")
+        try:
+            status, reason, headers, content = _panda_fetch(
+                request.method, request.url, request.headers, request.content, timeout)
+        except TimeoutError as exc:
+            raise httpx.ReadTimeout(str(exc), request=request) from None
+        except ConnectionError as exc:
+            raise httpx.ConnectError(f"[Errno 111] {exc}", request=request) from None
+        return httpx.Response(status, headers=headers, content=content, request=request,
+                              extensions={"reason_phrase": reason.encode()})
+    real_sync = httpx.HTTPTransport.handle_request
+    def handle_request(self, request):
+        if not _panda_is_practice(request.url):
+            return real_sync(self, request)
+        request.read()
+        return answer(request)
+    real_async = httpx.AsyncHTTPTransport.handle_async_request
+    async def handle_async_request(self, request):
+        if not _panda_is_practice(request.url):
+            return await real_async(self, request)
+        await request.aread()
+        return answer(request)
+    httpx.HTTPTransport.handle_request = handle_request
+    httpx.AsyncHTTPTransport.handle_async_request = handle_async_request
+
 # --- checking pytest results ---------------------------------------------
 
 class _PandaTally:
@@ -319,10 +432,11 @@ def _panda_pytest(patch=None):
 
 # --- running learner code -------------------------------------------------
 
-def _panda_run(code, checks, emit):
-    global _panda_emit
+def _panda_run(code, checks, emit, api=None):
+    global _panda_emit, _panda_api, _panda_requests
     emit = _PandaCounter(emit)
     _panda_emit = emit
+    _panda_api, _panda_requests = api, []
     with open(_PANDA_FILE, "w") as f:
         f.write(code)
     sys.modules.pop("lesson", None)
@@ -354,7 +468,7 @@ def _panda_run(code, checks, emit):
         sys.stdout, sys.stderr, builtins.input = old_out, old_err, old_input
     if checks:
         tests = []
-        scope = {**namespace, "_panda_pytest": _panda_pytest}
+        scope = {**namespace, "_panda_pytest": _panda_pytest, "_panda_requests": _panda_requests}
         for check in checks:
             if result["error"]:
                 tests.append({"passed": False, "error": "Fix the error in your code first."})
@@ -365,7 +479,7 @@ def _panda_run(code, checks, emit):
                 tests.append({"passed": False, "error": f"{type(exc).__name__}: {exc}"})
         result["tests"] = tests
     os.chdir(old_cwd)
-    _panda_emit = None
+    _panda_emit = _panda_api = None
     return json.dumps(result)
 `.replace("__MAX_LINES__", String(MAX_OUTPUT_LINES));
 
@@ -417,6 +531,16 @@ export function withImpliedImports(code: string) {
     : code;
 }
 
+/**
+ * A fresh practice API for one run, as the driver calls it: request JSON in,
+ * response JSON out. The browser worker builds the same from its own copy.
+ */
+export function practiceApi() {
+  const api = createFakeApi();
+  return (request: string) =>
+    JSON.stringify(api.handle(JSON.parse(request) as FakeRequest));
+}
+
 const driverLoaded = new WeakSet<PyodideInterface>();
 
 /**
@@ -451,7 +575,11 @@ export async function executePython(
   const run = pyodide.globals.get("_panda_run");
   const checks = pyodide.toPy(tests.map((t) => t.check));
   try {
-    return parsePythonResult(run(code, checks, emit), tests, output);
+    return parsePythonResult(
+      run(code, checks, emit, practiceApi()),
+      tests,
+      output,
+    );
   } finally {
     checks.destroy();
     run.destroy();

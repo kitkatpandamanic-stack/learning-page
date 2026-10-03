@@ -1,6 +1,7 @@
 import type { MetadataRoute } from "next";
 
 import { getAllLessons } from "@/lib/content";
+import { getAllProblems, getPracticeLanguages } from "@/lib/practice";
 import { locales, localizedPath } from "@/lib/i18n";
 import { languages } from "@/lib/languages";
 import { siteUrl } from "@/lib/site";
@@ -17,6 +18,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { path: "/", changeFrequency: "weekly", priority: 1 },
     { path: "/languages", changeFrequency: "weekly", priority: 0.9 },
     { path: "/playground", changeFrequency: "monthly", priority: 0.7 },
+    { path: "/practice", changeFrequency: "weekly", priority: 0.8 },
     ...["/about", "/pricing", "/privacy", "/terms"].map((path) => ({
       path,
       changeFrequency: "yearly" as const,
@@ -31,6 +33,16 @@ export default function sitemap(): MetadataRoute.Sitemap {
       path: lesson.permalink,
       changeFrequency: "monthly" as const,
       priority: 0.6,
+    })),
+    ...getPracticeLanguages().map((language) => ({
+      path: `/practice/${language}`,
+      changeFrequency: "weekly" as const,
+      priority: 0.7,
+    })),
+    ...getAllProblems().map((problem) => ({
+      path: problem.permalink,
+      changeFrequency: "monthly" as const,
+      priority: 0.5,
     })),
   ];
 
