@@ -1,0 +1,1219 @@
+---
+title: "Part 2: The typed client"
+description: "Build the web app's API client from the shared contract: every answer validated, every failure a typed Result, fetch injected, and tests with a fake fetch and against the practice API."
+duration: 25
+xp: 30
+---
+
+In Part 1 you built the server side of the contract. Now for the other side: the **API client** that the React app will use in Part 3. It's the only part of the front end that knows about URLs, HTTP and JSON. Everything else simply calls `todos.update(2, { done: true })` and gets back a typed `Result`. 🔌
+
+You'll reuse `Result` and the `ApiError` union from [Typed Fetch](/learn/typescript/typed-fetch), schemas and an injected `fetch` from [Runtime Validation](/learn/typescript/runtime-validation), the contract-typed `call` from [Sharing Types Between Client and Server](/learn/typescript/sharing-types-between-client-and-server), and typed fakes from [Dependency Injection and Fakes](/learn/typescript/dependency-injection-and-fakes).
+
+## The plan
+
+The client comes in two layers:
+
+```text
+web/
+├── api.ts            createApi<Api>: typed requests for ANY contract
+└── todos-client.ts   todoSchemas and createTodosClient: the to-do methods
+```
+
+And this is all the rest of the app will ever see of it:
+
+```ts
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+```
+
+Every method **returns** its failures as a `Result` instead of throwing, so a component can't forget that a request might fail: it can't reach the to-do without checking `ok` first.
+
+This part works in `shared/` and `web/`. The server stays in Part 1's file, just as in a real repository the web app never imports the server's code. The client talks to the practice API, which stands in for your server deployed online.
+
+## Step 1: trust, but verify
+
+In the Node module, the contract-typed client ended with a cast, `value as Api[R]["response"]`: it simply believed the server. That's a fair trade when one team deploys both sides together. But once the server runs somewhere else, the two sides drift apart in ways no compiler can see:
+
+- **Deploys don't happen at the same moment.** A browser may run yesterday's front end against today's server, and a phone app can be months old.
+- **Not every answer comes from your code.** A proxy or load balancer in front of the server may answer with an HTML error page, or with JSON of its own.
+- **Servers change.** Someone renames a field and updates the server's tests to match, so everything on the server side stays green.
+
+So the client checks every answer with the **shared schemas**. A bad deploy then becomes one clear error, `id: expected a number, got "4"`, instead of `undefined` showing up all over the app.
+
+### A schema for every route
+
+Each route needs a schema for its answer. A `DELETE` answers 204 with no content, which the client turns into `null`, so the shared schemas get one more building block:
+
+```ts
+// New in Part 2: the "no content" answer of a 204
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+```
+
+To make sure every route has a schema, and the **right** one, describe the whole set with a mapped type over the contract, just like `Handlers` on the server: "for every route `R`, a schema for `R`'s response".
+
+```ts
+// One schema per route, checked against the contract
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+```
+
+Now the contract and the schemas can't disagree. A wrong schema or an outdated one doesn't compile:
+
+```ts
+const OldTodoSchema = object({ id: number(), title: string() });
+
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": TodoSchema, // one to-do instead of a list
+  // ❌ Error: Type 'Schema<{ id: number; title: string; done: boolean; }>' is not assignable to type 'Schema<{ id: number; title: string; done: boolean; }[]>'.
+  "POST /todos": OldTodoSchema, // from before "done" existed
+  // ❌ Error: Type 'Schema<{ id: number; title: string; }>' is not assignable to type 'Schema<{ id: number; title: string; done: boolean; }>'.
+  // ...
+};
+```
+
+And neither does a forgotten route. You'll meet this one when you press **Run** in the exercise:
+
+```ts
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+};
+// ❌ Error: Type '{ "GET /todos": Schema<{ id: number; title: string; done: boolean; }[]>; "POST /todos": Schema<{ id: number; title: string; done: boolean; }>; }' is missing the following properties from type 'ResponseSchemas<TodosApi>': "GET /todos/:id", "PATCH /todos/:id", "DELETE /todos/:id"
+```
+
+## Step 2: one generic call
+
+`createApi<Api>` takes the schemas and the options, and gives back one `call` function for every route of the contract. It's the `call` from the Node module with three upgrades: it uses `fetch` with a `baseUrl` (both injectable), it returns a `Result` for every outcome, and it **validates** instead of casting:
+
+<CodeExample output={`{ id: 4, title: 'Nap', done: false }
+true
+{ ok: true, value: null }
+{
+  ok: false,
+  error: { kind: 'http', status: 404, message: 'Todo not found' }
+}
+{
+  ok: false,
+  error: { kind: 'http', status: 400, message: 'title is required' }
+}
+{
+  ok: false,
+  error: {
+    kind: 'invalid',
+    message: '[0].done: expected a boolean, got undefined'
+  }
+}`}>
+
+```ts
+// ========== shared/schemas.ts ==========
+// The schema library from Runtime Validation
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// What the server sends: the Todo type comes from the schema
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// New in Part 2: the "no content" answer of a 204
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// What clients send
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Every error answer, e.g. { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: a client for ANY contract ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// One schema per route, checked against the contract
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? `HTTP ${res.status}`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// ========== trying it on the practice API ==========
+const call = createApi<TodosApi>(todoSchemas);
+
+const created = await call("POST /todos", { body: { title: "Nap" } });
+if (created.ok) console.log(created.value); // Todo
+
+const id = created.ok ? String(created.value.id) : "0";
+const updated = await call("PATCH /todos/:id", {
+  params: { id },
+  body: { done: true },
+});
+if (updated.ok) console.log(updated.value.done); // boolean
+
+console.log(await call("DELETE /todos/:id", { params: { id } }));
+console.log(await call("GET /todos/:id", { params: { id } }));
+console.log(await call("POST /todos", { body: { title: " " } }));
+
+// A server that breaks the contract (a fake fetch)
+const odd = createApi<TodosApi>(todoSchemas, {
+  fetch: async () => Response.json([{ id: 1, title: "Nap" }]),
+});
+console.log(await odd("GET /todos", {}));
+```
+
+</CodeExample>
+
+Follow one request through `call`:
+
+1. **Build the request.** `"PATCH /todos/:id"` is split into the method and the path pattern, `:id` is filled in from `params`, and a `body` is sent as JSON.
+2. **No answer at all** (offline, a DNS failure, an aborted request): `fetch` rejects, and that becomes `{ kind: "network" }`.
+3. **An error status**: `{ kind: "http" }` with the server's own message from `{ "error": "..." }`, or `HTTP 503` if it didn't send one. A 204 isn't read at all, because it has no body.
+4. **A success** goes through `schemas[route].parse(data)`. Thanks to the mapped type, `schemas[route]` is a `Schema<Api[R]["response"]>`, so `parse` returns **exactly** the contract's response type, with no cast anywhere. If the data breaks the schema, the `ValidationError` becomes `{ kind: "invalid" }` with the path of the problem, as with the "odd" server at the end of the output.
+
+Any other error inside `call` is a bug in the client, so it's thrown again instead of being dressed up as an `ApiError`.
+
+## Step 3: a client for the app
+
+`call("PATCH /todos/:id", { params: { id: "2" }, body: { done: true } })` is precise, but it's not what you want to write in a React component. The to-do client wraps it in the `TodosClient` interface from the plan, plus one helper the user interface will need:
+
+```ts title="web/todos-client.ts"
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// What the rest of the app may do with the server
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    update: (id, patch) =>
+      call("PATCH /todos/:id", { params: params(id), body: patch }),
+    remove: (id) => call("DELETE /todos/:id", { params: params(id) }),
+  };
+}
+
+// One friendly sentence for every kind of error
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Can't reach the server. Are you online?";
+    case "http":
+      return `${error.message} (HTTP ${error.status})`;
+    case "invalid":
+      return "The server sent something unexpected.";
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+```
+
+- **Ids are numbers** for the app and strings in a path, so `params(id)` converts them in one place.
+- **`createTodosClient` returns a `TodosClient`.** The app depends on the interface, not on `fetch` or URLs, so in Part 3 a component can get a fake client just as easily as the real one.
+- **`errorMessage`** turns any `ApiError` into a sentence for the screen. The `never` check in `default` means that a new kind of error added to `ApiError` won't compile until it has a sentence too.
+
+## Step 4: tests with a typed fake fetch
+
+Fakes are the way to test what the real server would rarely do: drop the connection, or send data that breaks the contract. `vi.fn<typeof fetch>` makes sure the fake returns a real `Promise<Response>`, and `Response.json(body, { status })` builds one in a line:
+
+```ts title="web/todos-client.test.ts"
+// ========== web/todos-client.test.ts ==========
+const TEST_URL = "https://todos.test";
+
+describe("todos client with a fake fetch", () => {
+  it("creates a to-do: POST with a JSON body", async () => {
+    const todo = { id: 9, title: "Nap", done: false };
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json(todo, { status: 201 }),
+    );
+    const client = createTodosClient({
+      baseUrl: TEST_URL,
+      fetch: fakeFetch,
+    });
+
+    expect(await client.create({ title: "Nap" })).toEqual({
+      ok: true,
+      value: todo,
+    });
+    expect(fakeFetch).toHaveBeenCalledWith(`${TEST_URL}/todos`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: '{"title":"Nap"}',
+    });
+  });
+
+  it("reports network errors", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createTodosClient({ fetch: offline }).list();
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+  });
+
+  // ...plus your two tests from the exercise
+});
+```
+
+`TEST_URL` is a made-up address, which makes it obvious that these requests never leave the test. `toHaveBeenCalledWith` checks the **whole** request: URL, method, headers and body. Notice the fake creates a new `Response` on every call (an `async` function, not `mockResolvedValue`), since a response body can only be read once.
+
+## Step 5: contract tests against the practice API
+
+Fakes prove the client does what **you** think the server does. Only the real server can prove you were right. That's what the practice API is for here: it stands in for your server deployed online, so tests against it are **contract tests** for the client.
+
+```ts
+// The practice API stands in for your server deployed online
+describe("todos client against the practice API", () => {
+  const client = createTodosClient();
+
+  it("lists the to-dos", async () => {
+    const result = await client.list();
+    const ids = result.ok ? result.value.map((t) => t.id) : [];
+    expect(ids).toEqual([1, 2, 3]);
+  });
+
+  it("turns a 400 into an http error", async () => {
+    expect(await client.create({ title: " " })).toEqual({
+      ok: false,
+      error: {
+        kind: "http",
+        status: 400,
+        message: "title is required",
+      },
+    });
+  });
+
+  // ...plus your test from the exercise
+});
+```
+
+Real contract tests are slower than fakes and need a running server with known data, so teams usually run them separately: the fake-fetch tests on every save, and the contract tests in CI against a test server (often called **staging**) after every deploy. On PandaDev you get the known data for free: the practice API starts fresh on every run.
+
+<Callout type="warning" title="Contract tests change data">
+
+A test that creates or deletes to-dos on a shared server changes it for everyone else, including the next test. Against a real staging server, give each test run its own data (create what you need, clean up afterwards), and never point contract tests at production.
+
+</Callout>
+
+<Quiz
+  question="The server is changed to send done as the string 'yes' instead of true. Which test notices?"
+  options={[
+    "The fake-fetch test for create, because it checks the request",
+    "None: the client's types say done is a boolean, so it must be one",
+    "A contract test against the server: the client validates the answer with TodoSchema and returns an invalid error",
+    "TypeScript reports the change when the client is compiled"
+  ]}
+  answer={2}
+  explanation="Types are erased at runtime and the fake only sends what the test tells it to, so only a test against the real server sees the change. Because the client validates every answer, the result is { ok: false, error: { kind: 'invalid', ... } } and the test fails."
+/>
+
+<Exercise
+  title="Build it: the typed client"
+  language="typescript"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ========== shared/schemas.ts ==========
+// The schema library from Runtime Validation
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// What the server sends: the Todo type comes from the schema
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// New in Part 2: the "no content" answer of a 204
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// What clients send
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Every error answer, e.g. { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: a client for ANY contract ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// One schema per route, checked against the contract
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? \`HTTP \${res.status}\`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  // TODO 1: the other three routes
+};
+
+// What the rest of the app may do with the server
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    // TODO 2: update and remove
+  };
+}
+
+// One friendly sentence for every kind of error
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Can't reach the server. Are you online?";
+    case "http":
+      return \`\${error.message} (HTTP \${error.status})\`;
+    // TODO 3: the missing kind
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+
+// ========== web/todos-client.test.ts ==========
+const TEST_URL = "https://todos.test";
+
+describe("todos client with a fake fetch", () => {
+  it("creates a to-do: POST with a JSON body", async () => {
+    const todo = { id: 9, title: "Nap", done: false };
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json(todo, { status: 201 }),
+    );
+    const client = createTodosClient({
+      baseUrl: TEST_URL,
+      fetch: fakeFetch,
+    });
+
+    expect(await client.create({ title: "Nap" })).toEqual({
+      ok: true,
+      value: todo,
+    });
+    expect(fakeFetch).toHaveBeenCalledWith(\`\${TEST_URL}/todos\`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: '{"title":"Nap"}',
+    });
+  });
+
+  it("reports network errors", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createTodosClient({ fetch: offline }).list();
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+  });
+
+  // TODO 4: two tests with a fake fetch
+  it.todo("rejects a to-do that breaks the contract");
+  it.todo("update sends only the changed fields");
+});
+
+// The practice API stands in for your server deployed online
+describe("todos client against the practice API", () => {
+  const client = createTodosClient();
+
+  it("lists the to-dos", async () => {
+    const result = await client.list();
+    const ids = result.ok ? result.value.map((t) => t.id) : [];
+    expect(ids).toEqual([1, 2, 3]);
+  });
+
+  it("turns a 400 into an http error", async () => {
+    expect(await client.create({ title: " " })).toEqual({
+      ok: false,
+      error: {
+        kind: "http",
+        status: 400,
+        message: "title is required",
+      },
+    });
+  });
+
+  // TODO 5: a test against the practice API
+  it.todo("updates, then removes a to-do");
+});`}
+  tests={[
+    { name: "All the tests pass, with no it.todo left", check: `__vitest.failed === 0 && __vitest.skipped === 0 && __vitest.passed >= 7` },
+    { name: "Your tests catch a client that doesn't validate answers", check: `(await __retest([['value: schemas[route].parse(data)', 'value: data as Api[R]["response"]']])).failed > 0` },
+    { name: "Your tests catch a client that loses the id from the URL", check: `(await __retest([['encodeURIComponent(params[name] ?? "")', 'encodeURIComponent("")']])).failed > 0` },
+    { name: "todoSchemas has the right schema for every route", check: `(() => { const s = todoSchemas; const t = { id: 1, title: 'Nap', done: true }; const throws = (f) => { try { f(); return false; } catch (e) { return e instanceof ValidationError; } }; return s['DELETE /todos/:id'].parse(null) === null && throws(() => s['DELETE /todos/:id'].parse({})) && s['GET /todos/:id'].parse(t).title === 'Nap' && s['PATCH /todos/:id'].parse(t).done === true && throws(() => s['PATCH /todos/:id'].parse({ id: 1, title: 'Nap' })) && throws(() => s['GET /todos/:id'].parse([t])) && s['GET /todos'].parse([t]).length === 1; })()` },
+    { name: "update and remove talk to the practice API and return validated Results", check: `await (async () => { const c = createTodosClient(); const made = await c.create({ title: 'Check me' }); if (!made.ok) return false; const id = made.value.id; const u = await c.update(id, { done: true }); const sentU = __requests.at(-1); const r = await c.remove(id); const sentR = __requests.at(-1); const g = await c.get(id); return u.ok && u.value.id === id && u.value.title === 'Check me' && u.value.done === true && sentU.method === 'PATCH' && sentU.url === 'https://api.pandadev.test/todos/' + id && JSON.stringify(sentU.body) === '{"done":true}' && /json/.test(sentU.headers['content-type'] ?? '') && r.ok && r.value === null && sentR.method === 'DELETE' && sentR.url === 'https://api.pandadev.test/todos/' + id && sentR.body === undefined && !g.ok && g.error.kind === 'http' && g.error.status === 404; })()` },
+    { name: "update and remove turn the server's errors into http errors", check: `await (async () => { const c = createTodosClient(); const a = await c.update(999, { done: true }); const b = await c.remove(999); const made = await c.create({ title: 'Keep me' }); const bad = made.ok ? await c.update(made.value.id, { title: '' }) : null; const same = (r, status, message) => r && !r.ok && r.error.kind === 'http' && r.error.status === status && r.error.message === message; return same(a, 404, 'Todo not found') && same(b, 404, 'Todo not found') && same(bad, 400, 'title is required'); })()` },
+    { name: "Everything a server sends is validated, including empty answers", check: `await (async () => { const answer = (body, status) => createTodosClient({ fetch: async () => body === undefined ? new Response(null, { status }) : Response.json(body, { status }) }); const a = await answer({ id: 2, title: 7, done: true }, 200).update(2, { done: true }); const b = await answer({}, 200).remove(2); const c = await answer(undefined, 204).remove(2); const d = await answer({ error: 'Slow down' }, 429).update(2, {}); return !a.ok && a.error.kind === 'invalid' && a.error.message === 'title: expected a string, got 7' && !b.ok && b.error.kind === 'invalid' && b.error.message === 'value: expected no content, got {}' && c.ok && c.value === null && !d.ok && d.error.kind === 'http' && d.error.status === 429 && d.error.message === 'Slow down'; })()` },
+    { name: "errorMessage has a sentence for every kind of error", check: `errorMessage({ kind: 'network', message: 'Failed to fetch' }) === "Can't reach the server. Are you online?" && errorMessage({ kind: 'http', status: 404, message: 'Todo not found' }) === 'Todo not found (HTTP 404)' && errorMessage({ kind: 'invalid', message: 'id: expected a number, got "1"' }) === 'The server sent something unexpected.'` },
+  ]}
+>
+
+Finish the client. The starter has `shared/` from Part 1 (plus `nothing`), `createApi` and the to-do client so far. Press **Run**: TypeScript finds three gaps.
+
+1. **`todoSchemas`**: add the schemas for `GET /todos/:id`, `PATCH /todos/:id` and `DELETE /todos/:id`.
+2. **`update` and `remove`** in `createTodosClient`, written like `get`: `update(id, patch)` sends `PATCH /todos/:id` with the patch as its body, and `remove(id)` sends `DELETE /todos/:id`.
+3. **`errorMessage`**: the `invalid` kind gets `"The server sent something unexpected."`.
+4. **Three tests** instead of the `it.todo` lines:
+   - with a fake fetch, "rejects a to-do that breaks the contract": the fake answers `{ id: 2, title: "Nap", done: "yes" }`, and `update(2, { done: true })` gives `{ ok: false, error: { kind: "invalid", message: 'done: expected a boolean, got "yes"' } }`;
+   - with a fake fetch and `baseUrl: TEST_URL`, "update sends only the changed fields": `update(2, { done: true })` calls `fetch` with `` `${TEST_URL}/todos/2` `` and `{ method: "PATCH", headers: { "Content-Type": "application/json" }, body: '{"done":true}' }`;
+   - against the practice API, "updates, then removes a to-do": `update(2, { done: true })` gives `{ ok: true, value: { id: 2, title: "Build the movie app", done: true } }`, `remove(2)` gives `{ ok: true, value: null }`, and `get(2)` afterwards gives an `http` error with status 404 and the message `"Todo not found"`.
+
+The checks make sure your tests catch a client that skips validation, and one that loses the id from the URL.
+
+<Hint>
+
+1. `"DELETE /todos/:id": nothing()`; the other two answer with one to-do, so they use `TodoSchema`.
+2. `update: (id, patch) => call("PATCH /todos/:id", { params: params(id), body: patch })`, and `remove` is like `get` with the `DELETE` route.
+3. `case "invalid": return "The server sent something unexpected.";` goes before the `default`.
+4. Copy the "creates a to-do" test: `vi.fn<typeof fetch>(async () => Response.json({ id: 2, title: "Nap", done: "yes" }))`, then `expect(await client.update(2, { done: true })).toEqual({ ... })`. For the practice API test, use the `client` that the `describe` already creates.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+// ========== shared/schemas.ts ==========
+// The schema library from Runtime Validation
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// What the server sends: the Todo type comes from the schema
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// New in Part 2: the "no content" answer of a 204
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// What clients send
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Every error answer, e.g. { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: a client for ANY contract ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// One schema per route, checked against the contract
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? `HTTP ${res.status}`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// What the rest of the app may do with the server
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    update: (id, patch) =>
+      call("PATCH /todos/:id", { params: params(id), body: patch }),
+    remove: (id) => call("DELETE /todos/:id", { params: params(id) }),
+  };
+}
+
+// One friendly sentence for every kind of error
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Can't reach the server. Are you online?";
+    case "http":
+      return `${error.message} (HTTP ${error.status})`;
+    case "invalid":
+      return "The server sent something unexpected.";
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+
+// ========== web/todos-client.test.ts ==========
+const TEST_URL = "https://todos.test";
+
+describe("todos client with a fake fetch", () => {
+  it("creates a to-do: POST with a JSON body", async () => {
+    const todo = { id: 9, title: "Nap", done: false };
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json(todo, { status: 201 }),
+    );
+    const client = createTodosClient({
+      baseUrl: TEST_URL,
+      fetch: fakeFetch,
+    });
+
+    expect(await client.create({ title: "Nap" })).toEqual({
+      ok: true,
+      value: todo,
+    });
+    expect(fakeFetch).toHaveBeenCalledWith(`${TEST_URL}/todos`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: '{"title":"Nap"}',
+    });
+  });
+
+  it("reports network errors", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createTodosClient({ fetch: offline }).list();
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+  });
+
+  it("rejects a to-do that breaks the contract", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({ id: 2, title: "Nap", done: "yes" }),
+    );
+    const client = createTodosClient({ fetch: fakeFetch });
+    expect(await client.update(2, { done: true })).toEqual({
+      ok: false,
+      error: {
+        kind: "invalid",
+        message: 'done: expected a boolean, got "yes"',
+      },
+    });
+  });
+
+  it("update sends only the changed fields", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({ id: 2, title: "Nap", done: true }),
+    );
+    const client = createTodosClient({
+      baseUrl: TEST_URL,
+      fetch: fakeFetch,
+    });
+    await client.update(2, { done: true });
+    expect(fakeFetch).toHaveBeenCalledWith(`${TEST_URL}/todos/2`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: '{"done":true}',
+    });
+  });
+});
+
+// The practice API stands in for your server deployed online
+describe("todos client against the practice API", () => {
+  const client = createTodosClient();
+
+  it("lists the to-dos", async () => {
+    const result = await client.list();
+    const ids = result.ok ? result.value.map((t) => t.id) : [];
+    expect(ids).toEqual([1, 2, 3]);
+  });
+
+  it("turns a 400 into an http error", async () => {
+    expect(await client.create({ title: " " })).toEqual({
+      ok: false,
+      error: {
+        kind: "http",
+        status: 400,
+        message: "title is required",
+      },
+    });
+  });
+
+  it("updates, then removes a to-do", async () => {
+    const updated = await client.update(2, { done: true });
+    expect(updated).toEqual({
+      ok: true,
+      value: { id: 2, title: "Build the movie app", done: true },
+    });
+    expect(await client.remove(2)).toEqual({ ok: true, value: null });
+    const gone = await client.get(2);
+    expect(gone).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Todo not found" },
+    });
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- **`nothing()` and `ResponseSchemas<Api>`**: a mapped type that makes the compiler check there's a correct schema for every route of the contract.
+- **`createApi<Api>`**, one generic `call` for any contract, with an injectable `fetch` and `baseUrl`, a `Result` for every outcome, and validation instead of a cast.
+- **`createTodosClient`**, a small `TodosClient` interface for the app, and **`errorMessage`**, which has a sentence for every kind of `ApiError`.
+- **Tests with a typed fake fetch** for the rare cases (a dropped connection, data that breaks the contract) and **contract tests** against the practice API, standing in for your deployed server.
+
+In [Part 3](/learn/typescript/the-react-client), the React app gets this client and builds a user interface that answers at once, even before the server does.

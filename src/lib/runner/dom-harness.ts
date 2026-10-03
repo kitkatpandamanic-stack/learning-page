@@ -191,14 +191,16 @@ const HARNESS = String.raw`
     var done = function () {
       if (!finished) { finished = true; inflight--; }
     };
+    // Logged as soon as fetch() is called, so a check right after a click
+    // sees it; the body is filled in once it has been read.
+    var headers = {};
+    request.headers.forEach(function (value, key) { headers[key] = value; });
+    var entry = { method: request.method, url: request.url, headers: headers, body: undefined };
+    window.__requests.push(entry);
     var body = request.method === "GET" || request.method === "HEAD" ? Promise.resolve("") : request.text();
     return body.then(function (text) {
       if (text === "") text = undefined;
-      var headers = {};
-      request.headers.forEach(function (value, key) { headers[key] = value; });
-      var logged = text;
-      try { logged = text === undefined ? undefined : JSON.parse(text); } catch (e) {}
-      window.__requests.push({ method: request.method, url: request.url, headers: headers, body: logged });
+      try { entry.body = text === undefined ? undefined : JSON.parse(text); } catch (e) { entry.body = text; }
       if (signal && signal.aborted) throw signal.reason;
       return fetchBridge({ method: request.method, url: request.url, headers: headers, body: text });
     }).then(function (fake) {
@@ -326,6 +328,9 @@ const HARNESS = String.raw`
       } catch (e) {
         tests.push({ passed: false, error: e && e.name ? e.name + ": " + e.message : String(e) });
       }
+      // A check that failed between __hold() and __release() mustn't leave
+      // the practice API's answers waiting for every later check.
+      if (held) await window.__release();
     }
     return { error: error, tests: tests };
   };

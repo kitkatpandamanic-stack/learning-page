@@ -1,0 +1,1597 @@
+---
+title: "Part 1: Shared types and the API"
+description: "Plan a full-stack to-do app, write the contract both sides share, and build a validated, tested Express API that answers exactly like the practice API."
+duration: 25
+xp: 30
+---
+
+Welcome to the Level 2 capstone! 🐼 Over three parts you'll build a **full-stack to-do app** in TypeScript: an Express API, a typed client for it and a React front end, all held together by **one contract** that every part shares. When the server and the front end disagree about the data, the compiler and the tests will tell you long before a user does.
+
+This part lays the foundations: the shared types and schemas, and a server with validation, error handling and tests. You'll use the schema library from [Runtime Validation](/learn/typescript/runtime-validation), parsers and error middleware from [Validation & Error Handling](/learn/typescript/validation-and-errors), the contract and `mountApi` from [Sharing Types Between Client and Server](/learn/typescript/sharing-types-between-client-and-server), and the repository interface and fakes from [Dependency Injection and Fakes](/learn/typescript/dependency-injection-and-fakes).
+
+## The plan
+
+A real full-stack project keeps everything both sides need in one shared place:
+
+```text
+todo-app/
+├── shared/
+│   ├── schemas.ts        TodoSchema and the Todo type     Part 1
+│   └── contract.ts       NewTodo, TodoPatch, TodosApi     Part 1
+├── server/               Express API and its tests        Part 1
+└── web/
+    ├── todos-client.ts   typed API client and its tests   Part 2
+    └── App.tsx           the React app                    Part 3
+```
+
+The server and the web app both import from `shared/`, so they can't disagree about what a to-do looks like. PandaDev runs one file per exercise, so here the files sit one after another in the editor, each starting with a comment like `// ========== shared/contract.ts ==========`.
+
+There's one more player. The practice API at `https://api.pandadev.test` already has a `/todos` endpoint, and in this capstone it **stands in for your server deployed online**. In Parts 2 and 3, the client and the React app talk to it exactly as they would talk to your Express server running on a real host. That only works if your server answers **exactly** like it, so matching it is this part's goal. (PandaDev has the practice API built in, so everything works offline and its data starts fresh on every run. Real APIs work the same way.)
+
+## Step 1: the design note
+
+Before writing code, professional teams write a short **design note**: what the API offers, what it answers and what can go wrong. Ours has a twist: an API to match already exists. So start by asking it:
+
+<CodeExample output={`GET /todos → 200 [
+  { id: 1, title: 'Learn fetch', done: true },
+  { id: 2, title: 'Build the movie app', done: false },
+  { id: 3, title: 'Eat some bamboo', done: false }
+]
+POST /todos → 201 { id: 4, title: 'Write the contract', done: false }
+POST /todos → 400 { error: 'title is required' }
+PATCH /todos/2 → 200 { id: 2, title: 'Build the movie app', done: true }
+DELETE /todos/1 → 204 (no body)
+GET /todos/1 → 404 { error: 'Todo not found' }`}>
+
+```ts
+const API = "https://api.pandadev.test";
+
+async function show(method: string, path: string, body?: object) {
+  const res = await fetch(API + path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text(); // a 204 has no body at all
+  const answer = text ? JSON.parse(text) : "(no body)";
+  console.log(`${method} ${path} → ${res.status}`, answer);
+}
+
+await show("GET", "/todos");
+await show("POST", "/todos", { title: "  Write the contract " });
+await show("POST", "/todos", { title: "" });
+await show("PATCH", "/todos/2", { done: true });
+await show("DELETE", "/todos/1");
+await show("GET", "/todos/1");
+```
+
+</CodeExample>
+
+From those answers, the note almost writes itself:
+
+| Route | Client sends | Success | Errors |
+| --- | --- | --- | --- |
+| `GET /todos` | | 200 with the list | |
+| `POST /todos` | `{ title, done? }` | 201 with the new to-do | 400 |
+| `GET /todos/:id` | | 200 with the to-do | 404 |
+| `PATCH /todos/:id` | `{ title?, done? }` | 200 with the changed to-do | 400, 404 |
+| `DELETE /todos/:id` | | 204 with no body | 404 |
+
+And the decisions behind it:
+
+- **The server owns the ids.** Clients never send an `id`; the server picks the next number.
+- **Titles are trimmed and required.** `"  Write the contract "` is saved as `"Write the contract"`, and a blank title is a 400.
+- **`done` is optional when you create a to-do**, and starts as `false`.
+- **`PATCH` changes only what it's sent**, so ticking a to-do sends just `{ "done": true }`.
+- **Every error is `{ "error": "..." }`**, with a message a person can read.
+
+<Callout type="note" title="When the API already exists, it is the contract">
+
+In [Validation & Error Handling](/learn/typescript/validation-and-errors) every error had a `code` as well as a message. That's a good design, but the API we have to match doesn't send one, and a client can't rely on a field that only some servers send. So our error body is just `{ error: string }`. Changing a contract that's already in use is a decision for **both** sides: adding an optional field is safe, while renaming or removing one breaks every client that reads it.
+
+</Callout>
+
+## Step 2: shared schemas
+
+What the server **sends** gets checked by a schema. Clients need that check (that's Part 2), and the server's own tests can use it to prove that every answer follows the contract. Here's the schema library from Runtime Validation, unchanged, with the to-do schema at the end, checking real data from the practice API:
+
+<CodeExample output={`[ 'Build the movie app', 'Eat some bamboo' ]
+id: expected a number, got "4"
+done: expected a boolean, got undefined`}>
+
+```ts
+// ========== shared/schemas.ts ==========
+// The schema library from Runtime Validation
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// What the server sends: the Todo type comes from the schema
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// Check real data from the practice API
+const res = await fetch("https://api.pandadev.test/todos");
+const todos = array(TodoSchema).parse(await res.json()); // Todo[]
+console.log(todos.filter((t) => !t.done).map((t) => t.title));
+
+// And data that breaks the contract
+const broken: unknown[] = [
+  { id: "4", title: "Nap", done: false },
+  { id: 4, title: "Nap" },
+];
+for (const data of broken) {
+  try {
+    TodoSchema.parse(data);
+  } catch (error) {
+    if (error instanceof ValidationError) console.log(error.message);
+  }
+}
+```
+
+</CodeExample>
+
+Nobody writes the `Todo` type by hand: it's `Infer<typeof TodoSchema>`, which your editor shows as `{ id: number; title: string; done: boolean }`. Add a field to the schema and the type grows with it, on the server and in the web app at the same time.
+
+## Step 3: the contract
+
+Next to the schemas lives the contract: the types for what clients **send**, the error body, and the `"METHOD /path"` map of every endpoint from [Sharing Types Between Client and Server](/learn/typescript/sharing-types-between-client-and-server):
+
+```ts title="shared/contract.ts"
+// ========== shared/contract.ts ==========
+// What clients send
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Every error answer, e.g. { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+```
+
+Why are `NewTodo` and `TodoPatch` plain types and not schemas? Because they describe what clients send, and the server checks that with **parsers** that list **every** problem at once (next step). Our small schema library stops at the first problem and has no optional fields, so it's the right tool for checking answers, not request bodies. `TodoPatch` is `Partial<NewTodo>`: the same fields, all optional, which is exactly what a `PATCH` may send.
+
+The contract catches mistakes on both sides before anything runs:
+
+```ts
+type CreateBody = TodosApi["POST /todos"]["body"]; // NewTodo
+type DeleteAnswer = TodosApi["DELETE /todos/:id"]["response"];
+
+const draft: CreateBody = { title: "Nap", done: "no" };
+// ❌ Error: Type 'string' is not assignable to type 'boolean | undefined'.
+const patch: TodoPatch = { titel: "Nap" };
+// ❌ Error: Object literal may only specify known properties, but 'titel' does not exist in type 'Partial<NewTodo>'. Did you mean to write 'title'?
+const gone: DeleteAnswer = { ok: true };
+// ❌ Error: Type '{ ok: boolean; }' is not assignable to type 'null'.
+const route: keyof TodosApi = "PUT /todos/:id";
+// ❌ Error: Type '"PUT /todos/:id"' is not assignable to type 'keyof TodosApi'. Did you mean '"GET /todos/:id"'?
+```
+
+The last one is deliberate: the practice API also accepts `PUT`, but our app never needs it, so it isn't part of our contract. A contract describes what **this** app relies on, not everything a server can do.
+
+## Step 4: parsing what clients send
+
+On the server, `req.body` is whatever arrived, so it's `unknown` until a parser turns it into a `NewTodo` or a list of problems. This is the parser pattern from [Validation & Error Handling](/learn/typescript/validation-and-errors), with one improvement: small `check...` helpers that return the clean value **or** add a message, so each field is checked exactly once:
+
+<CodeExample output={`valid: { title: 'Nap' }
+valid: { title: 'Ship it', done: true }
+invalid: [ 'title is required', 'done must be true or false' ]
+invalid: [ 'body must be a JSON object' ]`}>
+
+```ts
+// From shared/: the contract types and isRecord
+type NewTodo = { title: string; done?: boolean };
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+// ========== server/parse.ts ==========
+// Each check returns the clean value, or adds a message to errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  errors.push("title is required");
+  return undefined;
+}
+
+function checkDone(
+  value: unknown,
+  errors: string[],
+): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  errors.push("done must be true or false");
+  return undefined;
+}
+
+function parseNewTodo(input: unknown): Result<NewTodo, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  let done: boolean | undefined;
+  if (input.done !== undefined) done = checkDone(input.done, errors);
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  // Copy only the fields we know: anything else is dropped
+  const todo: NewTodo = { title };
+  if (done !== undefined) todo.done = done;
+  return { ok: true, value: todo };
+}
+
+const inputs: unknown[] = [
+  { title: "  Nap  ", id: 99, isAdmin: true },
+  { title: "Ship it", done: true },
+  { title: "   ", done: "yes" },
+  ["not", "an", "object"],
+];
+for (const input of inputs) {
+  const result = parseNewTodo(input);
+  if (result.ok) console.log("valid:", result.value); // NewTodo
+  else console.log("invalid:", result.error); // string[]
+}
+```
+
+</CodeExample>
+
+The first input shows the two habits that keep an API safe: the title is **trimmed**, and the unknown fields `id` and `isAdmin` are **dropped**, so a client can't choose its own id (or anything else it shouldn't). The third input gets both of its problems back in one answer.
+
+## Step 5: the server
+
+Three building blocks turn the parsers into a server. You've met all of them in the Node module, so here they are in their to-do versions:
+
+- **Errors.** `HttpError` carries a status, and its type is the union `400 | 404 | 500`, the only statuses this API uses, so a typo like `new HttpError(440, ...)` doesn't compile. `parseOrThrow` turns a bad body into a 400 whose message lists every problem. The error handler (four annotated parameters, registered last) answers with an `ErrorBody` and hides the details of anything unexpected.
+- **A repository behind an interface.** The routes only know `TodoRepository`: five async methods, like a real database would have. `createMemoryRepository` keeps the to-dos in a `Map` and starts with the same three as the practice API, so the two servers start out identical.
+- **Routes from the contract.** `mountApi<Api>` from the Node module registers one handler per route, and its `Handlers` type makes each handler return exactly that route's response.
+
+For now, the server mounts only part of the contract. The utility type `Pick` from [Utility Types](/learn/typescript/utility-types) cuts `TodosApi` down to three routes; the other two are your job in the exercise:
+
+<CodeExample output={`200 { id: 2, title: 'Build the movie app', done: false }
+201 { id: 4, title: 'Write the server', done: false }
+400 { error: 'title is required, done must be true or false' }
+400 { error: 'Unexpected token in JSON' }
+404 { error: 'Todo not found' }
+404 { error: 'Not found' }`}>
+
+```ts
+import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+  type Router,
+} from "express";
+import request from "supertest";
+
+// ===== shared/ (shortened: Todo really comes from TodoSchema) =====
+type Todo = { id: number; title: string; done: boolean };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+// ========== shared/contract.ts ==========
+// What clients send
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Every error answer, e.g. { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== server/parse.ts ==========
+// Each check returns the clean value, or adds a message to errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  errors.push("title is required");
+  return undefined;
+}
+
+function checkDone(
+  value: unknown,
+  errors: string[],
+): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  errors.push("done must be true or false");
+  return undefined;
+}
+
+function parseNewTodo(input: unknown): Result<NewTodo, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  let done: boolean | undefined;
+  if (input.done !== undefined) done = checkDone(input.done, errors);
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  // Copy only the fields we know: anything else is dropped
+  const todo: NewTodo = { title };
+  if (done !== undefined) todo.done = done;
+  return { ok: true, value: todo };
+}
+
+// ========== server/errors.ts ==========
+type ErrorStatus = 400 | 404 | 500;
+
+class HttpError extends Error {
+  readonly status: ErrorStatus;
+  constructor(status: ErrorStatus, message: string) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+// A bad body is a 400 that lists every problem
+function parseOrThrow<T>(
+  parse: (input: unknown) => Result<T, string[]>,
+  input: unknown,
+): T {
+  const result = parse(input);
+  if (!result.ok) throw new HttpError(400, result.error.join(", "));
+  return result.value;
+}
+
+// Express's own errors (e.g. broken JSON) carry a 4xx status
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+function errorHandler(
+  err: unknown,
+  req: Request,
+  res: Response<ErrorBody>,
+  _next: NextFunction,
+): void {
+  if (err instanceof HttpError || isClientError(err)) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  console.error("Unexpected:", String(err));
+  res.status(500).json({ error: "Something went wrong" });
+}
+
+// ========== server/repository.ts ==========
+// What the routes need from storage (async, like a database)
+interface TodoRepository {
+  list(): Promise<Todo[]>;
+  get(id: number): Promise<Todo | undefined>;
+  create(input: NewTodo): Promise<Todo>;
+  update(id: number, patch: TodoPatch): Promise<Todo | undefined>;
+  remove(id: number): Promise<boolean>;
+}
+
+// The same three to-dos the practice API starts with
+const STARTER_TODOS: Todo[] = [
+  { id: 1, title: "Learn fetch", done: true },
+  { id: 2, title: "Build the movie app", done: false },
+  { id: 3, title: "Eat some bamboo", done: false },
+];
+
+function createMemoryRepository(
+  start: Todo[] = STARTER_TODOS,
+): TodoRepository {
+  const todos = new Map<number, Todo>();
+  for (const todo of start) todos.set(todo.id, { ...todo });
+  let nextId = Math.max(0, ...todos.keys()) + 1;
+  return {
+    async list() {
+      return [...todos.values()];
+    },
+    async get(id) {
+      return todos.get(id);
+    },
+    async create(input) {
+      const todo: Todo = {
+        id: nextId++,
+        title: input.title,
+        done: input.done ?? false,
+      };
+      todos.set(todo.id, todo);
+      return todo;
+    },
+    async update(id, patch) {
+      const todo = todos.get(id);
+      if (!todo) return undefined;
+      const updated: Todo = { ...todo, ...patch };
+      todos.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return todos.delete(id);
+    },
+  };
+}
+
+// ========== server/mount-api.ts (from the Node module) ==========
+type RawRequest = { params: Record<string, string>; body: unknown };
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+
+function register(
+  router: Router,
+  method: string,
+  path: string,
+  handler: RequestHandler,
+): void {
+  if (method === "GET") router.get(path, handler);
+  else if (method === "POST") router.post(path, handler);
+  else if (method === "PATCH") router.patch(path, handler);
+  else if (method === "DELETE") router.delete(path, handler);
+  else throw new Error(`Unsupported method: ${method}`);
+}
+
+// POST answers 201, a null result 204, everything else 200
+function mountApi<Api extends Record<keyof Api, Endpoint>>(
+  router: Router,
+  handlers: Handlers<Api>,
+): void {
+  for (const route of Object.keys(handlers) as (keyof Api & string)[]) {
+    const [method, path] = route.split(" ");
+    const handler = handlers[route];
+    register(router, method, path, async (req, res) => {
+      const { params, body } = req;
+      const result = await handler({ params, body });
+      if (result === null) {
+        res.sendStatus(204);
+        return;
+      }
+      res.status(method === "POST" ? 201 : 200).json(result);
+    });
+  }
+}
+
+// ========== server/app.ts ==========
+// For now, only part of the contract (the rest is your job)
+type FirstRoutes = Pick<
+  TodosApi,
+  "GET /todos" | "POST /todos" | "GET /todos/:id"
+>;
+
+function createApp(
+  repo: TodoRepository = createMemoryRepository(),
+): Application {
+  async function findTodo(idText: string): Promise<Todo> {
+    const todo = await repo.get(Number(idText));
+    if (!todo) throw new HttpError(404, "Todo not found");
+    return todo;
+  }
+
+  const router = express.Router();
+  mountApi<FirstRoutes>(router, {
+    "GET /todos": () => repo.list(),
+    "POST /todos": async ({ body }) =>
+      repo.create(parseOrThrow(parseNewTodo, body)),
+    "GET /todos/:id": ({ params }) => findTodo(params.id),
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use(router);
+  app.use((req, res: Response<ErrorBody>) => {
+    res.status(404).json({ error: "Not found" });
+  });
+  app.use(errorHandler);
+  return app;
+}
+
+// ========== trying it out ==========
+const api = request(createApp());
+type Answer = { status: number; body: unknown };
+async function show(test: PromiseLike<Answer>) {
+  const res = await test;
+  console.log(res.status, res.body);
+}
+
+await show(api.get("/todos/2"));
+await show(api.post("/todos").send({ title: "  Write the server " }));
+await show(api.post("/todos").send({ title: 42, done: "yes" }));
+await show(
+  api
+    .post("/todos")
+    .set("Content-Type", "application/json")
+    .send('{ "title": '), // broken JSON
+);
+await show(api.get("/todos/99"));
+await show(api.patch("/todos/2").send({ done: true })); // not yet!
+```
+
+</CodeExample>
+
+Things to notice:
+
+- **The routes are tiny.** `POST /todos` validates and saves in one line, and `GET /todos/:id` is just `findTodo`, which throws the 404. Every failure ends in the error handler, in the same `{ error }` shape.
+- **Broken JSON is a 400, not a 500.** `express.json()` throws its own `SyntaxError` with a `status` of 400, and `isClientError` recognises it.
+- **The `PATCH` answers "Not found"**: that route isn't mounted yet, so the 404 handler answers. When the exercise switches `mountApi<FirstRoutes>` to `mountApi<TodosApi>`, the compiler lists the two missing handlers for you.
+- **`createApp` takes its repository as a parameter.** The real server would pass one backed by a database; tests can pass anything that implements `TodoRepository`.
+
+## Step 6: tests that hold the server to the contract
+
+The test suite sends real requests with supertest, to a fresh app for every test:
+
+```ts title="server/todos.test.ts"
+// ========== server/todos.test.ts ==========
+describe("todos API", () => {
+  let api: ReturnType<typeof request>;
+
+  beforeEach(() => {
+    api = request(createApp(createMemoryRepository()));
+  });
+
+  it("lists the starter to-dos, as the contract says", async () => {
+    const res = await api.get("/todos").expect(200);
+    const todos = array(TodoSchema).parse(res.body); // Todo[]
+    expect(todos.map((t) => t.title)).toEqual([
+      "Learn fetch",
+      "Build the movie app",
+      "Eat some bamboo",
+    ]);
+  });
+
+  it("creates a to-do with a trimmed title", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: "  Nap  " })
+      .expect(201);
+    expect(TodoSchema.parse(res.body)).toEqual({
+      id: 4,
+      title: "Nap",
+      done: false,
+    });
+  });
+
+  it("lists every problem with a body", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: " ", done: "yes" })
+      .expect(400);
+    const body: ErrorBody = res.body;
+    expect(body).toEqual({
+      error: "title is required, done must be true or false",
+    });
+  });
+
+  it("answers 404 for a to-do that doesn't exist", async () => {
+    const res = await api.get("/todos/99").expect(404);
+    expect(res.body).toEqual({ error: "Todo not found" });
+  });
+
+  it("hides the details when the database fails", async () => {
+    const broken: TodoRepository = {
+      ...createMemoryRepository(),
+      list: async () => {
+        throw new Error("Database is down");
+      },
+    };
+    const res = await request(createApp(broken)).get("/todos");
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: "Something went wrong" });
+  });
+
+  // ...and the two tests you'll write in the exercise
+});
+```
+
+Two kinds of test here are worth copying into your own projects:
+
+- **Contract tests.** `array(TodoSchema).parse(res.body)` throws if any to-do in the answer breaks the shared schema. If someone changes the server to send `done: "yes"` or forgets a field, this test fails, before any client sees it.
+- **A fake that fails.** The last test spreads a working memory repository and replaces one method with one that throws. Because `createApp` receives its repository, testing "the database is down" takes three lines, and the test proves that clients get a polite 500 without the details. (The `console.error` line from the error handler shows up in the output: in a real server, that's your log.)
+
+<Callout type="tip" title="Same requests, two servers">
+
+How do you know your server really matches the practice API? Send both the same requests and compare every status and every body. The checks of the exercise below do exactly that. Teams do the same thing when they replace an old service with a new one: run the old and the new side by side, and compare their answers.
+
+</Callout>
+
+<Quiz
+  question="A PATCH /todos/9 request has a broken body, and there's no to-do 9. The practice API answers 404. Why should your server answer 404 as well, rather than 400?"
+  options={[
+    "Because 404 is always more important than 400",
+    "Because the clients are written against how the existing API behaves, and the contract includes which error wins",
+    "Because Express checks the id before the body automatically",
+    "It doesn't matter: clients never look at status codes"
+  ]}
+  answer={1}
+  explanation="Your server replaces an API that clients already use. If it reports a different error for the same request, a client that handles 'not found' (for example by removing the to-do from its list) behaves differently. Matching the existing behaviour, down to which check runs first, keeps every client working."
+/>
+
+<Exercise
+  title="Build it: the to-do API"
+  language="typescript"
+  starter={`import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+  type Router,
+} from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ========== shared/schemas.ts ==========
+// The schema library from Runtime Validation
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// What the server sends: the Todo type comes from the schema
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// ========== shared/contract.ts ==========
+// What clients send
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Every error answer, e.g. { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== server/parse.ts ==========
+// Each check returns the clean value, or adds a message to errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  errors.push("title is required");
+  return undefined;
+}
+
+function checkDone(
+  value: unknown,
+  errors: string[],
+): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  errors.push("done must be true or false");
+  return undefined;
+}
+
+function parseNewTodo(input: unknown): Result<NewTodo, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  let done: boolean | undefined;
+  if (input.done !== undefined) done = checkDone(input.done, errors);
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  // Copy only the fields we know: anything else is dropped
+  const todo: NewTodo = { title };
+  if (done !== undefined) todo.done = done;
+  return { ok: true, value: todo };
+}
+
+// TODO 1: like parseNewTodo, but every field is optional
+function parseTodoPatch(input: unknown): Result<TodoPatch, string[]> {
+  return { ok: false, error: ["not written yet"] };
+}
+
+// ========== server/errors.ts ==========
+type ErrorStatus = 400 | 404 | 500;
+
+class HttpError extends Error {
+  readonly status: ErrorStatus;
+  constructor(status: ErrorStatus, message: string) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+// A bad body is a 400 that lists every problem
+function parseOrThrow<T>(
+  parse: (input: unknown) => Result<T, string[]>,
+  input: unknown,
+): T {
+  const result = parse(input);
+  if (!result.ok) throw new HttpError(400, result.error.join(", "));
+  return result.value;
+}
+
+// Express's own errors (e.g. broken JSON) carry a 4xx status
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+function errorHandler(
+  err: unknown,
+  req: Request,
+  res: Response<ErrorBody>,
+  _next: NextFunction,
+): void {
+  if (err instanceof HttpError || isClientError(err)) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  console.error("Unexpected:", String(err));
+  res.status(500).json({ error: "Something went wrong" });
+}
+
+// ========== server/repository.ts ==========
+// What the routes need from storage (async, like a database)
+interface TodoRepository {
+  list(): Promise<Todo[]>;
+  get(id: number): Promise<Todo | undefined>;
+  create(input: NewTodo): Promise<Todo>;
+  update(id: number, patch: TodoPatch): Promise<Todo | undefined>;
+  remove(id: number): Promise<boolean>;
+}
+
+// The same three to-dos the practice API starts with
+const STARTER_TODOS: Todo[] = [
+  { id: 1, title: "Learn fetch", done: true },
+  { id: 2, title: "Build the movie app", done: false },
+  { id: 3, title: "Eat some bamboo", done: false },
+];
+
+function createMemoryRepository(
+  start: Todo[] = STARTER_TODOS,
+): TodoRepository {
+  const todos = new Map<number, Todo>();
+  for (const todo of start) todos.set(todo.id, { ...todo });
+  let nextId = Math.max(0, ...todos.keys()) + 1;
+  return {
+    async list() {
+      return [...todos.values()];
+    },
+    async get(id) {
+      return todos.get(id);
+    },
+    async create(input) {
+      const todo: Todo = {
+        id: nextId++,
+        title: input.title,
+        done: input.done ?? false,
+      };
+      todos.set(todo.id, todo);
+      return todo;
+    },
+    async update(id, patch) {
+      const todo = todos.get(id);
+      if (!todo) return undefined;
+      const updated: Todo = { ...todo, ...patch };
+      todos.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return todos.delete(id);
+    },
+  };
+}
+
+// ========== server/mount-api.ts (from the Node module) ==========
+type RawRequest = { params: Record<string, string>; body: unknown };
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+
+function register(
+  router: Router,
+  method: string,
+  path: string,
+  handler: RequestHandler,
+): void {
+  if (method === "GET") router.get(path, handler);
+  else if (method === "POST") router.post(path, handler);
+  else if (method === "PATCH") router.patch(path, handler);
+  else if (method === "DELETE") router.delete(path, handler);
+  else throw new Error(\`Unsupported method: \${method}\`);
+}
+
+// POST answers 201, a null result 204, everything else 200
+function mountApi<Api extends Record<keyof Api, Endpoint>>(
+  router: Router,
+  handlers: Handlers<Api>,
+): void {
+  for (const route of Object.keys(handlers) as (keyof Api & string)[]) {
+    const [method, path] = route.split(" ");
+    const handler = handlers[route];
+    register(router, method, path, async (req, res) => {
+      const { params, body } = req;
+      const result = await handler({ params, body });
+      if (result === null) {
+        res.sendStatus(204);
+        return;
+      }
+      res.status(method === "POST" ? 201 : 200).json(result);
+    });
+  }
+}
+
+// ========== server/app.ts ==========
+function createApp(
+  repo: TodoRepository = createMemoryRepository(),
+): Application {
+  async function findTodo(idText: string): Promise<Todo> {
+    const todo = await repo.get(Number(idText));
+    if (!todo) throw new HttpError(404, "Todo not found");
+    return todo;
+  }
+
+  const router = express.Router();
+  mountApi<TodosApi>(router, {
+    "GET /todos": () => repo.list(),
+    "POST /todos": async ({ body }) =>
+      repo.create(parseOrThrow(parseNewTodo, body)),
+    "GET /todos/:id": ({ params }) => findTodo(params.id),
+    // TODO 2: "PATCH /todos/:id" and "DELETE /todos/:id"
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use(router);
+  app.use((req, res: Response<ErrorBody>) => {
+    res.status(404).json({ error: "Not found" });
+  });
+  app.use(errorHandler);
+  return app;
+}
+
+// ========== server/todos.test.ts ==========
+describe("todos API", () => {
+  let api: ReturnType<typeof request>;
+
+  beforeEach(() => {
+    api = request(createApp(createMemoryRepository()));
+  });
+
+  it("lists the starter to-dos, as the contract says", async () => {
+    const res = await api.get("/todos").expect(200);
+    const todos = array(TodoSchema).parse(res.body); // Todo[]
+    expect(todos.map((t) => t.title)).toEqual([
+      "Learn fetch",
+      "Build the movie app",
+      "Eat some bamboo",
+    ]);
+  });
+
+  it("creates a to-do with a trimmed title", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: "  Nap  " })
+      .expect(201);
+    expect(TodoSchema.parse(res.body)).toEqual({
+      id: 4,
+      title: "Nap",
+      done: false,
+    });
+  });
+
+  it("lists every problem with a body", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: " ", done: "yes" })
+      .expect(400);
+    const body: ErrorBody = res.body;
+    expect(body).toEqual({
+      error: "title is required, done must be true or false",
+    });
+  });
+
+  it("answers 404 for a to-do that doesn't exist", async () => {
+    const res = await api.get("/todos/99").expect(404);
+    expect(res.body).toEqual({ error: "Todo not found" });
+  });
+
+  it("hides the details when the database fails", async () => {
+    const broken: TodoRepository = {
+      ...createMemoryRepository(),
+      list: async () => {
+        throw new Error("Database is down");
+      },
+    };
+    const res = await request(createApp(broken)).get("/todos");
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: "Something went wrong" });
+  });
+
+  // TODO 3: replace these with real tests
+  it.todo("PATCH changes only the fields it's sent");
+  it.todo("DELETE answers 204, then the to-do is gone");
+});`}
+  tests={[
+    { name: "All the tests pass, with no it.todo left", check: `__vitest.failed === 0 && __vitest.skipped === 0 && __vitest.passed >= 7` },
+    { name: "Your PATCH test catches an update that resets the fields it wasn't sent", check: `(await __retest([['const updated: Todo = { ...todo, ...patch };', 'const updated: Todo = { ...todo, title: "", done: false, ...patch };']])).failed > 0` },
+    { name: "Your DELETE test catches a remove that doesn't remove", check: `(await __retest([['return todos.delete(id);', 'return todos.has(id);']])).failed > 0` },
+    { name: "Your DELETE test catches a 200 instead of a 204", check: `(await __retest([['res.sendStatus(204);', 'res.json(result);']])).failed > 0` },
+    { name: "parseTodoPatch accepts any valid subset and lists every problem", check: `(() => { const same = (x, y) => JSON.stringify(Object.entries(x).sort()) === JSON.stringify(Object.entries(y).sort()); const p = (v) => parseTodoPatch(v); const a = p({}); const b = p({ title: '  Nap now ', id: 7 }); const c = p({ done: false }); const d = p({ title: 'Ship', done: true, extra: 1 }); const bad = p({ title: '  ', done: 'yes' }); const t = p({ title: 5 }); return a.ok && same(a.value, {}) && b.ok && same(b.value, { title: 'Nap now' }) && c.ok && same(c.value, { done: false }) && d.ok && same(d.value, { title: 'Ship', done: true }) && !bad.ok && bad.error.join('|') === 'title is required|done must be true or false' && !t.ok && t.error.join('|') === 'title is required' && [null, [], 'x', 3].every((v) => { const r = p(v); return !r.ok && r.error.join('|') === 'body must be a JSON object'; }); })()` },
+    { name: "PATCH /todos/:id changes only what it's sent, validates it and 404s unknown ids", check: `await (async () => { const api = require('supertest')(createApp(createMemoryRepository())); const a = await api.patch('/todos/2').send({ done: true, id: 50 }); const b = await api.patch('/todos/2').send({ title: '  Build the to-do app ' }); const bad = await api.patch('/todos/2').send({ title: '', done: 1 }); const missing = await api.patch('/todos/9').send({ done: 'nope' }); const after = (await api.get('/todos/2')).body; return a.status === 200 && JSON.stringify(a.body) === '{"id":2,"title":"Build the movie app","done":true}' && b.status === 200 && b.body.title === 'Build the to-do app' && b.body.done === true && bad.status === 400 && bad.body.error === 'title is required, done must be true or false' && missing.status === 404 && missing.body.error === 'Todo not found' && JSON.stringify(after) === '{"id":2,"title":"Build the to-do app","done":true}'; })()` },
+    { name: "DELETE /todos/:id answers 204, then the to-do is gone", check: `await (async () => { const api = require('supertest')(createApp(createMemoryRepository())); const d = await api.delete('/todos/1'); const g = await api.get('/todos/1'); const again = await api.delete('/todos/1'); const list = await api.get('/todos'); const next = await api.post('/todos').send({ title: 'Next' }); return d.status === 204 && d.text === '' && g.status === 404 && again.status === 404 && again.body.error === 'Todo not found' && list.body.length === 2 && next.body.id === 4; })()` },
+    { name: "Your server answers every request exactly like the practice API", check: `await (async () => { const ours = require('supertest')(createApp(createMemoryRepository())); const steps = [['GET', '/todos'], ['POST', '/todos', { title: '  Ship it ' }], ['POST', '/todos', { title: '' }], ['PATCH', '/todos/2', { done: true }], ['PATCH', '/todos/2', { title: 'Build the to-do app' }], ['PATCH', '/todos/2', { title: '  ' }], ['PATCH', '/todos/9', { title: '' }], ['GET', '/todos/2'], ['DELETE', '/todos/1'], ['GET', '/todos/1'], ['DELETE', '/todos/1'], ['GET', '/todos']]; for (const [method, path, body] of steps) { let test = ours[method.toLowerCase()](path); if (body) test = test.send(body); const a = await test; const res = await fetch('https://api.pandadev.test' + path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined }); const text = await res.text(); const mine = a.status === 204 ? null : a.body; const theirs = text ? JSON.parse(text) : null; if (a.status !== res.status || JSON.stringify(mine) !== JSON.stringify(theirs)) return false; } return true; })()` },
+  ]}
+>
+
+Finish the to-do API. The starter has everything from this lesson, from `shared/` to the tests. Press **Run**: TypeScript already knows what's missing.
+
+1. **`parseTodoPatch(input)`** in `server/parse.ts`: like `parseNewTodo`, but **every** field is optional. Check only the fields that are present (with `checkTitle` and `checkDone`) and return only those, so `{}` is a valid patch. Collect every problem, title first; anything that isn't an object gives only `"body must be a JSON object"`.
+2. **The last two routes.** `createApp` now mounts the whole `TodosApi`, and TypeScript says two handlers are missing:
+   - `PATCH /todos/:id`: find the to-do (a 404 if it doesn't exist), **then** parse the body with `parseOrThrow(parseTodoPatch, body)`, and return the updated to-do. That's the practice API's order: an unknown id is a 404 even when the body is bad too.
+   - `DELETE /todos/:id`: find the to-do (404), remove it and return `null`, which `mountApi` turns into a 204.
+3. **Two tests** instead of the `it.todo` lines:
+   - "PATCH changes only the fields it's sent": `PATCH /todos/2` with `{ done: true }` answers 200 with `{ id: 2, title: "Build the movie app", done: true }`, and a `GET /todos/2` afterwards gives the same to-do.
+   - "DELETE answers 204, then the to-do is gone": `DELETE /todos/3` answers 204, then `GET /todos/3` answers 404.
+
+The checks plant bugs in the ready-made repository and in `mountApi` to make sure your tests catch them. The last check sends the same requests to your server and to the practice API: every status and every body must match.
+
+<Hint>
+
+1. Start like `parseNewTodo`, then `const patch: TodoPatch = {};`. For each field: `if (input.title !== undefined) { const title = checkTitle(input.title, errors); if (title !== undefined) patch.title = title; }`, and the same for `done` with `checkDone`. Finish with `errors.length > 0 ? { ok: false, error: errors } : { ok: true, value: patch }`.
+2. `"PATCH /todos/:id": async ({ params, body }) => { const todo = await findTodo(params.id); const patch = parseOrThrow(parseTodoPatch, body); return (await repo.update(todo.id, patch)) ?? todo; }`. For `DELETE`, `await repo.remove(todo.id)` after `findTodo`, then `return null;`.
+3. `await api.delete("/todos/3").expect(204);` checks the status in one line; `toEqual` compares whole bodies.
+
+</Hint>
+
+<Solution>
+
+```ts
+import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+  type Router,
+} from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ========== shared/schemas.ts ==========
+// The schema library from Runtime Validation
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// What the server sends: the Todo type comes from the schema
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// ========== shared/contract.ts ==========
+// What clients send
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Every error answer, e.g. { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== server/parse.ts ==========
+// Each check returns the clean value, or adds a message to errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  errors.push("title is required");
+  return undefined;
+}
+
+function checkDone(
+  value: unknown,
+  errors: string[],
+): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  errors.push("done must be true or false");
+  return undefined;
+}
+
+function parseNewTodo(input: unknown): Result<NewTodo, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  let done: boolean | undefined;
+  if (input.done !== undefined) done = checkDone(input.done, errors);
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  // Copy only the fields we know: anything else is dropped
+  const todo: NewTodo = { title };
+  if (done !== undefined) todo.done = done;
+  return { ok: true, value: todo };
+}
+
+function parseTodoPatch(input: unknown): Result<TodoPatch, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const patch: TodoPatch = {};
+  if (input.title !== undefined) {
+    const title = checkTitle(input.title, errors);
+    if (title !== undefined) patch.title = title;
+  }
+  if (input.done !== undefined) {
+    const done = checkDone(input.done, errors);
+    if (done !== undefined) patch.done = done;
+  }
+  if (errors.length > 0) return { ok: false, error: errors };
+  return { ok: true, value: patch };
+}
+
+// ========== server/errors.ts ==========
+type ErrorStatus = 400 | 404 | 500;
+
+class HttpError extends Error {
+  readonly status: ErrorStatus;
+  constructor(status: ErrorStatus, message: string) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+// A bad body is a 400 that lists every problem
+function parseOrThrow<T>(
+  parse: (input: unknown) => Result<T, string[]>,
+  input: unknown,
+): T {
+  const result = parse(input);
+  if (!result.ok) throw new HttpError(400, result.error.join(", "));
+  return result.value;
+}
+
+// Express's own errors (e.g. broken JSON) carry a 4xx status
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+function errorHandler(
+  err: unknown,
+  req: Request,
+  res: Response<ErrorBody>,
+  _next: NextFunction,
+): void {
+  if (err instanceof HttpError || isClientError(err)) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  console.error("Unexpected:", String(err));
+  res.status(500).json({ error: "Something went wrong" });
+}
+
+// ========== server/repository.ts ==========
+// What the routes need from storage (async, like a database)
+interface TodoRepository {
+  list(): Promise<Todo[]>;
+  get(id: number): Promise<Todo | undefined>;
+  create(input: NewTodo): Promise<Todo>;
+  update(id: number, patch: TodoPatch): Promise<Todo | undefined>;
+  remove(id: number): Promise<boolean>;
+}
+
+// The same three to-dos the practice API starts with
+const STARTER_TODOS: Todo[] = [
+  { id: 1, title: "Learn fetch", done: true },
+  { id: 2, title: "Build the movie app", done: false },
+  { id: 3, title: "Eat some bamboo", done: false },
+];
+
+function createMemoryRepository(
+  start: Todo[] = STARTER_TODOS,
+): TodoRepository {
+  const todos = new Map<number, Todo>();
+  for (const todo of start) todos.set(todo.id, { ...todo });
+  let nextId = Math.max(0, ...todos.keys()) + 1;
+  return {
+    async list() {
+      return [...todos.values()];
+    },
+    async get(id) {
+      return todos.get(id);
+    },
+    async create(input) {
+      const todo: Todo = {
+        id: nextId++,
+        title: input.title,
+        done: input.done ?? false,
+      };
+      todos.set(todo.id, todo);
+      return todo;
+    },
+    async update(id, patch) {
+      const todo = todos.get(id);
+      if (!todo) return undefined;
+      const updated: Todo = { ...todo, ...patch };
+      todos.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return todos.delete(id);
+    },
+  };
+}
+
+// ========== server/mount-api.ts (from the Node module) ==========
+type RawRequest = { params: Record<string, string>; body: unknown };
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+
+function register(
+  router: Router,
+  method: string,
+  path: string,
+  handler: RequestHandler,
+): void {
+  if (method === "GET") router.get(path, handler);
+  else if (method === "POST") router.post(path, handler);
+  else if (method === "PATCH") router.patch(path, handler);
+  else if (method === "DELETE") router.delete(path, handler);
+  else throw new Error(`Unsupported method: ${method}`);
+}
+
+// POST answers 201, a null result 204, everything else 200
+function mountApi<Api extends Record<keyof Api, Endpoint>>(
+  router: Router,
+  handlers: Handlers<Api>,
+): void {
+  for (const route of Object.keys(handlers) as (keyof Api & string)[]) {
+    const [method, path] = route.split(" ");
+    const handler = handlers[route];
+    register(router, method, path, async (req, res) => {
+      const { params, body } = req;
+      const result = await handler({ params, body });
+      if (result === null) {
+        res.sendStatus(204);
+        return;
+      }
+      res.status(method === "POST" ? 201 : 200).json(result);
+    });
+  }
+}
+
+// ========== server/app.ts ==========
+function createApp(
+  repo: TodoRepository = createMemoryRepository(),
+): Application {
+  async function findTodo(idText: string): Promise<Todo> {
+    const todo = await repo.get(Number(idText));
+    if (!todo) throw new HttpError(404, "Todo not found");
+    return todo;
+  }
+
+  const router = express.Router();
+  mountApi<TodosApi>(router, {
+    "GET /todos": () => repo.list(),
+    "POST /todos": async ({ body }) =>
+      repo.create(parseOrThrow(parseNewTodo, body)),
+    "GET /todos/:id": ({ params }) => findTodo(params.id),
+    "PATCH /todos/:id": async ({ params, body }) => {
+      const todo = await findTodo(params.id);
+      const patch = parseOrThrow(parseTodoPatch, body);
+      return (await repo.update(todo.id, patch)) ?? todo;
+    },
+    "DELETE /todos/:id": async ({ params }) => {
+      const todo = await findTodo(params.id);
+      await repo.remove(todo.id);
+      return null;
+    },
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use(router);
+  app.use((req, res: Response<ErrorBody>) => {
+    res.status(404).json({ error: "Not found" });
+  });
+  app.use(errorHandler);
+  return app;
+}
+
+// ========== server/todos.test.ts ==========
+describe("todos API", () => {
+  let api: ReturnType<typeof request>;
+
+  beforeEach(() => {
+    api = request(createApp(createMemoryRepository()));
+  });
+
+  it("lists the starter to-dos, as the contract says", async () => {
+    const res = await api.get("/todos").expect(200);
+    const todos = array(TodoSchema).parse(res.body); // Todo[]
+    expect(todos.map((t) => t.title)).toEqual([
+      "Learn fetch",
+      "Build the movie app",
+      "Eat some bamboo",
+    ]);
+  });
+
+  it("creates a to-do with a trimmed title", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: "  Nap  " })
+      .expect(201);
+    expect(TodoSchema.parse(res.body)).toEqual({
+      id: 4,
+      title: "Nap",
+      done: false,
+    });
+  });
+
+  it("lists every problem with a body", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: " ", done: "yes" })
+      .expect(400);
+    const body: ErrorBody = res.body;
+    expect(body).toEqual({
+      error: "title is required, done must be true or false",
+    });
+  });
+
+  it("answers 404 for a to-do that doesn't exist", async () => {
+    const res = await api.get("/todos/99").expect(404);
+    expect(res.body).toEqual({ error: "Todo not found" });
+  });
+
+  it("hides the details when the database fails", async () => {
+    const broken: TodoRepository = {
+      ...createMemoryRepository(),
+      list: async () => {
+        throw new Error("Database is down");
+      },
+    };
+    const res = await request(createApp(broken)).get("/todos");
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: "Something went wrong" });
+  });
+
+  it("PATCH changes only the fields it's sent", async () => {
+    const res = await api.patch("/todos/2").send({ done: true });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      id: 2,
+      title: "Build the movie app",
+      done: true,
+    });
+    const saved = await api.get("/todos/2");
+    expect(saved.body).toEqual(res.body);
+  });
+
+  it("DELETE answers 204, then the to-do is gone", async () => {
+    await api.delete("/todos/3").expect(204);
+    await api.get("/todos/3").expect(404);
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- A **design note** for the to-do API, worked out from how the existing API behaves.
+- **Shared schemas**, where `Todo` comes from `TodoSchema`, and a **contract** (`NewTodo`, `TodoPatch`, `ErrorBody`, `TodosApi`) that the server and the web app both import.
+- **Parsers** that turn unknown request bodies into typed data, trimming titles, dropping unknown fields and listing every problem.
+- An Express server with **typed errors** and one error handler, a **repository behind an interface**, and routes that `mountApi` checks against the contract.
+- **Tests** that check every answer against the shared schema, and a fake repository that proves failures stay polite.
+- A server that answers **exactly** like the practice API, so in [Part 2](/learn/typescript/the-typed-client) you can build the client against the practice API, knowing it would work just the same with yours.

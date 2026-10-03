@@ -1,0 +1,1487 @@
+---
+title: "Part 1: Designing the SDK"
+description: "Write a design doc for a typed SDK, describe a whole API in one object, derive every type from it, brand the ids, pin the design down with type tests and turn input into requests."
+duration: 25
+xp: 30
+---
+
+Welcome to the **Level 3 capstone**, the final project of the whole TypeScript course! 🎓 Over three parts you'll design, build and ship **`@pandadev/sdk`**, a type-safe SDK for PandaDev's practice API: its movies, users, posts and to-dos. An SDK (software development kit) is the package a company publishes so that other developers can use its API without reading HTTP docs: think `stripe`, `@octokit/rest` or `openai` on npm.
+
+An SDK is the perfect senior project, because its users are **other developers**, and for them the types **are** the user interface. Get them right and people discover the API through autocomplete, and mistakes show up as red squiggles instead of 400 errors in production. Here's the promise we'll keep: **if your code compiles, it sends requests the API understands, and everything that comes back has been checked.**
+
+| Part | What we build | Lessons it uses |
+| --- | --- | --- |
+| 1 | The design doc, one description of the API, every type derived from it, branded ids, type tests, requests built from input | [Template Literal Types](/learn/typescript/template-literal-types), [Mapped Types](/learn/typescript/mapped-types), [Conditional Types & infer](/learn/typescript/conditional-types-and-infer), [Branded Types & Type-Safe APIs](/learn/typescript/branded-types-and-type-safe-apis), [Variance & Inference](/learn/typescript/variance-and-inference) |
+| 2 | `createClient`: typed errors, retries with backoff, pagination as an async iterator, hooks, tests | [Designing Types for Large Codebases](/learn/typescript/designing-types-for-large-codebases), [Typed Fetch](/learn/typescript/typed-fetch), [Dependency Injection & Fakes](/learn/typescript/dependency-injection-and-fakes) |
+| 3 | A polished public API, type tests for all of it, and a package ready for npm | [API Design & Migrations](/learn/typescript/api-design-and-migrations), [Building & Publishing Packages](/learn/typescript/building-and-publishing-packages), [Testing Types](/learn/typescript/testing-types) |
+
+As in the earlier capstones, the code grows from part to part: each part's exercise starts with the finished code of the part before, and the names stay the same all the way through.
+
+## Start with a design doc
+
+You've built typed clients before. In [Sharing Types Between Client and Server](/learn/typescript/sharing-types-between-client-and-server) a contract **type** described your own API and the client trusted the server with one cast; in the [Level 2 capstone](/learn/typescript/the-typed-client) the client validated every answer with shared schemas. An SDK for a **public** API is the grown-up version of both, with new problems: thousands of strangers will call it, from TypeScript **and** plain JavaScript, on flaky networks, and every change to its types is a change to its users' builds. So we start the senior way, with a short **design doc**.
+
+### Goals and non-goals
+
+**Goals for 1.0:**
+
+- Cover the practice API's movies (with search and pages), users, posts and to-dos (with create, update and delete).
+- **One description of the API** is the single source of truth: methods, paths, path params, query, body and response are written down once, and every type is derived from it.
+- **Typed input:** a misspelt query option, a missing path param or a to-do id passed where a movie id belongs doesn't compile.
+- **Checked output:** every response is validated at runtime. We don't deploy this API, so we don't trust it.
+- **Expected failures are values:** a `Result` with a typed, discriminated `ApiError`, never a surprise exception.
+- **Resilient:** safe requests are retried with backoff; pages can be walked with `for await`.
+- **Zero runtime dependencies**, ESM only, runs anywhere `fetch` does (browsers, Node 20+, edge runtimes).
+
+**Non-goals for 1.0:** caching, authentication flows, React hooks, the weather and recipe endpoints, and generating code from an OpenAPI file. Writing non-goals down is what stops a 1.0 from never shipping; it also gives everyone a list to argue about for 1.1.
+
+### The call site first
+
+Seniors design an SDK from the **outside in**: write the README example first, then build what it needs. If the example is awkward, the design is wrong, and that's far cheaper to find out now than after 1.0. Here's ours:
+
+```ts
+import { createPandaClient, paginate, MovieId } from "@pandadev/sdk";
+
+const panda = createPandaClient();
+
+const id = MovieId.parse(1); // a checked, branded id
+const movie = await panda.getMovie({ params: { id } });
+if (movie.ok) {
+  console.log(movie.value.title); // string, checked at runtime
+} else {
+  console.log(movie.error.kind); // "network" | "http" | ...
+}
+
+await panda.createTodo({ body: { title: "Ship the SDK" } });
+
+const dramas = paginate(panda.searchMovies, { genre: "drama" });
+for await (const film of dramas) {
+  console.log(film.title); // every page, fetched as you go
+}
+```
+
+Every call takes **one object** with up to three named parts, `params`, `query` and `body`, the same shape as the contract client in Level 2. Named parts can't be mixed up, adding an optional part later breaks nobody, and the three never clash, even if a path param and a query option share a name.
+
+### Decisions and trade-offs
+
+| Decision | Instead of | Why |
+| --- | --- | --- |
+| One **description object**, types derived from it | Hand-written methods and types | Two copies drift apart; one doesn't. Adding an endpoint is one entry. |
+| Our own description | Generating code from an **OpenAPI** file | The practice API publishes no OpenAPI file. When an API does, generators such as openapi-typescript use exactly the type tricks in this lesson. |
+| **Validate every response** | Trusting the server with a cast | We don't control deploys of this API. A schema turns drift into one clear error with a path, at the edge. |
+| `Result` for expected failures, **throw** for bugs | Throwing everything, or `Result` for everything | Callers must handle 404s and timeouts, so they're values. Bad input from a caller is a bug in their code, so it throws, like a `TypeError`. |
+| **Branded ids** (`MovieId`, `TodoId`) | Plain numbers | `getMovie` with a to-do's id is a bug we can rule out at compile time, for free. |
+| Our tiny schema library | zod or valibot | Zero dependencies for users. A real 1.x might accept any **Standard Schema** library instead, so users can bring their own. |
+
+One distinction from the table deserves a second look. In Level 2, a response that failed its schema was an `"invalid"` error. In an SDK, **invalid what?** matters: bad **input** is the caller's bug and throws a `ValidationError` before anything is sent, while a bad **response** means the API drifted, and becomes an `{ kind: "invalid-response" }` error value that the caller can show or report. Two causes, two owners, two mechanisms.
+
+## Schemas, one more time
+
+Responses are checked with the schema library you built in [Runtime Validation](/learn/typescript/runtime-validation): a `Schema<T>` has a `parse` method that turns `unknown` into a `T` or throws a `ValidationError` with a path, and `Infer<typeof schema>` reads the type back out. An SDK needs one thing that library couldn't do: **optional fields**. Query options like `search` and bodies like a to-do patch are full of them.
+
+Level 2's `object()` mapped every key to `Infer<...>`, so a field whose schema allows `undefined` was still a **required** key:
+
+```ts
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+type NewTodo = Infer<typeof NewTodo>;
+
+const draft: NewTodo = { title: "Nap" };
+// ❌ Error: Property 'done' is missing in type '{ title: string; }' but required in type '{ title: string; done: boolean | undefined; }'.
+```
+
+The fix uses two tools from [Mapped Types](/learn/typescript/mapped-types). `optional()` marks its schema with `optional: true`, and the type of an object splits its keys into two mapped types, one without `?` and one with it. `Simplify` from [Building Your Own Utility Types](/learn/typescript/building-utility-types) merges them back into one readable object:
+
+<CodeExample output={`{ title: 'Nap' }
+{ title: 'Nap', done: true }
+body.done: expected a boolean, got "yes"`}>
+
+```ts
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = {
+  parse: (value: unknown, path?: string) => T;
+  optional?: true; // set only by optional()
+};
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function optional<T>(
+  schema: Schema<T>,
+): Schema<T | undefined> & { optional: true } {
+  return {
+    optional: true,
+    parse: (value, path) =>
+      value === undefined ? undefined : schema.parse(value, path),
+  };
+}
+
+type Shape = Record<string, Schema<unknown>>;
+type OptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K] extends { optional: true } ? K : never;
+}[keyof S];
+type ObjectOf<S extends Shape> = Simplify<
+  { [K in Exclude<keyof S, OptionalKeys<S>>]: Infer<S[K]> } & {
+    [K in OptionalKeys<S>]?: Infer<S[K]>;
+  }
+>;
+
+function object<S extends Shape>(shape: S): Schema<ObjectOf<S>> {
+  return {
+    parse(value, path = "") {
+      if (typeof value !== "object" || value === null) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const input = value as Record<string, unknown>;
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        const parsed = shape[key].parse(input[key], where);
+        if (parsed !== undefined) result[key] = parsed;
+      }
+      return result as ObjectOf<S>;
+    },
+  };
+}
+
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+type NewTodo = Infer<typeof NewTodo>;
+// { title: string; done?: boolean | undefined }
+
+const draft: NewTodo = { title: "Nap" }; // done may be left out
+console.log(NewTodo.parse(draft));
+console.log(NewTodo.parse({ title: "Nap", done: true, admin: true }));
+try {
+  NewTodo.parse({ title: "Nap", done: "yes" }, "body");
+} catch (error) {
+  if (error instanceof ValidationError) console.log(error.message);
+}
+```
+
+</CodeExample>
+
+`OptionalKeys` is the `{ ... }[keyof S]` idiom from [Template Literal Types](/learn/typescript/template-literal-types): build an object with one entry per key, then index it to get the union of the keys whose schema says `optional: true`. At runtime `object()` leaves out keys whose value is `undefined`, so `{ title: 'Nap' }` doesn't grow a `done: undefined`, and the request bodies we send later stay clean. And as before, keys that aren't in the shape (`admin`) never get in.
+
+There's one more small schema: a `DELETE` answers **204 No Content**, which the client reads as `null`, so `nothing()` accepts exactly `null`, like in the Level 2 capstone.
+
+## Branded ids, parsed at the edge
+
+The practice API's ids are all numbers. Movie 3 and to-do 3 are different things, but a `number` can't tell them apart, so `panda.getMovie({ params: { id: todo.id } })` would compile and quietly fetch the wrong thing. That's the bug [Branded Types & Type-Safe APIs](/learn/typescript/branded-types-and-type-safe-apis) is all about, and our schemas give us the perfect place for the brand: a **smart constructor** that is also a schema.
+
+<CodeExample output={`/movies/42 43
+params.id: expected a TodoId, got 0
+params.id: expected a TodoId, got 1.5
+params.id: expected a TodoId, got "7"`}>
+
+```ts
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+// A schema for ids, and the only way to make one
+function brandedId<Name extends string>(
+  name: Name,
+): Schema<Brand<number, Name>> {
+  return {
+    parse(value, path = "") {
+      const ok =
+        typeof value === "number" &&
+        Number.isSafeInteger(value) &&
+        value > 0;
+      if (!ok) throw new ValidationError(path, `a ${name}`, value);
+      return value as Brand<number, Name>; // checked just above
+    },
+  };
+}
+
+// One name for the schema (a value) and the type it produces
+const MovieId = brandedId("MovieId");
+type MovieId = Infer<typeof MovieId>;
+const TodoId = brandedId("TodoId");
+type TodoId = Infer<typeof TodoId>;
+
+function moviePath(id: MovieId): string {
+  return `/movies/${id}`;
+}
+
+// An id from outside (a URL, a form) goes through parse once
+const fromUrl = "42";
+const id = MovieId.parse(Number(fromUrl));
+console.log(moviePath(id), id + 1);
+
+for (const bad of [0, 1.5, "7"]) {
+  try {
+    TodoId.parse(bad, "params.id");
+  } catch (error) {
+    if (error instanceof ValidationError) console.log(error.message);
+  }
+}
+```
+
+</CodeExample>
+
+- **`MovieId` is a value and a type.** The value is the schema (and the only way to make an id); the type is what it produces. Same name, different namespaces: the same trick as zod's `const Movie = z.object(...)` / `type Movie = z.infer<typeof Movie>`.
+- **Ids from responses arrive branded for free.** The `Movie` schema uses `id: MovieId`, so `movie.id` is a `MovieId`, `todo.id` is a `TodoId`, and the ids flow from one call to the next without anybody parsing them again.
+- **Ids from outside go through `parse` once.** A number from a URL or a form is just a `number` until `MovieId.parse` has checked it. `id + 1` is a plain `number` again: arithmetic drops brands on purpose.
+
+Now the mix-up is a compile error, and so is skipping the check:
+
+```ts
+panda.getMovie({ params: { id: todo.id } });
+// ❌ Error: Type 'Brand<number, "TodoId">' is not assignable to type 'Brand<number, "MovieId">'.
+
+panda.getMovie({ params: { id: 1 } });
+// ❌ Error: Type 'number' is not assignable to type 'Brand<number, "MovieId">'.
+```
+
+<Callout type="warning" title="Don't ship a forging kit">
+
+Users will be tempted to write `1 as MovieId`. In your own code review, treat that as a bug. In an SDK, make the honest way the easy way: `MovieId.parse(1)` is just as short, it's documented in the README, and it says something true. A brand that's forged with `as` all over a codebase is worse than no brand, because unchecked values now **look** checked.
+
+</Callout>
+
+## One description for the whole API
+
+Now the heart of the design. The contract in Level 2's [Sharing Types](/learn/typescript/sharing-types-between-client-and-server) lesson was a **type**, so it vanished at runtime and the client had to trust the server. Our description is a **value**: each endpoint has a method, a path, schemas for its params, query and body, and a schema for its response. The client reads it at runtime to build requests and check answers, and the compiler reads its **type** to derive every method's signature.
+
+How we declare it matters as much as what's in it. You know the three options from [Variance & Inference](/learn/typescript/variance-and-inference):
+
+- An **annotation**, `const pandaApi: ApiDescription = { ... }`, checks the object and then forgets it: the keys become `string` and the paths become `` `/${string}` ``. A client derived from that type has a method for every possible string, so `panda.getMovei()` compiles. Useless.
+- **`as const satisfies ApiDescription`** checks the object **and** keeps every key and literal. That works.
+- A **`defineApi` function** with a `const` type parameter does the same as `as const satisfies`, and it can check one more thing that `satisfies` can't: that each endpoint's `params` match the `:params` in **its own** path.
+
+That extra check reuses `ParamNames` from [Template Literal Types](/learn/typescript/template-literal-types), which reads parameter names out of a path string:
+
+<CodeExample output={`GET    /movies/:id getMovie
+GET    /todos      listTodos
+PATCH  /todos/:id  updateTodo`}>
+
+```ts
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+// Stand-ins for real schemas, to keep the example short
+const id: Schema<number> = { parse: (value) => Number(value) };
+const json: Schema<unknown> = { parse: (value) => value };
+
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface Endpoint {
+  method: Method;
+  path: `/${string}`;
+  params?: Record<string, Schema<unknown>>;
+  body?: Schema<unknown>;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+type ParamNames<P extends string> =
+  P extends `${string}:${infer Name}/${infer Rest}`
+    ? Name | ParamNames<Rest>
+    : P extends `${string}:${infer Name}`
+      ? Name
+      : never;
+
+type ParamsFor<P extends string> = [ParamNames<P>] extends [never]
+  ? {}
+  : { params: Record<ParamNames<P>, Schema<string | number>> };
+
+type CheckParams<A extends ApiDescription> = {
+  [K in keyof A]: ParamsFor<A[K]["path"]>;
+};
+
+function defineApi<const A extends ApiDescription>(
+  api: A & CheckParams<A>,
+): A {
+  return api;
+}
+
+const api = defineApi({
+  getMovie: {
+    method: "GET",
+    path: "/movies/:id",
+    params: { id },
+    response: json,
+  },
+  listTodos: { method: "GET", path: "/todos", response: json },
+  updateTodo: {
+    method: "PATCH",
+    path: "/todos/:id",
+    params: { id },
+    body: json,
+    response: json,
+  },
+});
+
+// The literal types survived: we can compute with them
+type Api = typeof api;
+type Route = {
+  [K in keyof Api]: `${Api[K]["method"]} ${Api[K]["path"]}`;
+};
+
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamNames<"/users/:userId/posts/:postId">,
+    "userId" | "postId">>,
+  Expect<Equal<Route["updateTodo"], "PATCH /todos/:id">>,
+  Expect<Equal<keyof Api, "getMovie" | "listTodos" | "updateTodo">>,
+];
+
+for (const [name, { method, path }] of Object.entries(api)) {
+  console.log(method.padEnd(6), path.padEnd(11), name);
+}
+```
+
+</CodeExample>
+
+The parameter type is `A & CheckParams<A>`. TypeScript infers `A` from the object you wrote (the `const` keeps every literal), then checks the same object against `CheckParams<A>`, a mapped type that demands a `params` entry with one schema per `:name` in each path. So a renamed param, a forgotten `params` or a made-up method fails right where you typed it:
+
+```ts
+getMovie: {
+  method: "GET",
+  path: "/movies/:id",
+  params: { movieId: MovieId },
+  // ❌ Error: Type '{ movieId: Schema<Brand<number, "MovieId">>; }' is not assignable to type '{ readonly movieId: Schema<Brand<number, "MovieId">>; } & Record<"id", Schema<string | number>>'.
+  response: Movie,
+},
+listTodos: { method: "FETCH", path: "/todos", response: array(Todo) },
+// ❌ Error: Type '"FETCH"' is not assignable to type 'Method'.
+```
+
+Read the first message to its end: `Record<"id", ...>` says the path wants an `id`. Not the friendliest message in the world, but it points at the right line, and only the SDK's own authors ever see it.
+
+The type tests in the example deserve a note too. `Route` builds `"PATCH /todos/:id"` from the description's literal types: proof that nothing was widened on the way. If someone "simplifies" `defineApi` and drops the `const`, `Equal` fails at once.
+
+## Deriving the types
+
+With the description in place, every type the users see is a **derivation**. Input first. Each endpoint contributes up to three parts, and each part is a conditional type with `infer` from [Conditional Types & infer](/learn/typescript/conditional-types-and-infer):
+
+```ts
+type ParamsInput<E> = E extends { params: infer P extends Shape }
+  ? { params: ObjectOf<P> }
+  : {};
+```
+
+Read it as: "if the endpoint has `params`, capture their shape as `P` and require `{ params: ... }` with the type each schema produces; otherwise contribute nothing". `infer P extends Shape` (TypeScript 4.7) captures and constrains in one go, so `ObjectOf<P>` is allowed. `QueryInput` and `BodyInput` follow the same pattern, with one twist for the query: when **every** query field is optional, the whole `query` should be optional too. The test for that is `{} extends Infer<Q>`: if an empty object is a valid query, nobody has to pass one.
+
+The three parts are glued together and flattened:
+
+```ts
+type Input<E extends Endpoint> = Simplify<
+  ParamsInput<E> & QueryInput<E> & BodyInput<E>
+>;
+type Output<E extends Endpoint> = Infer<E["response"]>;
+
+// No required input: the argument may be left out
+type InputArgs<E extends Endpoint> = {} extends Input<E>
+  ? [input?: Input<E>]
+  : [input: Input<E>];
+
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: (
+    ...input: InputArgs<A[K]>
+  ) => Promise<Result<Output<A[K]>, ApiError>>;
+};
+```
+
+- **`InputArgs`** is the rest-tuple trick from the typed translator in [Template Literal Types](/learn/typescript/template-literal-types): `panda.listTodos()` needs no argument at all, while `panda.getMovie()` without its params is an error.
+- **`Client<A>`** is one homomorphic mapped type: one method per endpoint, each with its own input and output. Because it maps over `keyof A`, it even keeps the description's JSDoc comments, so a comment on the `getMovie` entry shows up when users hover `panda.getMovie`.
+- **`Result` and `ApiError`** are designed now, before any code exists. A design doc that spells out the failure types is how a team agrees on error handling before it's too late.
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+```
+
+Here's what users get from all that, for free, on every endpoint:
+
+```ts
+panda.getMovie();
+// ❌ Error: Expected 1 arguments, but got 0.
+
+panda.searchMovies({ query: { limit: "5" } });
+// ❌ Error: Type 'string' is not assignable to type 'number'.
+
+panda.createTodo({ body: { done: true } });
+// ❌ Error: Property 'title' is missing in type '{ done: true; }' but required in type '{ title: string; done?: boolean | undefined; }'.
+
+const movie = await panda.getMovie({ params: { id } });
+movie.value;
+// ❌ Error: Property 'value' does not exist on type 'Result<{ id: Brand<number, "MovieId">; title: string; year: number; director: string; genres: string[]; rating: number; minutes: number; }, ApiError>'.
+```
+
+That last message shows a design decision paying off. Because `Output` comes from the schema, the hover shows the real shape of a movie, not a name you'd have to look up.
+
+<Quiz
+  question="In the description, searchMovies has a query schema where every field is optional(...). With the lesson's InputArgs, which call compiles?"
+  options={[
+    "Only panda.searchMovies({ query: {} })",
+    "panda.searchMovies() and panda.searchMovies({ query: { genre: 'drama' } })",
+    "Only panda.searchMovies({ query: { search: '', genre: '', page: 1, limit: 5 } })",
+    "None: query options must be passed as a second argument",
+  ]}
+  answer={1}
+  explanation="{} extends Infer<Q> is true when every query field is optional, so QueryInput gives { query?: ... }. Then nothing in Input is required, {} extends Input<E> is true too, and InputArgs makes the whole argument optional. A query with only some fields set is fine as well."
+/>
+
+## Type tests are the spec
+
+The derived types are the SDK's real product, so they get tests like any product. You know the tools from [Testing Types](/learn/typescript/testing-types): `Expect<Equal<A, B>>` for "this type is exactly that", and `// @ts-expect-error` for "this call must **not** compile". Together they turn the bullet points of the design doc into something the compiler checks on every change:
+
+```ts
+type _tests = [
+  Expect<Equal<Input<PandaApi["getMovie"]>,
+    { params: { id: MovieId } }>>,
+  Expect<Equal<Input<PandaApi["updateTodo"]>, {
+    params: { id: TodoId };
+    body: { title?: string; done?: boolean };
+  }>>,
+  Expect<Equal<Output<PandaApi["deleteTodo"]>, null>>,
+];
+
+async function typeTests(panda: Client<PandaApi>, todo: Todo) {
+  await panda.listTodos(); // nothing required, so no argument
+  // @ts-expect-error: a TodoId is not a MovieId
+  await panda.getMovie({ params: { id: todo.id } });
+}
+```
+
+The `typeTests` function is never called: its body only exists for the compiler. Two habits from this module make type tests worth having:
+
+- **Test the failure cases.** Every `// @ts-expect-error` line is a promise from the design doc ("mixing up ids doesn't compile"). If a refactor makes `Client` too loose, say `any` sneaks in, the line compiles, and TypeScript reports *Unused '@ts-expect-error' directive.* The happy-path lines alone would never notice.
+- **Pin exact shapes with `Equal`.** `Equal` is strict on purpose: `{ title?: string }` and `{ title: string | undefined }` are different types, and an intersection is different from its flattened version. That's what caught the Level 2 `object()` problem earlier, and it's why `Input` ends in `Simplify`.
+
+## From input to request
+
+The last piece of Part 1 is the first piece of runtime code: `buildRequest(baseUrl, endpoint, input)` turns a description entry and the caller's input into a plain request object, `{ method, url, headers, body }`. It doesn't send anything, so it's easy to test, and in Part 2 the client will hand its result to `fetch`.
+
+Its signature shows a pattern you saw in the typed event emitter of [Template Literal Types](/learn/typescript/template-literal-types): a **precise surface over a loosely typed inside**. Callers never call `buildRequest` directly; they call `panda.getMovie(...)`, whose types are precise. Inside, the input is just `RawInput`, `{ params?: Record<string, unknown>; query?: unknown; body?: unknown }`, and every part is checked with its schema at runtime. That's not paranoia: the SDK will be called from plain JavaScript (where nothing checks types) and from TypeScript with an `as any` here and there, and a clear `ValidationError` before anything is sent beats a 400 from the server.
+
+Filling in the path params shows both halves. Here's the same idea as a small function, typed for its callers with `ParamNames`:
+
+<CodeExample output={`/movies/7
+/users/1/posts/2
+/tags/sci-fi%20%26%20drama%2F2
+/todos`}>
+
+```ts
+type ParamNames<P extends string> =
+  P extends `${string}:${infer Name}/${infer Rest}`
+    ? Name | ParamNames<Rest>
+    : P extends `${string}:${infer Name}`
+      ? Name
+      : never;
+
+// Precise for callers, a plain Record inside
+function fillPath<P extends string>(
+  path: P,
+  params: Record<ParamNames<P>, string | number>,
+): string {
+  const values: Record<string, string | number> = params;
+  return path.replace(/:(\w+)/g, (_, name: string) =>
+    encodeURIComponent(String(values[name])),
+  );
+}
+
+console.log(fillPath("/movies/:id", { id: 7 }));
+console.log(fillPath("/users/:userId/posts/:postId", {
+  userId: 1,
+  postId: 2,
+}));
+console.log(fillPath("/tags/:name", { name: "sci-fi & drama/2" }));
+console.log(fillPath("/todos", {}));
+```
+
+</CodeExample>
+
+`encodeURIComponent` is not optional: without it, `"sci-fi & drama/2"` would turn into an extra path segment and a broken URL. Callers get a precise type, `Record<"id", string | number>` for `"/movies/:id"`; inside, `values` is a plain `Record<string, ...>`, and the regular expression finds the names. A wrong name is caught where it's written:
+
+```ts
+fillPath("/movies/:id", { movieId: 7 });
+// ❌ Error: Object literal may only specify known properties, and 'movieId' does not exist in type 'Record<"id", string | number>'.
+```
+
+`buildRequest` does the same with the endpoint's `params` schemas, so the values are checked too (`params.id: expected a MovieId, got "7"`). Then it adds the query and the body:
+
+- **Query:** parse `input.query ?? {}` with the endpoint's query schema (path `"query"`), put every value into a `URLSearchParams` and append `?...` only if there's something in it. Because `object()` drops `undefined` values, `{ search: undefined, limit: 2 }` becomes just `?limit=2`.
+- **Body:** parse `input.body` with the body schema (path `"body"`), send it as JSON, and add a `Content-Type: application/json` header. Every request also asks for JSON with `Accept: application/json`.
+
+<Quiz
+  question="A JavaScript user (no type checking) calls panda.getMovie({ params: { id: '7' } }). What should the SDK do, according to the design doc?"
+  options={[
+    "Send /movies/7 anyway; the server will figure it out",
+    "Throw a ValidationError ('params.id: expected a MovieId, got \"7\"') before sending anything, because bad input is a bug in the caller's code",
+    "Return { ok: false, error: { kind: 'invalid-response' } }",
+    "Convert '7' to the number 7 and carry on silently",
+  ]}
+  answer={1}
+  explanation="Bad input is the caller's bug, so it throws, like a TypeError, and nothing goes over the network. Error values are for expected failures that a correct program must handle, such as a 404 or a broken connection. invalid-response is reserved for answers that break their schema. Silently converting would hide the bug and make the brand meaningless."
+/>
+
+<Exercise
+  title="Build it: The API description and its types"
+  language="typescript"
+  starter={`import { describe, it, expect } from "vitest";
+
+// ---------- schemas: Level 2's library, grown up ----------
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = {
+  parse: (value: unknown, path?: string) => T;
+  optional?: true;
+};
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+// 204 No Content: the client reads it as null
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function optional<T>(
+  schema: Schema<T>,
+): Schema<T | undefined> & { optional: true } {
+  return {
+    optional: true,
+    parse: (value, path) =>
+      value === undefined ? undefined : schema.parse(value, path),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+// The keys whose schema is optional(...)
+type OptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K] extends { optional: true } ? K : never;
+}[keyof S];
+type ObjectOf<S extends Shape> = Simplify<
+  { [K in Exclude<keyof S, OptionalKeys<S>>]: Infer<S[K]> } & {
+    [K in OptionalKeys<S>]?: Infer<S[K]>;
+  }
+>;
+
+function object<S extends Shape>(shape: S): Schema<ObjectOf<S>> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        const parsed = shape[key].parse(value[key], where);
+        if (parsed !== undefined) result[key] = parsed;
+      }
+      // every key was checked, so this cast is safe
+      return result as ObjectOf<S>;
+    },
+  };
+}
+
+// ---------- branded ids ----------
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+// A schema for ids, and the only way to make one
+function brandedId<Name extends string>(
+  name: Name,
+): Schema<Brand<number, Name>> {
+  return primitive(
+    \`a \${name}\`,
+    (v): v is Brand<number, Name> =>
+      typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+  );
+}
+
+// ---------- the practice API's data ----------
+const MovieId = brandedId("MovieId");
+type MovieId = Infer<typeof MovieId>;
+const TodoId = brandedId("TodoId");
+type TodoId = Infer<typeof TodoId>;
+const UserId = brandedId("UserId");
+type UserId = Infer<typeof UserId>;
+const PostId = brandedId("PostId");
+type PostId = Infer<typeof PostId>;
+
+const Movie = object({
+  id: MovieId,
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof Movie>;
+
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+function page<T>(item: Schema<T>): Schema<Page<T>> {
+  return object({
+    page: number(),
+    totalPages: number(),
+    total: number(),
+    results: array(item),
+  });
+}
+
+const User = object({
+  id: UserId,
+  name: string(),
+  username: string(),
+  email: string(),
+});
+type User = Infer<typeof User>;
+
+const Post = object({
+  id: PostId,
+  userId: UserId,
+  title: string(),
+  likes: number(),
+});
+type Post = Infer<typeof Post>;
+
+const Todo = object({ id: TodoId, title: string(), done: boolean() });
+type Todo = Infer<typeof Todo>;
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+const TodoPatch = object({
+  title: optional(string()),
+  done: optional(boolean()),
+});
+
+// ---------- the API description ----------
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface Endpoint {
+  method: Method;
+  path: \`/\${string}\`;
+  params?: Shape;
+  query?: Schema<object>;
+  body?: Schema<unknown>;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// TODO: "/users/:userId/posts/:postId" -> "userId" | "postId",
+// and never for a path without :params
+type ParamNames<P extends string> = never;
+
+// A path with :params needs one schema per param
+type ParamsFor<P extends string> = [ParamNames<P>] extends [never]
+  ? {}
+  : { params: Record<ParamNames<P>, Schema<string | number>> };
+
+type CheckParams<A extends ApiDescription> = {
+  [K in keyof A]: ParamsFor<A[K]["path"]>;
+};
+
+function defineApi<const A extends ApiDescription>(
+  api: A & CheckParams<A>,
+): A {
+  return api;
+}
+
+const pandaApi = defineApi({
+  getMovie: {
+    method: "GET",
+    path: "/movies/:id",
+    params: { id: MovieId },
+    response: Movie,
+  },
+  searchMovies: {
+    method: "GET",
+    path: "/movies",
+    query: object({
+      search: optional(string()),
+      genre: optional(string()),
+      page: optional(number()),
+      limit: optional(number()),
+    }),
+    response: page(Movie),
+  },
+  listTodos: {
+    method: "GET",
+    path: "/todos",
+    response: array(Todo),
+  },
+  // TODO: getUser, listPosts, createTodo, updateTodo, deleteTodo
+});
+type PandaApi = typeof pandaApi;
+
+// ---------- types derived from the description ----------
+// TODO: { params: ... } with the type of each param, or {}
+// when the endpoint has no params
+type ParamsInput<E> = { params?: Record<string, unknown> };
+// TODO: { query?: ... } ({ query: ... } if a query field is
+// required), or {} when the endpoint has no query
+type QueryInput<E> = { query?: unknown };
+// TODO: { body: ... }, or {} when the endpoint has no body
+type BodyInput<E> = { body?: unknown };
+
+type Input<E extends Endpoint> = Simplify<
+  ParamsInput<E> & QueryInput<E> & BodyInput<E>
+>;
+type Output<E extends Endpoint> = Infer<E["response"]>;
+// No required input: the argument may be left out
+type InputArgs<E extends Endpoint> = {} extends Input<E>
+  ? [input?: Input<E>]
+  : [input: Input<E>];
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+// TODO: one method per endpoint, typed from the description
+type Client<A extends ApiDescription> = Record<
+  keyof A,
+  (input?: RawInput) => Promise<Result<unknown, ApiError>>
+>;
+
+// ---------- from input to request ----------
+interface SdkRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+// Inside the SDK, input is loosely typed (and checked at runtime)
+type RawInput = {
+  params?: Record<string, unknown>;
+  query?: unknown;
+  body?: unknown;
+};
+
+function buildRequest(
+  baseUrl: string,
+  endpoint: Endpoint,
+  input: RawInput = {},
+): SdkRequest {
+  // TODO: fill in the :params, add the query string and the
+  // JSON body, checking each part with its schema
+  throw new Error("Not written yet");
+}
+
+// ---------- tests ----------
+const BASE = "https://api.pandadev.test";
+
+describe("buildRequest", () => {
+  it("fills in path params", () => {
+    const request = buildRequest(BASE, pandaApi.getMovie, {
+      params: { id: 7 },
+    });
+    expect(request).toEqual({
+      method: "GET",
+      url: \`\${BASE}/movies/7\`,
+      headers: { Accept: "application/json" },
+    });
+  });
+
+  it("adds only the query values that are set", () => {
+    const request = buildRequest(BASE, pandaApi.searchMovies, {
+      query: { search: "bamboo & tea", page: undefined, limit: 2 },
+    });
+    expect(request.url).toBe(
+      \`\${BASE}/movies?search=bamboo+%26+tea&limit=2\`,
+    );
+    const all = buildRequest(BASE, pandaApi.searchMovies);
+    expect(all.url).toBe(\`\${BASE}/movies\`);
+  });
+
+  it("sends the body as JSON", () => {
+    const request = buildRequest(BASE, pandaApi.updateTodo, {
+      params: { id: 2 },
+      body: { done: true },
+    });
+    expect(request.method).toBe("PATCH");
+    expect(request.url).toBe(\`\${BASE}/todos/2\`);
+    expect(request.body).toBe('{"done":true}');
+    expect(request.headers["Content-Type"]).toBe("application/json");
+  });
+
+  it("checks every part of the input before sending", () => {
+    expect(() =>
+      buildRequest(BASE, pandaApi.getMovie, { params: { id: "7" } }),
+    ).toThrow('params.id: expected a MovieId, got "7"');
+    expect(() =>
+      buildRequest(BASE, pandaApi.createTodo, { body: { title: 5 } }),
+    ).toThrow("body.title: expected a string, got 5");
+  });
+});
+
+describe("brandedId", () => {
+  // TODO: test the smart constructor. MovieId.parse accepts a
+  // positive whole number and refuses 0, negative numbers,
+  // fractions and strings, with a ValidationError
+});
+
+// ---------- type tests: don't change them ----------
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamNames<"/users/:userId/posts/:postId">,
+    "userId" | "postId">>,
+  Expect<Equal<ParamNames<"/todos">, never>>,
+  Expect<Equal<Input<PandaApi["getMovie"]>,
+    { params: { id: MovieId } }>>,
+  Expect<Equal<Input<PandaApi["listPosts"]>,
+    { query?: { userId?: UserId } }>>,
+  Expect<Equal<Input<PandaApi["updateTodo"]>, {
+    params: { id: TodoId };
+    body: { title?: string; done?: boolean };
+  }>>,
+  Expect<Equal<Input<PandaApi["listTodos"]>, {}>>,
+  Expect<Equal<Output<PandaApi["getUser"]>, User>>,
+  Expect<Equal<Output<PandaApi["deleteTodo"]>, null>>,
+];
+
+async function typeTests(
+  panda: Client<PandaApi>,
+  todo: Todo,
+  post: Post,
+) {
+  await panda.listTodos(); // nothing required, so no argument
+  await panda.getUser({ params: { id: post.userId } });
+  await panda.createTodo({ body: { title: "Nap" } });
+  // @ts-expect-error: a TodoId is not a MovieId
+  await panda.getMovie({ params: { id: todo.id } });
+  // @ts-expect-error: a plain number is not a checked id
+  await panda.getMovie({ params: { id: 1 } });
+  // @ts-expect-error: getMovie needs its params
+  await panda.getMovie();
+  // @ts-expect-error: limit is a number
+  await panda.searchMovies({ query: { limit: "5" } });
+  // @ts-expect-error: a new todo needs a title
+  await panda.createTodo({ body: { done: true } });
+  const id = MovieId.parse(1);
+  const movie = await panda.getMovie({ params: { id } });
+  // @ts-expect-error: check ok before reading value
+  movie.value;
+}
+
+// ---------- try it ----------
+for (const [name, endpoint] of Object.entries(pandaApi)) {
+  const { method, path } = endpoint;
+  console.log(method.padEnd(6), path.padEnd(11), name);
+}
+const request = buildRequest(BASE, pandaApi.createTodo, {
+  body: { title: "Ship the SDK" },
+});
+console.log(request);`}
+  tests={[
+    { name: "The code compiles, type tests included", check: "true" },
+    { name: "All the tests pass, including your brandedId tests", check: "__vitest.failed === 0 && __vitest.passed >= 5 && __vitest.tests.some((t) => t.name.startsWith('brandedId'))" },
+    { name: "The description has all 8 endpoints, with the right methods and paths", check: "(() => { const want = { getMovie: 'GET /movies/:id', searchMovies: 'GET /movies', getUser: 'GET /users/:id', listPosts: 'GET /posts', listTodos: 'GET /todos', createTodo: 'POST /todos', updateTodo: 'PATCH /todos/:id', deleteTodo: 'DELETE /todos/:id' }; return Object.keys(pandaApi).length === 8 && Object.entries(want).every(([name, route]) => pandaApi[name] !== undefined && pandaApi[name].method + ' ' + pandaApi[name].path === route); })()" },
+    { name: "The new endpoints use the right schemas", check: "(() => { const throws = (fn) => { try { fn(); return false; } catch (e) { return e instanceof ValidationError; } }; const user = { id: 2, name: 'Sam Ortiz', username: 'sam', email: 'sam@pandadev.test' }; const post = { id: 3, userId: 2, title: 'Async', likes: 58 }; const todo = { id: 4, title: 'Nap', done: false }; return pandaApi.getUser.params.id.parse(2) === 2 && throws(() => pandaApi.getUser.params.id.parse(0)) && pandaApi.getUser.response.parse(user).username === 'sam' && pandaApi.listPosts.query.parse({ userId: 2 }).userId === 2 && Object.keys(pandaApi.listPosts.query.parse({})).length === 0 && pandaApi.listPosts.response.parse([post])[0].likes === 58 && throws(() => pandaApi.listPosts.response.parse([{ ...post, userId: '2' }])) && pandaApi.createTodo.body.parse({ title: 'Nap' }).title === 'Nap' && throws(() => pandaApi.createTodo.body.parse({ done: true })) && pandaApi.createTodo.response.parse(todo).id === 4 && pandaApi.updateTodo.params.id.parse(4) === 4 && Object.keys(pandaApi.updateTodo.body.parse({})).length === 0 && pandaApi.updateTodo.body.parse({ done: true }).done === true && pandaApi.updateTodo.response.parse(todo).title === 'Nap' && pandaApi.deleteTodo.params.id.parse(4) === 4 && pandaApi.deleteTodo.response.parse(null) === null && throws(() => pandaApi.deleteTodo.response.parse({})); })()" },
+    { name: "buildRequest fills in and encodes path params", check: "(() => { const a = buildRequest('https://x.test', pandaApi.getUser, { params: { id: 3 } }); const b = buildRequest('https://x.test/', pandaApi.deleteTodo, { params: { id: 12 } }); const tags = { method: 'GET', path: '/tags/:name/posts/:page', params: { name: string(), page: number() }, response: string() }; const c = buildRequest('https://x.test', tags, { params: { name: 'a b/c', page: 2 } }); return a.method === 'GET' && a.url === 'https://x.test/users/3' && b.method === 'DELETE' && b.url === 'https://x.test/todos/12' && !('body' in b) && c.url === 'https://x.test/tags/a%20b%2Fc/posts/2'; })()" },
+    { name: "buildRequest adds a query string with only the values that are set", check: "buildRequest('https://x.test', pandaApi.searchMovies, { query: { genre: 'sci-fi', search: undefined, page: 2 } }).url === 'https://x.test/movies?genre=sci-fi&page=2' && buildRequest('https://x.test', pandaApi.listPosts).url === 'https://x.test/posts' && buildRequest('https://x.test', pandaApi.listPosts, { query: {} }).url === 'https://x.test/posts' && buildRequest('https://x.test', pandaApi.listPosts, { query: { userId: 2 } }).url === 'https://x.test/posts?userId=2'" },
+    { name: "buildRequest sends JSON bodies, and only when there is one", check: "(() => { const r = buildRequest('https://x.test', pandaApi.createTodo, { body: { title: 'Nap', done: false } }); const g = buildRequest('https://x.test', pandaApi.listTodos); return r.method === 'POST' && r.url === 'https://x.test/todos' && r.body === '{\"title\":\"Nap\",\"done\":false}' && r.headers['Content-Type'] === 'application/json' && r.headers.Accept === 'application/json' && JSON.stringify(g) === JSON.stringify({ method: 'GET', url: 'https://x.test/todos', headers: { Accept: 'application/json' } }); })()" },
+    { name: "buildRequest refuses bad input with a ValidationError that names the field", check: "(() => { const msg = (fn) => { try { fn(); return 'no error'; } catch (e) { return e instanceof ValidationError ? e.message : 'wrong error'; } }; return msg(() => buildRequest('https://x.test', pandaApi.searchMovies, { query: { limit: '5' } })) === 'query.limit: expected a number, got \"5\"' && msg(() => buildRequest('https://x.test', pandaApi.updateTodo, { body: {} })) === 'params.id: expected a TodoId, got undefined' && msg(() => buildRequest('https://x.test', pandaApi.createTodo, {})) === 'body: expected an object, got undefined' && msg(() => buildRequest('https://x.test', pandaApi.getUser, { params: { id: 1.5 } })) === 'params.id: expected a UserId, got 1.5'; })()" },
+    { name: "Your tests catch a brandedId that accepts fractions", check: "(await __retest([['Number.isSafeInteger(v) && v > 0', 'v > 0']])).failed > __vitest.failed" },
+    { name: "Your tests catch a brandedId that accepts 0 and negative ids", check: "(await __retest([['Number.isSafeInteger(v) && v > 0', 'Number.isSafeInteger(v)']])).failed > __vitest.failed" },
+  ]}
+>
+
+Build the foundation of `@pandadev/sdk`. The schema library (with `optional`, `nothing` and `brandedId`) and the models (`Movie`, `User`, `Post`, `Todo`, `NewTodo`, `TodoPatch` and the four id schemas) are done. Everything below them is yours:
+
+1. **`ParamNames<P>`**: the names of the `:params` in a path, as a union (`never` for a path without any). It's the type from [Template Literal Types](/learn/typescript/template-literal-types).
+2. **The rest of `pandaApi`**: `getUser` (`GET /users/:id`, params `{ id: UserId }`, a `User`), `listPosts` (`GET /posts`, an optional `userId` query of type `UserId`, an array of `Post`), `createTodo` (`POST /todos`, body `NewTodo`, a `Todo`), `updateTodo` (`PATCH /todos/:id`, `TodoId`, body `TodoPatch`, a `Todo`) and `deleteTodo` (`DELETE /todos/:id`, `TodoId`, no content).
+3. **`ParamsInput`, `QueryInput` and `BodyInput`**, and the mapped type **`Client<A>`**, as in the lesson.
+4. **`buildRequest(baseUrl, endpoint, input)`**: fill in the `:params` (checked and encoded), add the query string (only when there's something in it), and the JSON body with its `Content-Type`. Every part is checked with its schema, using the paths `params.<name>`, `query` and `body`, so errors say where the problem is. Remove trailing slashes from `baseUrl`.
+5. **Tests for the smart constructor**: in the empty `describe("brandedId")`, check that `MovieId.parse` accepts a positive whole number and refuses `0`, negative numbers, fractions and strings with a `ValidationError`.
+
+The type tests at the bottom are the design doc in code: the starter fails them all, so it won't run until your types are right. Then the Vitest tests and the checks take over.
+
+<Hint>
+
+**`ParamNames`**: `` P extends `${string}:${infer Name}/${infer Rest}` ? Name | ParamNames<Rest> : P extends `${string}:${infer Name}` ? Name : never ``.
+
+**Input types**: `QueryInput<E>` is `` E extends { query: infer Q extends Schema<object> } ? ({} extends Infer<Q> ? { query?: Infer<Q> } : { query: Infer<Q> }) : {} ``, and `BodyInput` is the same shape as `ParamsInput` with `body` and `Schema<unknown>`, giving `{ body: Infer<B> }`. For `Client`, map over `keyof A`: each key gets `(...input: InputArgs<A[K]>) => Promise<Result<Output<A[K]>, ApiError>>`.
+
+**`buildRequest`**: for the path, use `endpoint.path.replace(/:(\w+)/g, (_, name: string) => ...)`: find `endpoint.params?.[name]`, parse `input.params?.[name]` with the path `` `params.${name}` `` and return `encodeURIComponent(String(value))`. Start the URL with `baseUrl.replace(/\/+$/, "") + path`. For the query, parse `input.query ?? {}`, loop over `Object.entries(...)` into a `URLSearchParams`, and add `` `?${search}` `` when `search.size > 0`. Build `const headers: Record<string, string> = { Accept: "application/json" }`, and only when the endpoint has a `body` schema, set `request.body = JSON.stringify(parsedBody)` and the `Content-Type` header.
+
+**Tests**: `expect(MovieId.parse(7)).toBe(7)`, and `expect(() => MovieId.parse(0)).toThrow(ValidationError)` for each bad value (`it.each` keeps that short).
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect } from "vitest";
+
+// ---------- schemas: Level 2's library, grown up ----------
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = {
+  parse: (value: unknown, path?: string) => T;
+  optional?: true;
+};
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+// 204 No Content: the client reads it as null
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function optional<T>(
+  schema: Schema<T>,
+): Schema<T | undefined> & { optional: true } {
+  return {
+    optional: true,
+    parse: (value, path) =>
+      value === undefined ? undefined : schema.parse(value, path),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+// The keys whose schema is optional(...)
+type OptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K] extends { optional: true } ? K : never;
+}[keyof S];
+type ObjectOf<S extends Shape> = Simplify<
+  { [K in Exclude<keyof S, OptionalKeys<S>>]: Infer<S[K]> } & {
+    [K in OptionalKeys<S>]?: Infer<S[K]>;
+  }
+>;
+
+function object<S extends Shape>(shape: S): Schema<ObjectOf<S>> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        const parsed = shape[key].parse(value[key], where);
+        if (parsed !== undefined) result[key] = parsed;
+      }
+      // every key was checked, so this cast is safe
+      return result as ObjectOf<S>;
+    },
+  };
+}
+
+// ---------- branded ids ----------
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+// A schema for ids, and the only way to make one
+function brandedId<Name extends string>(
+  name: Name,
+): Schema<Brand<number, Name>> {
+  return primitive(
+    `a ${name}`,
+    (v): v is Brand<number, Name> =>
+      typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+  );
+}
+
+// ---------- the practice API's data ----------
+const MovieId = brandedId("MovieId");
+type MovieId = Infer<typeof MovieId>;
+const TodoId = brandedId("TodoId");
+type TodoId = Infer<typeof TodoId>;
+const UserId = brandedId("UserId");
+type UserId = Infer<typeof UserId>;
+const PostId = brandedId("PostId");
+type PostId = Infer<typeof PostId>;
+
+const Movie = object({
+  id: MovieId,
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof Movie>;
+
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+function page<T>(item: Schema<T>): Schema<Page<T>> {
+  return object({
+    page: number(),
+    totalPages: number(),
+    total: number(),
+    results: array(item),
+  });
+}
+
+const User = object({
+  id: UserId,
+  name: string(),
+  username: string(),
+  email: string(),
+});
+type User = Infer<typeof User>;
+
+const Post = object({
+  id: PostId,
+  userId: UserId,
+  title: string(),
+  likes: number(),
+});
+type Post = Infer<typeof Post>;
+
+const Todo = object({ id: TodoId, title: string(), done: boolean() });
+type Todo = Infer<typeof Todo>;
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+const TodoPatch = object({
+  title: optional(string()),
+  done: optional(boolean()),
+});
+
+// ---------- the API description ----------
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface Endpoint {
+  method: Method;
+  path: `/${string}`;
+  params?: Shape;
+  query?: Schema<object>;
+  body?: Schema<unknown>;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// "/users/:userId/posts/:postId" -> "userId" | "postId"
+type ParamNames<P extends string> =
+  P extends `${string}:${infer Name}/${infer Rest}`
+    ? Name | ParamNames<Rest>
+    : P extends `${string}:${infer Name}`
+      ? Name
+      : never;
+
+// A path with :params needs one schema per param
+type ParamsFor<P extends string> = [ParamNames<P>] extends [never]
+  ? {}
+  : { params: Record<ParamNames<P>, Schema<string | number>> };
+
+type CheckParams<A extends ApiDescription> = {
+  [K in keyof A]: ParamsFor<A[K]["path"]>;
+};
+
+function defineApi<const A extends ApiDescription>(
+  api: A & CheckParams<A>,
+): A {
+  return api;
+}
+
+const pandaApi = defineApi({
+  getMovie: {
+    method: "GET",
+    path: "/movies/:id",
+    params: { id: MovieId },
+    response: Movie,
+  },
+  searchMovies: {
+    method: "GET",
+    path: "/movies",
+    query: object({
+      search: optional(string()),
+      genre: optional(string()),
+      page: optional(number()),
+      limit: optional(number()),
+    }),
+    response: page(Movie),
+  },
+  getUser: {
+    method: "GET",
+    path: "/users/:id",
+    params: { id: UserId },
+    response: User,
+  },
+  listPosts: {
+    method: "GET",
+    path: "/posts",
+    query: object({ userId: optional(UserId) }),
+    response: array(Post),
+  },
+  listTodos: {
+    method: "GET",
+    path: "/todos",
+    response: array(Todo),
+  },
+  createTodo: {
+    method: "POST",
+    path: "/todos",
+    body: NewTodo,
+    response: Todo,
+  },
+  updateTodo: {
+    method: "PATCH",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    body: TodoPatch,
+    response: Todo,
+  },
+  deleteTodo: {
+    method: "DELETE",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    response: nothing(),
+  },
+});
+type PandaApi = typeof pandaApi;
+
+// ---------- types derived from the description ----------
+type ParamsInput<E> = E extends { params: infer P extends Shape }
+  ? { params: ObjectOf<P> }
+  : {};
+type QueryInput<E> = E extends { query: infer Q extends Schema<object> }
+  ? {} extends Infer<Q>
+    ? { query?: Infer<Q> } // every query field is optional
+    : { query: Infer<Q> }
+  : {};
+type BodyInput<E> = E extends { body: infer B extends Schema<unknown> }
+  ? { body: Infer<B> }
+  : {};
+
+type Input<E extends Endpoint> = Simplify<
+  ParamsInput<E> & QueryInput<E> & BodyInput<E>
+>;
+type Output<E extends Endpoint> = Infer<E["response"]>;
+// No required input: the argument may be left out
+type InputArgs<E extends Endpoint> = {} extends Input<E>
+  ? [input?: Input<E>]
+  : [input: Input<E>];
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: (
+    ...input: InputArgs<A[K]>
+  ) => Promise<Result<Output<A[K]>, ApiError>>;
+};
+
+// ---------- from input to request ----------
+interface SdkRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+// Inside the SDK, input is loosely typed (and checked at runtime)
+type RawInput = {
+  params?: Record<string, unknown>;
+  query?: unknown;
+  body?: unknown;
+};
+
+function buildRequest(
+  baseUrl: string,
+  endpoint: Endpoint,
+  input: RawInput = {},
+): SdkRequest {
+  const path = endpoint.path.replace(/:(\w+)/g, (_, name: string) => {
+    const schema = endpoint.params?.[name];
+    if (!schema) throw new Error(`No schema for :${name}`);
+    const value = schema.parse(input.params?.[name], `params.${name}`);
+    return encodeURIComponent(String(value));
+  });
+  let url = baseUrl.replace(/\/+$/, "") + path;
+  if (endpoint.query) {
+    const query = endpoint.query.parse(input.query ?? {}, "query");
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      search.set(key, String(value));
+    }
+    if (search.size > 0) url += `?${search}`;
+  }
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  const request: SdkRequest = { method: endpoint.method, url, headers };
+  if (endpoint.body) {
+    const body = endpoint.body.parse(input.body, "body");
+    request.body = JSON.stringify(body);
+    headers["Content-Type"] = "application/json";
+  }
+  return request;
+}
+
+// ---------- tests ----------
+const BASE = "https://api.pandadev.test";
+
+describe("buildRequest", () => {
+  it("fills in path params", () => {
+    const request = buildRequest(BASE, pandaApi.getMovie, {
+      params: { id: 7 },
+    });
+    expect(request).toEqual({
+      method: "GET",
+      url: `${BASE}/movies/7`,
+      headers: { Accept: "application/json" },
+    });
+  });
+
+  it("adds only the query values that are set", () => {
+    const request = buildRequest(BASE, pandaApi.searchMovies, {
+      query: { search: "bamboo & tea", page: undefined, limit: 2 },
+    });
+    expect(request.url).toBe(
+      `${BASE}/movies?search=bamboo+%26+tea&limit=2`,
+    );
+    const all = buildRequest(BASE, pandaApi.searchMovies);
+    expect(all.url).toBe(`${BASE}/movies`);
+  });
+
+  it("sends the body as JSON", () => {
+    const request = buildRequest(BASE, pandaApi.updateTodo, {
+      params: { id: 2 },
+      body: { done: true },
+    });
+    expect(request.method).toBe("PATCH");
+    expect(request.url).toBe(`${BASE}/todos/2`);
+    expect(request.body).toBe('{"done":true}');
+    expect(request.headers["Content-Type"]).toBe("application/json");
+  });
+
+  it("checks every part of the input before sending", () => {
+    expect(() =>
+      buildRequest(BASE, pandaApi.getMovie, { params: { id: "7" } }),
+    ).toThrow('params.id: expected a MovieId, got "7"');
+    expect(() =>
+      buildRequest(BASE, pandaApi.createTodo, { body: { title: 5 } }),
+    ).toThrow("body.title: expected a string, got 5");
+  });
+});
+
+describe("brandedId", () => {
+  it("accepts a positive whole number", () => {
+    expect(MovieId.parse(7)).toBe(7);
+  });
+
+  it.each([0, -3, 1.5])("refuses %s", (value) => {
+    expect(() => MovieId.parse(value)).toThrow(ValidationError);
+  });
+
+  it("refuses strings", () => {
+    expect(() => MovieId.parse("7")).toThrow('expected a MovieId');
+  });
+});
+
+// ---------- type tests: don't change them ----------
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamNames<"/users/:userId/posts/:postId">,
+    "userId" | "postId">>,
+  Expect<Equal<ParamNames<"/todos">, never>>,
+  Expect<Equal<Input<PandaApi["getMovie"]>,
+    { params: { id: MovieId } }>>,
+  Expect<Equal<Input<PandaApi["listPosts"]>,
+    { query?: { userId?: UserId } }>>,
+  Expect<Equal<Input<PandaApi["updateTodo"]>, {
+    params: { id: TodoId };
+    body: { title?: string; done?: boolean };
+  }>>,
+  Expect<Equal<Input<PandaApi["listTodos"]>, {}>>,
+  Expect<Equal<Output<PandaApi["getUser"]>, User>>,
+  Expect<Equal<Output<PandaApi["deleteTodo"]>, null>>,
+];
+
+async function typeTests(
+  panda: Client<PandaApi>,
+  todo: Todo,
+  post: Post,
+) {
+  await panda.listTodos(); // nothing required, so no argument
+  await panda.getUser({ params: { id: post.userId } });
+  await panda.createTodo({ body: { title: "Nap" } });
+  // @ts-expect-error: a TodoId is not a MovieId
+  await panda.getMovie({ params: { id: todo.id } });
+  // @ts-expect-error: a plain number is not a checked id
+  await panda.getMovie({ params: { id: 1 } });
+  // @ts-expect-error: getMovie needs its params
+  await panda.getMovie();
+  // @ts-expect-error: limit is a number
+  await panda.searchMovies({ query: { limit: "5" } });
+  // @ts-expect-error: a new todo needs a title
+  await panda.createTodo({ body: { done: true } });
+  const id = MovieId.parse(1);
+  const movie = await panda.getMovie({ params: { id } });
+  // @ts-expect-error: check ok before reading value
+  movie.value;
+}
+
+// ---------- try it ----------
+for (const [name, endpoint] of Object.entries(pandaApi)) {
+  const { method, path } = endpoint;
+  console.log(method.padEnd(6), path.padEnd(11), name);
+}
+const request = buildRequest(BASE, pandaApi.createTodo, {
+  body: { title: "Ship the SDK" },
+});
+console.log(request);
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- A **design doc**: goals and non-goals, the call site first, and a table of decisions, including the split between thrown `ValidationError`s for bad input and `invalid-response` values for bad answers.
+- A schema library that understands **optional fields** (`OptionalKeys`, `ObjectOf`), plus `nothing()` for 204s.
+- **Branded ids** whose schemas are their smart constructors, so ids are checked once and flow branded from response to request.
+- **`pandaApi`**, one description of the whole API, declared with `defineApi` so every literal survives and every `:param` has a schema.
+- **Derived types**: `Input`, `Output` and the mapped `Client<A>`, all from the description, with `Result` and `ApiError` designed up front.
+- **Type tests** that pin the design down, and **`buildRequest`**, which checks the caller's input and turns it into a request.
+
+There's still no network in sight. In **Part 2** the description becomes a working client, with typed errors, retries with backoff, pagination and hooks. 🔌

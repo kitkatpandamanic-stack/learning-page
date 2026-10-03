@@ -162,6 +162,40 @@ createRoot(document.getElementById("root")!).render(<Hello label="Hi" />);`,
     expect(react.tests?.[0].passed).toBe(true);
   });
 
+  it("logs requests right away and releases answers a failed check held", async () => {
+    const r = await runDomInNode(
+      `document.querySelector("#save").addEventListener("click", () => {
+  fetch("https://api.pandadev.test/todos", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: "Nap" }),
+  });
+});`,
+      '<button id="save">Save</button>',
+      [
+        // logged as soon as the click calls fetch, before the body is read
+        {
+          name: "logged",
+          check:
+            '(save.click(), __requests.length === 1 && __requests[0].method === "POST")',
+        },
+        {
+          name: "body",
+          check: "(await __settle(), __requests[0].body.title === 'Nap')",
+        },
+        // fails while answers are held…
+        { name: "throws", check: "(__hold(), save.click(), missing.value)" },
+        // …and the next check still gets its answer
+        {
+          name: "next",
+          check:
+            '(await fetch("https://api.pandadev.test/todos")).status === 200',
+        },
+      ],
+    );
+    expect(r.tests?.map((t) => t.passed)).toEqual([true, true, false, true]);
+  });
+
   it("reports errors and fails the checks", async () => {
     const r = await runDomInNode(
       'const el = document.querySelector("#nope");\nel.textContent = "x";',
