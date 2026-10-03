@@ -1,7 +1,4 @@
-"use client";
-
 import { Link } from "@/i18n/navigation";
-import { motion } from "motion/react";
 import { useTranslations } from "next-intl";
 import {
   ArrowRight,
@@ -19,13 +16,10 @@ import { Chip } from "@/components/ui/chip";
 import { Container } from "@/components/ui/container";
 import { GradientText } from "@/components/ui/gradient-text";
 
-const ease = [0.22, 1, 0.36, 1] as const;
-
-const fadeUp = (delay: number) => ({
-  initial: { opacity: 0, y: 24 },
-  animate: { opacity: 1, y: 0 },
-  transition: { duration: 0.7, delay, ease },
-});
+// Entrance animations are plain CSS (see globals.css), so the hero shows
+// before any JavaScript runs. The headline and description only move,
+// never fade, so phones can show the page's largest text right away.
+const fadeUp = "motion-safe:animate-fade-up";
 
 const perks = ["free", "browser", "path"] as const;
 
@@ -70,31 +64,24 @@ export function Hero() {
     <section className="relative pt-12 pb-8 sm:pt-20 sm:pb-20 lg:pb-28">
       <Container className="grid items-center gap-12 lg:grid-cols-[1.05fr_1fr] lg:gap-6">
         <div className="flex flex-col items-center text-center lg:items-start lg:text-left">
-          <motion.div {...fadeUp(0)}>
+          <div className={fadeUp}>
             <Badge tone="cyan" dot>
               <Sparkles className="size-3.5" /> {t("badge")}
             </Badge>
-          </motion.div>
+          </div>
 
-          <motion.h1
-            {...fadeUp(0.1)}
-            className="mt-6 text-5xl leading-[1.05] font-extrabold tracking-tight text-white sm:text-6xl lg:text-7xl"
-          >
+          <h1 className="mt-6 text-5xl leading-[1.05] font-extrabold tracking-tight text-white motion-safe:animate-rise sm:text-6xl lg:text-7xl">
             {t("titleLine1")}
             <br />
             <GradientText>{t("titleLine2")}</GradientText>
-          </motion.h1>
+          </h1>
 
-          <motion.p
-            {...fadeUp(0.2)}
-            className="mt-6 max-w-xl text-lg text-pretty text-muted-foreground sm:text-xl"
-          >
+          <p className="mt-6 max-w-xl text-lg text-pretty text-muted-foreground [animation-delay:100ms] motion-safe:animate-rise sm:text-xl">
             {t("description")}
-          </motion.p>
+          </p>
 
-          <motion.div
-            {...fadeUp(0.3)}
-            className="mt-9 flex flex-wrap justify-center gap-3 lg:justify-start"
+          <div
+            className={`mt-9 flex flex-wrap justify-center gap-3 [animation-delay:300ms] lg:justify-start ${fadeUp}`}
           >
             <Button asChild variant="gradient" size="xl">
               <Link href="/languages">
@@ -106,11 +93,10 @@ export function Hero() {
                 <MapIcon /> {t("seeRoadmap")}
               </Link>
             </Button>
-          </motion.div>
+          </div>
 
-          <motion.ul
-            {...fadeUp(0.4)}
-            className="mt-8 flex flex-wrap justify-center gap-x-6 gap-y-2 text-sm text-white/75 lg:justify-start"
+          <ul
+            className={`mt-8 flex flex-wrap justify-center gap-x-6 gap-y-2 text-sm text-white/75 [animation-delay:400ms] lg:justify-start ${fadeUp}`}
           >
             {perks.map((perk) => (
               <li key={perk} className="flex items-center gap-2">
@@ -118,21 +104,15 @@ export function Hero() {
                 {t(`perks.${perk}`)}
               </li>
             ))}
-          </motion.ul>
+          </ul>
         </div>
 
-        <motion.div
-          initial={{ opacity: 0, scale: 0.9 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ duration: 1, delay: 0.2, ease }}
-          className="relative mx-auto w-full max-w-[560px]"
-        >
+        <div className="relative mx-auto w-full max-w-[560px] [animation-delay:200ms] motion-safe:animate-pop-in">
           <Orb />
 
           {/* Floating glass chips around the orb */}
-          <motion.div
-            {...fadeUp(0.7)}
-            className="absolute top-[6%] left-0 sm:left-[2%]"
+          <div
+            className={`absolute top-[6%] left-0 [animation-delay:700ms] sm:left-[2%] ${fadeUp}`}
           >
             <Chip
               icon={<CheckCircle2 />}
@@ -141,8 +121,10 @@ export function Hero() {
               sublabel={t("chips.lessonTopic")}
               className="motion-safe:animate-float"
             />
-          </motion.div>
-          <motion.div {...fadeUp(0.85)} className="absolute top-[18%] right-0">
+          </div>
+          <div
+            className={`absolute top-[18%] right-0 [animation-delay:850ms] ${fadeUp}`}
+          >
             <Chip
               icon={<Zap />}
               tone="amber"
@@ -150,10 +132,9 @@ export function Hero() {
               sublabel={t("chips.dailyGoal")}
               className="[animation-delay:-2s] motion-safe:animate-float"
             />
-          </motion.div>
-          <motion.div
-            {...fadeUp(1)}
-            className="absolute bottom-[14%] left-0 hidden sm:block"
+          </div>
+          <div
+            className={`absolute bottom-[14%] left-0 hidden [animation-delay:1000ms] sm:block ${fadeUp}`}
           >
             <Chip
               icon={<Flame />}
@@ -162,16 +143,15 @@ export function Hero() {
               sublabel={t("chips.keepGoing")}
               className="[animation-delay:-4s] motion-safe:animate-float"
             />
-          </motion.div>
-          <motion.div
-            {...fadeUp(1.15)}
-            className="absolute right-0 bottom-[4%] hidden sm:block"
+          </div>
+          <div
+            className={`absolute right-0 bottom-[4%] hidden [animation-delay:1150ms] sm:block ${fadeUp}`}
           >
             <div className="[animation-delay:-3s] motion-safe:animate-float">
               <CodeCard />
             </div>
-          </motion.div>
-        </motion.div>
+          </div>
+        </div>
       </Container>
     </section>
   );

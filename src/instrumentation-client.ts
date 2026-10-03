@@ -1,15 +1,11 @@
-import * as Sentry from "@sentry/nextjs";
-
+import { whenIdle } from "@/lib/idle";
+import { loadSentry } from "@/lib/sentry-client";
 import { sentryOptions } from "@/lib/sentry-options";
 
 /**
  * Reports crashes in visitors' browsers to Sentry; off until
- * NEXT_PUBLIC_SENTRY_DSN is set. Learners' own code runs in Web Workers and
- * sandboxed iframes, so mistakes in their exercises never reach Sentry.
+ * NEXT_PUBLIC_SENTRY_DSN is set. The SDK is fairly large, so it loads once
+ * the page is idle instead of with the page (phones show lessons sooner);
+ * the error page loads it itself if a crash comes first (global-error.tsx).
  */
-Sentry.init({
-  ...sentryOptions,
-  environment: process.env.NEXT_PUBLIC_VERCEL_ENV ?? "development",
-  // Browser extensions throw on many sites; those aren't our bugs.
-  denyUrls: [/^(chrome|moz|safari(-web)?)-extension:\/\//],
-});
+if (sentryOptions.enabled) whenIdle(() => void loadSentry());

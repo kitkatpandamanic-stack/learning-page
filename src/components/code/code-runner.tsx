@@ -29,6 +29,7 @@ import {
 import { REACT_HTML } from "@/lib/runner/dom-harness";
 import { runCode, type RunResult, type RunStatus } from "@/lib/runner/run-code";
 import { runDom, type DomRun } from "@/lib/runner/run-dom";
+import { whenIdle } from "@/lib/idle";
 import { isPythonReady, preloadPython } from "@/lib/runner/run-python";
 import {
   isTypeScriptReady,
@@ -179,10 +180,12 @@ export function CodeRunner({
   }, []);
 
   // Python and the TypeScript checker take a few seconds to download the
-  // first time; start early.
+  // first time; start early, but after the page has finished loading so
+  // the download doesn't slow the lesson itself down.
   React.useEffect(() => {
-    if (language === "python") preloadPython();
-    if (language === "typescript") preloadTypeScript();
+    if (language !== "python" && language !== "typescript") return;
+    const preload = language === "python" ? preloadPython : preloadTypeScript;
+    return whenIdle(preload);
   }, [language]);
 
   function updateCode(value: string) {

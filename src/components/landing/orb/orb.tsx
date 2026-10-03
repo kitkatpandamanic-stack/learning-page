@@ -1,6 +1,9 @@
 "use client";
 
+import * as React from "react";
 import dynamic from "next/dynamic";
+
+import { whenIdle } from "@/lib/idle";
 
 /** CSS-only orb shown while the 3D scene loads (and if WebGL is unavailable). */
 function OrbFallback() {
@@ -15,13 +18,17 @@ const OrbScene = dynamic(() => import("./orb-scene"), {
 });
 
 export function Orb() {
+  // three.js is big: start it after the page has loaded, so the hero text
+  // and buttons appear first (the CSS orb shows until then).
+  const [ready, setReady] = React.useState(false);
+  React.useEffect(() => whenIdle(() => setReady(true)), []);
   return (
     <div aria-hidden className="relative aspect-square w-full">
       {/* Soft glow behind the canvas */}
       <div className="absolute inset-[12%] rounded-full bg-neon-violet/40 blur-[80px]" />
       <div className="absolute inset-[30%] translate-x-[15%] translate-y-[20%] rounded-full bg-neon-cyan/30 blur-[70px]" />
       <div className="absolute inset-0">
-        <OrbScene />
+        {ready ? <OrbScene /> : <OrbFallback />}
       </div>
     </div>
   );

@@ -19,10 +19,18 @@ export function SpaceBackground() {
       aria-hidden
       className="pointer-events-none fixed inset-0 -z-10 overflow-hidden bg-space-950"
     >
-      {/* Colour blobs */}
-      <div className="absolute -top-[20%] left-[15%] size-[42rem] rounded-full bg-neon-violet/45 blur-[140px] motion-safe:animate-blob" />
-      <div className="absolute top-[30%] -right-[10%] size-[34rem] rounded-full bg-neon-pink/35 blur-[140px] [animation-delay:-7s] motion-safe:animate-blob" />
-      <div className="absolute -bottom-[20%] -left-[10%] size-[36rem] rounded-full bg-neon-cyan/35 blur-[140px] [animation-delay:-14s] motion-safe:animate-blob" />
+      {/* Colour blobs: soft radial gradients rather than blurred circles, which
+          look the same but are far cheaper to draw (phones redraw them on
+          every frame of the drifting animation). */}
+      <div className="absolute -top-[20%] left-[15%] size-[42rem] motion-safe:animate-blob">
+        <div className="size-full scale-[1.7] bg-radial-[closest-side] from-neon-violet/45 from-25% to-transparent" />
+      </div>
+      <div className="absolute top-[30%] -right-[10%] size-[34rem] [animation-delay:-7s] motion-safe:animate-blob">
+        <div className="size-full scale-[1.8] bg-radial-[closest-side] from-neon-pink/35 from-20% to-transparent" />
+      </div>
+      <div className="absolute -bottom-[20%] -left-[10%] size-[36rem] [animation-delay:-14s] motion-safe:animate-blob">
+        <div className="size-full scale-[1.8] bg-radial-[closest-side] from-neon-cyan/35 from-20% to-transparent" />
+      </div>
 
       {/* Faint grid that fades out towards the edges */}
       <div className="absolute inset-0 bg-[linear-gradient(rgb(255_255_255/0.035)_1px,transparent_1px),linear-gradient(90deg,rgb(255_255_255/0.035)_1px,transparent_1px)] [mask-image:radial-gradient(ellipse_70%_55%_at_50%_0%,black,transparent)] bg-[size:64px_64px]" />

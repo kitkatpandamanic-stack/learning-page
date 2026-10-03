@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect } from "react";
-import * as Sentry from "@sentry/nextjs";
+
+import { sentryOptions } from "@/lib/sentry-options";
+import { loadSentry } from "@/lib/sentry-client";
 
 /** Last-resort error page when even the root layout fails to render. */
 export default function GlobalError({
@@ -12,7 +14,9 @@ export default function GlobalError({
   reset: () => void;
 }) {
   useEffect(() => {
-    Sentry.captureException(error);
+    // Loaded on demand: Sentry isn't part of the normal page bundle.
+    if (!sentryOptions.enabled) return;
+    void loadSentry().then((Sentry) => Sentry.captureException(error));
   }, [error]);
 
   return (
