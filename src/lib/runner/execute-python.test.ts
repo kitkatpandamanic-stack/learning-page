@@ -104,6 +104,20 @@ describe("error hints", () => {
 });
 
 describe("executePython with packages", () => {
+  it("trains scikit-learn models without Pyodide's internal warnings", async () => {
+    const r = await executePython(
+      py,
+      [
+        "from sklearn.datasets import load_breast_cancer",
+        "from sklearn.neighbors import KNeighborsClassifier",
+        "X, y = load_breast_cancer(return_X_y=True)",
+        "print(round(KNeighborsClassifier().fit(X, y).score(X, y), 3))",
+      ].join("\n"),
+    );
+    expect(r.error).toBeUndefined();
+    expect(r.output.map((l) => l.text)).toEqual(["0.947"]);
+  }, 120_000);
+
   it("has time zones for zoneinfo", async () => {
     const r = await executePython(
       py,

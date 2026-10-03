@@ -32,6 +32,10 @@ _PANDA_DIR = "/home/pyodide/lesson"
 _PANDA_FILE = _PANDA_DIR + "/lesson.py"
 
 sys.dont_write_bytecode = True  # lesson.py changes every run
+import warnings
+# Libraries inside Pyodide (e.g. threadpoolctl, used by scikit-learn) warn
+# about Pyodide's own deprecated APIs; that says nothing about the lesson.
+warnings.filterwarnings("ignore", message=r"JsProxy\\.", category=RuntimeWarning)
 os.environ["MPLBACKEND"] = "agg"
 os.environ["COLUMNS"] = "60"
 os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"  # e.g. anyio's, which warns once imported
