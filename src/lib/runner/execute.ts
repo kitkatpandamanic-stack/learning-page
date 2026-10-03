@@ -14,8 +14,12 @@ import {
 } from "./vitest-shim";
 import { createWsNetwork } from "./ws-shim";
 
-/** "react" is JavaScript with JSX, run in the live preview with React loaded. */
-export type RunLanguage = "javascript" | "typescript" | "python" | "react";
+/**
+ * "react" is JavaScript with JSX, run in the live preview with React loaded;
+ * "tsx" is the same in TypeScript, type-checked first.
+ */
+export type RunLanguage =
+  "javascript" | "typescript" | "python" | "react" | "tsx";
 export type LogLevel = "log" | "info" | "warn" | "error";
 export type OutputLine = {
   level: LogLevel;

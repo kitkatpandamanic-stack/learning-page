@@ -61,6 +61,8 @@ export function runDom(
     onStorage?: (data: Record<string, string>) => void;
     /** Load React into the page and turn JSX into JavaScript */
     react?: boolean;
+    /** TypeScript (already type-checked): strip the types before running */
+    typescript?: boolean;
   },
 ): DomRun {
   const {
@@ -72,6 +74,7 @@ export function runDom(
     storage,
     onStorage,
     react = false,
+    typescript = false,
   } = options;
   const token = Math.random().toString(36).slice(2);
   const started = performance.now();
@@ -185,7 +188,7 @@ export function runDom(
       {
         type: "panda-run",
         token,
-        code: prepareDomCode(code, { react }),
+        code: prepareDomCode(code, { react, typescript }),
         checks: (tests ?? []).map((t) => t.check),
         storage: storage ?? {},
       },

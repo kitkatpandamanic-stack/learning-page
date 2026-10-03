@@ -1,0 +1,673 @@
+---
+title: Mapped Types
+description: Transform every property of a type with mapped types. Change modifiers, keep them with homomorphic mapping, remap and filter keys with as, rebuild Partial and Pick, and map unions to handlers.
+duration: 22
+xp: 25
+---
+
+In [Utility Types](/learn/typescript/utility-types) you met the definition of `Partial`, with a promise: the `[K in ...]` part is a **mapped type**, and you'd learn to write your own in Level 3. Here we are. Conditional types (the [previous lesson](/learn/typescript/conditional-types-and-infer)) make decisions about **one** type. Mapped types **loop over keys** and build a new object type, property by property. Together they're how almost every "derived" type in a modern codebase is made: form state from a model, handlers from an event list, a typed client from an API description. 🔁
+
+## Looping over keys
+
+A mapped type looks like an index signature with `in`:
+
+```ts
+type Flags = { [K in "darkMode" | "beta"]: boolean };
+// { darkMode: boolean; beta: boolean }
+
+type MyRecord<K extends PropertyKey, V> = { [P in K]: V };
+```
+
+`K in Keys` walks through each member of a union of keys (`PropertyKey` is `string | number | symbol`). The real power comes from looping over **another type's** keys with `keyof T`, and using `T[K]` to look at each property's type. Here's a form whose validators are derived from the form's own shape:
+
+<CodeExample output={`{ age: 'You must be 13 or older', terms: 'Please accept the terms' }
+{}`}>
+
+```ts
+interface SignUp {
+  email: string;
+  age: number;
+  terms: boolean;
+}
+
+type Validators<T> = {
+  [K in keyof T]: (value: T[K]) => string | null;
+};
+type Errors<T> = { [K in keyof T]?: string };
+
+const rules: Validators<SignUp> = {
+  email: (v) => (v.includes("@") ? null : "Enter a valid email"),
+  age: (v) => (v >= 13 ? null : "You must be 13 or older"),
+  terms: (v) => (v ? null : "Please accept the terms"),
+};
+
+function validate<T>(values: T, validators: Validators<T>): Errors<T> {
+  const errors: Errors<T> = {};
+  for (const key in validators) {
+    const message = validators[key](values[key]);
+    if (message !== null) {
+      errors[key] = message;
+    }
+  }
+  return errors;
+}
+
+const young = { email: "mei@panda.dev", age: 12, terms: false };
+const adult = { email: "sam@panda.dev", age: 30, terms: true };
+console.log(validate(young, rules));
+console.log(validate(adult, rules));
+```
+
+</CodeExample>
+
+Look at what you get for free. Each validator's `v` has the right type (`string`, `number`, `boolean`) without a single annotation. And when someone adds a `country` field to `SignUp` next month, the rules object stops compiling until it has a validator for it:
+
+```ts
+const rules: Validators<SignUp> = {
+  email: (v) => (v.includes("@") ? null : "Enter a valid email"),
+  age: (v) => (v >= 13 ? null : "You must be 13 or older"),
+  terms: (v) => (v ? null : "Please accept the terms"),
+};
+// ❌ Error: Property 'country' is missing in type '{ email: (v: string) => "Enter a valid email" | null; age: (v: number) => "You must be 13 or older" | null; terms: (v: boolean) => "Please accept the terms" | null; }' but required in type 'Validators<SignUp>'.
+```
+
+That's the whole point of deriving types: **one source of truth**, and the compiler walks you to every place that has to change.
+
+## Modifiers: `readonly` and `?`
+
+A mapped type can add or remove the two property **modifiers**. Put `readonly` before the key or `?` after it to add them; prefix them with `-` to remove them (`+` also exists and means "add", but nobody writes it). That's all it takes to rebuild four utility types:
+
+```ts
+type MyPartial<T> = { [K in keyof T]?: T[K] };
+type MyRequired<T> = { [K in keyof T]-?: T[K] };
+type MyReadonly<T> = { readonly [K in keyof T]: T[K] };
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+```
+
+`Mutable` isn't built in, but it's a classic. Here's where it earns its keep: a "change a copy" helper, the idea behind the Immer library (used by Redux Toolkit). Your state stays `readonly` everywhere, and only inside the recipe may you write to the **draft**:
+
+<CodeExample output={`light 14
+dark 16`}>
+
+```ts
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+interface Settings {
+  readonly theme: "light" | "dark";
+  readonly fontSize: number;
+  readonly shortcuts: readonly string[];
+}
+
+// Change a copy, never the original (the idea behind Immer)
+function produce<T>(base: T, recipe: (draft: Mutable<T>) => void): T {
+  const draft: Mutable<T> = structuredClone(base);
+  recipe(draft);
+  return draft;
+}
+
+const current: Settings = {
+  theme: "light",
+  fontSize: 14,
+  shortcuts: ["ctrl+s"],
+};
+
+const next = produce(current, (draft) => {
+  draft.theme = "dark";
+  draft.fontSize += 2;
+});
+
+console.log(current.theme, current.fontSize);
+console.log(next.theme, next.fontSize);
+```
+
+</CodeExample>
+
+Like the built-in `Readonly`, `Mutable` is **shallow**: it changes the top-level properties only. `draft.shortcuts` is still a `readonly string[]`:
+
+```ts
+produce(current, (draft) => {
+  draft.shortcuts.push("ctrl+k");
+  // ❌ Error: Property 'push' does not exist on type 'readonly string[]'.
+});
+```
+
+A deep version needs a mapped type that calls itself through a conditional type; you'll build `DeepReadonly` and friends in [Building Your Own Utility Types](/learn/typescript/building-utility-types).
+
+<Quiz
+  question="What is { -readonly [K in keyof T]-?: T[K] } when T is { readonly a?: number }?"
+  options={[
+    "{ readonly a?: number }",
+    "{ a?: number }",
+    "{ a: number }",
+    "{ a: number | undefined }",
+  ]}
+  answer={2}
+  explanation="-readonly removes readonly and -? removes the question mark. Removing ? also removes the undefined that the optional property added, exactly like Required<T>, so the result is { a: number }."
+/>
+
+## Homomorphic mapped types keep modifiers
+
+Something subtle happened in `MyPartial`: we only **added** `?`, yet `readonly` properties stayed `readonly`. A mapped type over `keyof T` is called **homomorphic** ("same shape"), and it copies each property's modifiers from `T`. `Pick` is homomorphic too, because its keys are constrained to `keyof T`:
+
+```ts
+interface Profile {
+  readonly id: string;
+  name: string;
+  bio?: string;
+}
+
+type Copy<T> = { [K in keyof T]: T[K] };
+type A = Copy<Profile>;
+// { readonly id: string; name: string; bio?: string }
+
+type MyPick<T, K extends keyof T> = { [P in K]: T[P] };
+type B = MyPick<Profile, "id" | "bio">;
+// { readonly id: string; bio?: string }
+```
+
+The moment TypeScript can't see `keyof T` in the mapped type, it stops copying. Store the keys in an alias first, and the modifiers silently disappear:
+
+```ts
+type ProfileKey = keyof Profile;
+type Flat = { [K in ProfileKey]: Profile[K] };
+// { id: string; name: string; bio: string | undefined }
+```
+
+`id` is no longer `readonly`, and `bio` became **required** (it may hold `undefined`, but it must be there). That's the kind of bug that never shows up in a code review: the type still "looks right". A type test with `Equal` catches it immediately.
+
+Homomorphic mapped types have one more superpower: on an **array or tuple**, they map the elements and give you back an array or tuple. That's exactly how `Promise.all` is typed in TypeScript's library (a mapped type with `Awaited<T[P]>`). You can use the same trick to await an **object** of promises:
+
+<CodeExample output={`Inbox: Mei, 3 new`}>
+
+```ts
+type Resolved<T> = { [K in keyof T]: Awaited<T[K]> };
+
+async function allProps<T extends object>(
+  tasks: T,
+): Promise<Resolved<T>> {
+  const entries = await Promise.all(
+    Object.entries(tasks).map(async ([key, task]) => {
+      return [key, await task] as const;
+    }),
+  );
+  return Object.fromEntries(entries) as Resolved<T>;
+}
+
+const wait = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function loadUser() {
+  await wait(30);
+  return { name: "Mei", plan: "pro" };
+}
+
+async function loadUnread() {
+  await wait(10);
+  return 3;
+}
+
+const page = await allProps({
+  user: loadUser(),
+  unread: loadUnread(),
+  title: "Inbox", // plain values are fine too
+});
+
+console.log(`${page.title}: ${page.user.name}, ${page.unread} new`);
+```
+
+</CodeExample>
+
+The loads run in parallel, and `page` is `{ user: { name: string; plan: string }; unread: number; title: string }`, with names instead of tuple positions. (The `as` is there because `Object.fromEntries` returns a loose `{ [k: string]: ... }`; the mapped type is the honest description of what it built.)
+
+<Callout type="tip" title="Rebuild a utility, then test it">
+
+`Omit` combines both of this module's tools: `type MyOmit<T, K extends PropertyKey> = MyPick<T, Exclude<keyof T, K>>`. Because it goes through `Pick` with keys from `keyof T`, modifiers survive. Whenever you write a type like this, pin it with a type test against the real thing, `Expect<Equal<MyOmit<Profile, "id">, Omit<Profile, "id">>>`, and against a hand-written expected shape that includes a `readonly` and an optional property. Those two are exactly where hand-written mapped types go wrong.
+
+</Callout>
+
+## Key remapping with `as`
+
+Since TypeScript 4.1, a mapped type can also **rename** keys with an `as` clause: `[K in keyof T as NewName]`. The new name is usually built with a **template literal type**, the topic of the next lesson. Here's a quick preview that turns every property into a getter:
+
+<CodeExample output={`PO 8
+[ 'getName', 'getAge' ]`}>
+
+```ts
+type Getters<T> = {
+  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
+};
+
+function makeGetters<T extends object>(obj: T): Getters<T> {
+  const getters: Record<string, () => unknown> = {};
+  for (const key of Object.keys(obj)) {
+    const name = `get${key[0].toUpperCase()}${key.slice(1)}`;
+    getters[name] = () => obj[key as keyof T];
+  }
+  return getters as Getters<T>;
+}
+
+const panda = makeGetters({ name: "Po", age: 7 });
+console.log(panda.getName().toUpperCase(), panda.getAge() + 1);
+console.log(Object.keys(panda));
+```
+
+</CodeExample>
+
+`string & K` is needed because keys can also be numbers or symbols, and `Capitalize` only works on strings: the intersection keeps just the string keys. Notice that the type and the runtime code each spell out the renaming rule separately. The type can't check that `makeGetters` really builds `getName`, which is why the implementation ends in a single cast.
+
+The `as` clause can also **filter**: when the new name is `never`, the property is dropped. Combine that with a conditional type, and you can select keys by the **type of their value**:
+
+<CodeExample output="65 5">
+
+```ts
+type KeysOfType<T, V> = keyof {
+  [K in keyof T as T[K] extends V ? K : never]: T[K];
+};
+
+interface Order {
+  id: string;
+  total: number;
+  shipping: number;
+  paid: boolean;
+}
+
+type MoneyField = KeysOfType<Order, number>; // "total" | "shipping"
+
+function sumBy<T>(items: T[], key: KeysOfType<T, number>): number {
+  let sum = 0;
+  for (const item of items) {
+    sum += item[key] as number; // TypeScript can't see it's a number
+  }
+  return sum;
+}
+
+const orders: Order[] = [
+  { id: "o1", total: 40, shipping: 5, paid: true },
+  { id: "o2", total: 25, shipping: 0, paid: false },
+];
+const field: MoneyField = "shipping";
+console.log(sumBy(orders, "total"), sumBy(orders, field));
+```
+
+</CodeExample>
+
+For callers this is lovely: the editor suggests only `"total"` and `"shipping"`, and a mistake reads clearly:
+
+```ts
+sumBy(orders, "id");
+// ❌ Error: Argument of type '"id"' is not assignable to parameter of type '"total" | "shipping"'.
+```
+
+Inside the function, though, TypeScript can't work out that `item[key]` is a number for an unknown `T`, so we need a cast. The alternative puts the constraint on `T` instead, `function sumBy<T extends Record<K, number>, K extends keyof T>(items: T[], key: K)`, which needs no cast but gives callers a worse message (`Argument of type 'Order[]' is not assignable to parameter of type 'Record<"id", number>[]'.`, pointing at the **orders**, not the key). Which is better depends on who reads the errors more: a library's users, or its maintainers.
+
+## Mapped types over unions
+
+`in` loops over **any** union, not just keys. Combined with `as`, that turns a union of events into an object with one handler per event:
+
+```ts
+type AppEvent =
+  | { type: "login"; userId: string }
+  | { type: "logout"; userId: string; reason: "manual" | "timeout" }
+  | { type: "purchase"; userId: string; amount: number };
+
+type Handlers = {
+  [E in AppEvent as E["type"]]: (event: E) => void;
+};
+// { login: (event: { type: "login"; ... }) => void; logout: ...; ... }
+```
+
+Each handler receives exactly its own event. But try to **call** the right handler, and you hit one of TypeScript's best-known limitations:
+
+```ts
+function dispatch(event: AppEvent, handlers: Handlers) {
+  handlers[event.type](event);
+  // ❌ Error: Argument of type 'AppEvent' is not assignable to parameter of type 'never'.
+}
+```
+
+TypeScript doesn't track that `event.type` and `event` belong **together** (this is called a **correlated union**). `handlers[event.type]` could be any of the three handlers, so the only argument safe for all of them is one that's every event at once, which is `never`. The fix that TypeScript's own team recommends: **start from a map** of event name to payload, and derive both the union and the handlers from it:
+
+<CodeExample output={`[ 'mei logged in', 'mei paid £12', 'mei left (timeout)' ]`}>
+
+```ts
+// Start from a map: event name -> what the event carries
+interface EventMap {
+  login: { userId: string };
+  logout: { userId: string; reason: "manual" | "timeout" };
+  purchase: { userId: string; amount: number };
+}
+
+// Derive the union of events from it...
+type AppEvent<K extends keyof EventMap = keyof EventMap> = {
+  [P in K]: { type: P } & EventMap[P];
+}[K];
+
+// ...and an object with one handler per event
+type Handlers = {
+  [K in keyof EventMap]: (event: AppEvent<K>) => void;
+};
+
+function dispatch<K extends keyof EventMap>(
+  event: AppEvent<K>,
+  handlers: Handlers,
+): void {
+  handlers[event.type](event);
+}
+
+const log: string[] = [];
+const handlers: Handlers = {
+  login: (e) => log.push(`${e.userId} logged in`),
+  logout: (e) => log.push(`${e.userId} left (${e.reason})`),
+  purchase: (e) => log.push(`${e.userId} paid £${e.amount}`),
+};
+
+dispatch({ type: "login", userId: "mei" }, handlers);
+dispatch({ type: "purchase", userId: "mei", amount: 12 }, handlers);
+dispatch({ type: "logout", userId: "mei", reason: "timeout" }, handlers);
+console.log(log);
+```
+
+</CodeExample>
+
+`{ [P in K]: ... }[K]` is a common idiom: build an object with one entry per key, then index it with all the keys to get the **union** of its values. `AppEvent` (with the default) is the same three-event union as before, and `AppEvent<"login">` is just the login event. Because everything is expressed through the same `K`, TypeScript can now see that the handler and the event match, with no cast. Adding an event is one line in `EventMap`, and every `Handlers` object then demands a handler for it.
+
+<Quiz
+  question="type ProfileKey = keyof Profile, where Profile is { readonly id: string; bio?: string }. What is { [K in ProfileKey]: Profile[K] }?"
+  options={[
+    "{ readonly id: string; bio?: string }",
+    "{ id: string; bio: string | undefined }",
+    "{ id: string; bio?: string }",
+    "{ readonly id: string; bio: string }",
+  ]}
+  answer={1}
+  explanation="Through an alias, TypeScript no longer sees keyof T in the mapped type, so it isn't homomorphic and doesn't copy modifiers: readonly is lost, and bio becomes required with the type string | undefined. Write [K in keyof Profile] to keep the modifiers."
+/>
+
+## When to derive, and when to write it out
+
+Mapped types are so convenient that teams overdo them. One codebase I reviewed derived every API shape from its database model through chains like `Partial<Omit<Pick<DbUser, ...>, ...>>`, five levels deep. Renaming a column broke forty types at once, and the errors all pointed at the **derived** names, so nobody could tell which API had actually changed. Some guidelines:
+
+- **Domain models: write them out.** `User`, `Order` and `Invoice` are the vocabulary of your app. Spell them out as interfaces, so they show up readably in hovers and errors.
+- **Variants of a model: derive them.** Validators, error maps, patches, read-only views and handler maps should follow the model automatically; that's where mapped types shine.
+- **Shapes that change for different reasons: don't derive.** An API response and a database row may look alike today, but they change for different reasons (a public contract vs a storage decision). Deriving one from the other couples them. Map between them in code instead.
+- **Hovers show formulas.** Your editor shows `Validators<SignUp>`, not its properties. For types people read a lot, the common trick `type Simplify<T> = { [K in keyof T]: T[K] } & {}` makes hovers expand. It also turns an intersection like `{ a: 1 } & { b: 2 }` into one object type, which strict `Equal` tests treat as different from `{ a: 1; b: 2 }` otherwise.
+- **Count the casts.** A mapped type that needs a cast inside every function that uses it (like `sumBy`) is still worth it if it protects many callers. If it protects one, write the simple version.
+
+<Callout type="warning" title="Mapped types don't make runtime code">
+
+A mapped type describes an object; it never creates one. `Getters<T>`, `Setters<T>` and `Resolved<T>` promise that certain properties exist, and only your runtime code (and its tests) can keep that promise. When a derived type and the code that builds the object follow the same rule (like "add `get` and capitalise"), put them next to each other, and test both.
+
+</Callout>
+
+<Exercise
+  title="A typed form model"
+  language="typescript"
+  starter={`type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+// One validator per field, even for optional fields
+type Validators<T> = unknown;
+
+// An optional, read-only error message per field
+type Errors<T> = unknown;
+
+// setEmail(value), setAge(value), ...: one per field, never optional
+type Setters<T> = unknown;
+
+// The names of the fields whose values are booleans
+type FlagFields<T> = unknown;
+
+interface Form<T> {
+  values(): T;
+  set: Setters<T>;
+  toggle(field: FlagFields<T>): void;
+  errors(): Errors<T>;
+}
+
+function createForm<T extends object>(
+  initial: T,
+  validators: Validators<T>,
+): Form<T> {
+  // TODO: keep the current values, starting with a copy of initial.
+  // Every change replaces them with a NEW object.
+  throw new Error("Not written yet");
+}
+
+interface SignUp {
+  email: string;
+  age: number;
+  newsletter: boolean;
+  referral?: string;
+}
+
+// ===== Type tests: don't change these =====
+type _tests = [
+  Expect<Equal<Validators<SignUp>, {
+    email: (value: string) => string | null;
+    age: (value: number) => string | null;
+    newsletter: (value: boolean) => string | null;
+    referral: (value: string | undefined) => string | null;
+  }>>,
+  Expect<Equal<Errors<SignUp>, {
+    readonly email?: string;
+    readonly age?: string;
+    readonly newsletter?: string;
+    readonly referral?: string;
+  }>>,
+  Expect<Equal<Setters<SignUp>, {
+    setEmail: (value: string) => void;
+    setAge: (value: number) => void;
+    setNewsletter: (value: boolean) => void;
+    setReferral: (value: string | undefined) => void;
+  }>>,
+  Expect<Equal<FlagFields<SignUp>, "newsletter">>,
+  Expect<Equal<FlagFields<{ a: boolean; b: true; c: 1 }>, "a" | "b">>,
+];
+
+function typeTests(form: Form<SignUp>) {
+  // @ts-expect-error: age is a number
+  form.set.setAge("18");
+  // @ts-expect-error: only boolean fields can be toggled
+  form.toggle("email");
+  // @ts-expect-error: errors are read-only
+  form.errors().email = "Nope";
+}
+
+// ===== Try it =====
+const form = createForm<SignUp>(
+  { email: "", age: 0, newsletter: false },
+  {
+    email: (v) => (v.includes("@") ? null : "Enter a valid email"),
+    age: (v) => (v >= 13 ? null : "You must be 13 or older"),
+    newsletter: () => null,
+    referral: (v) =>
+      v === undefined || v.length >= 3 ? null : "Code too short",
+  },
+);
+
+console.log(form.errors());
+form.set.setEmail("mei@panda.dev");
+form.set.setAge(28);
+form.set.setReferral("PO");
+form.toggle("newsletter");
+console.log(form.values());
+console.log(form.errors());
+`}
+  tests={[
+    { name: "values() starts as a copy of the initial values", check: "(() => { const init = { a: 1, b: 'x' }; const f = createForm(init, { a: () => null, b: () => null }); const v = f.values(); return v.a === 1 && v.b === 'x' && v !== init; })()" },
+    { name: "Setters change the values, not the initial object", check: "(() => { const init = { a: 1, b: 'x' }; const f = createForm(init, { a: () => null, b: () => null }); f.set.setA(5); f.set.setB('y'); return f.values().a === 5 && f.values().b === 'y' && init.a === 1; })()" },
+    { name: "There is a setter for every validated field, even a missing one", check: "(() => { const f = createForm({ name: 'Po' }, { name: () => null, nickname: () => null }); f.set.setNickname('Dragon'); return f.values().nickname === 'Dragon' && Object.keys(f.set).sort().join() === 'setName,setNickname'; })()" },
+    { name: "toggle flips a boolean field and makes a new values object", check: "(() => { const f = createForm({ on: false, n: 1 }, { on: () => null, n: () => null }); const before = f.values(); f.toggle('on'); const mid = f.values().on; f.toggle('on'); return mid === true && f.values().on === false && before.on === false; })()" },
+    { name: "errors() lists only the fields that fail", check: "(() => { const f = createForm({ a: 1, b: 2, c: 3 }, { a: (v) => v > 1 ? null : 'a too small', b: (v) => v > 1 ? null : 'b too small', c: () => 'always' }); const e = f.errors(); return Object.keys(e).sort().join() === 'a,c' && e.a === 'a too small' && e.c === 'always' && !('b' in e); })()" },
+    { name: "errors() checks the current values", check: "(() => { const f = createForm({ a: 0 }, { a: (v) => v > 0 ? null : 'bad' }); const first = f.errors().a; f.set.setA(3); return first === 'bad' && Object.keys(f.errors()).length === 0; })()" },
+  ]}
+>
+
+Form libraries (React Hook Form, Formik, TanStack Form) are mostly mapped types over **your** form's shape. Build a small one: `createForm(initial, validators)` returns a form model with the current values, a setter per field, a `toggle` for checkbox fields, and validation.
+
+**Types.** Replace each `unknown` with a mapped type:
+
+1. `Validators<T>`: a validator `(value: T[K]) => string | null` for **every** field, including optional ones (the form must decide what an empty referral code means).
+2. `Errors<T>`: an optional, **read-only** error message (`string`) per field.
+3. `Setters<T>`: `setEmail`, `setAge` and so on, each taking that field's type. Setters are never optional, even for optional fields.
+4. `FlagFields<T>`: the union of the names of fields whose value type is a boolean.
+
+The `Expect<Equal<...>>` lines compile only when your types are exactly right, and each `// @ts-expect-error` line passes only when the line below it **is** an error.
+
+**Behaviour.** Then write `createForm`:
+
+- `values()` returns the current values: at first a **copy** of `initial`. Every change (a setter or `toggle`) replaces them with a **new** object, like state in React.
+- `set` has one setter per key of `validators` (the validators list every field, even ones missing from `initial`).
+- `toggle(field)` flips a boolean field.
+- `errors()` runs every validator on the current values and returns an object with only the failing fields' messages.
+
+<Hint>
+
+**Types:** `Validators` needs `-?`: `{ [K in keyof T]-?: (value: T[K]) => string | null }`. `Errors` is `{ readonly [K in keyof T]?: string }`. `Setters` renames with `as` like `Getters` in the lesson, plus `-?`. For `FlagFields`, filter with `as T[K] extends boolean ? K : never` and take the `keyof` of the result, like `KeysOfType`.
+
+**Behaviour:** start with `let values: T = { ...initial };`. Build the setters in a `const set: Record<string, (value: unknown) => void> = {}` by looping over `Object.keys(validators)`; each one does `values = { ...values, [key]: value };`. Return it as `set as Setters<T>` (the one cast: TypeScript can't check the renaming). `toggle(field)` is `values = { ...values, [field]: !values[field] };`. In `errors()`, loop with `for (const key in validators)`, call `validators[key](values[key])`, and collect the messages that aren't `null` in a writable `{ [K in keyof T]?: string }` object.
+
+</Hint>
+
+<Solution>
+
+```ts
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type Validators<T> = {
+  [K in keyof T]-?: (value: T[K]) => string | null;
+};
+
+type Errors<T> = { readonly [K in keyof T]?: string };
+
+type Setters<T> = {
+  [K in keyof T as `set${Capitalize<string & K>}`]-?: (
+    value: T[K],
+  ) => void;
+};
+
+type FlagFields<T> = keyof {
+  [K in keyof T as T[K] extends boolean ? K : never]: T[K];
+};
+
+interface Form<T> {
+  values(): T;
+  set: Setters<T>;
+  toggle(field: FlagFields<T>): void;
+  errors(): Errors<T>;
+}
+
+function createForm<T extends object>(
+  initial: T,
+  validators: Validators<T>,
+): Form<T> {
+  let values: T = { ...initial };
+
+  const set: Record<string, (value: unknown) => void> = {};
+  for (const key of Object.keys(validators)) {
+    const name = `set${key[0].toUpperCase()}${key.slice(1)}`;
+    set[name] = (value) => {
+      values = { ...values, [key]: value };
+    };
+  }
+
+  return {
+    values: () => values,
+    set: set as Setters<T>,
+    toggle(field) {
+      values = { ...values, [field]: !values[field] };
+    },
+    errors() {
+      const errors: { [K in keyof T]?: string } = {};
+      for (const key in validators) {
+        const message = validators[key](values[key]);
+        if (message !== null) {
+          errors[key] = message;
+        }
+      }
+      return errors;
+    },
+  };
+}
+
+interface SignUp {
+  email: string;
+  age: number;
+  newsletter: boolean;
+  referral?: string;
+}
+
+// ===== Type tests: don't change these =====
+type _tests = [
+  Expect<Equal<Validators<SignUp>, {
+    email: (value: string) => string | null;
+    age: (value: number) => string | null;
+    newsletter: (value: boolean) => string | null;
+    referral: (value: string | undefined) => string | null;
+  }>>,
+  Expect<Equal<Errors<SignUp>, {
+    readonly email?: string;
+    readonly age?: string;
+    readonly newsletter?: string;
+    readonly referral?: string;
+  }>>,
+  Expect<Equal<Setters<SignUp>, {
+    setEmail: (value: string) => void;
+    setAge: (value: number) => void;
+    setNewsletter: (value: boolean) => void;
+    setReferral: (value: string | undefined) => void;
+  }>>,
+  Expect<Equal<FlagFields<SignUp>, "newsletter">>,
+  Expect<Equal<FlagFields<{ a: boolean; b: true; c: 1 }>, "a" | "b">>,
+];
+
+function typeTests(form: Form<SignUp>) {
+  // @ts-expect-error: age is a number
+  form.set.setAge("18");
+  // @ts-expect-error: only boolean fields can be toggled
+  form.toggle("email");
+  // @ts-expect-error: errors are read-only
+  form.errors().email = "Nope";
+}
+
+// ===== Try it =====
+const form = createForm<SignUp>(
+  { email: "", age: 0, newsletter: false },
+  {
+    email: (v) => (v.includes("@") ? null : "Enter a valid email"),
+    age: (v) => (v >= 13 ? null : "You must be 13 or older"),
+    newsletter: () => null,
+    referral: (v) =>
+      v === undefined || v.length >= 3 ? null : "Code too short",
+  },
+);
+
+console.log(form.errors());
+form.set.setEmail("mei@panda.dev");
+form.set.setAge(28);
+form.set.setReferral("PO");
+form.toggle("newsletter");
+console.log(form.values());
+console.log(form.errors());
+// { email: 'Enter a valid email', age: 'You must be 13 or older' }
+// { email: 'mei@panda.dev', age: 28, newsletter: true, referral: 'PO' }
+// { referral: 'Code too short' }
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **mapped type** `{ [K in Keys]: ... }` builds an object type by looping over a union of keys; with `keyof T` and `T[K]` it transforms another type property by property.
+- **Modifiers**: add `readonly` / `?`, remove them with `-readonly` / `-?`. That's all `Partial`, `Required`, `Readonly` and `Mutable` are, and they're all **shallow**.
+- **Homomorphic** mapped types (over `keyof T`, like `Pick`) copy `readonly` and `?` from the original, and map arrays and tuples element by element (how `Promise.all` is typed). Hide the keys behind an alias and the modifiers are lost.
+- **Key remapping** with `as` renames keys (`get${Capitalize<...>}`) and **filters** them (`as ... ? K : never`), for example to select keys by value type.
+- Mapping over a **union** gives you per-variant handlers. To call them without casts, **start from a map** (`EventMap`) and derive the union and the handlers from it.
+- Write domain models out; derive their variants. Keep types that change for different reasons independent, watch how many casts a derived type needs, and test every hand-written mapped type, especially with `readonly` and optional properties.

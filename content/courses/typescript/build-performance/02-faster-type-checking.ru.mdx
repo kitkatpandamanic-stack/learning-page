@@ -1,0 +1,676 @@
+---
+title: Ускоряем проверку типов
+description: Измерьте, на что tsc тратит время, проверяйте меньше с skipLibCheck, инкрементальными сборками и ссылками на проекты и перепишите шаблоны типов, которые тормозят проверщик.
+duration: 24
+xp: 25
+---
+
+Проверка типов на 10 секунд — мелкая неприятность. Проверка на 6 минут меняет то, как работает команда: люди перестают запускать её локально, об ошибках узнают только в CI, а автодополнение не успевает за набором текста. В одном проекте виновником оказался единственный хитроумный вспомогательный тип, используемый в 40 файлах: из-за него проверщик при каждом запуске выполнял несколько миллионов инстанцирований. 🐢
+
+Хорошая новость: медленная проверка типов почти всегда вызвана одной из немногих причин, и в TypeScript есть инструменты, чтобы найти вашу. В этом уроке — измерения, способы проверять меньше и самые дорогие шаблоны типов вместе с их исправлениями.
+
+## Сначала измерьте
+
+Не гадайте. С `--extendedDiagnostics` команда `tsc` печатает, что она сделала и сколько времени занял каждый этап из прошлого урока. Вот результат для крошечного проекта из двух исходных файлов, который использует библиотеку DOM:
+
+```bash
+$ npx tsc --noEmit --extendedDiagnostics
+Files:                          64
+Lines of Library:            56754
+Lines of Definitions:            0
+Lines of TypeScript:             9
+Lines of JavaScript:             0
+Lines of JSON:                   0
+Lines of Other:                  0
+Identifiers:                 48658
+Symbols:                     53837
+Types:                       28238
+Instantiations:              27138
+Memory used:               125234K
+Assignability cache size:    12257
+Identity cache size:             0
+Subtype cache size:              0
+Strict subtype cache size:       4
+I/O Read time:               0.01s
+Parse time:                  0.08s
+ResolveModule time:          0.00s
+Program time:                0.10s
+Bind time:                   0.04s
+Check time:                  0.45s
+printTime time:              0.00s
+Emit time:                   0.00s
+Total time:                  0.59s
+```
+
+Как это читать:
+
+- **Files** и **Lines of …** показывают, **сколько** кода в программе. Девять строк — наши; 56 754 — стандартная библиотека, в основном `lib.dom.d.ts`. В реальных проектах самым большим числом часто оказывается `Lines of Definitions` (файлы `.d.ts` ваших npm-пакетов).
+- **Types** и **Instantiations** показывают, сколько работы проделал **проверщик**. Инстанцирование (instantiation) — это одно использование дженерика с конкретными аргументами типов: `Array<string>`, `Promise<User>`, `Paths<Settings>`. Сотни тысяч — норма для большого приложения. Несколько миллионов в среднем проекте означают, что какой-то тип умножает работу, как глубокие утилитные типы, которые вы измеряли в уроке [Собственные утилитные типы](/learn/typescript/building-utility-types).
+- **Parse**, **Bind**, **Check** и **Emit time** — это этапы из прошлого урока. **Check time** почти всегда самый большой.
+
+Время меняется от запуска к запуску и от машины к машине, поэтому сравнивайте запуски на одной машине и смотрите на счётчики — они не меняются.
+
+Чтобы узнать, **почему** файл вообще попал в программу, попросите `tsc` объяснить каждый файл:
+
+```bash
+$ npx tsc --noEmit --explainFiles > files.txt
+```
+
+```text title="files.txt"
+src/cart.ts
+  Matched by include pattern 'src' in 'tsconfig.json'
+  Imported via "./cart.js" from file 'src/main.ts'
+```
+
+Так и обнаруживается библиотека иконок на 3000 файлов, подтянутая одним невинным импортом, или папка `dist`, которая проверяется второй раз, потому что `include` слишком широкий.
+
+### skipLibCheck: не проверяйте то, чем только пользуетесь
+
+Вот тот же проект с ещё одним флагом:
+
+```bash
+$ npx tsc --noEmit --extendedDiagnostics --skipLibCheck
+Types:                         107
+Instantiations:                  1
+Check time:                  0.01s
+Total time:                  0.14s
+```
+
+С 28 238 типов до 107. Без этого флага проверщик не просто **использовал** `lib.dom.d.ts`, а при каждом запуске **проверял** все его 45 000 строк на ошибки. **`skipLibCheck`** пропускает проверку **файлов объявлений** (`.d.ts`): стандартной библиотеки, каждого пакета `@types` и типов каждой библиотеки. Они по-прежнему читаются и используются для проверки **вашего** кода — просто сами не проверяются.
+
+У этого есть цена: об ошибках **внутри** файлов `.d.ts` никто не сообщит. Это касается и конфликтов между двумя версиями одного пакета `@types`, и ошибок в файлах `.d.ts`, которые вы написали сами. Почти все шаблоны проектов (Vite, Next.js и другие) всё равно включают этот флаг: такие ошибки редки, а экономия времени велика. Если вы пишете важные файлы `.d.ts` вручную, время от времени проверяйте их отдельным шагом без флага.
+
+Ещё одна экономия в **TypeScript 6** достаётся бесплатно: настройка `types` теперь по умолчанию — **пустой список**. Раньше TypeScript загружал в каждую программу все пакеты `@types/*` из `node_modules`, используете вы их или нет. Теперь вы сами перечисляете нужные глобальные типы — программа остаётся маленькой, а неожиданные глобальные имена не появляются:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "types": ["node"],
+    "skipLibCheck": true
+  }
+}
+```
+
+### --generateTrace: найдите медленный файл и медленный тип
+
+Когда счётчики говорят «что-то дорогое», но не говорят **что**, запишите трассировку (trace):
+
+```bash
+$ npx tsc --noEmit --generateTrace trace
+$ ls trace
+trace.json  types.json
+```
+
+Откройте `trace.json` в просмотрщике трассировок, например [Perfetto](https://ui.perfetto.dev) (или `about:tracing` в Chrome). Вы получите временную шкалу всего запуска: каждый блок `checkSourceFile` — это один файл, а внутри можно спуститься до отдельного выражения или переменной, на которые ушло две секунды. Для готовой сводки горячих точек команда TypeScript публикует анализатор:
+
+```bash
+$ npx @typescript/analyze-trace trace
+```
+
+Он перечисляет самые медленные файлы и выражения с их позициями в коде. На практике это приводит к нескольким строкам — и обычно к одному из шаблонов, описанных дальше в этом уроке.
+
+<Quiz
+  question="Проверка типов в CI замедлилась с 1 до 7 минут. extendedDiagnostics показывает, что Check time занимает 95% общего времени, а Instantiations выросли с 600 000 до 9 миллионов. Какой следующий шаг лучше всего?"
+  options={[
+    "Отключить строгий режим, чтобы у проверщика было меньше работы",
+    "Записать трассировку через --generateTrace и найти, какие файлы и выражения отнимают время",
+    "Перейти на более быстрый бандлер, например esbuild",
+    "Удалить файл tsbuildinfo и снова запустить tsc",
+  ]}
+  answer={1}
+  explanation="Цифры говорят, что какой-то тип умножает работу, но не говорят какой. Трассировка точно показывает, на каком файле и выражении проверщик тратит время. Бандлер вообще не проверяет типы, а отключение строгости выбрасывает безопасность, не устраняя причину."
+/>
+
+## Проверяйте меньше: инкрементальные сборки
+
+Большинство запусков меняют лишь несколько файлов — зачем снова проверять всё? С **`incremental`** команда `tsc` сохраняет то, что узнала, в файл **`.tsbuildinfo`**:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "incremental": true
+  }
+}
+```
+
+В этом файле для каждого исходного файла записаны хеш содержимого, его **сигнатура** (signature — форма публичного API, примерно то, что сказал бы его `.d.ts`) и его ошибки. При следующем запуске `tsc` пропускает неизменённые файлы. Более того: если вы правите **тело** функции, но не её сигнатуру, файлы, которые её импортируют, перепроверять не нужно — ничего видимого для них не изменилось. Вот небольшой проект, запущенный дважды без изменений:
+
+```bash
+$ npx tsc --extendedDiagnostics | grep "Total time"
+Total time:                  0.51s
+$ npx tsc --extendedDiagnostics | grep "Total time"
+Total time:                  0.15s
+```
+
+На большой кодовой базе разница измеряется минутами. Это работает и с `noEmit`, так что `tsc --noEmit` в CI тоже может этим пользоваться, если кэшировать файл между запусками:
+
+```yaml title=".github/workflows/ci.yml"
+- uses: actions/cache@v4
+  with:
+    path: tsconfig.tsbuildinfo
+    key: tsc-${{ github.sha }}
+    restore-keys: tsc-
+- run: npx tsc --noEmit
+```
+
+<Callout type="warning" title="Загадка пропавшей папки dist">
+
+Классика: кто-то запускает `rm -rf dist`, потом `tsc`, а `dist` не появляется. Ни ошибок, ни вывода. Файл `.tsbuildinfo` говорит, что всё актуально, поэтому `tsc` нечего делать. При очистке удаляйте и информацию о сборке, например скриптом `"clean": "rm -rf dist tsconfig.tsbuildinfo"`.
+
+</Callout>
+
+### Ссылки на проекты: проверяйте каждую часть один раз
+
+Вы настраивали их в уроке [Монорепозитории и ссылки на проекты](/learn/typescript/monorepos-and-project-references), чтобы задать репозиторию чёткие границы. А ещё это главный инструмент ускорения для больших кодовых баз. Инкрементальные сборки перестают перепроверять **неизменённые** файлы, но в большом репозитории есть вторая потеря: когда приложение `web` и `api` оба импортируют `shared`, проверщик обрабатывает исходники `shared` внутри каждой программы, снова и снова. **Ссылки на проекты** (project references) делят репозиторий на отдельные проекты, которые собираются по порядку:
+
+```json title="packages/shared/tsconfig.json"
+{
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
+```
+
+```json title="apps/web/tsconfig.json"
+{
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "include": ["src"],
+  "references": [{ "path": "../../packages/shared" }]
+}
+```
+
+`composite` включает всё, что нужно проекту, на который ссылаются, в том числе `declaration` и `incremental`. Затем `tsc -b` (режим сборки) собирает проекты в порядке зависимостей и пропускает актуальные. Выигрыш в том, что `web` вообще не проверяет **исходники** `shared`: он читает файлы `.d.ts`, которые создал `shared`. Каждый файл проверяется один раз, в своём проекте. Редакторы тоже работают по проектам, так что одна гигантская программа превращается в несколько меньших.
+
+Это не бесплатно: больше конфигурации, каждый общий проект обязан создавать файлы объявлений, а проекты не могут зависеть друг от друга по кругу (что обычно идёт архитектуре на пользу). Это окупается, когда в репозитории несколько приложений и пакетов или проверка типов занимает минуты. При меньших масштабах обычно хватает `incremental` и `skipLibCheck`.
+
+## Самые дорогие шаблоны
+
+Иногда программа не так уж велика — просто несколько типов очень дорогие. Вот обычные подозреваемые, примерно в том порядке, в котором вы их встретите.
+
+### Интерфейсы вместо пересечений
+
+Оба варианта описывают один и тот же объект:
+
+```ts
+// Либо так…
+type Admin = Entity & Timestamps & { name: string };
+
+// …либо так
+interface Admin extends Entity, Timestamps {
+  name: string;
+}
+```
+
+`interface` — это единый именованный плоский тип. TypeScript строит его один раз и кэширует, как он соотносится с другими типами. Пересечение (intersection) так целиком не кэшируется, и чтобы сравнить с ним что-либо, сначала приходится проверять его части по одной. Кроме того, интерфейсы ловят ошибки, которые пересечения скрывают. Дайте `id` два разных типа — интерфейс об этом сообщит, а пересечение молча превратит `id` в `never`, тип без значений:
+
+```ts
+interface User { id: string; name: string }
+
+interface Admin extends User { id: number }
+// ❌ Error: Interface 'Admin' incorrectly extends interface 'User'.
+
+type Admin2 = User & { id: number };
+const admin: Admin2 = { id: 1, name: "Mei" };
+// ❌ Error: Type 'number' is not assignable to type 'never'.
+```
+
+Так что для **объектных типов**, которые объединяют другие, предпочитайте `interface … extends`. Пересечения по-прежнему подходят для того, что интерфейсы выразить не могут, например для добавления свойства к параметру типа (`T & { id: string }`):
+
+<CodeExample output="Mei (u1): billing, users">
+
+```ts
+interface Entity {
+  id: string;
+}
+
+interface Timestamps {
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Один именованный плоский тип: строится один раз,
+// кэшируется, о конфликтах сообщает
+interface Admin extends Entity, Timestamps {
+  name: string;
+  permissions: readonly string[];
+}
+
+function describeAdmin(admin: Admin): string {
+  const list = admin.permissions.join(", ");
+  return `${admin.name} (${admin.id}): ${list}`;
+}
+
+console.log(describeAdmin({
+  id: "u1",
+  name: "Mei",
+  permissions: ["billing", "users"],
+  createdAt: "2026-01-15",
+  updatedAt: "2026-03-02",
+}));
+```
+
+</CodeExample>
+
+### Аннотируйте возвращаемые типы и давайте им имена
+
+Вывод типов отлично работает внутри функции. Но от выведенного типа **экспортируемых** функций зависят все вызывающие и каждый файл объявлений, а проверщику сначала нужно вычислить его по телу. Для фабрики, возвращающей объект, вся структура выписывается в файл объявлений и повторяется везде, где тип записан полностью:
+
+```ts title="dist/cart.d.ts (inferred)"
+export declare function createCart(): {
+    items: CartItem[];
+    add(item: CartItem): void;
+    total(): number;
+    find(name: string): CartItem | undefined;
+};
+```
+
+С именованным интерфейсом и явным возвращаемым типом объявление гласит `createCart(): Cart`, другие файлы ссылаются на `Cart` по имени, а проверщику достаточно один раз сравнить тело с `Cart`. И бонус: изменение тела не сможет случайно изменить публичный API.
+
+<CodeExample output="2 1399">
+
+```ts
+interface CartItem {
+  name: string;
+  cents: number;
+  quantity: number;
+}
+
+// Публичная форма: записана один раз и получила имя
+interface Cart {
+  readonly items: readonly CartItem[];
+  add(item: CartItem): void;
+  total(): number;
+}
+
+function createCart(): Cart {
+  const items: CartItem[] = [];
+  return {
+    items,
+    add(item) {
+      items.push(item);
+    },
+    total() {
+      return items.reduce((s, i) => s + i.cents * i.quantity, 0);
+    },
+  };
+}
+
+const cart = createCart();
+cart.add({ name: "Бамбук", cents: 250, quantity: 4 });
+cart.add({ name: "Чай", cents: 399, quantity: 1 });
+console.log(cart.items.length, cart.total());
+```
+
+</CodeExample>
+
+Та же идея относится к большим выведенным типам из библиотек. Если каждый файл пишет `z.infer<typeof UserSchema>` или `Awaited<ReturnType<typeof getUser>>`, проверщик может вычислять это в каждом из них. Вычислите один раз, дайте имя и импортируйте имя:
+
+```ts title="src/user.ts"
+export const UserSchema = z.object({ /* … */ });
+export type User = z.infer<typeof UserSchema>;
+```
+
+### Огромные объединения
+
+Каждое объединение где-то приходится сравнивать член за членом, а некоторые возможности типов **умножают** объединения. Классический пример — шаблонные литеральные типы: каждый слот `${Hex}` умножает число членов на 16. Объединение из 100 000 членов и больше TypeScript строить отказывается. Попробуйте сами: нажмите «Запустить», а потом следуйте комментариям.
+
+<TryIt
+  language="typescript"
+  code={`// Рекурсивный вызов стоит внутри объединения (A | Range<…>),
+// поэтому TypeScript держит открытыми все уровни сразу.
+type Range<N extends number, Acc extends number[] = []> =
+  Acc["length"] extends N
+    ? never
+    : Acc["length"] | Range<N, [...Acc, 0]>;
+
+// Хвостовая рекурсия: рекурсивный вызов И ЕСТЬ результат,
+// а накопленный ответ передаётся дальше в Out.
+type TailRange<
+  N extends number,
+  Acc extends number[] = [],
+  Out = never,
+> = Acc["length"] extends N
+  ? Out
+  : TailRange<N, [...Acc, 0], Out | Acc["length"]>;
+
+type Hour = Range<24>; // 0 | 1 | … | 23
+type Percent = TailRange<101>; // 0 | 1 | … | 100
+
+const opening: Hour = 9;
+const progress: Percent = 100;
+console.log(opening, progress);
+
+// Попробуйте: замените выше TailRange<101> на Range<101>.
+// Потом добавьте пятый \${Digit} в Pin ниже.
+type Digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+type Pin = \`\${Digit}\${Digit}\${Digit}\${Digit}\`; // 10 000 членов
+const pin: Pin = "2468";
+console.log(pin);`}
+/>
+
+Вот две ошибки, которые вы увидите:
+
+```ts
+type Percent = Range<101>;
+// ❌ Error: Type instantiation is excessively deep and possibly infinite.
+
+type Pin = `${Digit}${Digit}${Digit}${Digit}${Digit}`;
+// ❌ Error: Expression produces a union type that is too complex to represent.
+```
+
+Задолго до этих пределов большие объединения тормозят повседневную работу: с ними приходится иметь дело каждому присваиванию, сравнению и автодополнению. Решение почти никогда не в более хитром объединении. Нужно **более дешёвое описание**:
+
+- **Шаблон** вместо списка: `` `#${string}` `` означает «строка, которая начинается с #». TypeScript проверяет его напрямую, не строя ни одного члена.
+- **Проверка во время выполнения** для остального. «Ровно шесть шестнадцатеричных цифр» — задача для регулярного выражения и защитника типа, а не для объединения из 16,7 миллиона строк. Если гарантия важна повсюду, возвращайте из проверяющей функции **брендированный** тип (см. [Брендированные типы и типобезопасные API](/learn/typescript/branded-types-and-type-safe-apis)).
+- **Обычный `number` или `string`** плюс проверка для диапазонов вроде процентов и портов. `TailRange<101>` работает, но объединение `Percent` из 101 члена даёт немногим больше, чем `number` и проверка.
+
+### Неограниченная рекурсия
+
+Пределы глубины рекурсивных типов вы знаете из урока [Собственные утилитные типы](/learn/typescript/building-utility-types). Типы вроде «все пути через точку внутри объекта» популярны и работают — пока не встретят **рекурсивный** объектный тип. Направьте этот `Paths` на категорию с родительской категорией `parent` — и конца не будет:
+
+```ts
+type Paths<T> = T extends object
+  ? {
+      [K in keyof T & string]: K | `${K}.${Paths<T[K]>}`;
+    }[keyof T & string]
+  : never;
+
+interface Category {
+  name: string;
+  parent: Category;
+}
+
+type CategoryPath = Paths<Category>;
+// ❌ Error: Type of property 'parent' circularly references itself in mapped type '{ [K in "name" | "parent"]: K | `${K}.${Paths<Category[K]>}`; }'.
+```
+
+Даже без ошибки глубокая рекурсия — это то место, где взрывается число инстанцирований: у типа, который уходит на десять уровней в объект с десятью ключами на уровень, путей для построения очень много. Решение — **ограничить** её: передавать счётчик и останавливаться на разумной глубине. Параметры типа не умеют считать, но кортеж может расти, а его `length` — числовой литерал:
+
+<CodeExample output="[ 'name', 'parent.name', 'parent.parent.name' ]">
+
+```ts
+// Depth растёт на один элемент за уровень: [], [0], [0, 0]…
+// и на 3 тип останавливается, а не продолжается вечно.
+type Paths<T, Depth extends unknown[] = []> =
+  Depth["length"] extends 3
+    ? never
+    : T extends object
+      ? {
+          [K in keyof T & string]:
+            | K
+            | `${K}.${Paths<T[K], [...Depth, 0]>}`;
+        }[keyof T & string]
+      : never;
+
+interface Category {
+  name: string;
+  parent: Category; // рекурсия: без предела не закончится
+}
+
+type CategoryPath = Paths<Category>;
+const paths: CategoryPath[] = [
+  "name",
+  "parent.name",
+  "parent.parent.name",
+];
+console.log(paths);
+```
+
+</CodeExample>
+
+<Callout type="tip" title="Когда не стоит писать хитрый тип">
+
+Прежде чем оптимизировать тип, спросите себя, нужен ли он вообще. Чек-лист senior-разработчика: ловит ли он настоящие баги или только впечатляюще выглядит? Сможет ли коллега изменить его без страха? Останется ли он быстрым на самом большом типе, который ему когда-либо встретится? `getSetting(path)` с типизированным путём оправдан в модуле настроек, который используется повсюду. Тип, разбирающий SQL-строки во время компиляции, обычно нет. Простые типы — это ещё и быстрые типы.
+
+</Callout>
+
+## Как сохранить скорость редактора
+
+Ваш редактор запускает тот же проверщик в фоне — как **языковой сервер TypeScript** (TypeScript language server, `tsserver`). Каждое нажатие клавиши перепроверяет открытый файл и всё, что ему нужно, поэтому один медленный тип проявляется как тормозящее автодополнение задолго до того, как кто-то заглянет в CI. Всё описанное выше помогает и редактору, а вот несколько привычек именно для него:
+
+- Не включайте результаты сборки и сгенерированные папки в `include`, чтобы сервер их не загружал.
+- Делите большие репозитории ссылками на проекты, чтобы редактор работал с несколькими небольшими проектами вместо одного гигантского.
+- Когда всё зависло, выполните **TypeScript: Restart TS Server** из палитры команд. Чтобы увидеть, чем сервер занят, **TypeScript: Open TS Server log** показывает, какие проекты он загрузил и сколько длятся запросы.
+- Очень большие кодовые базы — главная причина появления TypeScript 7. Его нативный проверщик обрабатывает тот же проект в несколько раз быстрее, в том числе в редакторе.
+
+<Quiz
+  question="Какое изменение обычно заставляет проверщик делать МЕНЬШЕ работы, ничуть не жертвуя безопасностью?"
+  options={[
+    "Замена type Admin = User & Timestamps & { name: string } на interface Admin extends User, Timestamps { name: string }",
+    "Удаление аннотаций возвращаемых типов у экспортируемых функций",
+    "Генерация объединения всех допустимых 6-значных PIN-кодов шаблонным литеральным типом",
+    "Снятие ограничения глубины с рекурсивного типа Paths",
+  ]}
+  answer={0}
+  explanation="Интерфейс строится один раз, его связи кэшируются, и он даже сообщает о конфликтующих свойствах. Без аннотаций проверщику приходится выводить больше, в объединении PIN-кодов миллион членов (TypeScript от него откажется), а неограниченный рекурсивный тип — именно то, что взрывается."
+/>
+
+<Exercise
+  title="Исправьте типы настроек"
+  language="typescript"
+  starter={`type Hex =
+  | "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7"
+  | "8" | "9" | "a" | "b" | "c" | "d" | "e" | "f";
+
+// "#" и за ним шесть шестнадцатеричных цифр
+type HexColour = \`#\${Hex}\${Hex}\${Hex}\${Hex}\${Hex}\${Hex}\`;
+
+interface MenuItem {
+  label: string;
+  submenu: MenuItem | null;
+}
+
+interface Settings {
+  theme: { accent: HexColour; fontSize: number };
+  editor: { tabSize: number; wordWrap: boolean };
+  menu: MenuItem;
+}
+
+// Все пути через точку внутри T: "theme" | "theme.accent" | …
+type Paths<T> = T extends object
+  ? {
+      [K in keyof T & string]: K | \`\${K}.\${Paths<T[K]>}\`;
+    }[keyof T & string]
+  : never;
+
+// Тип, который лежит по пути P внутри T
+type PathValue<T, P extends string> =
+  P extends \`\${infer K}.\${infer Rest}\`
+    ? K extends keyof T
+      ? PathValue<NonNullable<T[K]>, Rest>
+      : never
+    : P extends keyof T
+      ? T[P]
+      : never;
+
+function getSetting<P extends Paths<Settings>>(
+  settings: Settings,
+  path: P,
+): PathValue<Settings, P> | undefined {
+  let value: unknown = settings;
+  for (const key of path.split(".")) {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    value = (value as Record<string, unknown>)[key];
+  }
+  return value as PathValue<Settings, P>;
+}
+
+// Превращает ввод пользователя в HexColour или null
+function parseHexColour(input: string): HexColour | null {
+  return null;
+}
+
+// Тесты типов: функция не вызывается, только проверяется.
+// Строка под каждым expect-error ДОЛЖНА быть ошибкой.
+function typeTests(settings: Settings): void {
+  const size: number | undefined =
+    getSetting(settings, "theme.fontSize");
+  const accent: HexColour | undefined =
+    getSetting(settings, "theme.accent");
+  const label: string | undefined =
+    getSetting(settings, "menu.submenu.label");
+  const colour: HexColour = "#ff8800";
+  // @ts-expect-error: опечатка в пути
+  getSetting(settings, "theme.fontSzie");
+  // @ts-expect-error: fontSize — это число
+  const wrong: string | undefined =
+    getSetting(settings, "theme.fontSize");
+  // @ts-expect-error: глубже 3 уровней пути не предлагаются
+  getSetting(settings, "menu.submenu.submenu.label");
+  // @ts-expect-error: цвет начинается с "#"
+  const noHash: HexColour = "ff8800";
+}
+
+const accent = parseHexColour(" #FF8800 ");
+if (accent) {
+  const settings: Settings = {
+    theme: { accent, fontSize: 14 },
+    editor: { tabSize: 2, wordWrap: true },
+    menu: { label: "Файл", submenu: { label: "Открыть", submenu: null } },
+  };
+  console.log(getSetting(settings, "theme.accent"));
+  console.log(getSetting(settings, "menu.submenu.label"));
+}
+console.log(parseHexColour("orange"));
+`}
+  tests={[
+    { name: "parseHexColour принимает шесть шестнадцатеричных цифр и переводит их в нижний регистр", check: 'parseHexColour("#A1B2C3") === "#a1b2c3" && parseHexColour("#00ff00") === "#00ff00"' },
+    { name: "parseHexColour сначала обрезает пробелы", check: 'parseHexColour("  #FF8800 ") === "#ff8800"' },
+    { name: "parseHexColour отвергает всё остальное", check: '[ "#12345", "#1234567", "#12345g", "123456", "orange", "" ].every((s) => parseHexColour(s) === null)' },
+    { name: "getSetting по-прежнему читает значения и возвращает undefined после null", check: '(() => { const s = { theme: { accent: "#000000", fontSize: 12 }, editor: { tabSize: 4, wordWrap: false }, menu: { label: "Edit", submenu: { label: "Undo", submenu: null } } }; return getSetting(s, "editor.tabSize") === 4 && getSetting(s, "menu.submenu.label") === "Undo" && getSetting(s, "menu.submenu.submenu.label") === undefined; })()' },
+    { name: "Программа печатает цвет акцента и подпись подменю", check: 'JSON.stringify(__output) === JSON.stringify(["#ff8800", "Открыть", "null"])' },
+  ]}
+>
+
+В этом модуле настроек есть оба дорогих шаблона из урока, и ни один даже не компилируется: `HexColour` был бы объединением из 16,7 миллиона строк, а `Paths` ходит по кругу на рекурсивном `MenuItem`. Исправьте типы, не потеряв того, ради чего они написаны. **Тесты типов** в `typeTests()` должны пройти: каждая строка в функции должна компилироваться, кроме строк под `// @ts-expect-error` — они обязаны быть ошибками (иначе TypeScript сообщит `Unused '@ts-expect-error' directive.`).
+
+1. Замените `HexColour` **дешёвым шаблоном**: строкой, которая начинается с `#`.
+2. Напишите `parseHexColour(input)`: обрежьте пробелы, переведите в нижний регистр и верните значение, только если это `#` и ровно шесть шестнадцатеричных цифр (`0`–`9`, `a`–`f`), иначе `null`.
+3. **Ограничьте** `Paths`, чтобы он предлагал пути не длиннее **3** ключей (`"menu.submenu.label"` — да, `"menu.submenu.submenu.label"` — нет).
+
+`getSetting` и `PathValue` трогать не нужно.
+
+<Hint>
+
+Шаблон — это `` type HexColour = `#${string}`; ``. Для проверки регулярное выражение вроде `/^#[0-9a-f]{6}$/` внутри защитника типа `function isHexColour(value: string): value is HexColour` позволит вернуть значение без приведения.
+
+Для `Paths` используйте счётчик глубины из урока: добавьте второй параметр типа `Depth extends unknown[] = []`, возвращайте `never`, когда `Depth["length"] extends 3`, и передавайте `[...Depth, 0]` в рекурсивный вызов.
+
+</Hint>
+
+<Solution>
+
+```ts
+// Дешёвый шаблон: "#" и затем любая строка. TypeScript
+// проверяет его, не строя ни одного члена объединения.
+type HexColour = `#${string}`;
+
+interface MenuItem {
+  label: string;
+  submenu: MenuItem | null;
+}
+
+interface Settings {
+  theme: { accent: HexColour; fontSize: number };
+  editor: { tabSize: number; wordWrap: boolean };
+  menu: MenuItem;
+}
+
+// Все пути через точку внутри T, не длиннее 3 ключей
+type Paths<T, Depth extends unknown[] = []> =
+  Depth["length"] extends 3
+    ? never
+    : T extends object
+      ? {
+          [K in keyof T & string]:
+            | K
+            | `${K}.${Paths<T[K], [...Depth, 0]>}`;
+        }[keyof T & string]
+      : never;
+
+// Тип, который лежит по пути P внутри T
+type PathValue<T, P extends string> =
+  P extends `${infer K}.${infer Rest}`
+    ? K extends keyof T
+      ? PathValue<NonNullable<T[K]>, Rest>
+      : never
+    : P extends keyof T
+      ? T[P]
+      : never;
+
+function getSetting<P extends Paths<Settings>>(
+  settings: Settings,
+  path: P,
+): PathValue<Settings, P> | undefined {
+  let value: unknown = settings;
+  for (const key of path.split(".")) {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    value = (value as Record<string, unknown>)[key];
+  }
+  return value as PathValue<Settings, P>;
+}
+
+// Точное правило живёт в одной проверке во время выполнения
+function isHexColour(value: string): value is HexColour {
+  return /^#[0-9a-f]{6}$/.test(value);
+}
+
+// Превращает ввод пользователя в HexColour или null
+function parseHexColour(input: string): HexColour | null {
+  const value = input.trim().toLowerCase();
+  return isHexColour(value) ? value : null;
+}
+
+// Тесты типов: функция не вызывается, только проверяется.
+// Строка под каждым expect-error ДОЛЖНА быть ошибкой.
+function typeTests(settings: Settings): void {
+  const size: number | undefined =
+    getSetting(settings, "theme.fontSize");
+  const accent: HexColour | undefined =
+    getSetting(settings, "theme.accent");
+  const label: string | undefined =
+    getSetting(settings, "menu.submenu.label");
+  const colour: HexColour = "#ff8800";
+  // @ts-expect-error: опечатка в пути
+  getSetting(settings, "theme.fontSzie");
+  // @ts-expect-error: fontSize — это число
+  const wrong: string | undefined =
+    getSetting(settings, "theme.fontSize");
+  // @ts-expect-error: глубже 3 уровней пути не предлагаются
+  getSetting(settings, "menu.submenu.submenu.label");
+  // @ts-expect-error: цвет начинается с "#"
+  const noHash: HexColour = "ff8800";
+}
+
+const accent = parseHexColour(" #FF8800 ");
+if (accent) {
+  const settings: Settings = {
+    theme: { accent, fontSize: 14 },
+    editor: { tabSize: 2, wordWrap: true },
+    menu: { label: "Файл", submenu: { label: "Открыть", submenu: null } },
+  };
+  console.log(getSetting(settings, "theme.accent"));
+  console.log(getSetting(settings, "menu.submenu.label"));
+}
+console.log(parseHexColour("orange"));
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Сначала измеряйте.** `--extendedDiagnostics` показывает размер программы и то, куда уходит время (обычно Check time); `--explainFiles` объясняет, почему включён каждый файл; `--generateTrace` вместе с `@typescript/analyze-trace` находит медленный файл и выражение.
+- **`skipLibCheck`** отключает проверку файлов `.d.ts` (большая экономия; об ошибках внутри них никто не сообщит). В TypeScript 6 `types` по умолчанию — пустой список, поэтому загружаются только те глобальные типы, которые вы назвали.
+- **`incremental`** сохраняет результаты в `.tsbuildinfo` и пропускает неизменённые файлы и незатронутые импортирующие их файлы. Кэшируйте его в CI и удаляйте вместе с `dist` при очистке.
+- **Ссылки на проекты** (`composite`, `references`, `tsc -b`) проверяют каждую часть большого репозитория один раз, а зависимые проекты читают её файлы `.d.ts`.
+- Дорогие типы и их исправления: **интерфейсы** вместо пересечений, **аннотированные и именованные** возвращаемые типы, **шаблоны, проверки и бренды** вместо огромных объединений и **ограниченная** рекурсия со счётчиком глубины.
+- Редактор запускает тот же проверщик в `tsserver`, поэтому всё, что ускоряет `tsc`, ускоряет и автодополнение.

@@ -1,0 +1,675 @@
+---
+title: Faster Type Checking
+description: Measure where tsc spends its time, check less with skipLibCheck, incremental builds and project references, and rewrite the type patterns that make the checker crawl.
+duration: 24
+xp: 25
+---
+
+A type check that takes 10 seconds is a nuisance. One that takes 6 minutes changes how a team works: people stop running it locally, CI becomes the place where you find out, and autocomplete lags behind your typing. On one project the culprit turned out to be a single clever helper type, used in 40 files, that made the checker do several million instantiations on every run. 🐢
+
+The good news: slow type checking almost always comes from a short list of causes, and TypeScript has tools to find which one you have. This lesson covers measuring, checking less, and the type patterns that cost the most, with their fixes.
+
+## Measure first
+
+Don't guess. `--extendedDiagnostics` makes `tsc` print what it did and how long each stage from the last lesson took. Here it is for a tiny project with two source files that uses the DOM library:
+
+```bash
+$ npx tsc --noEmit --extendedDiagnostics
+Files:                          64
+Lines of Library:            56754
+Lines of Definitions:            0
+Lines of TypeScript:             9
+Lines of JavaScript:             0
+Lines of JSON:                   0
+Lines of Other:                  0
+Identifiers:                 48658
+Symbols:                     53837
+Types:                       28238
+Instantiations:              27138
+Memory used:               125234K
+Assignability cache size:    12257
+Identity cache size:             0
+Subtype cache size:              0
+Strict subtype cache size:       4
+I/O Read time:               0.01s
+Parse time:                  0.08s
+ResolveModule time:          0.00s
+Program time:                0.10s
+Bind time:                   0.04s
+Check time:                  0.45s
+printTime time:              0.00s
+Emit time:                   0.00s
+Total time:                  0.59s
+```
+
+How to read it:
+
+- **Files** and **Lines of …** tell you **how much** code is in the program. Nine lines are ours; 56,754 are the standard library, mostly `lib.dom.d.ts`. In real projects, `Lines of Definitions` (the `.d.ts` files of your npm packages) is often the biggest number.
+- **Types** and **Instantiations** tell you how much work the **checker** did. An instantiation is one use of a generic with specific type arguments: `Array<string>`, `Promise<User>`, `Paths<Settings>`. Hundreds of thousands is normal for a large app. Several million in a medium one means some type is multiplying work, like the deep utility types you measured in [Building Your Own Utility Types](/learn/typescript/building-utility-types).
+- **Parse**, **Bind**, **Check** and **Emit time** are the stages from the last lesson. **Check time** is almost always the big one.
+
+Times change from run to run and machine to machine, so compare runs on the same machine, and look at the counts, which don't change.
+
+To find out **why** a file is in the program at all, ask `tsc` to explain every file:
+
+```bash
+$ npx tsc --noEmit --explainFiles > files.txt
+```
+
+```text title="files.txt"
+src/cart.ts
+  Matched by include pattern 'src' in 'tsconfig.json'
+  Imported via "./cart.js" from file 'src/main.ts'
+```
+
+That's how you discover the 3,000-file icon library pulled in by one innocent import, or the whole `dist` folder being checked a second time because `include` was too wide.
+
+### skipLibCheck: don't check what you only use
+
+Here's the same project with one more flag:
+
+```bash
+$ npx tsc --noEmit --extendedDiagnostics --skipLibCheck
+Types:                         107
+Instantiations:                  1
+Check time:                  0.01s
+Total time:                  0.14s
+```
+
+From 28,238 types to 107. Without the flag, the checker didn't just **use** `lib.dom.d.ts`; it **checked** all 45,000 lines of it for errors, on every run. **`skipLibCheck`** skips checking **declaration files** (`.d.ts`): the standard library, every `@types` package and every library's types. They're still read and used to check **your** code; they just aren't checked themselves.
+
+It has a cost: errors **inside** `.d.ts` files go unreported. That includes conflicts between two versions of the same `@types` package and mistakes in `.d.ts` files you wrote yourself. Almost every project template (Vite, Next.js and others) turns it on anyway, because those errors are rare and the time saved is large. If you write important `.d.ts` files by hand, check them in a separate step without the flag now and then.
+
+One more saving comes free in **TypeScript 6**: the `types` option now defaults to an **empty list**. Before, TypeScript loaded every `@types/*` package in `node_modules` into every program, whether you used it or not. Now you list the global types you want, which keeps the program small and stops surprise globals:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "types": ["node"],
+    "skipLibCheck": true
+  }
+}
+```
+
+### --generateTrace: find the slow file and the slow type
+
+When the counts say "something is expensive" but not **what**, record a trace:
+
+```bash
+$ npx tsc --noEmit --generateTrace trace
+$ ls trace
+trace.json  types.json
+```
+
+Open `trace.json` in a trace viewer such as [Perfetto](https://ui.perfetto.dev) (or `about:tracing` in Chrome). You get a timeline of the whole run: each `checkSourceFile` block is one file, and inside it you can drill down to the single expression or variable that took two seconds. For a ready-made summary of the hot spots, the TypeScript team publishes an analyser:
+
+```bash
+$ npx @typescript/analyze-trace trace
+```
+
+It lists the slowest files and expressions, with their positions in your code. In practice that leads to a handful of lines, and usually to one of the patterns later in this lesson.
+
+<Quiz
+  question="Your CI type check slowed from 1 to 7 minutes. extendedDiagnostics shows Check time is 95% of the total and Instantiations went from 600,000 to 9 million. What's the best next step?"
+  options={[
+    "Turn off strict mode to give the checker less to do",
+    "Record a trace with --generateTrace to find which files and expressions take the time",
+    "Switch to a faster bundler such as esbuild",
+    "Delete the tsbuildinfo file and run tsc again",
+  ]}
+  answer={1}
+  explanation="The numbers say some type is multiplying work, but not which one. A trace shows exactly which file and expression the checker spends its time on. A bundler doesn't type-check at all, and turning off strictness throws away safety without fixing the cause."
+/>
+
+## Check less: incremental builds
+
+Most runs only change a few files, so why check everything again? With **`incremental`**, `tsc` saves what it learned in a **`.tsbuildinfo`** file:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "incremental": true
+  }
+}
+```
+
+The file records, for every source file, a hash of its contents, its **signature** (the shape of its public API, roughly what its `.d.ts` would say) and its errors. On the next run, `tsc` skips unchanged files. Even better: if you edit a function's **body** but not its signature, the files that import it don't need checking again, because nothing they can see has changed. Here's a small project run twice without changes:
+
+```bash
+$ npx tsc --extendedDiagnostics | grep "Total time"
+Total time:                  0.51s
+$ npx tsc --extendedDiagnostics | grep "Total time"
+Total time:                  0.15s
+```
+
+On a big codebase the difference is minutes. It works with `noEmit` too, so `tsc --noEmit` in CI can use it if you cache the file between runs:
+
+```yaml title=".github/workflows/ci.yml"
+- uses: actions/cache@v4
+  with:
+    path: tsconfig.tsbuildinfo
+    key: tsc-${{ github.sha }}
+    restore-keys: tsc-
+- run: npx tsc --noEmit
+```
+
+<Callout type="warning" title="The case of the missing dist folder">
+
+A classic: someone runs `rm -rf dist`, then `tsc`, and `dist` doesn't come back. No errors, no output. The `.tsbuildinfo` file says everything is up to date, so `tsc` has nothing to do. When you clean, delete the build info too, for example with a script like `"clean": "rm -rf dist tsconfig.tsbuildinfo"`.
+
+</Callout>
+
+### Project references: check each part once
+
+You set these up in [Monorepos & Project References](/learn/typescript/monorepos-and-project-references) to give a repository clear boundaries. They're also the biggest speed tool for large codebases. Incremental builds stop rechecking **unchanged** files, but in a big repository there's a second waste: when the `web` app and the `api` both import `shared`, the checker processes the source of `shared` inside each program, again and again. **Project references** split the repository into separate projects that build in order:
+
+```json title="packages/shared/tsconfig.json"
+{
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
+```
+
+```json title="apps/web/tsconfig.json"
+{
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "include": ["src"],
+  "references": [{ "path": "../../packages/shared" }]
+}
+```
+
+`composite` turns on what a referenced project needs, including `declaration` and `incremental`. Then `tsc -b` (build mode) builds the projects in dependency order and skips the ones that are up to date. The win is that `web` doesn't check the **source** of `shared` at all: it reads the `.d.ts` files `shared` produced. Each file is checked once, in its own project. Editors work per project too, so one giant program becomes several smaller ones.
+
+It isn't free: more configuration, every shared project must produce declaration files, and projects can't depend on each other in a circle (which tends to be good for the design). It pays off once a repository has several apps and packages, or the type check runs into minutes. Below that, `incremental` and `skipLibCheck` are usually enough.
+
+## The patterns that cost the most
+
+Sometimes the program isn't too big; a few types are just very expensive. These are the usual suspects, roughly in the order you'll meet them.
+
+### Interfaces instead of intersections
+
+Both of these describe the same object:
+
+```ts
+// Either this…
+type Admin = Entity & Timestamps & { name: string };
+
+// …or this
+interface Admin extends Entity, Timestamps {
+  name: string;
+}
+```
+
+The `interface` is a single, named, flat type. TypeScript builds it once and caches how it relates to other types. An intersection isn't cached as a whole like that, and comparing something with it means checking its parts one by one first. Interfaces also catch mistakes that intersections hide. Give `id` two different types and the interface reports it, while the intersection quietly turns `id` into `never`, the type with no values:
+
+```ts
+interface User { id: string; name: string }
+
+interface Admin extends User { id: number }
+// ❌ Error: Interface 'Admin' incorrectly extends interface 'User'.
+
+type Admin2 = User & { id: number };
+const admin: Admin2 = { id: 1, name: "Mei" };
+// ❌ Error: Type 'number' is not assignable to type 'never'.
+```
+
+So for **object types** that combine others, prefer `interface … extends`. Intersections are still the right tool for things interfaces can't express, such as adding a property to a type parameter (`T & { id: string }`):
+
+<CodeExample output="Mei (u1): billing, users">
+
+```ts
+interface Entity {
+  id: string;
+}
+
+interface Timestamps {
+  createdAt: string;
+  updatedAt: string;
+}
+
+// One named, flat type: built once, cached, conflicts reported
+interface Admin extends Entity, Timestamps {
+  name: string;
+  permissions: readonly string[];
+}
+
+function describeAdmin(admin: Admin): string {
+  const list = admin.permissions.join(", ");
+  return `${admin.name} (${admin.id}): ${list}`;
+}
+
+console.log(describeAdmin({
+  id: "u1",
+  name: "Mei",
+  permissions: ["billing", "users"],
+  createdAt: "2026-01-15",
+  updatedAt: "2026-03-02",
+}));
+```
+
+</CodeExample>
+
+### Annotate return types, and name them
+
+Inference is great inside a function. On the **exported** ones, every caller and every declaration file depends on the inferred type, and the checker has to work it out from the body first. For a factory that returns an object, the full structure gets written out in the declaration file, and repeated wherever the type is spelled out:
+
+```ts title="dist/cart.d.ts (inferred)"
+export declare function createCart(): {
+    items: CartItem[];
+    add(item: CartItem): void;
+    total(): number;
+    find(name: string): CartItem | undefined;
+};
+```
+
+With a named interface and an explicit return type, the declaration says `createCart(): Cart`, other files refer to `Cart` by name, and the checker only has to compare the body with `Cart` once. You also get a bonus: changing the body can't change the public API by accident.
+
+<CodeExample output="2 1399">
+
+```ts
+interface CartItem {
+  name: string;
+  cents: number;
+  quantity: number;
+}
+
+// The public shape, written once and given a name
+interface Cart {
+  readonly items: readonly CartItem[];
+  add(item: CartItem): void;
+  total(): number;
+}
+
+function createCart(): Cart {
+  const items: CartItem[] = [];
+  return {
+    items,
+    add(item) {
+      items.push(item);
+    },
+    total() {
+      return items.reduce((s, i) => s + i.cents * i.quantity, 0);
+    },
+  };
+}
+
+const cart = createCart();
+cart.add({ name: "Bamboo", cents: 250, quantity: 4 });
+cart.add({ name: "Tea", cents: 399, quantity: 1 });
+console.log(cart.items.length, cart.total());
+```
+
+</CodeExample>
+
+The same idea applies to big inferred library types. If every file writes `z.infer<typeof UserSchema>` or `Awaited<ReturnType<typeof getUser>>`, the checker may work it out in every one of them. Compute it once, give it a name, and import the name:
+
+```ts title="src/user.ts"
+export const UserSchema = z.object({ /* … */ });
+export type User = z.infer<typeof UserSchema>;
+```
+
+### Huge unions
+
+Every union has to be compared member by member somewhere, and some type features **multiply** unions. Template literal types are the classic: each `${Hex}` slot multiplies the number of members by 16. TypeScript refuses to build a union of 100,000 members or more. Try it below: press Run, then follow the comments.
+
+<TryIt
+  language="typescript"
+  code={`// The recursive call sits inside a union (A | Range<…>),
+// so TypeScript has to keep every level open at once.
+type Range<N extends number, Acc extends number[] = []> =
+  Acc["length"] extends N
+    ? never
+    : Acc["length"] | Range<N, [...Acc, 0]>;
+
+// Tail-recursive: the recursive call IS the result, and
+// the answer so far travels along in Out.
+type TailRange<
+  N extends number,
+  Acc extends number[] = [],
+  Out = never,
+> = Acc["length"] extends N
+  ? Out
+  : TailRange<N, [...Acc, 0], Out | Acc["length"]>;
+
+type Hour = Range<24>; // 0 | 1 | … | 23
+type Percent = TailRange<101>; // 0 | 1 | … | 100
+
+const opening: Hour = 9;
+const progress: Percent = 100;
+console.log(opening, progress);
+
+// Try: change TailRange<101> to Range<101> above.
+// Then add a fifth \${Digit} to Pin below.
+type Digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+type Pin = \`\${Digit}\${Digit}\${Digit}\${Digit}\`; // 10,000 members
+const pin: Pin = "2468";
+console.log(pin);`}
+/>
+
+The two errors you'll see:
+
+```ts
+type Percent = Range<101>;
+// ❌ Error: Type instantiation is excessively deep and possibly infinite.
+
+type Pin = `${Digit}${Digit}${Digit}${Digit}${Digit}`;
+// ❌ Error: Expression produces a union type that is too complex to represent.
+```
+
+Long before those limits, big unions are slow in everyday use: every assignment, comparison and autocomplete has to deal with them. The fix is almost never a smarter union. It's a **cheaper description**:
+
+- A **pattern** instead of a list: `` `#${string}` `` means "a string that starts with #". TypeScript checks it directly, without building any members.
+- A **runtime check** for the rest. "Exactly six hex digits" is a job for a regular expression and a type guard, not for a union of 16.7 million strings. If the guarantee matters everywhere, return a **branded** type from the validating function (see [Branded Types & Type-Safe APIs](/learn/typescript/branded-types-and-type-safe-apis)).
+- A **plain `number` or `string`** plus validation for ranges like percentages and ports. `TailRange<101>` works, but a `Percent` union of 101 members buys little over `number` and a check.
+
+### Unbounded recursion
+
+You know the depth limits of recursive types from [Building Your Own Utility Types](/learn/typescript/building-utility-types). Types like "every dotted path through an object" are popular, and they work until they meet a **recursive** object type. Point this `Paths` at a category with a `parent` category, and there is no end:
+
+```ts
+type Paths<T> = T extends object
+  ? {
+      [K in keyof T & string]: K | `${K}.${Paths<T[K]>}`;
+    }[keyof T & string]
+  : never;
+
+interface Category {
+  name: string;
+  parent: Category;
+}
+
+type CategoryPath = Paths<Category>;
+// ❌ Error: Type of property 'parent' circularly references itself in mapped type '{ [K in "name" | "parent"]: K | `${K}.${Paths<Category[K]>}`; }'.
+```
+
+Even without an error, deep recursion is where the instantiation count explodes: a type that goes ten levels deep into an object with ten keys per level has a lot of paths to build. The fix is to **bound** it: carry a counter and stop at a sensible depth. Type parameters can't do arithmetic, but a tuple can grow, and its `length` is a number literal:
+
+<CodeExample output="[ 'name', 'parent.name', 'parent.parent.name' ]">
+
+```ts
+// Depth grows by one element per level: [], [0], [0, 0]…
+// and at 3 the type stops instead of going on for ever.
+type Paths<T, Depth extends unknown[] = []> =
+  Depth["length"] extends 3
+    ? never
+    : T extends object
+      ? {
+          [K in keyof T & string]:
+            | K
+            | `${K}.${Paths<T[K], [...Depth, 0]>}`;
+        }[keyof T & string]
+      : never;
+
+interface Category {
+  name: string;
+  parent: Category; // recursive: endless without a limit
+}
+
+type CategoryPath = Paths<Category>;
+const paths: CategoryPath[] = [
+  "name",
+  "parent.name",
+  "parent.parent.name",
+];
+console.log(paths);
+```
+
+</CodeExample>
+
+<Callout type="tip" title="When not to write the clever type">
+
+Before you optimise a type, ask whether it needs to exist. A senior's checklist: Does it catch real bugs, or only look impressive? Can a teammate change it without fear? Does it stay fast on the biggest type it will ever see? A `getSetting(path)` with a typed path is worth it in a settings module used everywhere. A type that parses SQL strings at compile time usually isn't. Simple types are also fast types.
+
+</Callout>
+
+## Keeping the editor fast
+
+Your editor runs the same checker in the background, as the **TypeScript language server** (`tsserver`). Every keystroke re-checks the open file and whatever it needs, which is why one slow type shows up as laggy autocomplete long before anyone looks at CI. Everything above helps the editor too, plus a few editor-specific habits:
+
+- Keep build output and generated folders out of `include`, so the server doesn't load them.
+- Split big repositories with project references, so the editor works with several smaller projects instead of one giant one.
+- When things get stuck, run **TypeScript: Restart TS Server** from the command palette. To see what it's doing, **TypeScript: Open TS Server log** shows which projects it loaded and how long requests take.
+- Very large codebases are the main reason TypeScript 7 exists. Its native checker runs the same project several times faster, in the editor too.
+
+<Quiz
+  question="Which change usually makes the checker do LESS work without losing any safety?"
+  options={[
+    "Replacing type Admin = User & Timestamps & { name: string } with interface Admin extends User, Timestamps { name: string }",
+    "Removing the return type annotations from exported functions",
+    "Generating a union of every valid 6-digit PIN with a template literal type",
+    "Removing the depth limit from a recursive Paths type",
+  ]}
+  answer={0}
+  explanation="An interface is built once and its relationships are cached, and it even reports conflicting properties. Removing annotations makes the checker infer more, the PIN union has a million members (TypeScript refuses it), and an unbounded recursive type is exactly what explodes."
+/>
+
+<Exercise
+  title="Fix the settings types"
+  language="typescript"
+  starter={`type Hex =
+  | "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7"
+  | "8" | "9" | "a" | "b" | "c" | "d" | "e" | "f";
+
+// "#" followed by six hex digits
+type HexColour = \`#\${Hex}\${Hex}\${Hex}\${Hex}\${Hex}\${Hex}\`;
+
+interface MenuItem {
+  label: string;
+  submenu: MenuItem | null;
+}
+
+interface Settings {
+  theme: { accent: HexColour; fontSize: number };
+  editor: { tabSize: number; wordWrap: boolean };
+  menu: MenuItem;
+}
+
+// Every dotted path through T: "theme" | "theme.accent" | …
+type Paths<T> = T extends object
+  ? {
+      [K in keyof T & string]: K | \`\${K}.\${Paths<T[K]>}\`;
+    }[keyof T & string]
+  : never;
+
+// The type found at path P inside T
+type PathValue<T, P extends string> =
+  P extends \`\${infer K}.\${infer Rest}\`
+    ? K extends keyof T
+      ? PathValue<NonNullable<T[K]>, Rest>
+      : never
+    : P extends keyof T
+      ? T[P]
+      : never;
+
+function getSetting<P extends Paths<Settings>>(
+  settings: Settings,
+  path: P,
+): PathValue<Settings, P> | undefined {
+  let value: unknown = settings;
+  for (const key of path.split(".")) {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    value = (value as Record<string, unknown>)[key];
+  }
+  return value as PathValue<Settings, P>;
+}
+
+// Turn user input into a HexColour, or null if it isn't one
+function parseHexColour(input: string): HexColour | null {
+  return null;
+}
+
+// Type tests: never called, only type-checked. The line
+// under each expect-error comment MUST be a type error.
+function typeTests(settings: Settings): void {
+  const size: number | undefined =
+    getSetting(settings, "theme.fontSize");
+  const accent: HexColour | undefined =
+    getSetting(settings, "theme.accent");
+  const label: string | undefined =
+    getSetting(settings, "menu.submenu.label");
+  const colour: HexColour = "#ff8800";
+  // @ts-expect-error: typo in the path
+  getSetting(settings, "theme.fontSzie");
+  // @ts-expect-error: fontSize is a number
+  const wrong: string | undefined =
+    getSetting(settings, "theme.fontSize");
+  // @ts-expect-error: deeper than 3 levels isn't offered
+  getSetting(settings, "menu.submenu.submenu.label");
+  // @ts-expect-error: a colour starts with "#"
+  const noHash: HexColour = "ff8800";
+}
+
+const accent = parseHexColour(" #FF8800 ");
+if (accent) {
+  const settings: Settings = {
+    theme: { accent, fontSize: 14 },
+    editor: { tabSize: 2, wordWrap: true },
+    menu: { label: "File", submenu: { label: "Open", submenu: null } },
+  };
+  console.log(getSetting(settings, "theme.accent"));
+  console.log(getSetting(settings, "menu.submenu.label"));
+}
+console.log(parseHexColour("orange"));
+`}
+  tests={[
+    { name: "parseHexColour accepts six hex digits and lower-cases them", check: 'parseHexColour("#A1B2C3") === "#a1b2c3" && parseHexColour("#00ff00") === "#00ff00"' },
+    { name: "parseHexColour trims spaces first", check: 'parseHexColour("  #FF8800 ") === "#ff8800"' },
+    { name: "parseHexColour rejects everything else", check: '[ "#12345", "#1234567", "#12345g", "123456", "orange", "" ].every((s) => parseHexColour(s) === null)' },
+    { name: "getSetting still reads values, and returns undefined past a null", check: '(() => { const s = { theme: { accent: "#000000", fontSize: 12 }, editor: { tabSize: 4, wordWrap: false }, menu: { label: "Edit", submenu: { label: "Undo", submenu: null } } }; return getSetting(s, "editor.tabSize") === 4 && getSetting(s, "menu.submenu.label") === "Undo" && getSetting(s, "menu.submenu.submenu.label") === undefined; })()' },
+    { name: "The program prints the accent colour and the submenu label", check: 'JSON.stringify(__output) === JSON.stringify(["#ff8800", "Open", "null"])' },
+  ]}
+>
+
+This settings module has both expensive patterns from the lesson, and neither even compiles: `HexColour` would be a union of 16.7 million strings, and `Paths` runs in circles on the recursive `MenuItem`. Fix the types without losing what they're for. The **type tests** in `typeTests()` must pass: every line in it must compile, except the ones under `// @ts-expect-error`, which must be errors (otherwise TypeScript reports `Unused '@ts-expect-error' directive.`).
+
+1. Replace `HexColour` with a **cheap pattern**: a string that starts with `#`.
+2. Write `parseHexColour(input)`: trim it, lower-case it, and return it only if it's `#` followed by exactly six hex digits (`0`–`9`, `a`–`f`), otherwise `null`.
+3. **Bound** `Paths` so it offers paths of at most **3** keys (`"menu.submenu.label"` yes, `"menu.submenu.submenu.label"` no).
+
+`getSetting` and `PathValue` are fine as they are.
+
+<Hint>
+
+The pattern is `` type HexColour = `#${string}`; ``. For the check, a regular expression like `/^#[0-9a-f]{6}$/` inside a type guard `function isHexColour(value: string): value is HexColour` lets you return the value without a cast.
+
+For `Paths`, use the depth counter from the lesson: add a second type parameter `Depth extends unknown[] = []`, return `never` when `Depth["length"] extends 3`, and pass `[...Depth, 0]` to the recursive call.
+
+</Hint>
+
+<Solution>
+
+```ts
+// A cheap pattern: "#" and then any string. TypeScript
+// checks it without building a single union member.
+type HexColour = `#${string}`;
+
+interface MenuItem {
+  label: string;
+  submenu: MenuItem | null;
+}
+
+interface Settings {
+  theme: { accent: HexColour; fontSize: number };
+  editor: { tabSize: number; wordWrap: boolean };
+  menu: MenuItem;
+}
+
+// Every dotted path through T, at most 3 keys long
+type Paths<T, Depth extends unknown[] = []> =
+  Depth["length"] extends 3
+    ? never
+    : T extends object
+      ? {
+          [K in keyof T & string]:
+            | K
+            | `${K}.${Paths<T[K], [...Depth, 0]>}`;
+        }[keyof T & string]
+      : never;
+
+// The type found at path P inside T
+type PathValue<T, P extends string> =
+  P extends `${infer K}.${infer Rest}`
+    ? K extends keyof T
+      ? PathValue<NonNullable<T[K]>, Rest>
+      : never
+    : P extends keyof T
+      ? T[P]
+      : never;
+
+function getSetting<P extends Paths<Settings>>(
+  settings: Settings,
+  path: P,
+): PathValue<Settings, P> | undefined {
+  let value: unknown = settings;
+  for (const key of path.split(".")) {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    value = (value as Record<string, unknown>)[key];
+  }
+  return value as PathValue<Settings, P>;
+}
+
+// The exact rule lives in one runtime check
+function isHexColour(value: string): value is HexColour {
+  return /^#[0-9a-f]{6}$/.test(value);
+}
+
+// Turn user input into a HexColour, or null if it isn't one
+function parseHexColour(input: string): HexColour | null {
+  const value = input.trim().toLowerCase();
+  return isHexColour(value) ? value : null;
+}
+
+// Type tests: never called, only type-checked. The line
+// under each expect-error comment MUST be a type error.
+function typeTests(settings: Settings): void {
+  const size: number | undefined =
+    getSetting(settings, "theme.fontSize");
+  const accent: HexColour | undefined =
+    getSetting(settings, "theme.accent");
+  const label: string | undefined =
+    getSetting(settings, "menu.submenu.label");
+  const colour: HexColour = "#ff8800";
+  // @ts-expect-error: typo in the path
+  getSetting(settings, "theme.fontSzie");
+  // @ts-expect-error: fontSize is a number
+  const wrong: string | undefined =
+    getSetting(settings, "theme.fontSize");
+  // @ts-expect-error: deeper than 3 levels isn't offered
+  getSetting(settings, "menu.submenu.submenu.label");
+  // @ts-expect-error: a colour starts with "#"
+  const noHash: HexColour = "ff8800";
+}
+
+const accent = parseHexColour(" #FF8800 ");
+if (accent) {
+  const settings: Settings = {
+    theme: { accent, fontSize: 14 },
+    editor: { tabSize: 2, wordWrap: true },
+    menu: { label: "File", submenu: { label: "Open", submenu: null } },
+  };
+  console.log(getSetting(settings, "theme.accent"));
+  console.log(getSetting(settings, "menu.submenu.label"));
+}
+console.log(parseHexColour("orange"));
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Measure first.** `--extendedDiagnostics` shows how big the program is and where the time goes (usually Check time); `--explainFiles` shows why each file is included; `--generateTrace` plus `@typescript/analyze-trace` finds the slow file and expression.
+- **`skipLibCheck`** stops checking `.d.ts` files (a big saving; errors inside them go unreported). In TypeScript 6, `types` defaults to an empty list, so only the global types you name are loaded.
+- **`incremental`** saves results in `.tsbuildinfo` and skips unchanged files and unaffected importers. Cache it in CI, and delete it together with `dist` when cleaning.
+- **Project references** (`composite`, `references`, `tsc -b`) check each part of a big repository once and let dependents read its `.d.ts` files.
+- Expensive types and their fixes: **interfaces** instead of intersections, **annotated and named** return types, **patterns, validation and brands** instead of huge unions, and **bounded** recursion with a depth counter.
+- The editor runs the same checker in `tsserver`, so everything that speeds up `tsc` speeds up autocomplete too.

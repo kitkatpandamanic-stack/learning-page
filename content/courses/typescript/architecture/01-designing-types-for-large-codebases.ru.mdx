@@ -1,0 +1,937 @@
+---
+title: Проектируем типы для больших кодовых баз
+description: Разделяйте доменные типы, DTO и типы хранения, держите unknown на границах, выбирайте стратегию ошибок для каждого слоя, не давайте any расползаться и дайте каждой фиче маленький публичный API.
+duration: 24
+xp: 25
+---
+
+В маленьком приложении один интерфейс `User` делает всё: это и строка в базе данных, и то, с чем работает бизнес-логика, и JSON, который отдаёт API. Кажется, что это экономно, — пока не перестаёт так казаться. В одной команде, с которой я работал, был именно такой тип `User`, и использовался он в 300 файлах. Кто-то добавил в него `resetToken`, чтобы процесс сброса пароля мог прочитать его из базы. Поскольку API отправлял тот же самый `User`, каждый ответ на `GET /users/:id` три недели содержал действующий токен сброса, пока это кто-то не заметил. TypeScript ни разу не пожаловался: с типами всё было в порядке. Неправильным было **проектирование** типов. 🏗️
+
+Этот урок как раз о проектировании: какие типы нужны большой кодовой базе, где проверяются данные, как распространяются ошибки, как не дать `any` расползтись и как провести границы между фичами, чтобы 50 разработчиков могли работать в одном репозитории (repository), не мешая друг другу. Если слои чистой архитектуры для вас в новинку, их объясняет [урок о чистой архитектуре в курсе JavaScript](/learn/javascript/clean-architecture); здесь мы посмотрим на них через типы.
+
+## Одно понятие — три типа
+
+Данные о пользователе живут как минимум в трёх местах, и у каждого свои потребности:
+
+| Тип | Где живёт | Чем определяется | Пример |
+| --- | --- | --- | --- |
+| **Тип хранения** (persistence type) | Репозиторий / адаптер базы данных | Базой данных: столбцы в snake_case, числа вместо дат, столбцы, допускающие NULL | `UserRow` |
+| **Доменный тип** (domain type) | Бизнес-логика | Бизнесом: `Date`, объединения для состояний, инварианты | `User` |
+| **DTO** (data transfer object, объект передачи данных) | Граница API | Клиентами: значения, безопасные для JSON, никаких секретов, стабильность во времени | `UserDto` |
+
+В первый день они выглядят похоже, но меняются по **разным причинам**. Администратор БД переименовывает столбец, продакт добавляет статус «заблокирован», мобильному клиенту нужен `createdAt` строкой — с одним общим типом каждое такое изменение расходится волнами по всей кодовой базе. С тремя типами и двумя маленькими **функциями преобразования** (mapping functions) между ними каждое изменение остаётся в одном месте:
+
+<CodeExample output={`active 2026
+{
+  id: 'u1',
+  email: 'mei@pandadev.test',
+  displayName: 'Mei',
+  createdAt: '2026-01-01T00:00:00.000Z'
+}`}>
+
+```ts
+// хранение: то, что лежит в базе данных
+interface UserRow {
+  id: string;
+  email: string;
+  display_name: string;
+  password_hash: string;
+  created_at: number; // миллисекунды с 1970 года
+  deleted_at: number | null;
+}
+
+// домен: то, с чем работают бизнес-правила
+interface User {
+  id: string;
+  email: string;
+  displayName: string;
+  passwordHash: string;
+  createdAt: Date;
+  status: "active" | "deleted";
+}
+
+// DTO: то, что отправляет API (безопасно для JSON, без секретов)
+interface UserDto {
+  id: string;
+  email: string;
+  displayName: string;
+  createdAt: string; // ISO 8601
+}
+
+function rowToUser(row: UserRow): User {
+  return {
+    id: row.id,
+    email: row.email,
+    displayName: row.display_name,
+    passwordHash: row.password_hash,
+    createdAt: new Date(row.created_at),
+    status: row.deleted_at === null ? "active" : "deleted",
+  };
+}
+
+function toUserDto(user: User): UserDto {
+  return {
+    id: user.id,
+    email: user.email,
+    displayName: user.displayName,
+    createdAt: user.createdAt.toISOString(),
+  };
+}
+
+const row: UserRow = {
+  id: "u1",
+  email: "mei@pandadev.test",
+  display_name: "Mei",
+  password_hash: "pbkdf2$1000$9f2c…",
+  created_at: 1767225600000,
+  deleted_at: null,
+};
+
+const user = rowToUser(row);
+console.log(user.status, user.createdAt.getUTCFullYear());
+console.log(toUserDto(user));
+```
+
+</CodeExample>
+
+Домен никогда не видит `deleted_at`: он видит объединение `status` — именно то, о чём на самом деле говорит бизнес. DTO никогда не видит `passwordHash`, и это гарантирует `toUserDto` — функция, которую можно прочитать за десять секунд и протестировать одной строкой.
+
+### Аннотации ничего не отфильтровывают
+
+Вот ловушка, в которую попала команда из вступления. Может показаться, что функция, принимающая `PublicProfile`, способна отправить только публичные поля. Это не так, потому что типизация в TypeScript **структурная** (structural typing): у `User` есть все свойства, которые нужны `PublicProfile`, поэтому он принимается — вместе со всеми лишними свойствами:
+
+<CodeExample output={`{"id":"u1","displayName":"Mei","passwordHash":"pbkdf2$1000$9f2c"}
+{"id":"u1","displayName":"Mei"}`}>
+
+```ts
+interface User {
+  id: string;
+  displayName: string;
+  passwordHash: string;
+}
+
+interface PublicProfile {
+  id: string;
+  displayName: string;
+}
+
+function sendJson(body: PublicProfile): void {
+  console.log(JSON.stringify(body));
+}
+
+const user: User = {
+  id: "u1",
+  displayName: "Mei",
+  passwordHash: "pbkdf2$1000$9f2c",
+};
+
+sendJson(user); // компилируется: в User есть всё, что нужно PublicProfile
+
+function toPublicProfile(user: User): PublicProfile {
+  return { id: user.id, displayName: user.displayName };
+}
+sendJson(toPublicProfile(user));
+```
+
+</CodeExample>
+
+**Проверка лишних свойств** (excess property check) из урока [Вариантность и вывод типов](/learn/typescript/variance-and-inference) срабатывает только для **свежего** литерала, написанного прямо на месте, например `sendJson({ id: "u1", displayName: "Mei", passwordHash: "x" })`. Переменная, в которой уже лежит объект побольше, проходит без вопросов. Типы описывают **минимум** того, что есть у значения; во время выполнения они ничего не удаляют. Это делает только код, и функция преобразования — как раз такой код.
+
+Та же идея определяет, как выводить типы DTO. `type UserDto = Omit<User, "passwordHash">` — это **чёрный список** (denylist): когда через год кто-нибудь добавит в `User` поле `mfaSecret`, в DTO молча появится новое поле. `Pick<User, "id" | "email">` или отдельный интерфейс — это **белый список** (allowlist): новые поля остаются закрытыми, пока кто-то сознательно их не откроет. Для всего, что пересекает границу доверия, выбирайте белые списки.
+
+<Callout type="warning" title="Не разделяйте типы, которые пока не нужны">
+
+Три типа на одно понятие — это цена: больше имён, больше кода преобразований, больше тестов. Для внутренней админки, где таблица **и есть** API, одного типа (может быть, с `Omit` для пароля) вполне достаточно. Разделяйте, когда формы начинают расходиться: переименование столбца, которое клиентам видеть не нужно, секретное поле, неудобное для JSON значение вроде `Date` или `bigint`, второй клиент с другими потребностями. Функции преобразования легко добавить позже, если доменный код никогда не трогает строки базы напрямую.
+
+</Callout>
+
+## `unknown` на границах, проверенные типы внутри
+
+**Граница** (edge) — это любое место, где в программу попадают данные, созданные не TypeScript: тела HTTP-запросов и строки запроса, `JSON.parse`, `res.json()` из `fetch`, `localStorage`, переменные окружения, сообщения из очереди, файлы, сторонние SDK, которые возвращают `any`. На каждой границе честный тип — `unknown`, как вы видели в уроках [Защитники типов и unknown](/learn/typescript/type-guards-and-unknown) и [Типизированный fetch](/learn/typescript/typed-fetch).
+
+Правило для большой кодовой базы легко сформулировать: **проверяйте данные один раз, на границе, и превращайте их в тип, который доказывает, что проверка пройдена.** Тогда код внутри никогда не проверяет данные повторно и никогда не видит `unknown`. Часто это называют **«parse, don't validate»** («разбирай, а не проверяй»): валидатор отвечает на вопрос «всё ли в порядке?» и выбрасывает ответ, а парсер возвращает *новое, более точное значение*. [Брендированный](/learn/typescript/branded-types-and-type-safe-apis) тип `Email` (строка `string`, прошедшая проверку на email) делает это доказательство видимым в каждой сигнатуре:
+
+<CodeExample output={`Pandas: 5 seats, owner mei@pandadev.test
+[ 'name', 'owner', 'seats' ]
+{
+  ok: false,
+  error: [
+    'name is required',
+    'owner must be an email',
+    'seats must be a whole number ≥ 1'
+  ]
+}
+{ ok: false, error: [ 'body must be an object' ] }`}>
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// Строка, прошедшая проверку (брендированный тип)
+type Email = string & { readonly __brand: "Email" };
+
+interface NewTeam {
+  name: string;
+  owner: Email;
+  seats: number;
+}
+
+// Маленькие парсеры: на входе unknown, на выходе проверенное значение или null
+function parseEmail(value: unknown): Email | null {
+  if (typeof value !== "string") return null;
+  const email = value.trim().toLowerCase();
+  const valid = /^[^@\s]+@[^@\s]+$/.test(email);
+  return valid ? (email as Email) : null; // единственное приведение
+}
+
+function parseName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return value.trim() === "" ? null : value.trim();
+}
+
+function parseSeats(value: unknown): number | null {
+  if (typeof value !== "number") return null;
+  return Number.isInteger(value) && value >= 1 ? value : null;
+}
+
+// Граница: на входе unknown, на выходе NewTeam или список проблем
+function parseNewTeam(input: unknown): Result<NewTeam, string[]> {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: ["body must be an object"] };
+  }
+  const name = parseName("name" in input ? input.name : undefined);
+  const owner = parseEmail("owner" in input ? input.owner : undefined);
+  const seats = parseSeats("seats" in input ? input.seats : 5);
+
+  const issues: string[] = [];
+  if (name === null) issues.push("name is required");
+  if (owner === null) issues.push("owner must be an email");
+  if (seats === null) issues.push("seats must be a whole number ≥ 1");
+  if (name === null || owner === null || seats === null) {
+    return { ok: false, error: issues };
+  }
+  // Свежий объект только с известными полями: лишние ключи не попадут
+  return { ok: true, value: { name, owner, seats } };
+}
+
+// Внутренняя часть: принимает только данные, прошедшие через границу
+function welcome(team: NewTeam): string {
+  return `${team.name}: ${team.seats} seats, owner ${team.owner}`;
+}
+
+const body: unknown = JSON.parse(
+  '{"name":" Pandas ","owner":"MEI@pandadev.test","isAdmin":true}',
+);
+const parsed = parseNewTeam(body);
+if (parsed.ok) {
+  console.log(welcome(parsed.value));
+  console.log(Object.keys(parsed.value));
+}
+console.log(parseNewTeam({ name: " ", owner: "mei", seats: 0 }));
+console.log(parseNewTeam("hello"));
+```
+
+</CodeExample>
+
+Три детали делают этот код готовым к продакшену:
+
+- **Парсер собирает свежий объект.** Запрос протащил с собой `"isAdmin": true`, но это поле просто не копируется. Если развернуть тело запроса (`{ ...body }`) в доменный объект, получатся баги «массового присваивания» (mass assignment), когда пользователи назначают себя админами, просто добавив поле.
+- **Единственный `as` находится внутри `parseEmail`**, сразу после проверки, которая его оправдывает. У брендированного типа должен быть ровно один вход. В любом другом месте `"mei@pandadev.test"` — просто `string`, поэтому `welcome({ name: "Pandas", owner: "mei@pandadev.test", seats: 3 })` — ошибка: *Type 'string' is not assignable to type 'Email'.*
+- **Он сообщает обо всех проблемах сразу**, а не только о первой, поэтому форма может подсветить все неверные поля за один запрос.
+
+В реальном проекте вы написали бы то же самое с помощью библиотеки схем, например **Zod** или **Valibot** — это «взрослые» версии той, что вы построили в уроке [Проверка во время выполнения](/learn/typescript/runtime-validation). Они создают и парсер, и тип из одного определения (и по умолчанию отбрасывают неизвестные ключи):
+
+```ts
+import { z } from "zod";
+
+const NewTeam = z.object({
+  name: z.string().trim().min(1),
+  owner: z.email().brand<"Email">(),
+  seats: z.number().int().min(1).default(5),
+});
+type NewTeam = z.infer<typeof NewTeam>;
+
+const parsed = NewTeam.safeParse(req.body);
+if (!parsed.success) {
+  res.status(400).json({ issues: parsed.error.issues });
+  return;
+}
+createTeam(parsed.data); // NewTeam, проверен
+```
+
+Какая именно библиотека — не так уж важно. Важна **архитектура**: один парсер на каждую границу, `unknown` до него, точные типы после.
+
+## Стратегия ошибок, а не просто обработка ошибок
+
+В уроках [Типизированный fetch](/learn/typescript/typed-fetch) и [Валидация и обработка ошибок](/learn/typescript/validation-and-errors) вы сравнивали выбрасывание исключений с возвратом `Result`. В большой кодовой базе вопрос не в том, «что лучше», а в том, «что **где**», и решается он один раз и записывается. Стратегия, которая хорошо подходит большинству бэкендов:
+
+- **Ожидаемые сбои — это значения.** Неверный ввод, «имя уже занято», «достигнут лимит тарифа» — это часть нормальной жизни, вызывающий код обязан их обработать, и у каждого есть свой тег в размеченном объединении (discriminated union). Сценарий использования (use case) возвращает `Result<Team, CreateTeamError>`.
+- **Неожиданные сбои — это исключения.** База данных недоступна, из-за бага вылетел `TypeError`. Никакой вызывающий код не может с этим ничего сделать, поэтому они всплывают в **одно** место (middleware ошибок в Express, `catch` в запускалке фоновых задач), которое пишет лог, поднимает тревогу и отвечает `500`.
+- **Граница переводит.** Только HTTP-адаптер знает о кодах ответа; домен знает только `"name-taken"`.
+
+<CodeExample output={`201 { id: 't1', name: 'Pandas' }
+400 { error: 'name is required' }
+409 { error: '"Pandas" is already taken' }
+201 { id: 't2', name: 'Otters' }
+403 { error: 'your plan allows 2 teams' }
+ALERT: connection refused
+500 { error: 'Something went wrong' }`}>
+
+```ts
+import express from "express";
+import type { Request, Response, NextFunction } from "express";
+import request from "supertest";
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+interface Team {
+  id: string;
+  name: string;
+}
+
+// Все ОЖИДАЕМЫЕ причины, по которым создание команды может не удаться, — в виде данных
+type CreateTeamError =
+  | { kind: "invalid"; issues: string[] }
+  | { kind: "name-taken"; name: string }
+  | { kind: "over-limit"; limit: number };
+
+interface TeamRepository {
+  findByName(name: string): Promise<Team | null>;
+  count(): Promise<number>;
+  save(team: Team): Promise<void>;
+}
+
+// Сценарий: ожидаемые сбои возвращаются, баги и аварии выбрасываются
+async function createTeam(
+  input: unknown,
+  teams: TeamRepository,
+): Promise<Result<Team, CreateTeamError>> {
+  const name =
+    typeof input === "object" && input !== null && "name" in input
+      ? input.name
+      : undefined;
+  if (typeof name !== "string" || name.trim() === "") {
+    return fail({ kind: "invalid", issues: ["name is required"] });
+  }
+  if (await teams.findByName(name.trim())) {
+    return fail({ kind: "name-taken", name: name.trim() });
+  }
+  const count = await teams.count();
+  if (count >= 2) {
+    return fail({ kind: "over-limit", limit: 2 });
+  }
+  const team = { id: `t${count + 1}`, name: name.trim() };
+  await teams.save(team);
+  return { ok: true, value: team };
+}
+
+function fail(error: CreateTeamError): Result<never, CreateTeamError> {
+  return { ok: false, error };
+}
+
+// HTTP-граница сопоставляет каждый kind. satisfies проверяет, что
+// список полный, не расширяя тип объекта
+const statusFor = {
+  invalid: 400,
+  "name-taken": 409,
+  "over-limit": 403,
+} satisfies Record<CreateTeamError["kind"], number>;
+
+function message(error: CreateTeamError): string {
+  switch (error.kind) {
+    case "invalid":
+      return error.issues.join("; ");
+    case "name-taken":
+      return `"${error.name}" is already taken`;
+    case "over-limit":
+      return `your plan allows ${error.limit} teams`;
+  }
+}
+
+function createApp(teams: TeamRepository) {
+  const app = express();
+  app.use(express.json());
+  app.post("/teams", async (req, res) => {
+    const result = await createTeam(req.body, teams);
+    if (result.ok) {
+      res.status(201).json(result.value);
+      return;
+    }
+    res
+      .status(statusFor[result.error.kind])
+      .json({ error: message(result.error) });
+  });
+  // Всё выброшенное — неожиданно: пишем в лог, отвечаем 500
+  app.use(
+    (err: unknown, req: Request, res: Response, next: NextFunction) => {
+      console.log("ALERT:", err instanceof Error ? err.message : err);
+      res.status(500).json({ error: "Something went wrong" });
+    },
+  );
+  return app;
+}
+
+const rows = new Map<string, Team>();
+let databaseUp = true;
+const teams: TeamRepository = {
+  async findByName(name) {
+    if (!databaseUp) throw new Error("connection refused");
+    return [...rows.values()].find((t) => t.name === name) ?? null;
+  },
+  async count() {
+    return rows.size;
+  },
+  async save(team) {
+    rows.set(team.id, team);
+  },
+};
+
+const api = request(createApp(teams));
+for (const name of ["Pandas", "", "Pandas", "Otters", "Koalas"]) {
+  const res = await api.post("/teams").send({ name });
+  console.log(res.status, res.body);
+}
+databaseUp = false;
+const res = await api.post("/teams").send({ name: "Lemurs" });
+console.log(res.status, res.body);
+```
+
+</CodeExample>
+
+`fail` возвращает `Result<never, CreateTeamError>` — результат, у которого успешной стороны быть не может, а значит, его можно присвоить `Result` с **любым** типом успеха. Теперь посмотрите, что будет, когда продакт добавит четвёртый вид сбоя, `{ kind: "owner-suspended" }`. Компилятор сам приведёт вас к обоим местам, которые нужно поменять:
+
+```ts
+} satisfies Record<CreateTeamError["kind"], number>;
+// ❌ Error: Type '{ invalid: number; "name-taken": number; "over-limit": number; }' does not satisfy the expected type 'Record<"invalid" | "name-taken" | "over-limit" | "owner-suspended", number>'.
+
+function message(error: CreateTeamError): string {
+// ❌ Error: Function lacks ending return statement and return type does not include 'undefined'.
+```
+
+В этом и есть настоящая выгода ошибок-как-значений в большой кодовой базе: список сбоев — это **данные, которые компилятор может пересчитать**. С выбрасываемыми ошибками новый класс `OwnerSuspendedError` компилируется везде и всплывает в продакшене как `500`.
+
+Антипаттерны — на обоих полюсах. Команды, которые выбрасывают всё подряд, в итоге сравнивают строки: `catch (e) { if (e.message.includes("taken")) … }`. Команды, которые заворачивают в `Result` **всё**, включая «база данных недоступна», заставляют каждый вызывающий код писать `if (!result.ok) return result;` по четыре раза на функцию — а это просто более медленный способ выбросить исключение. И что бы вы ни выбрали, **не смешивайте подходы в одном слое**: репозиторий, который иногда выбрасывает `NotFound`, а иногда возвращает `null`, заставляет каждого вызывающего обрабатывать оба варианта.
+
+<Callout type="tip" title="Запишите стратегию">
+
+Изложите правила в коротком `CONTRIBUTING.md` или в записи об архитектурном решении (architecture decision record): «сценарии использования возвращают `Result` с объединением `kind`; репозитории возвращают `null`, если ничего не найдено, и выбрасывают исключения при ошибках инфраструктуры; коды ответа знает только `http/`». Новые коллеги следуют записанным правилам; соглашению, которое живёт только в трёх головах senior-разработчиков, следовать невозможно.
+
+</Callout>
+
+## Как остановить распространение `any`
+
+`any` — это не одно непроверенное значение. Он **заразен**: каждое свойство, прочитанное из него, — `any`, каждая функция, которая его возвращает, возвращает `any`, и каждая переменная, выведенная из этого, — тоже `any`. Одна пропущенная аннотация может выключить проверку типов далеко от того места, где всё началось:
+
+<CodeExample output={`night NaN
+true`}>
+
+```ts
+// settings.ts: тип возвращаемого значения не указан, поэтому выводится... any
+function loadSettings(text: string) {
+  return JSON.parse(text);
+}
+
+// через три файла этого уже никто не видит
+const settings = loadSettings('{"theme":"night"}');
+const theme: string = settings.theme; // any → string, без проверки
+const size = settings.fontSize;      // any переходит в size
+const doubled = size * 2;            // и в doubled
+
+console.log(theme, doubled);
+try {
+  console.log(settings.layout.columns);
+} catch (error) {
+  console.log(error instanceof TypeError); // упало во время выполнения
+}
+```
+
+</CodeExample>
+
+Ни одной ошибки, зато `NaN` и падение. Исправление — снова правило границы: `JSON.parse` возвращает `any`, поэтому функция, которая его вызывает, должна **остановить** `any`, вернув проверенный тип (здесь — с разумными значениями по умолчанию):
+
+<CodeExample output={`{ theme: 'night', fontSize: 16 }
+{ theme: 'bamboo', fontSize: 16 }
+{ theme: 'bamboo', fontSize: 16 }`}>
+
+```ts
+interface Settings {
+  theme: "bamboo" | "night";
+  fontSize: number;
+}
+
+const defaults: Settings = { theme: "bamboo", fontSize: 16 };
+
+// на входе unknown, на выходе Settings: any останавливается здесь
+function loadSettings(text: string): Settings {
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return defaults;
+  }
+  if (typeof data !== "object" || data === null) return defaults;
+  const theme = "theme" in data ? data.theme : undefined;
+  const fontSize = "fontSize" in data ? data.fontSize : undefined;
+  return {
+    theme: theme === "night" || theme === "bamboo"
+      ? theme
+      : defaults.theme,
+    fontSize: typeof fontSize === "number"
+      ? fontSize
+      : defaults.fontSize,
+  };
+}
+
+console.log(loadSettings('{"theme":"night"}'));
+console.log(loadSettings('{"fontSize":"huge"}'));
+console.log(loadSettings("not json"));
+```
+
+</CodeExample>
+
+В кодовой базе с большим числом участников одной дисциплины мало: нужно, чтобы падала сборка. Это работа **typescript-eslint**. Его правила с информацией о типах не просто запрещают писать `any` — они отслеживают значения `any`, **текущие** по коду: `no-unsafe-assignment` отмечает `const theme: string = settings.theme`, `no-unsafe-member-access` — `settings.layout`, `no-unsafe-return` — возврат `JSON.parse(text)`:
+
+```js title="eslint.config.mjs"
+import { defineConfig } from "eslint/config";
+import js from "@eslint/js";
+import tseslint from "typescript-eslint";
+
+export default defineConfig(
+  js.configs.recommended,
+  // включает no-explicit-any и всё семейство no-unsafe-*
+  tseslint.configs.recommendedTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: { projectService: true },
+    },
+    rules: {
+      // экспортируемые функции должны объявлять, что они возвращают
+      "@typescript-eslint/explicit-module-boundary-types": "error",
+    },
+  },
+);
+```
+
+Ещё несколько привычек, которые не пускают `any`:
+
+- **Указывайте тип возвращаемого значения у экспортируемых функций.** Внутри модуля вывод типов прекрасен. На границе модуля явный тип возвращаемого значения — это контракт: он не даёт случайному `any` (или случайно огромному выведенному типу) утечь ко всем вызывающим. Библиотеки могут включить опцию компилятора `isolatedDeclarations`, которая требует этого для каждого экспорта (тогда инструменты могут писать файлы `.d.ts`, не запуская проверку типов, — вы видели это в уроке [Как работает компилятор](/learn/typescript/how-the-compiler-works)).
+- **Оборачивайте нетипизированные библиотеки один раз.** Если SDK возвращает `any`, напишите один модуль-адаптер, который превращает его результаты в ваши собственные типы, и импортируйте везде адаптер, а не SDK.
+- **Относитесь к `as` как к `any`.** `as Settings` на разобранном JSON — это замаскированный `any`. Разрешайте приведения только внутри «умных конструкторов» вроде `parseEmail`, а о каждом остальном пусть спрашивают на ревью.
+- **Когда `any` действительно нужен** (редко: внутренности обобщённого помощника, миграция в процессе), держите его локально, объясните причину в комментарии и используйте `// eslint-disable-next-line`, чтобы он находился поиском.
+
+## Границы модулей и публичные API
+
+Последнее проектное решение касается того, **где** живут типы и кто может их импортировать. Большие кодовые базы обычно организуют **сначала по фичам**, а уже потом по слоям, так что всё, что касается биллинга, лежит рядом и может принадлежать одной команде:
+
+```text
+src/
+├── features/
+│   ├── billing/
+│   │   ├── index.ts          ← публичный API фичи
+│   │   ├── billing.ts        createBilling(), интерфейс Billing
+│   │   ├── invoice.ts        доменные типы и правила
+│   │   ├── stripe-adapter.ts единственный файл, который импортирует stripe
+│   │   └── billing.test.ts
+│   └── teams/
+│       ├── index.ts
+│       └── ...та же структура...
+├── shared/                   Result, брендированные id, логгер
+└── main.ts                   связывает фичи между собой
+```
+
+Каждая фича открывает **маленький публичный API с явными типами**, а всё остальное закрыто. В TypeScript самый дешёвый способ обеспечить «закрытость» — аннотировать тип возвращаемого значения: вызывающие видят интерфейс, а не то, что реализация вернула по случайности:
+
+<CodeExample output={`[
+  { id: 'inv-1', customerId: 'c1', totalCents: 4500 },
+  { id: 'inv-3', customerId: 'c1', totalCents: 990 }
+]`}>
+
+```ts
+// ---- features/billing/billing.ts (внутри фичи) ----
+interface Invoice {
+  id: string;
+  customerId: string;
+  totalCents: number;
+}
+
+// Публичный API фичи: то, чем могут пользоваться другие фичи
+interface Billing {
+  createInvoice(customerId: string, totalCents: number): Invoice;
+  invoicesFor(customerId: string): readonly Invoice[];
+}
+
+function createBilling(): Billing {
+  const invoices = new Map<string, Invoice>();
+  return {
+    createInvoice(customerId, totalCents) {
+      const invoice = {
+        id: `inv-${invoices.size + 1}`,
+        customerId,
+        totalCents,
+      };
+      invoices.set(invoice.id, invoice);
+      return invoice;
+    },
+    invoicesFor(customerId) {
+      return [...invoices.values()].filter(
+        (invoice) => invoice.customerId === customerId,
+      );
+    },
+  };
+}
+
+// ---- features/orders/checkout.ts (другая фича) ----
+const billing = createBilling();
+billing.createInvoice("c1", 4_500);
+billing.createInvoice("c2", 1_200);
+billing.createInvoice("c1", 990);
+console.log(billing.invoicesFor("c1"));
+```
+
+</CodeExample>
+
+Без `: Billing` тип возвращаемого значения **выводился бы** из того, что окажется в объектном литерале. Если бы кто-то добавил туда `invoices` «для отладки», сырой `Map` стал бы частью публичного API, фича отчётов начала бы его читать, и через год вы уже не смогли бы поменять хранилище, не сломав другую команду. С аннотацией то же изменение — ошибка: *Object literal may only specify known properties, and 'invoices' does not exist in type 'Billing'.* Тип `readonly Invoice[]` говорит то же самое о списке: вызывающие могут его читать, но не делать `push`.
+
+### Баррели и их цена
+
+Файл `index.ts`, который реэкспортирует публичные имена папки, называют **баррелем** (barrel):
+
+```ts title="src/features/billing/index.ts"
+export { createBilling } from "./billing";
+export type { Billing, Invoice } from "./billing";
+```
+
+Другие фичи импортируют `from "@/features/billing"` и никогда — из `@/features/billing/stripe-adapter`. Если баррель используется так, на **границе**, он делает публичный API видимым, и это можно закрепить через ESLint:
+
+```js
+// в eslint.config.mjs
+{
+  rules: {
+    "no-restricted-imports": ["error", {
+      patterns: [{
+        group: ["@/features/*/*"],
+        message: "Import other features through their index.ts",
+      }],
+    }],
+  },
+}
+```
+
+Баррели становятся дорогими, когда они повсюду. Остерегайтесь:
+
+- **Загрузки всего подряд.** `import { formatCents } from "@/shared"` заставляет среду выполнения загрузить **каждый** модуль, который реэкспортирует `shared/index.ts`, и всё, что импортируют они. Бандлеры могут выбросить лишнее (tree-shaking) в продакшен-сборке, но тест-раннеры и dev-серверы обычно не могут: команды видели наборы тестов Vitest, которые тратили большую часть времени на импорт баррелей, и dev-серверы, делающие сотни лишних запросов. (В Next.js даже есть опция `optimizePackageImports`, которая переписывает импорты из баррелей больших пакетов.)
+- **Циклических импортов.** С баррелями циклы возникают легко: `billing/invoice.ts` импортирует из `@/shared`, а `shared/index.ts` реэкспортирует помощника, который импортирует из `@/features/billing`. TypeScript спокойно это компилирует, а во время выполнения один модуль видит другой наполовину инициализированным: `ReferenceError: Cannot access 'createBilling' before initialization` или `undefined`, который появляется только при одном порядке импортов.
+- **`export *`.** `export * from "./billing"` реэкспортирует всё, включая внутренности, которые вы хотели скрыть, так что «публичный API» — это то, что случайно экспортируется сегодня. Называйте экспорты явно и используйте `export type` для типов — тогда баррель сам документирует API.
+
+Практическое правило: **один баррель на границу** (фичу, пакет), явные именованные экспорты, а внутри фичи импортируйте файлы напрямую.
+
+<Quiz
+  question="Тип ответа API — type UserDto = Omit<User, 'passwordHash'>, а обработчики делают const { passwordHash, ...dto } = user; res.json(dto). Через месяц кто-то добавляет в User поле mfaSecret: string. Что произойдёт?"
+  options={[
+    "Компилятор сообщит об ошибке в каждом обработчике, пока UserDto не обновят",
+    "Всё скомпилируется, и ответы теперь будут содержать mfaSecret",
+    "mfaSecret удалится автоматически, потому что его нет в UserDto",
+    "Omit выбросит исключение во время выполнения, потому что ключи изменились",
+  ]}
+  answer={1}
+  explanation="И Omit, и rest-деструктуризация — это чёрные списки: UserDto теперь включает mfaSecret, и ...dto его копирует. Ничего не перестаёт компилироваться, потому что чёрный список по-прежнему соблюдён. Белый список (Pick или отдельный интерфейс) плюс функция преобразования, которая собирает свежий объект, держат новые поля закрытыми, пока их сознательно не откроют."
+/>
+
+<Quiz
+  question="Что должно произойти, по стратегии ошибок из этого урока, если соединение с базой данных обрывается посреди сценария createTeam?"
+  options={[
+    "createTeam возвращает { ok: false, error: { kind: 'database-down' } }, чтобы его обработал каждый вызывающий",
+    "Репозиторий возвращает null, и createTeam считает имя команды свободным",
+    "Репозиторий выбрасывает исключение, оно всплывает до middleware ошибок, которое пишет лог и отвечает 500",
+    "HTTP-обработчик перехватывает его и отвечает 400, чтобы клиент повторил запрос",
+  ]}
+  answer={2}
+  explanation="Авария неожиданна, и никакой вызывающий код не может её исправить, поэтому это исключение, которое доходит до одного центрального обработчика. Возвращать null опасно (неверный ответ вместо отсутствия ответа), а превращение аварии в kind у Result лишь заставляет каждого вызывающего вручную передавать её дальше."
+/>
+
+<Exercise
+  title="Границы для фичи регистрации"
+  language="typescript"
+  starter={`type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// ---------- хранение (готово) ----------
+interface UserRow {
+  id: string;
+  email: string;
+  display_name: string;
+  password_hash: string;
+  created_at: number; // миллисекунды с 1970 года
+  deleted_at: number | null;
+}
+
+// ---------- домен (готово) ----------
+type Email = string & { readonly __brand: "Email" };
+
+interface User {
+  id: string;
+  email: Email;
+  displayName: string;
+  passwordHash: string;
+  createdAt: Date;
+  status: "active" | "deleted";
+}
+
+interface Signup {
+  email: Email;
+  displayName: string;
+  password: string;
+}
+
+// ---------- API (готово) ----------
+interface UserDto {
+  id: string;
+  email: string;
+  displayName: string;
+  createdAt: string; // ISO 8601
+}
+
+// ---------- TODO 1: граница ----------
+// на входе unknown; на выходе Signup или ВСЕ проблемы (в этом порядке):
+//   "body must be an object"   (единственная, если это не объект)
+//   "email must be a valid email address"
+//   "displayName must be 1-40 characters"
+//   "password must be at least 8 characters"
+function parseSignup(input: any): any {
+  return { ok: true, value: input };
+}
+
+// ---------- TODO 2: хранение → домен ----------
+function rowToUser(row: any): any {
+  return row;
+}
+
+// ---------- TODO 3: домен → API ----------
+function toUserDto(user: any): any {
+  return user;
+}
+
+// ---------- тесты типов (не меняйте их) ----------
+// Каждая строка под @ts-expect-error ДОЛЖНА быть ошибкой. Если тип
+// слишком широкий (any), TypeScript сообщит о неиспользованной директиве.
+function typeTests(row: UserRow, user: User): void {
+  const parsed = parseSignup({});
+  // @ts-expect-error: сначала проверьте parsed.ok, потом читайте value
+  console.log(parsed.value);
+  // @ts-expect-error: строки базы не попадают в домен напрямую
+  rowToUser(user);
+  // @ts-expect-error: даты в домене — это Date
+  rowToUser(row).createdAt.toUpperCase();
+  // @ts-expect-error: в DTO никогда нет хеша пароля
+  console.log(toUserDto(user).passwordHash);
+}
+
+// ---------- попробуйте ----------
+const result = parseSignup({
+  email: " Mei@PandaDev.test ",
+  displayName: "Mei",
+  password: "bamboo-forever",
+  isAdmin: true,
+});
+console.log(result);
+console.log(parseSignup({ email: "mei", password: "short" }));
+
+const user = rowToUser({
+  id: "u1",
+  email: "mei@pandadev.test",
+  display_name: "Mei",
+  password_hash: "pbkdf2$1000$9f2c",
+  created_at: 1767225600000,
+  deleted_at: null,
+});
+console.log(toUserDto(user));
+`}
+  tests={[
+    { name: "Тесты типов компилируются (нет неиспользованных @ts-expect-error)", check: `true` },
+    { name: "parseSignup возвращает нормализованный Signup только с известными полями", check: `(() => { const r = parseSignup({ email: "  Kim@Example.COM", displayName: "  Kim  ", password: "12345678", role: "admin" }); return r.ok === true && r.value.email === "kim@example.com" && r.value.displayName === "Kim" && r.value.password === "12345678" && Object.keys(r.value).sort().join() === "displayName,email,password"; })()` },
+    { name: "parseSignup собирает все проблемы по порядку", check: `(() => { const r = parseSignup({ email: "no-at-sign", displayName: "x".repeat(41), password: 1234567890 }); const r2 = parseSignup({ email: "a@b.test", displayName: "", password: "long enough" }); return r.ok === false && JSON.stringify(r.error) === JSON.stringify(["email must be a valid email address", "displayName must be 1-40 characters", "password must be at least 8 characters"]) && r2.ok === false && JSON.stringify(r2.error) === JSON.stringify(["displayName must be 1-40 characters"]); })()` },
+    { name: "parseSignup отклоняет тела запросов, которые не являются объектами", check: `[null, "hi", 42, undefined].every((x) => { const r = parseSignup(x); return r.ok === false && r.error.length === 1 && r.error[0] === "body must be an object"; })` },
+    { name: "rowToUser преобразует столбцы, даты и статус", check: `(() => { const u = rowToUser({ id: "u9", email: "z@z.test", display_name: "Zed", password_hash: "h", created_at: 0, deleted_at: 5 }); const a = rowToUser({ id: "u1", email: "a@a.test", display_name: "A", password_hash: "h", created_at: 1, deleted_at: null }); return u.id === "u9" && u.email === "z@z.test" && u.displayName === "Zed" && u.passwordHash === "h" && u.createdAt instanceof Date && u.createdAt.getTime() === 0 && u.status === "deleted" && !("display_name" in u) && a.status === "active"; })()` },
+    { name: "toUserDto отправляет ровно четыре поля, даже из объекта побольше", check: `(() => { const d = toUserDto({ id: "u2", email: "b@b.test", displayName: "Bo", passwordHash: "secret", createdAt: new Date(86400000), status: "active", mfaSecret: "hidden" }); return Object.keys(d).sort().join() === "createdAt,displayName,email,id" && d.createdAt === "1970-01-02T00:00:00.000Z" && d.displayName === "Bo" && !JSON.stringify(d).includes("secret") && !JSON.stringify(d).includes("hidden"); })()` },
+  ]}
+>
+
+В фиче регистрации есть все три вида типов, а код между ними сейчас насквозь `any`. Типы (`UserRow`, `User`, `Signup`, `UserDto`) готовы. Замените три функции с `any`:
+
+1. **`parseSignup(input: unknown): Result<Signup, string[]>`** — граница. Если `input` не объект (или `null`), верните только `["body must be an object"]`. Иначе проверьте каждое поле и соберите **все** проблемы в таком порядке: `email` должен быть строкой, которая после обрезки пробелов и приведения к нижнему регистру соответствует `/^[^@\s]+@[^@\s]+$/` (`"email must be a valid email address"`); `displayName` должен быть строкой из 1–40 символов после обрезки пробелов (`"displayName must be 1-40 characters"`); `password` должен быть строкой длиной не меньше 8 символов, без обрезки (`"password must be at least 8 characters"`). При успехе верните **свежий** объект только с тремя нормализованными полями.
+2. **`rowToUser(row: UserRow): User`**: преобразуйте столбцы, превратите `created_at` в `Date` и установите `status` в `"deleted"`, когда `deleted_at` не `null`. Сохранённые email проверялись при записи, поэтому приведение к `Email` здесь допустимо.
+3. **`toUserDto(user: User): UserDto`**: белый список. Ровно `id`, `email`, `displayName` и `createdAt` строкой ISO, даже если переданный объект содержит больше.
+
+Функция `typeTests` никогда не вызывается; её строки с `@ts-expect-error` — это **тесты типов**: каждый проходит, только когда эта строка действительно ошибка, поэтому они не проходят, пока ваши функции используют `any`.
+
+<Hint>
+
+Повторите форму `parseNewTeam` из раздела «`unknown` на границах»: по маленькому парсеру на каждое поле (`parseEmail`, `parseDisplayName`, `parsePassword`, каждый — `unknown` → значение или `null`), читайте поля через `"email" in input ? input.email : undefined`, добавляйте проблемы в массив и возвращайте `{ ok: false, error: issues }`, если хоть один парсер вернул `null`. После этого `if` TypeScript знает, что все три значения не `null`. `rowToUser` и `toUserDto` — это функции преобразования из раздела «Одно понятие — три типа», с приведением `row.email` к `Email`.
+
+</Hint>
+
+<Solution>
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// ---------- хранение (готово) ----------
+interface UserRow {
+  id: string;
+  email: string;
+  display_name: string;
+  password_hash: string;
+  created_at: number; // миллисекунды с 1970 года
+  deleted_at: number | null;
+}
+
+// ---------- домен (готово) ----------
+type Email = string & { readonly __brand: "Email" };
+
+interface User {
+  id: string;
+  email: Email;
+  displayName: string;
+  passwordHash: string;
+  createdAt: Date;
+  status: "active" | "deleted";
+}
+
+interface Signup {
+  email: Email;
+  displayName: string;
+  password: string;
+}
+
+// ---------- API (готово) ----------
+interface UserDto {
+  id: string;
+  email: string;
+  displayName: string;
+  createdAt: string; // ISO 8601
+}
+
+// ---------- граница ----------
+function parseEmail(value: unknown): Email | null {
+  if (typeof value !== "string") return null;
+  const email = value.trim().toLowerCase();
+  const valid = /^[^@\s]+@[^@\s]+$/.test(email);
+  return valid ? (email as Email) : null;
+}
+
+function parseDisplayName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const name = value.trim();
+  return name.length >= 1 && name.length <= 40 ? name : null;
+}
+
+function parsePassword(value: unknown): string | null {
+  return typeof value === "string" && value.length >= 8
+    ? value
+    : null;
+}
+
+function parseSignup(input: unknown): Result<Signup, string[]> {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: ["body must be an object"] };
+  }
+  const email = parseEmail("email" in input ? input.email : undefined);
+  const displayName = parseDisplayName(
+    "displayName" in input ? input.displayName : undefined,
+  );
+  const password = parsePassword(
+    "password" in input ? input.password : undefined,
+  );
+
+  const issues: string[] = [];
+  if (email === null) {
+    issues.push("email must be a valid email address");
+  }
+  if (displayName === null) {
+    issues.push("displayName must be 1-40 characters");
+  }
+  if (password === null) {
+    issues.push("password must be at least 8 characters");
+  }
+  if (email === null || displayName === null || password === null) {
+    return { ok: false, error: issues };
+  }
+  return { ok: true, value: { email, displayName, password } };
+}
+
+// ---------- хранение → домен ----------
+function rowToUser(row: UserRow): User {
+  return {
+    id: row.id,
+    email: row.email as Email, // сохранённые email уже проверены
+    displayName: row.display_name,
+    passwordHash: row.password_hash,
+    createdAt: new Date(row.created_at),
+    status: row.deleted_at === null ? "active" : "deleted",
+  };
+}
+
+// ---------- домен → API ----------
+function toUserDto(user: User): UserDto {
+  return {
+    id: user.id,
+    email: user.email,
+    displayName: user.displayName,
+    createdAt: user.createdAt.toISOString(),
+  };
+}
+
+// ---------- тесты типов (не меняйте их) ----------
+// Каждая строка под @ts-expect-error ДОЛЖНА быть ошибкой. Если тип
+// слишком широкий (any), TypeScript сообщит о неиспользованной директиве.
+function typeTests(row: UserRow, user: User): void {
+  const parsed = parseSignup({});
+  // @ts-expect-error: сначала проверьте parsed.ok, потом читайте value
+  console.log(parsed.value);
+  // @ts-expect-error: строки базы не попадают в домен напрямую
+  rowToUser(user);
+  // @ts-expect-error: даты в домене — это Date
+  rowToUser(row).createdAt.toUpperCase();
+  // @ts-expect-error: в DTO никогда нет хеша пароля
+  console.log(toUserDto(user).passwordHash);
+}
+
+// ---------- попробуйте ----------
+const result = parseSignup({
+  email: " Mei@PandaDev.test ",
+  displayName: "Mei",
+  password: "bamboo-forever",
+  isAdmin: true,
+});
+console.log(result);
+console.log(parseSignup({ email: "mei", password: "short" }));
+
+const user = rowToUser({
+  id: "u1",
+  email: "mei@pandadev.test",
+  display_name: "Mei",
+  password_hash: "pbkdf2$1000$9f2c",
+  created_at: 1767225600000,
+  deleted_at: null,
+});
+console.log(toUserDto(user));
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Одному понятию часто нужны три типа: **тип хранения**, который определяет база данных, **доменный тип**, который определяет бизнес, и **DTO**, который определяют клиенты. Их связывают маленькие функции преобразования, и каждое изменение остаётся в одном месте. Не разделяйте типы, пока формы не начали расходиться.
+- Типы описывают **минимум**; они никогда не удаляют свойства. Только функция преобразования, собирающая свежий объект, не пускает секреты в ответы. Выводите публичные типы через белые списки (`Pick`, отдельные интерфейсы), а не через `Omit`.
+- Данные снаружи на **границе** имеют тип `unknown`. Разберите их один раз в точный тип (брендированный `Email`, `NewTeam`), копируйте только известные поля, и пусть код внутри доверяет своим параметрам. Zod или Valibot делают то же самое с меньшим количеством кода.
+- Выберите **стратегию ошибок для каждого слоя** и запишите её: ожидаемые сбои — как `Result` с объединением `kind` (компилятор их пересчитывает, а `satisfies Record<Kind, …>` сопоставляет), неожиданные — выбрасываются в один центральный обработчик. Не смешивайте оба подхода в одном слое.
+- `any` заразен. Останавливайте его там, где он входит (`JSON.parse`, SDK, `req.body`), указывайте типы возвращаемых значений у экспортируемых функций, относитесь к `as` как к `any` и позвольте правилам `no-unsafe-*` из typescript-eslint ронять сборку.
+- Организуйте код **по фичам**, давайте каждой фиче маленький публичный API с явными типами и используйте **один баррель на границу** с явными именованными экспортами. Баррели повсюду стоят времени загрузки и провоцируют циклические импорты.

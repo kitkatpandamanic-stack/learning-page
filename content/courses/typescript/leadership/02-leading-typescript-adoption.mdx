@@ -1,0 +1,734 @@
+---
+title: Leading TypeScript Adoption
+description: Set team standards for TypeScript, roll out strict mode in a big codebase, measure progress honestly, mentor juniors on types, write design docs for type changes, and know when to stop.
+duration: 25
+xp: 30
+---
+
+Sooner or later you become "the TypeScript person": the one people ask why an error makes no sense, whether to turn on a flag, or how to type the weird thing the API returns. Your impact then comes less from the types you write yourself and more from how the **whole team** works with types: a shared baseline, conventions people actually follow, a strictness rollout that doesn't stop feature work, juniors who grow, and the judgement to say "that's enough types". This lesson is the playbook. 🧭
+
+## A baseline everyone shares
+
+In a codebase with twelve packages and twelve hand-written `tsconfig.json` files, the settings drift. One package turns out to have `"strict": false`, another has a typo in a flag name that's been silently ignored for a year, and nobody knows which rules apply where. The fix is one **base config** that every package extends:
+
+```jsonc title="tsconfig.base.json"
+{
+  "compilerOptions": {
+    // Correctness: the team's non-negotiables
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+
+    // Modules: match what our bundler and Node do
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+
+    // Speed: don't re-check every library's .d.ts files
+    "skipLibCheck": true,
+    "noEmit": true
+  }
+}
+```
+
+```jsonc title="packages/checkout/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src"]
+}
+```
+
+Since TypeScript 6, `strict` is on even when you leave it out, so new projects start strict. Older codebases usually have `"strict": false` written in their config (often added on the day they upgraded, to keep the build green). Either way, write `"strict": true` explicitly: it documents the decision. You met all of these flags in [tsconfig & the Compiler](/learn/typescript/tsconfig-and-the-compiler). The leadership question is **which ones go into the baseline**. Some criteria:
+
+- **Does it catch bugs we've actually had?** Look at recent incidents and bug tickets. If three of the last ten production errors were "Cannot read properties of undefined" from lookups, `noUncheckedIndexedAccess` has earned its place.
+- **What does it cost?** Switch it on in a branch and count the errors. Twenty is an afternoon. Four thousand is a project (see below).
+- **Are the fixes mechanical or do they need thought?** Mechanical fixes can be shared out or scripted; fixes that need domain knowledge need owners.
+- **Does it fight our tools?** `exactOptionalPropertyTypes` is great for libraries and patch-style APIs, but some UI libraries' types weren't written with it in mind. Try before you decide.
+
+Whatever you choose, write down **why** next to it (a comment, or a short decision record), and make `tsc --noEmit` a **required check** in CI. A baseline that only runs in some people's editors isn't a baseline.
+
+## Conventions: short, with reasons, enforced by tools
+
+A conventions document is where a team writes down how it uses TypeScript. The ones that work are **short**, give the **reason** for each rule (people follow rules they understand), and point to the lint rule wherever a machine can check it:
+
+```markdown title="docs/typescript.md"
+# How we write TypeScript
+
+1. Data from outside (HTTP, JSON, storage, env) arrives as `unknown`
+   and is validated with a schema. Why: types vanish at runtime.
+2. No `any`, and no `as` outside validators and tests.
+   (lint: no-explicit-any, no-unsafe-*)
+3. Fixed sets of values are unions derived from an `as const` array,
+   not enums. Why: one source for the type and the runtime check.
+4. Expected failures return a `Result`; bugs throw.
+5. Every `switch` over a union is exhaustive.
+   (lint: switch-exhaustiveness-check)
+6. Exported functions declare their return type.
+   (lint: explicit-module-boundary-types)
+7. `@ts-expect-error` needs a reason and a ticket. No `@ts-ignore`.
+   (lint: ban-ts-comment)
+8. Object shapes: `interface`; unions and everything else: `type`.
+   Why: no reason. We picked one so nobody argues about it again.
+```
+
+Rule 8 deserves a comment. Some questions, like `type` vs `interface` or where to put the semicolons, don't have a meaningfully right answer, and a team can lose hours to them in review. The value is in **deciding once**, not in the choice. Write it down, link to it, and move on.
+
+Rule 3 is worth seeing in code, because it's the kind of convention that quietly prevents bugs. The list of values exists **once**, and both the type and the runtime check come from it:
+
+<CodeExample output={`pro: £9.00 a month
+enterprise: not a plan
+team: £29.00 a month`}>
+
+```ts
+// One list of values: the type and the runtime check share it
+const PLANS = ["free", "pro", "team"] as const;
+type Plan = (typeof PLANS)[number]; // "free" | "pro" | "team"
+
+function isPlan(value: string): value is Plan {
+  return PLANS.some((plan) => plan === value);
+}
+
+// Lookup tables are Record<Union, …>: a new plan won't compile
+// until every table has an entry for it
+const PRICE_PENCE: Record<Plan, number> = {
+  free: 0,
+  pro: 900,
+  team: 2900,
+};
+
+// Values from outside (a form, a URL, JSON) are checked once
+for (const input of ["pro", "enterprise", "team"]) {
+  if (isPlan(input)) {
+    const price = (PRICE_PENCE[input] / 100).toFixed(2);
+    console.log(`${input}: £${price} a month`);
+  } else {
+    console.log(`${input}: not a plan`);
+  }
+}
+```
+
+</CodeExample>
+
+When sales adds `"enterprise"` to `PLANS`, `isPlan` accepts it automatically, and every lookup table that forgot about it stops compiling:
+
+```ts
+const PRICE_PENCE: Record<Plan, number> = {
+// ❌ Error: Property 'enterprise' is missing in type '{ free: number; pro: number; team: number; }' but required in type 'Record<"free" | "pro" | "team" | "enterprise", number>'.
+```
+
+<Callout type="tip" title="Conventions are code too">
+
+Keep the conventions doc in the repository, and change it through pull requests like any other code. When a review comment keeps coming up, the fix is a new lint rule or a new line in the doc, not the same comment for the twentieth time. When a rule keeps getting disabled, it's probably wrong: talk about it and change it.
+
+</Callout>
+
+## Rolling out strict mode in a big codebase
+
+Switching on `strict` (or `strictNullChecks`, its biggest part) in a 300,000-line codebase can produce thousands of errors at once. You can't fix them in one pull request, and you can't freeze feature work for a month. You need a plan that lets the codebase get stricter **gradually**, while new code is strict from day one.
+
+| Strategy | How | Pick it when |
+| --- | --- | --- |
+| **Big bang** | Switch it on, fix everything in one go | small codebase, a few hundred errors at most |
+| **Flag by flag** | `noImplicitAny` first, then `strictNullChecks`, then the rest | errors are spread evenly; each flag is its own milestone |
+| **Folder by folder** | a second config, `tsconfig.strict.json`, that only includes migrated folders; CI runs both | the code has clear modules with clear owners |
+| **File by file** | strict everywhere, with an ignore comment at the top of each unmigrated file | a big tangled codebase; new files are strict automatically |
+| **Suppress and burn down** | `@ts-expect-error` on every existing error, then remove them over time | errors are few per file, but in many files |
+
+The folder-by-folder config is plain TypeScript:
+
+```jsonc title="tsconfig.strict.json"
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "strict": true },
+  // Add folders here as they're migrated
+  "include": ["src/shared", "src/billing"]
+}
+```
+
+For file by file, a popular tool is **typescript-strict-plugin**: the main config stays non-strict, the plugin (registered under `plugins` in `tsconfig.json`) checks strict rules in every file that doesn't start with `//@ts-strict-ignore`, and it comes with a script that adds that comment to every file that currently has errors:
+
+```bash
+npm install --save-dev typescript-strict-plugin
+npx update-strict-comments   # mark today's failing files
+npx tsc-strict               # CI: strict errors in all other files
+```
+
+From then on, every new file is strict, and migrating a file means deleting one comment and fixing what appears.
+
+### Make it countable, and only let it go down
+
+A rollout without numbers stalls quietly. Count the remaining errors per team, commit the counts, and let CI fail when they **rise**. When they fall, the lower number becomes the new baseline. This is a **ratchet**, the same idea you'd use for a JS-to-TS migration, and it turns "we should really finish strict mode" into a visible, shared trend:
+
+<CodeExample output={`Payments   9 → 6
+Discovery  4 → 5 ❌ new errors
+Platform   2 → 0 🎉 done
+Total      15 → 11
+CI fails: new strict errors from Discovery`}>
+
+```ts
+// Today's `tsc -p tsconfig.strict.json`, one line per error
+// (messages trimmed)
+const tscOutput = `
+src/billing/invoice.ts(14,7): error TS2322
+src/billing/invoice.ts(31,12): error TS18048
+src/billing/refunds.ts(9,3): error TS18048
+src/billing/refunds.ts(40,18): error TS2345
+src/billing/tax.ts(5,10): error TS7006
+src/billing/tax.ts(22,5): error TS18047
+src/search/query.ts(8,20): error TS7006
+src/search/query.ts(19,4): error TS2532
+src/search/ranking.ts(3,15): error TS7006
+src/search/filters.ts(12,9): error TS18048
+src/search/filters.ts(30,2): error TS2322
+`;
+
+const TEAMS = ["Payments", "Discovery", "Platform"] as const;
+type Team = (typeof TEAMS)[number];
+
+// Who owns which folder (like a CODEOWNERS file)
+const owners: Record<string, Team> = {
+  "src/billing/": "Payments",
+  "src/search/": "Discovery",
+  "src/shared/": "Platform",
+};
+
+// Last week's numbers, committed as strict-baseline.json
+const baseline: Record<Team, number> = {
+  Payments: 9,
+  Discovery: 4,
+  Platform: 2,
+};
+
+function ownerOf(file: string): Team {
+  for (const [folder, team] of Object.entries(owners)) {
+    if (file.startsWith(folder)) return team;
+  }
+  throw new Error(`Nobody owns ${file}: add it to owners`);
+}
+
+const today: Record<Team, number> = {
+  Payments: 0,
+  Discovery: 0,
+  Platform: 0,
+};
+for (const line of tscOutput.trim().split("\n")) {
+  const file = line.slice(0, line.indexOf("("));
+  today[ownerOf(file)]++;
+}
+
+const worse: Team[] = [];
+for (const team of TEAMS) {
+  const [before, now] = [baseline[team], today[team]];
+  let note = "";
+  if (now > before) {
+    note = "❌ new errors";
+    worse.push(team);
+  } else if (now === 0) {
+    note = "🎉 done";
+  }
+  console.log(`${team.padEnd(10)} ${before} → ${now} ${note}`.trim());
+}
+
+const total = (counts: Record<Team, number>) =>
+  TEAMS.reduce((sum, team) => sum + counts[team], 0);
+console.log(`Total      ${total(baseline)} → ${total(today)}`);
+console.log(
+  worse.length > 0
+    ? `CI fails: new strict errors from ${worse.join(", ")}`
+    : "CI passes: commit the lower numbers as the new baseline",
+);
+```
+
+</CodeExample>
+
+Grouping by **owner** matters as much as the numbers. "11 strict errors left" is nobody's job. "Discovery has 5, and went up this week" is a conversation one team lead can have. Notice the script also fails loudly for a file with no owner, so nothing falls through the cracks.
+
+<Callout type="danger" title="The flag is on, and the code is worse">
+
+A team I know switched on `strictNullChecks` across a large app in two weeks. The trick: wherever the compiler complained, someone added `!` or `as any`. About 1,800 of them. The flag was on, the dashboard was green, and the code was **less** safe than before: every `!` now looked like a deliberate, reviewed decision, and nobody could tell the real ones from the panic ones. A year later they were still finding them, one crash at a time.
+
+Suppressions are fine during a rollout, but they must be **visible and countable**: an ignore comment at the top of the file, or `@ts-expect-error` with a ticket number. Never a "fix" that looks like real code. Making the error disappear is not the same as making the code correct.
+
+</Callout>
+
+The people side decides whether any of this works:
+
+- **Explain why first.** "We had 14 production crashes from `undefined` last quarter; `strictNullChecks` would have caught 11" convinces people. "Strict is best practice" doesn't.
+- **New code is strict from day one.** The pile only shrinks if nobody adds to it.
+- **Make fixing easy.** A short page with the ten most common strict errors and how to fix each, a chat channel, weekly office hours, pairing sessions.
+- **Share the work fairly.** Each team migrates its own code, a little every sprint, with the ratchet keeping score. One hero doing it all burns out, and the others learn nothing.
+- **Celebrate milestones.** "Payments is fully strict 🎉" in the team channel is cheap and works.
+
+## Measuring type safety honestly
+
+What gets measured gets attention, so pick numbers that point at real safety. The best known is **type coverage**: the share of identifiers whose type isn't `any`. The `type-coverage` tool computes it, prints something like `4021 / 4235 94.94%`, and can fail CI below a threshold:
+
+```bash
+npx type-coverage --at-least 95   # fails below 95%
+npx type-coverage --detail        # lists every any, file:line
+```
+
+Next to it, track:
+
+- **Escape hatches**: counts of `as`, `!`, `@ts-expect-error` and lint suppressions, per folder, over time. typescript-eslint's rules can report them, or a simple `grep -c` will do.
+- **Strict progress**: files or folders migrated, and the ratchet's total.
+- **Outcomes**: the number that really matters. How many production errors are "Cannot read properties of undefined" or "x is not a function"? Your error tracker knows. Type work should make that line go down.
+
+Watch out for **Goodhart's law**: when a measure becomes a target, it stops being a good measure. Make "98% type coverage" a hard goal, and someone will turn `any` into `as unknown as Order`. Coverage goes up, safety stays exactly the same. So track several numbers together (coverage **and** casts), look at trends rather than single values, and keep reading the diffs.
+
+## Mentoring juniors on types
+
+Juniors usually meet TypeScript through its errors, and long errors are intimidating. One of the most useful things you can teach is how to **read** them. Here's a typical one:
+
+```ts
+const order: Order = fromForm;
+// ❌ Error: Type '{ id: string; customer: { name: string; address: { street: string; postcode: number; }; }; }' is not assignable to type 'Order'.
+//   The types of 'customer.address.postcode' are incompatible between these types.
+//     Type 'number' is not assignable to type 'string'.
+```
+
+Teach them to **read from the bottom up**. The first line says "something somewhere doesn't fit". The last lines say what: the path `customer.address.postcode` and the actual mismatch, a `number` where a `string` belongs. Hovering over values in the editor, and pasting a small example into the [TypeScript Playground](https://www.typescriptlang.org/play), are the other two everyday tools worth showing.
+
+Beyond that:
+
+- **Fix the type, not the error.** When a junior's PR contains `as any`, don't just say "no casts". Ask "what did the error say?", and read it together. Usually the error was right, and the fix is a guard or a better type. That conversation teaches more than any rule.
+- **Teach in the right order.** Unions and narrowing first, they pay off every day. Generics when they need to write a reusable helper. Conditional and mapped types much later, mostly for reading library code.
+- **Explain the conventions' reasons.** "We parse env into a typed config *so a typo in LOG_LEVEL fails at startup, not at 3 a.m.*" sticks; "always validate config" doesn't.
+- **Review generously.** On a junior's PR, pick the two or three type points that matter most. Twenty comments about `readonly` and return types bury the one about the unchecked JSON.
+- **Pair on real problems.** Removing one real `as` together (finding where the value comes from, writing the guard, adding the test) teaches the whole chain.
+- **Make it safe to not know.** "I don't know why TypeScript infers that either, let's find out" from a senior gives everyone permission to ask.
+
+## Design docs for type-heavy changes
+
+Some type changes are as big as a new service: changing a domain type that 400 files use, introducing branded ids, switching error handling to `Result`, or redesigning the types of a package other teams depend on. They deserve a short **design doc** before anyone writes the code (the general template is in [Code Review and Technical Leadership](/learn/javascript/code-review-and-leadership)). For type changes, a few sections matter most:
+
+```markdown
+# Design: branded ids for orders and customers
+
+## Context
+Twice this year an OrderId was passed where a CustomerId belonged.
+
+## Proposed types (paste the real declarations)
+type OrderId = string & { readonly __brand: "OrderId" };
+
+## Before and after, at three real call sites
+
+## What mistakes look like now (paste the compiler errors)
+
+## Migration
+Old names stay as @deprecated aliases for one release;
+a codemod updates imports; one PR per package.
+
+## Cost
+Type-check time before/after (tsc --extendedDiagnostics).
+
+## Type tests
+## Alternatives considered
+## Rollout and how to undo it
+```
+
+Two sections are special to TypeScript. **What mistakes look like** forces you to paste the actual errors developers will see: if they're unreadable, the design isn't done. And the **migration** section usually relies on `@deprecated`, which editors show as a strikethrough and typescript-eslint's `no-deprecated` rule can report:
+
+```ts
+/** @deprecated Use `OrderId`. Will be removed in v5. */
+export type LegacyOrderId = string;
+```
+
+## When to stop adding types
+
+Types have a cost: time to write, time to read, time to compile, and time to change when the business changes its mind. They have the best return in some places:
+
+- **Boundaries**: HTTP, JSON, the database, user input, config. Most real bugs enter here.
+- **Shared domain types** that many files and teams depend on.
+- **Public APIs** of packages and modules.
+- **Code that changes often**, where the compiler finds every place a change has to reach.
+
+And less in others: one-off scripts, prototypes you'll throw away, test internals, and glue code that just passes values along. Those should still be strict and free of `any`, but they don't need branded types or a state machine in the type system.
+
+Signs a codebase has gone too far: type-level code longer than the runtime code it describes, pull requests stuck for days on a type puzzle, type-check times creeping up, errors nobody can read, and juniors who are afraid to touch the types folder. A good rule of thumb: **a type earns its place if it prevents a mistake someone would plausibly make, at a cost the team can read.**
+
+<Callout type="note" title="Leading is mostly about defaults">
+
+Most developers never read the conventions doc. They copy the code next to them, accept the editor's suggestions, and do whatever CI lets through. So lead through the defaults: a strict baseline, a lint config that catches the common mistakes, examples in the codebase worth copying, and templates for new packages. Make the safe way the easy way, and most of the team follows without being told.
+
+</Callout>
+
+<Quiz
+  question="A 300,000-line codebase gets about 4,000 errors when strictNullChecks is switched on, spread over code owned by 15 teams. Which plan is most likely to succeed?"
+  options={[
+    "One senior engineer fixes all 4,000 errors on a long-lived branch, then merges it",
+    "Switch it on, mark today's failing files with an ignore comment so new files are strict, and track the remaining errors per team with a ratchet in CI",
+    "Switch it on and add ! wherever the compiler complains, so the flag is on this week",
+    "Wait until the next big rewrite, then start strict",
+  ]}
+  answer={1}
+  explanation="New code is strict immediately, the existing debt is visible and countable, each team owns its part, and CI stops the number from growing. A long-lived branch conflicts with everyone's work, ! hides the errors without fixing them, and the big rewrite may never come."
+/>
+
+<Quiz
+  question="Your team made 'type coverage at least 98%' a CI gate. Two weeks later coverage jumped from 91% to 98%. What should you check first?"
+  options={[
+    "Nothing: the number proves the code is safer",
+    "Whether the type-coverage tool was updated",
+    "Whether the number of casts like as unknown as Order, ! and @ts-expect-error went up at the same time",
+    "Whether the tests still pass",
+  ]}
+  answer={2}
+  explanation="Goodhart's law: once coverage is a target, the cheapest way to raise it is to hide any behind casts. Coverage only means something next to the escape-hatch counts, and next to the outcome you really care about: fewer runtime type errors in production."
+/>
+
+<Exercise
+  title="Team standard: a typed, validated config"
+  language="typescript"
+  starter={`import { describe, it, expect } from "vitest";
+
+type Env = Record<string, string | undefined>; // like process.env
+
+// Written before the team standard: strings all the way down
+interface Config {
+  port: number | string;
+  logLevel: string; // debug, info, warn or error
+  databaseUrl: string | undefined;
+  features: string[];
+}
+
+type LoadResult =
+  | { ok: true; config: Config }
+  | { ok: false; errors: string[] };
+
+function loadConfig(env: Env): LoadResult {
+  const config: Config = {
+    port: env.PORT || 3000,
+    logLevel: env.LOG_LEVEL || "info",
+    databaseUrl: env.DATABASE_URL,
+    features: (env.FEATURES || "").split(","),
+  };
+  return { ok: true, config };
+}
+
+function shouldLog(config: Config, level: string): boolean {
+  return level >= config.logLevel;
+}
+
+// ---- Tests (don't change them) ----
+const DB = "postgres://db.internal/shop";
+
+function load(env: Env): Config {
+  const result = loadConfig(env);
+  if (!result.ok) throw new Error(result.errors.join("; "));
+  return result.config;
+}
+
+function errorsFor(env: Env): string[] {
+  const result = loadConfig(env);
+  return result.ok ? [] : result.errors;
+}
+
+describe("loadConfig", () => {
+  it("uses defaults for optional variables", () => {
+    const config = load({ DATABASE_URL: DB, PORT: "" });
+    expect(config.port).toBe(3000);
+    expect(config.logLevel).toBe("info");
+    expect(config.databaseUrl).toBe(DB);
+    expect([...config.features]).toEqual([]);
+  });
+
+  it("reads every variable", () => {
+    const config = load({
+      DATABASE_URL: DB,
+      PORT: "8080",
+      LOG_LEVEL: "warn",
+      FEATURES: " dark-mode, beta-search ",
+    });
+    expect(config.port).toBe(8080);
+    expect(config.logLevel).toBe("warn");
+    expect([...config.features]).toEqual(["dark-mode", "beta-search"]);
+  });
+
+  it("rejects bad values and names the variable", () => {
+    const cases: [Env, string][] = [
+      [{ PORT: "80abc" }, "PORT"],
+      [{ PORT: "0" }, "PORT"],
+      [{ PORT: "70000" }, "PORT"],
+      [{ LOG_LEVEL: "verbose" }, "LOG_LEVEL"],
+      [{ FEATURES: "dark-mode,teleport" }, "FEATURES"],
+      [{ DATABASE_URL: "" }, "DATABASE_URL"],
+      [{ DATABASE_URL: "mysql://db/shop" }, "DATABASE_URL"],
+    ];
+    for (const [env, name] of cases) {
+      const errors = errorsFor({ DATABASE_URL: DB, ...env });
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain(name);
+    }
+  });
+
+  it("reports every problem at once", () => {
+    const errors = errorsFor({ PORT: "x", LOG_LEVEL: "loud" });
+    expect(errors).toHaveLength(3);
+  });
+});
+
+describe("shouldLog", () => {
+  it("logs messages at or above the configured level", () => {
+    const info = load({ DATABASE_URL: DB });
+    expect(shouldLog(info, "debug")).toBe(false);
+    expect(shouldLog(info, "info")).toBe(true);
+    expect(shouldLog(info, "warn")).toBe(true);
+    expect(shouldLog(info, "error")).toBe(true);
+
+    const warn = load({ DATABASE_URL: DB, LOG_LEVEL: "warn" });
+    expect(shouldLog(warn, "info")).toBe(false);
+    expect(shouldLog(warn, "error")).toBe(true);
+  });
+});
+
+// ---- Type tests (don't change them) ----
+// A line under @ts-expect-error must BE a type error.
+function typeTests(config: Config) {
+  // These must compile...
+  const port: number = config.port;
+  const url: string = config.databaseUrl;
+  const dark: boolean = config.features.has("dark-mode");
+
+  // ...and these must not
+  // @ts-expect-error: config can't change after startup
+  config.port = 8080;
+  // @ts-expect-error: "verbose" is not a log level
+  const level: Config["logLevel"] = "verbose";
+  // @ts-expect-error: "dark-mod" is not a feature (typo)
+  config.features.has("dark-mod");
+  // @ts-expect-error: "loud" is not a log level
+  shouldLog(config, "loud");
+}
+`}
+  tests={[
+    { name: "All 5 tests in the file pass", check: "__vitest.failed === 0 && __vitest.passed === 5" },
+    { name: "The type tests are still there, all four of them", check: `typeof typeTests === "function" && typeTests.toString().split("@ts-expect-error").length === 5` },
+    { name: "loadConfig reads other valid values", check: `(() => { const r = loadConfig({ DATABASE_URL: "postgres://x", PORT: "65535", LOG_LEVEL: "error", FEATURES: "new-checkout" }); return r.ok && r.config.port === 65535 && r.config.logLevel === "error" && r.config.features.has("new-checkout") && r.config.features.size === 1; })()` },
+    { name: "PORT must be digits only, from 1 to 65535", check: `["-1", "3.5", "65536", "1e3", " 80", "eighty"].every((p) => { const r = loadConfig({ DATABASE_URL: "postgres://x", PORT: p }); return !r.ok && r.errors.length === 1 && r.errors[0].includes("PORT"); })` },
+    { name: "FEATURES ignores empty entries", check: `(() => { const r = loadConfig({ DATABASE_URL: "postgres://x", FEATURES: ",,beta-search,, " }); return r.ok && r.config.features.size === 1 && r.config.features.has("beta-search"); })()` },
+    { name: "Every problem is reported, naming its variable", check: `(() => { const r = loadConfig({ PORT: "x", LOG_LEVEL: "LOUD", FEATURES: "a,dark-mode" }); return !r.ok && ["PORT", "LOG_LEVEL", "DATABASE_URL", "FEATURES"].every((n) => r.errors.some((e) => e.includes(n))); })()` },
+    { name: "shouldLog works for every level", check: `(() => { const e = loadConfig({ DATABASE_URL: "postgres://x", LOG_LEVEL: "error" }); const d = loadConfig({ DATABASE_URL: "postgres://x", LOG_LEVEL: "debug" }); return e.ok && d.ok && !shouldLog(e.config, "warn") && shouldLog(e.config, "error") && ["debug", "info", "warn", "error"].every((l) => shouldLog(d.config, l)); })()` },
+  ]}
+>
+
+Your team just agreed on a new standard: **"Configuration is read from the environment once, at startup, into a validated, typed, read-only object. If anything is wrong, the app refuses to start and lists every problem."** (Listing every problem at once matters at 3 a.m.: nobody wants to fix one variable, redeploy, and discover the next one.)
+
+The config module was written before the standard, and it's strings all the way down. Bring it up to standard; the tests and type tests at the bottom are the standard written as code. Don't change them.
+
+The environment looks like Node's `process.env`: names mapped to strings, or `undefined`. A variable that is **missing or an empty string** counts as not set.
+
+| Variable | Rules | Default |
+| --- | --- | --- |
+| `PORT` | digits only, from 1 to 65535; becomes a `number` | `3000` |
+| `LOG_LEVEL` | `debug`, `info`, `warn` or `error` | `"info"` |
+| `DATABASE_URL` | required; must start with `postgres://` | none |
+| `FEATURES` | comma-separated names of known features: `new-checkout`, `dark-mode`, `beta-search`. Spaces around names and empty entries are ignored | no features |
+
+- `loadConfig(env)` returns `{ ok: true, config }`, or `{ ok: false, errors }` with **one error per bad variable** (each unknown feature may get its own), each error message containing the variable's name.
+- `config` is read-only, `logLevel` is a union of the four levels, and `features` is a `ReadonlySet` of the known feature names, so `config.features.has("dark-mod")` is a type error.
+- `shouldLog(config, level)` is `true` when `level` is at least as severe as the configured level (`debug` < `info` < `warn` < `error`). It only accepts real levels.
+
+<Hint>
+
+1. Follow rule 3 from the conventions doc: `const LOG_LEVELS = ["debug", "info", "warn", "error"] as const;` and `type LogLevel = (typeof LOG_LEVELS)[number];`, and the same for `FEATURES`. A small generic guard, `isOneOf<T extends string>(options: readonly T[], value: string): value is T`, checks a string against either list.
+2. Make every `Config` property `readonly`, with `features: ReadonlySet<Feature>`.
+3. In `loadConfig`, collect messages in an `errors` array instead of returning at the first problem. `env[name] || undefined` treats `""` as not set. For `PORT`, test `/^\d+$/` before `Number(...)`: `Number(" 80")` is `80` and `Number("")` is `0`.
+4. `shouldLog` has a classic bug: `"error" >= "info"` compares strings alphabetically, so it's `false`. Compare positions instead: `LOG_LEVELS.indexOf(level)`.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect } from "vitest";
+
+type Env = Record<string, string | undefined>; // like process.env
+
+// One list of values: the types AND the checks come from it
+const LOG_LEVELS = ["debug", "info", "warn", "error"] as const;
+type LogLevel = (typeof LOG_LEVELS)[number];
+
+const FEATURES = ["new-checkout", "dark-mode", "beta-search"] as const;
+type Feature = (typeof FEATURES)[number];
+
+interface Config {
+  readonly port: number;
+  readonly logLevel: LogLevel;
+  readonly databaseUrl: string;
+  readonly features: ReadonlySet<Feature>;
+}
+
+type LoadResult =
+  | { ok: true; config: Config }
+  | { ok: false; errors: string[] };
+
+function isOneOf<T extends string>(
+  options: readonly T[],
+  value: string,
+): value is T {
+  return options.some((option) => option === value);
+}
+
+function loadConfig(env: Env): LoadResult {
+  const errors: string[] = [];
+  // Missing and empty both mean "not set"
+  const read = (name: string) => env[name] || undefined;
+
+  let port = 3000;
+  const rawPort = read("PORT");
+  if (rawPort !== undefined) {
+    const n = Number(rawPort);
+    if (/^\d+$/.test(rawPort) && n >= 1 && n <= 65535) {
+      port = n;
+    } else {
+      errors.push(`PORT must be 1 to 65535, got "${rawPort}"`);
+    }
+  }
+
+  let logLevel: LogLevel = "info";
+  const rawLevel = read("LOG_LEVEL");
+  if (rawLevel !== undefined) {
+    if (isOneOf(LOG_LEVELS, rawLevel)) {
+      logLevel = rawLevel;
+    } else {
+      const options = LOG_LEVELS.join(", ");
+      errors.push(`LOG_LEVEL must be ${options}, got "${rawLevel}"`);
+    }
+  }
+
+  const databaseUrl = read("DATABASE_URL") ?? "";
+  if (!databaseUrl.startsWith("postgres://")) {
+    errors.push("DATABASE_URL must be a postgres:// URL");
+  }
+
+  const features = new Set<Feature>();
+  for (const part of (read("FEATURES") ?? "").split(",")) {
+    const name = part.trim();
+    if (name === "") continue;
+    if (isOneOf(FEATURES, name)) {
+      features.add(name);
+    } else {
+      errors.push(`FEATURES: unknown feature "${name}"`);
+    }
+  }
+
+  if (errors.length > 0) return { ok: false, errors };
+  const config = { port, logLevel, databaseUrl, features };
+  return { ok: true, config };
+}
+
+function shouldLog(config: Config, level: LogLevel): boolean {
+  const rank = (l: LogLevel) => LOG_LEVELS.indexOf(l);
+  return rank(level) >= rank(config.logLevel);
+}
+
+// ---- Tests (don't change them) ----
+const DB = "postgres://db.internal/shop";
+
+function load(env: Env): Config {
+  const result = loadConfig(env);
+  if (!result.ok) throw new Error(result.errors.join("; "));
+  return result.config;
+}
+
+function errorsFor(env: Env): string[] {
+  const result = loadConfig(env);
+  return result.ok ? [] : result.errors;
+}
+
+describe("loadConfig", () => {
+  it("uses defaults for optional variables", () => {
+    const config = load({ DATABASE_URL: DB, PORT: "" });
+    expect(config.port).toBe(3000);
+    expect(config.logLevel).toBe("info");
+    expect(config.databaseUrl).toBe(DB);
+    expect([...config.features]).toEqual([]);
+  });
+
+  it("reads every variable", () => {
+    const config = load({
+      DATABASE_URL: DB,
+      PORT: "8080",
+      LOG_LEVEL: "warn",
+      FEATURES: " dark-mode, beta-search ",
+    });
+    expect(config.port).toBe(8080);
+    expect(config.logLevel).toBe("warn");
+    expect([...config.features]).toEqual(["dark-mode", "beta-search"]);
+  });
+
+  it("rejects bad values and names the variable", () => {
+    const cases: [Env, string][] = [
+      [{ PORT: "80abc" }, "PORT"],
+      [{ PORT: "0" }, "PORT"],
+      [{ PORT: "70000" }, "PORT"],
+      [{ LOG_LEVEL: "verbose" }, "LOG_LEVEL"],
+      [{ FEATURES: "dark-mode,teleport" }, "FEATURES"],
+      [{ DATABASE_URL: "" }, "DATABASE_URL"],
+      [{ DATABASE_URL: "mysql://db/shop" }, "DATABASE_URL"],
+    ];
+    for (const [env, name] of cases) {
+      const errors = errorsFor({ DATABASE_URL: DB, ...env });
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain(name);
+    }
+  });
+
+  it("reports every problem at once", () => {
+    const errors = errorsFor({ PORT: "x", LOG_LEVEL: "loud" });
+    expect(errors).toHaveLength(3);
+  });
+});
+
+describe("shouldLog", () => {
+  it("logs messages at or above the configured level", () => {
+    const info = load({ DATABASE_URL: DB });
+    expect(shouldLog(info, "debug")).toBe(false);
+    expect(shouldLog(info, "info")).toBe(true);
+    expect(shouldLog(info, "warn")).toBe(true);
+    expect(shouldLog(info, "error")).toBe(true);
+
+    const warn = load({ DATABASE_URL: DB, LOG_LEVEL: "warn" });
+    expect(shouldLog(warn, "info")).toBe(false);
+    expect(shouldLog(warn, "error")).toBe(true);
+  });
+});
+
+// ---- Type tests (don't change them) ----
+// A line under @ts-expect-error must BE a type error.
+function typeTests(config: Config) {
+  // These must compile...
+  const port: number = config.port;
+  const url: string = config.databaseUrl;
+  const dark: boolean = config.features.has("dark-mode");
+
+  // ...and these must not
+  // @ts-expect-error: config can't change after startup
+  config.port = 8080;
+  // @ts-expect-error: "verbose" is not a log level
+  const level: Config["logLevel"] = "verbose";
+  // @ts-expect-error: "dark-mod" is not a feature (typo)
+  config.features.has("dark-mod");
+  // @ts-expect-error: "loud" is not a log level
+  shouldLog(config, "loud");
+}
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Give the team **one base tsconfig** that every package extends, with reasons for each flag, and make `tsc --noEmit` a required CI check. Choose flags by the bugs they catch and what they cost to adopt.
+- Keep the **conventions doc** short, with a reason for each rule, and move every rule a machine can check into lint. Settle bikesheds once.
+- Roll out **strict mode** gradually: new code strict from day one, unmigrated files marked visibly, remaining errors counted **per owner** with a ratchet in CI. Never "fix" errors with `!` or `as any`.
+- **Measure** coverage together with escape hatches and real production errors; a single number as a target invites gaming (Goodhart's law).
+- **Mentor** by teaching people to read errors bottom-up, asking "what did the error say?" instead of banning casts, and picking the few comments that matter.
+- Write a **design doc** for type changes that reach far: paste the proposed types and the errors people will see, and plan the migration with `@deprecated`.
+- **Stop** adding types when they cost more than the mistakes they prevent. Lead through good defaults, so the safe way is the easy way.

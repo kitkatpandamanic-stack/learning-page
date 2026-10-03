@@ -1,0 +1,754 @@
+---
+title: Monorepos & Project References
+description: Put apps and shared packages in one repository with workspaces, give each package a typed public surface, and build them in order with tsconfig project references and tsc -b.
+duration: 23
+xp: 25
+---
+
+A company I worked with kept its shared TypeScript types in their own repository, published to a private npm registry as `@acme/types`. The API used version 3.2, the web app 2.8 and the mobile app 3.0, because upgrading was always "next sprint". When the API renamed `todo.title` to `todo.text`, every repository still compiled perfectly, each against its own version of the truth, and the web app showed empty to-do lists in production. The types were correct. They just weren't **shared**. 📦
+
+In [Sharing Types Between Client and Server](/learn/typescript/sharing-types-between-client-and-server), the contract, the server and the client lived in one file, so they couldn't drift apart. A **monorepo** gives a real project the same property by putting the apps and the packages they share in one repository, so one commit can change a contract and every app that uses it, and one CI run proves they still agree. In this lesson you'll set one up the TypeScript way: **workspaces** to link the packages, a typed **public surface** for each package, and **project references** so `tsc` builds and checks them in the right order, fast.
+
+<Callout type="note" title="Examples in this lesson">
+
+The PandaDev editor runs one file at a time, so configs and folder trees are plain blocks, and the error messages in them come from running the real `tsc` on a real monorepo. The runnable examples put several "packages" into one file, with a comment at the top of each part saying where it would live.
+
+</Callout>
+
+## Monorepo or many repos?
+
+A monorepo is **not** a monolith: the apps still build and deploy separately. It's a decision about where code lives, and like every architecture decision it depends:
+
+- **Choose a monorepo** when apps share code that changes often (API contracts, a design system, validation rules), when you want one change to update producer and consumers together, and when the same people work across apps. One lockfile and one toolchain are nice bonuses.
+- **Stay with separate repos** when teams and release cycles are truly independent, when access must be restricted per codebase, or when the shared package is a real product with outside users (then it needs semver and a changelog anyway; see the next lesson).
+
+The costs are real: CI time grows with the repo unless you only build what changed, one red `main` blocks everybody, and the tooling needs an owner. The rest of this lesson is about keeping those costs small.
+
+## Workspaces link the packages
+
+A typical TypeScript monorepo has deployable **apps** and reusable **packages**:
+
+```text
+acme/
+├── package.json              "workspaces": ["apps/*", "packages/*"]
+├── package-lock.json         ONE lockfile for everything
+├── tsconfig.base.json        shared compiler options
+├── tsconfig.json             the "solution": references every project
+├── apps/
+│   ├── api/                  Express server   (@acme/api)
+│   └── web/                  React app        (@acme/web)
+└── packages/
+    ├── contracts/            types + parsers  (@acme/contracts)
+    └── config/               typed env loader (@acme/config)
+```
+
+**Workspaces** are a package-manager feature (npm, pnpm, Yarn and Bun all have them). The root `package.json` lists where packages live, and each package has its own `package.json` with a scoped name:
+
+```json title="package.json"
+{
+  "name": "acme",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}
+```
+
+```json title="apps/web/package.json"
+{
+  "name": "@acme/web",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@acme/contracts": "*"
+  }
+}
+```
+
+With pnpm, the list goes in `pnpm-workspace.yaml` instead, and you write `"@acme/contracts": "workspace:*"`, which fails loudly if the package isn't in the repo (npm's `"*"` could silently fetch a public package with the same name). Either way, installing **symlinks** the package instead of downloading it:
+
+```bash
+npm install
+ls -l node_modules/@acme
+# contracts -> ../../packages/contracts
+# web -> ../../apps/web
+# ...
+
+npm run build --workspace @acme/api      # one package
+npm run test --workspaces --if-present   # all with a test script
+pnpm --filter @acme/web dev              # the pnpm way
+```
+
+So `import { isTodo } from "@acme/contracts"` in the web app resolves exactly like an npm package, through `node_modules`, to the code in `packages/contracts`. Change it there, and every app sees the change on the next build.
+
+## What goes in a shared package
+
+A shared package is code that **several** apps need: API contracts and their parsers, a typed config loader, a UI kit, a few pure helpers. Here are three "packages" in one file: the contracts, an API that validates request bodies with them, and a web client that validates responses with **the same** code (it talks to PandaDev's practice API, which follows the same contract, so it stands in for the deployed server):
+
+<CodeExample output={`201 { id: 1, title: 'Nap', done: false }
+400 { error: 'title is required' }
+[ 'Learn fetch', 'Build the movie app', 'Eat some bamboo' ]`}>
+
+```ts
+import express from "express";
+import request from "supertest";
+
+// ======== packages/contracts/src/index.ts ========
+// Types + pure functions only: no Node, no DOM, no Express
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+interface Todo {
+  id: number;
+  title: string;
+  done: boolean;
+}
+
+interface NewTodo {
+  title: string;
+  done: boolean;
+}
+
+const TITLE_MAX = 80;
+
+function parseNewTodo(input: unknown): Result<NewTodo, string> {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: "send a JSON object" };
+  }
+  const title = "title" in input ? input.title : undefined;
+  if (typeof title !== "string" || title.trim() === "") {
+    return { ok: false, error: "title is required" };
+  }
+  if (title.trim().length > TITLE_MAX) {
+    return { ok: false, error: `title is over ${TITLE_MAX} chars` };
+  }
+  const done = "done" in input && input.done === true;
+  return { ok: true, value: { title: title.trim(), done } };
+}
+
+function isTodo(value: unknown): value is Todo {
+  return (
+    typeof value === "object" && value !== null &&
+    "id" in value && typeof value.id === "number" &&
+    "title" in value && typeof value.title === "string" &&
+    "done" in value && typeof value.done === "boolean"
+  );
+}
+
+// ======== apps/api/src/app.ts ========
+// import { parseNewTodo, type Todo } from "@acme/contracts";
+function createApi() {
+  const todos: Todo[] = [];
+  const app = express();
+  app.use(express.json());
+  app.post("/todos", (req, res) => {
+    const parsed = parseNewTodo(req.body);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const todo: Todo = { id: todos.length + 1, ...parsed.value };
+    todos.push(todo);
+    res.status(201).json(todo);
+  });
+  return app;
+}
+
+// ======== apps/web/src/todos.ts ========
+// import { isTodo, type Todo } from "@acme/contracts";
+async function loadTodos(baseUrl: string): Promise<Todo[]> {
+  const res = await fetch(`${baseUrl}/todos`);
+  const data: unknown = await res.json();
+  return Array.isArray(data) ? data.filter(isTodo) : [];
+}
+
+// The API, tested in-process
+const api = request(createApi());
+for (const body of [{ title: " Nap " }, { title: "" }]) {
+  const res = await api.post("/todos").send(body);
+  console.log(res.status, res.body);
+}
+
+// The web app, against PandaDev's practice API (same contract)
+const todos = await loadTodos("https://api.pandadev.test");
+console.log(todos.map((todo) => todo.title));
+```
+
+</CodeExample>
+
+The `TITLE_MAX` rule now lives in **one** place: the browser can check it before sending, and the server checks it again on arrival, with identical code. Notice what the contracts part does **not** contain: no `express`, no `fetch`, no `document`, no `process.env`. A shared package must run everywhere its consumers run. If `contracts` imported Express's types, the web app's bundle would drag Node-only code along, or fail to build.
+
+You can make the compiler guard that. Give the package a `lib` without the DOM and an empty `types` list (no `@types/node` globals):
+
+```json title="packages/contracts/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["es2023"],
+    "types": [],
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
+```
+
+Now environment-specific code is a compile error inside the package, while the apps keep their own `lib` settings:
+
+```ts title="packages/contracts/src/ids.ts"
+export function newId(): string {
+  return `${process.pid}-${Date.now()}`;
+  // ❌ Error: Cannot find name 'process'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.
+}
+
+export function pageTitle(): string {
+  return document.title;
+  // ❌ Error: Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'.
+}
+```
+
+### The public surface: `exports`
+
+A package's `package.json` **`exports`** field is its front door. Only the paths listed there can be imported, and TypeScript respects it (with `moduleResolution` set to `bundler`, `node16` or `nodenext`). The `types` condition comes first and tells TypeScript where the declarations are:
+
+```json title="packages/contracts/package.json"
+{
+  "name": "@acme/contracts",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  }
+}
+```
+
+Reaching around the front door is now an error, so the package's internals can change freely:
+
+```ts title="apps/web/src/main.ts"
+import { secret } from "@acme/contracts/src/internal.js";
+// ❌ Error: Cannot find module '@acme/contracts/src/internal.js' or its corresponding type declarations.
+```
+
+Need a second entry point, such as test factories that production code must never import? Add it on purpose: `"./testing": { "types": "./dist/testing.d.ts", "default": "./dist/testing.js" }`. Each entry in `exports` is public API, with all the compatibility promises that brings.
+
+<Callout type="warning" title="Beware the utils package">
+
+The first shared package in most monorepos is called `shared` or `utils`, and two years later it's a junk drawer that every package depends on, so changing anything rebuilds everything. Name packages by **purpose** (`contracts`, `config`, `money`, `ui`), keep each one small with few dependencies, and let a package depend on another only when it truly must. A package that "might be useful later" is just code without an owner.
+
+</Callout>
+
+## Built packages and internal packages
+
+There are two ways for an app to consume a workspace package, and big repos often use both:
+
+- **Built packages.** `exports` points at `dist/*.js` and `dist/*.d.ts`, produced by `tsc`. Apps consume compiled output exactly like an npm package, which works with every tool (Node, Jest, any bundler) and is ready to publish (see [Building & Publishing Packages](/learn/typescript/building-and-publishing-packages)). The price is a build step: `dist` must be up to date before an app type-checks. Project references (next section) automate that.
+- **Internal packages** (Turborepo calls them "just-in-time"). `exports` points straight at the TypeScript source, and the app's bundler compiles it as if it were the app's own code:
+
+```json title="packages/ui/package.json"
+{
+  "name": "@acme/ui",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
+```
+
+No build step and instant changes, which feels great. But only tools that compile TypeScript can consume it (Vite, Next.js with `transpilePackages`, Vitest; not plain `node`), every app re-type-checks the package's source with **its own** compiler options, and you can't publish it as is. A good default: internal packages for app-only code like a UI kit, built packages for anything Node runs directly or that might be published.
+
+## Project references and `tsc -b`
+
+Without extra setup, many monorepos have one giant `tsconfig.json` that includes everything. It works, but every `tsc` run checks the whole repo, the editor loads one enormous program, and nothing stops `apps/web` from importing a file deep inside `apps/api`.
+
+**Project references** split the repo into separate TypeScript **projects**, one per package, that know about each other. Shared options go in a base config:
+
+```json title="tsconfig.base.json"
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "strict": true,
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+Each package extends it and lists the projects it **depends on** in `references`:
+
+```json title="apps/api/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"],
+  "references": [{ "path": "../../packages/contracts" }]
+}
+```
+
+And the root `tsconfig.json` is a **solution file**: no files of its own, just a list of every project:
+
+```json title="tsconfig.json"
+{
+  "files": [],
+  "references": [
+    { "path": "packages/contracts" },
+    { "path": "packages/config" },
+    { "path": "apps/api" },
+    { "path": "apps/web" }
+  ]
+}
+```
+
+The options doing the work:
+
+| Option | What it does |
+| --- | --- |
+| `composite` | Marks a project that others can reference. It requires `declaration`, requires every file to be matched by `include`/`files`, and writes a `.tsbuildinfo` file so later builds know what changed. |
+| `declaration` | Emits `.d.ts` files. Referencing projects type-check against these instead of re-checking the package's source, which is where the speed comes from. |
+| `declarationMap` | Emits `.d.ts.map` files so "Go to definition" in the editor jumps to the real `.ts` source instead of the `.d.ts`. |
+| `references` | "This project uses that one": build it first, and resolve its imports to its declarations. |
+
+These sit on top of the options from [tsconfig & the Compiler](/learn/typescript/tsconfig-and-the-compiler). Then build everything with **`tsc -b`** (`--build`). It works out the dependency order, builds each out-of-date project and **skips** the rest. Here's real output (timestamps removed) from a repo with three projects, after editing one file in `apps/web`:
+
+```bash
+npx tsc -b --verbose
+# Projects in this build:
+#     * packages/contracts/tsconfig.json
+#     * apps/api/tsconfig.json
+#     * apps/web/tsconfig.json
+#     * tsconfig.json
+# Project 'packages/contracts/tsconfig.json' is up to date because newest input 'packages/contracts/src/internal.ts' is older than output 'packages/contracts/tsconfig.tsbuildinfo'
+# Project 'apps/api/tsconfig.json' is up to date because newest input 'apps/api/src/server.ts' is older than output 'apps/api/tsconfig.tsbuildinfo'
+# Project 'apps/web/tsconfig.json' is out of date because output 'apps/web/tsconfig.tsbuildinfo' is older than input 'apps/web/src/main.ts'
+# Building project 'apps/web/tsconfig.json'...
+```
+
+Change the contract instead (rename `title` to `text` in `Todo`), and `tsc -b` rebuilds `contracts`, then every project that references it, and reports the break where it happens:
+
+```text
+Building project 'packages/contracts/tsconfig.json'...
+Project 'apps/api/tsconfig.json' is out of date because output 'apps/api/tsconfig.tsbuildinfo' is older than input 'packages/contracts'
+Building project 'apps/api/tsconfig.json'...
+apps/api/src/server.ts(2,42): error TS2353: Object literal may only specify known properties, and 'title' does not exist in type 'Todo'.
+```
+
+That's the war story from the intro, caught in one command before the commit. (How much time this saves on a big repo, and how to measure it, is part of [Faster Type Checking](/learn/typescript/faster-type-checking).) A few more commands you'll use:
+
+```bash
+npx tsc -b                # build everything that's out of date
+npx tsc -b apps/web       # just web and what it depends on
+npx tsc -b --watch        # rebuild on save
+npx tsc -b --clean        # delete the outputs
+npx tsc -b --force        # rebuild everything
+```
+
+Apps that a bundler builds (Vite, Next.js) don't need `tsc`'s JavaScript. Give them `"noEmit": true`: `tsc -b` then only type-checks them, still skipping them when nothing changed. Nobody references an app, so it doesn't need declarations.
+
+### What references enforce
+
+References also turn the package graph into rules. Importing another project's **source** by relative path, without a reference, fails twice:
+
+```text
+apps/web/src/rel.ts(1,24): error TS6059: File 'packages/contracts/src/internal.ts' is not under 'rootDir' 'apps/web/src'. 'rootDir' is expected to contain all source files.
+apps/web/src/rel.ts(1,24): error TS6307: File 'packages/contracts/src/internal.ts' is not listed within the file list of project 'apps/web/tsconfig.json'. Projects must list all files or use an 'include' pattern.
+```
+
+And referencing a project that isn't `composite`:
+
+```text
+apps/web/tsconfig.json(8,18): error TS6306: Referenced project 'packages/contracts' must have setting "composite": true.
+```
+
+<Callout type="danger" title="Works on my machine: the missing reference">
+
+Here's a classic. `apps/web` imports `@acme/contracts` through the workspace symlink but its tsconfig has **no reference** to it. On your laptop, `packages/contracts/dist` exists from an earlier build, so everything type-checks, against **stale** declarations. In CI, on a fresh clone, nothing built `contracts` first:
+
+```text
+apps/web/src/main.ts(1,24): error TS2307: Cannot find module '@acme/contracts' or its corresponding type declarations.
+```
+
+Rule: every workspace dependency in `package.json` gets a matching entry in `references`. Tools can keep them in sync for you (for example, Nx can update references from the package graph), and CI should always start from a clean checkout.
+
+</Callout>
+
+## Path aliases vs packages
+
+Before workspaces, monorepos often glued code together with **path aliases** in `tsconfig.json`:
+
+```json title="apps/web/tsconfig.json"
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"],
+      "@acme/contracts": ["../../packages/contracts/src/index.ts"]
+    }
+  }
+}
+```
+
+Two different things are going on there:
+
+- **`@/*` → `./src/*`** is a convenience **inside one package**, to avoid `../../../`. Fine, with one catch: `paths` only tells the **type checker**. The bundler, the test runner and Node each need the same mapping (Vite's `resolve.alias` or a tsconfig-paths plugin, for instance). For code that Node runs directly, the standard alternative is **subpath imports** in `package.json`, which Node and TypeScript both understand: `"imports": { "#lib/*": "./src/lib/*" }` and then `import { slugify } from "#lib/slugify.js"`. (You don't need `baseUrl` for `paths`; TypeScript 6 deprecates it.)
+- **`@acme/contracts` → another package's source** is an anti-pattern. It bypasses the package's `exports`, so internals become importable. It compiles the other package's files as part of this project, with this project's options (hello, `rootDir` errors). And the package manager and build tools can't see the dependency, so they don't know that changing `contracts` affects `web`.
+
+Rule of thumb: **aliases within a package, workspace dependencies between packages.**
+
+## Task runners: Turborepo and Nx
+
+`tsc -b` knows the TypeScript graph. But a monorepo has more tasks: tests, lint, bundling, Docker images. **Turborepo** and **Nx** read the workspace graph from your `package.json` files and add three things:
+
+1. **Task ordering**: "build a package's dependencies before the package" is one line of config.
+2. **Caching**: a task's result is stored under a hash of its inputs (source files, dependencies, env vars). Run it again with the same inputs and the output is replayed in milliseconds. With **remote caching**, a teammate's or CI's build can be reused on your machine.
+3. **Affected-only runs**: on a pull request, test only the packages changed since `main` and the packages that depend on them.
+
+```json title="turbo.json"
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    "typecheck": { "dependsOn": ["^build"] },
+    "test": { "dependsOn": ["^build"] },
+    "lint": {}
+  }
+}
+```
+
+`"^build"` means "the `build` task of my **dependencies**". In CI, `npx turbo run typecheck test lint --affected` (or `npx nx affected -t typecheck test lint`) keeps a 40-package repo's pull requests as quick as a 4-package one. You don't need either tool on day one: npm workspaces plus `tsc -b` carry a small monorepo a long way. Reach for them when CI time or "which packages does this change affect?" starts to hurt.
+
+<Quiz
+  question="apps/web imports @acme/contracts, but its tsconfig.json has no references entry for it. tsc -b passes on your laptop, but CI on a fresh clone fails with Cannot find module '@acme/contracts'. Why?"
+  options={[
+    "CI uses a different TypeScript version that doesn't support workspaces",
+    "Your laptop has an old packages/contracts/dist from an earlier build; without a reference, tsc -b never builds contracts first",
+    "The workspace symlink is only created on macOS",
+    "exports must list ./src/index.ts for TypeScript to find the package",
+  ]}
+  answer={1}
+  explanation="The import resolves through the symlink to contracts' package.json, whose types point at dist. Locally a stale dist exists, so it type-checks (against old declarations!). On a clean checkout nothing has built it. Adding the reference makes tsc -b build contracts first, every time."
+/>
+
+<Quiz
+  question="Why give packages/contracts a tsconfig with lib set to ['es2023'] and types set to []?"
+  options={[
+    "To make the package compile faster by skipping lib checks",
+    "So that browser globals like document and Node globals like process are compile errors, keeping the package usable by both the web app and the API",
+    "Because composite projects aren't allowed to use the DOM library",
+    "So the package can be published without declaration files",
+  ]}
+  answer={1}
+  explanation="A shared package must run everywhere its consumers run. Without the DOM lib and without @types/node, any accidental use of document, localStorage or process inside the package is caught by the compiler instead of breaking one of the apps at runtime."
+/>
+
+<Exercise
+  title="A typed config package for two apps"
+  language="typescript"
+  starter={`type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// ======== packages/config/src/index.ts ========
+type FieldSpec =
+  | { type: "string"; default?: string }
+  | { type: "number"; default?: number }
+  | { type: "boolean"; default?: boolean }
+  | {
+      type: "enum";
+      values: readonly string[];
+      default?: string;
+    };
+
+type Schema = Record<string, FieldSpec>;
+
+// \`const\` keeps literal types: values stays ["debug", "info", …]
+function defineSchema<const S extends Schema>(schema: S): S {
+  return schema;
+}
+
+type Env = Record<string, string | undefined>;
+
+// ---------- TODO 1 ----------
+// The type of a loaded config, derived from its schema:
+// "number" → number, "boolean" → boolean, "string" → string,
+// "enum" → the union of its values
+type ConfigOf<S extends Schema> = Record<string, any>;
+
+// ---------- TODO 2 ----------
+// For every key in the schema, read env[key]:
+//   missing or "" → the default, or "<KEY> is required"
+//   number:  a finite number, or "<KEY> must be a number"
+//   boolean: "true"/"1" or "false"/"0",
+//            or "<KEY> must be true or false"
+//   enum:    one of the values,
+//            or "<KEY> must be one of a, b, c"
+// Return ALL the issues in schema order, or the config with
+// the schema's keys only.
+function loadConfig<S extends Schema>(
+  schema: S,
+  env: Env,
+): Result<ConfigOf<S>, string[]> {
+  return { ok: false, error: ["not implemented yet"] };
+}
+
+// ======== apps/api/src/config.ts ========
+const apiSchema = defineSchema({
+  PORT: { type: "number", default: 3000 },
+  DATABASE_URL: { type: "string" },
+  LOG_LEVEL: {
+    type: "enum",
+    values: ["debug", "info", "warn"],
+    default: "info",
+  },
+});
+type ApiConfig = ConfigOf<typeof apiSchema>;
+
+function describeApi(config: ApiConfig): string {
+  return \`api on port \${config.PORT}, log level \${config.LOG_LEVEL}\`;
+}
+
+// ======== apps/worker/src/config.ts ========
+const workerSchema = defineSchema({
+  QUEUE_URL: { type: "string" },
+  CONCURRENCY: { type: "number", default: 4 },
+  DRY_RUN: { type: "boolean", default: false },
+});
+type WorkerConfig = ConfigOf<typeof workerSchema>;
+
+function describeWorker(config: WorkerConfig): string {
+  const mode = config.DRY_RUN ? "dry run" : "live";
+  return \`worker with \${config.CONCURRENCY} jobs at once (\${mode})\`;
+}
+
+// ======== type tests (don't change them) ========
+function typeTests(api: ApiConfig, worker: WorkerConfig): void {
+  const port: number = api.PORT;
+  const level: "debug" | "info" | "warn" = api.LOG_LEVEL;
+  const dryRun: boolean = worker.DRY_RUN;
+  // @ts-expect-error: PORT is a number, not a string
+  const portText: string = api.PORT;
+  // @ts-expect-error: LOG_LEVEL is one of three literals
+  console.log(api.LOG_LEVEL === "verbose");
+  // @ts-expect-error: typos are caught
+  console.log(api.DATABASE_ULR);
+  // @ts-expect-error: each app only sees its own keys
+  console.log(worker.PORT);
+}
+
+// ======== try it ========
+const api = loadConfig(apiSchema, {
+  DATABASE_URL: "postgres://localhost/acme",
+  HOME: "/home/mei",
+});
+if (api.ok) {
+  console.log(api.value);
+  console.log(describeApi(api.value));
+}
+const worker = loadConfig(workerSchema, {
+  QUEUE_URL: "amqp://localhost",
+  CONCURRENCY: "8",
+  DRY_RUN: "true",
+});
+if (worker.ok) console.log(describeWorker(worker.value));
+const broken = { PORT: "eighty", LOG_LEVEL: "loud" };
+console.log(loadConfig(apiSchema, broken));
+`}
+  tests={[
+    { name: "The type tests compile (no unused @ts-expect-error)", check: `true` },
+    { name: "Defaults fill in missing values, and only the schema's keys are kept", check: `(() => { const r = loadConfig(apiSchema, { DATABASE_URL: "pg://x", HOME: "/h" }); return r.ok && r.value.PORT === 3000 && r.value.LOG_LEVEL === "info" && r.value.DATABASE_URL === "pg://x" && Object.keys(r.value).sort().join() === "DATABASE_URL,LOG_LEVEL,PORT"; })()` },
+    { name: "Numbers, booleans and enum values are parsed", check: `(() => { const w = loadConfig(workerSchema, { QUEUE_URL: "q", CONCURRENCY: "16", DRY_RUN: "1" }); const w2 = loadConfig(workerSchema, { QUEUE_URL: "q", DRY_RUN: "false" }); const a = loadConfig(apiSchema, { DATABASE_URL: "d", PORT: "8080", LOG_LEVEL: "warn" }); return w.ok && w.value.CONCURRENCY === 16 && w.value.DRY_RUN === true && w2.ok && w2.value.DRY_RUN === false && w2.value.CONCURRENCY === 4 && a.ok && a.value.PORT === 8080 && a.value.LOG_LEVEL === "warn"; })()` },
+    { name: "Every issue is reported, in schema order", check: `(() => { const r = loadConfig(apiSchema, { PORT: "eighty", LOG_LEVEL: "loud" }); return !r.ok && JSON.stringify(r.error) === JSON.stringify(["PORT must be a number", "DATABASE_URL is required", "LOG_LEVEL must be one of debug, info, warn"]); })()` },
+    { name: "Empty strings count as missing; bad numbers and booleans are rejected", check: `(() => { const r = loadConfig(workerSchema, { QUEUE_URL: "", DRY_RUN: "yes", CONCURRENCY: "Infinity" }); return !r.ok && JSON.stringify(r.error) === JSON.stringify(["QUEUE_URL is required", "CONCURRENCY must be a number", "DRY_RUN must be true or false"]); })()` },
+    { name: "loadConfig works for any schema, not just the two apps'", check: `(() => { const r = loadConfig({ MODE: { type: "enum", values: ["a", "b"], default: "b" }, NAME: { type: "string", default: "panda" }, ON: { type: "boolean" } }, { ON: "0" }); const bad = loadConfig({ ON: { type: "boolean" } }, {}); return r.ok && r.value.MODE === "b" && r.value.NAME === "panda" && r.value.ON === false && !bad.ok && bad.error[0] === "ON is required"; })()` },
+  ]}
+>
+
+Every app in the monorepo reads settings from environment variables, and every app used to do it differently: `Number(process.env.PORT)` here, a typo in `DATABASE_ULR` there, a `"false"` string that counted as true somewhere else. Build a shared **`@acme/config`** package that two apps (an API and a background worker, in the same file) use with full types.
+
+The package's input types are done: a `FieldSpec` describes one variable (`"string"`, `"number"`, `"boolean"` or `"enum"` with `values`, each with an optional `default`), and `defineSchema` keeps the literal types of a schema thanks to its `const` type parameter. You write:
+
+1. **`ConfigOf<S>`**: a mapped type over the schema's keys. `"number"` fields become `number`, `"boolean"` fields `boolean`, `"enum"` fields the **union of their values**, and `"string"` fields `string`. Then `ApiConfig` and `WorkerConfig` (already declared from it) get exact types, and the `@ts-expect-error` type tests pass: each passes only when that line really is an error.
+2. **`loadConfig(schema, env)`**: for every key in the schema, read `env[key]`. Missing or `""` means "use the default", or the issue `"<KEY> is required"` if there's none. Numbers must be finite (`"<KEY> must be a number"`); booleans accept `"true"`/`"1"` and `"false"`/`"0"` (`"<KEY> must be true or false"`); enum values must be in the list (`"<KEY> must be one of debug, info, warn"`, joined with `", "`); strings are used as they are. Return **all** issues in schema order, or the config with the schema's keys only (no `HOME` sneaking in).
+
+<Hint>
+
+For the type, use a [mapped type](/learn/typescript/mapped-types) of the shape `{ [K in keyof S]: S[K] extends { type: "number" } ? number : … }`, nesting the conditions. For enums, `S[K] extends { values: readonly (infer V)[] } ? V : …` pulls the union out of the tuple. For the function, loop over `Object.entries(schema)`, and write a small `parseField(key, spec, raw)` that returns a `Result<string | number | boolean, string>` with a `switch (spec.type)`. Collect values in a `Record<string, string | number | boolean>`; at the end one cast, `config as ConfigOf<S>`, is fine: the loop built exactly that shape, and the type tests check the surface from outside.
+
+</Hint>
+
+<Solution>
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// ======== packages/config/src/index.ts ========
+type FieldSpec =
+  | { type: "string"; default?: string }
+  | { type: "number"; default?: number }
+  | { type: "boolean"; default?: boolean }
+  | {
+      type: "enum";
+      values: readonly string[];
+      default?: string;
+    };
+
+type Schema = Record<string, FieldSpec>;
+
+// `const` keeps literal types: values stays ["debug", "info", …]
+function defineSchema<const S extends Schema>(schema: S): S {
+  return schema;
+}
+
+type Env = Record<string, string | undefined>;
+
+// The type of a loaded config, derived from its schema
+type ConfigOf<S extends Schema> = {
+  [K in keyof S]: S[K] extends { type: "number" }
+    ? number
+    : S[K] extends { type: "boolean" }
+      ? boolean
+      : S[K] extends { values: readonly (infer V)[] }
+        ? V
+        : string;
+};
+
+function parseField(
+  key: string,
+  spec: FieldSpec,
+  raw: string | undefined,
+): Result<string | number | boolean, string> {
+  if (raw === undefined || raw === "") {
+    return spec.default === undefined
+      ? { ok: false, error: `${key} is required` }
+      : { ok: true, value: spec.default };
+  }
+  switch (spec.type) {
+    case "string":
+      return { ok: true, value: raw };
+    case "number": {
+      const value = Number(raw);
+      return Number.isFinite(value)
+        ? { ok: true, value }
+        : { ok: false, error: `${key} must be a number` };
+    }
+    case "boolean":
+      if (raw === "true" || raw === "1") {
+        return { ok: true, value: true };
+      }
+      if (raw === "false" || raw === "0") {
+        return { ok: true, value: false };
+      }
+      return { ok: false, error: `${key} must be true or false` };
+    case "enum":
+      return spec.values.includes(raw)
+        ? { ok: true, value: raw }
+        : {
+            ok: false,
+            error: `${key} must be one of ${spec.values.join(", ")}`,
+          };
+  }
+}
+
+function loadConfig<S extends Schema>(
+  schema: S,
+  env: Env,
+): Result<ConfigOf<S>, string[]> {
+  const config: Record<string, string | number | boolean> = {};
+  const issues: string[] = [];
+  for (const [key, spec] of Object.entries(schema)) {
+    const field = parseField(key, spec, env[key]);
+    if (field.ok) config[key] = field.value;
+    else issues.push(field.error);
+  }
+  if (issues.length > 0) return { ok: false, error: issues };
+  // The one cast: the loop above built exactly ConfigOf<S>
+  return { ok: true, value: config as ConfigOf<S> };
+}
+
+// ======== apps/api/src/config.ts ========
+const apiSchema = defineSchema({
+  PORT: { type: "number", default: 3000 },
+  DATABASE_URL: { type: "string" },
+  LOG_LEVEL: {
+    type: "enum",
+    values: ["debug", "info", "warn"],
+    default: "info",
+  },
+});
+type ApiConfig = ConfigOf<typeof apiSchema>;
+
+function describeApi(config: ApiConfig): string {
+  return `api on port ${config.PORT}, log level ${config.LOG_LEVEL}`;
+}
+
+// ======== apps/worker/src/config.ts ========
+const workerSchema = defineSchema({
+  QUEUE_URL: { type: "string" },
+  CONCURRENCY: { type: "number", default: 4 },
+  DRY_RUN: { type: "boolean", default: false },
+});
+type WorkerConfig = ConfigOf<typeof workerSchema>;
+
+function describeWorker(config: WorkerConfig): string {
+  const mode = config.DRY_RUN ? "dry run" : "live";
+  return `worker with ${config.CONCURRENCY} jobs at once (${mode})`;
+}
+
+// ======== type tests (don't change them) ========
+function typeTests(api: ApiConfig, worker: WorkerConfig): void {
+  const port: number = api.PORT;
+  const level: "debug" | "info" | "warn" = api.LOG_LEVEL;
+  const dryRun: boolean = worker.DRY_RUN;
+  // @ts-expect-error: PORT is a number, not a string
+  const portText: string = api.PORT;
+  // @ts-expect-error: LOG_LEVEL is one of three literals
+  console.log(api.LOG_LEVEL === "verbose");
+  // @ts-expect-error: typos are caught
+  console.log(api.DATABASE_ULR);
+  // @ts-expect-error: each app only sees its own keys
+  console.log(worker.PORT);
+}
+
+// ======== try it ========
+const api = loadConfig(apiSchema, {
+  DATABASE_URL: "postgres://localhost/acme",
+  HOME: "/home/mei",
+});
+if (api.ok) {
+  console.log(api.value);
+  console.log(describeApi(api.value));
+}
+const worker = loadConfig(workerSchema, {
+  QUEUE_URL: "amqp://localhost",
+  CONCURRENCY: "8",
+  DRY_RUN: "true",
+});
+if (worker.ok) console.log(describeWorker(worker.value));
+const broken = { PORT: "eighty", LOG_LEVEL: "loud" };
+console.log(loadConfig(apiSchema, broken));
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **monorepo** keeps apps and the packages they share in one repository, so one commit changes a contract and its consumers together. It's not a monolith; apps still deploy separately. Separate repos fit independent teams and truly public packages.
+- **Workspaces** (npm, pnpm, Yarn, Bun) symlink packages into `node_modules`, so `@acme/contracts` imports like any npm package. Prefer pnpm's `workspace:*` protocol when you can.
+- Shared packages hold contracts, parsers, config and UI, named by purpose. Keep them **environment-neutral** (`lib` without DOM, `types: []`) and give them a front door with **`exports`**; deep imports become errors.
+- **Built packages** ship `dist` + `.d.ts` and work everywhere; **internal packages** point `exports` at `.ts` source and rely on the app's bundler.
+- **Project references** split the repo into projects: `composite` + `declaration` (+ `declarationMap` for the editor) in each, `references` for dependencies, a root solution file, and `tsc -b` to build in order and skip what's up to date. Leaf apps can use `noEmit`.
+- Every workspace dependency needs a matching **reference**, or a stale `dist` will hide errors until CI.
+- Use **path aliases** only inside a package; between packages, use workspace dependencies. **Turborepo** and **Nx** add task ordering, caching and affected-only CI when the repo grows.

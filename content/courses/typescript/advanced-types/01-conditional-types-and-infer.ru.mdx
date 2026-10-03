@@ -1,0 +1,567 @@
+---
+title: "Условные типы и infer"
+description: "Пишем типы, которые принимают решения (T extends U ? X : Y), разбираем типы на части с infer, изучаем распределение по объединениям, безопасную рекурсию и меру разумной сложности."
+duration: 22
+xp: 25
+---
+
+Вы уже давно пользуетесь условными типами, просто не видели их. [`Exclude`, `Extract`, `NonNullable`, `ReturnType`, `Parameters` и `Awaited`](/learn/typescript/utility-types) — всё это **условные типы** (conditional types): по несколько строк в файлах стандартной библиотеки TypeScript. В этом уроке вы напишете их сами. Это важно по двум причинам. Вы сможете **читать** типы библиотек, с которыми работаете каждый день (в React, Express и Zod их полно), и сможете решить, когда такой тип действительно нужен в **вашем** коде, а когда он превратится в головоломку, которую коллегам придётся разгадывать при каждом изменении. 🧠
+
+## Типы, которые принимают решения
+
+Условный тип похож на тернарный оператор, только для типов:
+
+```ts
+type IsString<T> = T extends string ? true : false;
+
+type A = IsString<"hi">; // true
+type B = IsString<42>; // false
+```
+
+Читайте `T extends string ? X : Y` так: «**если `T` можно присвоить `string`**, то `X`, иначе `Y`». `extends` здесь означает то же, что и в [ограничении дженерика](/learn/typescript/generic-functions): «помещается в». А раз условный тип — это тоже тип, их можно выстраивать в цепочку, как `else if`.
+
+Где это пригодится в реальном коде? Везде, где **выходной тип зависит от входного**. Вот помощник для чтения значений из строки запроса: от того, какой вид значения вы просите, зависит, что вы получите:
+
+<CodeExample output="4 true PRICE">
+
+```ts
+type ParamKind = "string" | "number" | "boolean";
+
+type ParamValue<K extends ParamKind> = K extends "number"
+  ? number
+  : K extends "boolean"
+    ? boolean
+    : string;
+
+function readParam<K extends ParamKind>(
+  raw: string,
+  kind: K,
+): ParamValue<K> {
+  if (kind === "number") return Number(raw) as ParamValue<K>;
+  if (kind === "boolean") return (raw === "true") as ParamValue<K>;
+  return raw as ParamValue<K>;
+}
+
+const page = readParam("3", "number"); // number
+const debug = readParam("true", "boolean"); // boolean
+const sort = readParam("price", "string"); // string
+
+console.log(page + 1, debug, sort.toUpperCase());
+```
+
+</CodeExample>
+
+Каждый вызов получает точный тип, поэтому `page + 1` — это сложение чисел, а не склейка строк, и `sort.toUpperCase()` разрешён. Обратите внимание на приведения `as ParamValue<K>` внутри функции. Это не лень: TypeScript не умеет проверять тело функции против условного возвращаемого типа. Чего это стоит, мы обсудим в конце урока.
+
+## Тестируем типы с `Equal` и `Expect`
+
+Типы никогда не попадают в вывод — как же убедиться, что `ParamValue<"boolean">` действительно равен `boolean`? Для беглого взгляда хватит подсказки при наведении в редакторе. А для всего, что должно **продолжать** работать, пишите **тесты типов** (type tests): строки, которые компилируются, только если тип в точности такой, как вы ожидаете. С этой парой помощников вы познакомились в уроке [Тестирование типов](/learn/typescript/testing-types); напомним:
+
+```ts
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamValue<"number">, number>>,
+  Expect<Equal<ParamValue<"boolean">, boolean>>,
+  Expect<Equal<ParamValue<"string">, string>>,
+];
+```
+
+`Expect` принимает только `true`, а `Equal` равен `true`, только когда два типа **в точности** совпадают. Странное на вид определение (сравнение двух обобщённых функций) — известный трюк, который делает сравнение строгим: `any` не совпадает со `string`, а `readonly`-свойства — с изменяемыми. Относитесь к нему как к инструменту: наизусть его никто не пишет. Если тест не проходит, на этой строке появляется ошибка типа, и код не запускается:
+
+```ts
+type _broken = Expect<Equal<ParamValue<"number">, string>>;
+// ❌ Error: Type 'false' does not satisfy the constraint 'true'.
+```
+
+Дальше в этом модуле примеры и упражнения доказывают поведение типов тестами типов. Кроме того, это главный способ защитить хитрый тип от следующего человека, который захочет его «упростить».
+
+## Распределение: условные типы над объединениями
+
+Что будет, если передать в условный тип **объединение** (union)? Кое-что неожиданное и полезное: условие выполняется **для каждого члена отдельно**, а результаты снова собираются в объединение. Такой тип называется **дистрибутивным условным типом** (distributive conditional type).
+
+Именно так работает `Exclude`. Соберём его заново:
+
+```ts
+type MyExclude<T, U> = T extends U ? never : T;
+
+type Left = MyExclude<"a" | "b" | "c", "a">;
+// = MyExclude<"a", "a"> | MyExclude<"b", "a"> | MyExclude<"c", "a">
+// = never | "b" | "c"
+// = "b" | "c"
+```
+
+Весь фокус в `never` — пустом объединении: при объединении с другими членами он исчезает. Поэтому «вернуть `never` для ненужных» — это способ **отфильтровать** объединение. `Extract` — тот же тип с переставленными ветками.
+
+Часто распределение — именно то, что нужно. Помощник `toArray` должен превращать значение в массив, а массивы оставлять как есть:
+
+<CodeExample output={`[ 'urgent' ]
+[ 'bug', 'ui' ]
+[ 42 ] [ 1, 2 ]`}>
+
+```ts
+type ToArray<T> = T extends readonly unknown[] ? T : T[];
+
+function toArray<T>(value: T): ToArray<T> {
+  return (Array.isArray(value) ? value : [value]) as ToArray<T>;
+}
+
+function normaliseTags(tags: string | string[]): string[] {
+  return toArray(tags); // ToArray<string> | ToArray<string[]>
+}
+
+console.log(normaliseTags("urgent"));
+console.log(normaliseTags(["bug", "ui"]));
+console.log(toArray(42), toArray([1, 2]));
+```
+
+</CodeExample>
+
+Для `string | string[]` тип вычисляется по членам: `ToArray<string>` — это `string[]`, `ToArray<string[]>` — тоже `string[]`, значит, результат — `string[]`. Всё верно, и `normaliseTags` проходит проверку типов без приведения.
+
+Но иногда объединение нужно рассматривать **целиком**. Распределение происходит, только когда проверяемый тип — это **«голый» параметр типа** (naked type parameter, `T extends ...`), поэтому, чтобы его отключить, оберните обе стороны в кортеж из одного элемента:
+
+```ts
+type ListOf<T> = T extends unknown ? T[] : never;
+type ListOfWhole<T> = [T] extends [unknown] ? T[] : never;
+
+type A = ListOf<string | number>; // string[] | number[]
+type B = ListOfWhole<string | number>; // (string | number)[]
+
+const mixed: ListOf<string | number> = ["a", 1];
+// ❌ Error: Type '(string | number)[]' is not assignable to type 'string[] | number[]'.
+```
+
+`A` означает «список строк или список чисел», а это редко то, что вы имели в виду под «списком строк и чисел».
+
+Те же скобки исправляют самый известный сюрприз распределения. `never` — пустое объединение, поэтому дистрибутивный условный тип над `never` выполняется ноль раз и возвращает `never`, а не `true` или `false`:
+
+```ts
+type IsNever<T> = T extends never ? true : false;
+type Oops = IsNever<never>; // never (!)
+
+type IsNeverFixed<T> = [T] extends [never] ? true : false;
+type Good = IsNeverFixed<never>; // true
+type AlsoGood = IsNeverFixed<string>; // false
+```
+
+<Callout type="tip" title="Спросите себя: по членам или целиком?">
+
+Каждый раз, когда вы пишете `T extends ...`, а `T` может оказаться объединением, решите, что именно вы имеете в виду. Фильтруете или преобразуете каждый член (`Exclude`, `ToArray`, выбор вариантов [размеченного объединения](/learn/typescript/discriminated-unions)) — оставьте параметр «голым». Задаёте вопрос «да или нет» обо всём типе (`IsNever`, «это ровно `any`?», «равны ли эти два типа?») — оберните в `[T]`. Ошибка здесь — самый частый баг в самописных условных типах, и тест типов с объединением на входе его ловит.
+
+</Callout>
+
+<Quiz
+  question="Дано type Wrap<T> = T extends unknown ? { value: T } : never. Чему равен Wrap<'a' | 'b'>?"
+  options={[
+    "{ value: 'a' | 'b' }",
+    "{ value: 'a' } | { value: 'b' }",
+    "never",
+    "{ value: unknown }",
+  ]}
+  answer={1}
+  explanation="T — «голый» параметр типа, поэтому условие применяется к 'a' и к 'b' по отдельности, а результаты объединяются: { value: 'a' } | { value: 'b' }. Чтобы получить { value: 'a' | 'b' }, напишите [T] extends [unknown]."
+/>
+
+## Разбираем типы на части с `infer`
+
+До сих пор условия отвечали только «да» или «нет». С **`infer`** условие может ещё и **захватить** часть типа. Внутри части `extends` запись `infer U` объявляет новую переменную типа, и TypeScript заполняет её, сопоставляя с образцом:
+
+```ts
+type ElementType<T> = T extends readonly (infer U)[] ? U : never;
+
+type A = ElementType<string[]>; // string
+type B = ElementType<readonly ["a", 1]>; // "a" | 1
+type C = ElementType<number>; // never: это не массив
+```
+
+«Если `T` — массив *чего-то*, назови это что-то `U` и верни его». `infer` можно использовать только в части `extends` условного типа, а захваченная переменная существует только в ветке «истина». Образцом может быть тип любой формы. Вот как устроены `ReturnType` и `Parameters`:
+
+```ts
+type MyReturnType<F> =
+  F extends (...args: never[]) => infer R ? R : never;
+type MyParameters<F> =
+  F extends (...args: infer P) => unknown ? P : never;
+
+function add(a: number, b: number) {
+  return a + b;
+}
+
+type R = MyReturnType<typeof add>; // number
+type P = MyParameters<typeof add>; // [a: number, b: number]
+```
+
+Почему в `MyReturnType` параметры описаны как `never[]`, а не `unknown[]`? Потому что функцию, которая принимает `string`, **нельзя** использовать там, где ожидается функция, принимающая аргументы типа `unknown`, так что `((x: string) => void) extends ((...args: unknown[]) => unknown)` ложно. А вот в `(...args: never[]) => unknown` помещается любая функция. (По той же причине в библиотеке TypeScript вы увидите `any[]`; правила, которые за этим стоят, объясняются в модуле о программировании на уровне типов.)
+
+Кортежи тоже бывают образцами, а spread означает «всё остальное»:
+
+```ts
+type Tail<T extends readonly unknown[]> =
+  T extends readonly [unknown, ...infer Rest] ? Rest : [];
+type Swap<T> = T extends [infer A, infer B] ? [B, A] : never;
+
+type T1 = Tail<[1, 2, 3]>; // [2, 3]
+type T2 = Swap<[string, number]>; // [number, string]
+```
+
+В повседневной работе `infer` нужен, чтобы добраться до типов, которые никто не экспортировал. Библиотека отдаёт вам объект клиента, но экспортирует только функцию, которая его создаёт. Вместо того чтобы копировать формы вручную (и смотреть, как они расходятся с оригиналом), извлеките их:
+
+<CodeExample output={`Mei (pro)
+42`}>
+
+```ts
+// Представьте, что это библиотека, которая не экспортирует типы
+function createClient() {
+  return {
+    async getUser(id: string) {
+      return { id, name: "Mei", plan: "pro" as "free" | "pro" };
+    },
+    async listOrders(userId: string) {
+      return [{ id: "o1", userId, total: 42 }];
+    },
+  };
+}
+
+type ReturnOf<F> = F extends (...args: never[]) => infer R ? R : never;
+type Unpromise<T> = T extends Promise<infer V> ? V : T;
+type ItemOf<T> = T extends readonly (infer U)[] ? U : never;
+
+type Client = ReturnOf<typeof createClient>;
+type User = Unpromise<ReturnOf<Client["getUser"]>>;
+type Order = ItemOf<Unpromise<ReturnOf<Client["listOrders"]>>>;
+
+function describeUser(user: User): string {
+  return `${user.name} (${user.plan})`;
+}
+
+function sumOrders(orders: Order[]): number {
+  return orders.reduce((sum, order) => sum + order.total, 0);
+}
+
+const client = createClient();
+const user = await client.getUser("u1");
+const orders = await client.listOrders(user.id);
+console.log(describeUser(user));
+console.log(sumOrders(orders));
+```
+
+</CodeExample>
+
+Когда библиотека добавит пользователям новое поле, оно автоматически появится и в `User`. В реальном коде вы бы взяли встроенные `ReturnType` и [`Awaited`](/learn/typescript/typing-promises-and-async); суть в том, что они устроены ровно так же.
+
+<Callout type="note" title="Часто infer вообще не нужен">
+
+Если обобщённую функцию пишете **вы**, захватывайте части сразу как параметры типа, а не принимайте целый тип функции, чтобы потом в нём копаться. `function logged<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R` не нуждается ни в `Parameters`, ни в `ReturnType`, даёт более понятные сообщения об ошибках и обходится без приведений. `infer` хорош, когда тип пришёл откуда-то извне.
+
+</Callout>
+
+<Quiz
+  question="Дано type ElementType<T> = T extends readonly (infer U)[] ? U : never. Чему равен ElementType<string[][]>?"
+  options={["string", "string[]", "string[][]", "never"]}
+  answer={1}
+  explanation="string[][] — массив, элементы которого — string[], поэтому U — это string[]. Образец сопоставляется только на один уровень. Чтобы добраться до string, тип должен вызывать сам себя: это рекурсия, о ней дальше."
+/>
+
+## Рекурсивные условные типы
+
+Условный тип может ссылаться **на самого себя** в одной из веток. Так обрабатывают структуры любой глубины. Классический пример — промисы. Во время выполнения промис, который разрешается другим промисом, «сплющивается»: `await` всегда даёт итоговое значение. Тип, который разворачивает один уровень, здесь ошибается, а рекурсивный — нет:
+
+<CodeExample output="5 number">
+
+```ts
+type OneLevel<T> = T extends Promise<infer V> ? V : T;
+type Unwrap<T> = T extends Promise<infer V> ? Unwrap<V> : T;
+
+function later<T>(value: T): Promise<T> {
+  return new Promise((resolve) => {
+    setTimeout(() => resolve(value), 10);
+  });
+}
+
+const nested = later(later(5)); // Promise<Promise<number>>
+
+type Shallow = OneLevel<typeof nested>; // Promise<number>: неверно
+type Deep = Unwrap<typeof nested>; // number: верно
+
+const value: Deep = await nested;
+console.log(value, typeof value);
+```
+
+</CodeExample>
+
+С `OneLevel` TypeScript настаивал бы, что `value` — это `Promise<number>`, и ругался бы при использовании его как числа, хотя программа спокойно печатает `5`. Встроенный `Awaited<T>` — это `Unwrap` плюс аккуратная обработка `null`, `undefined` и «thenable»-объектов, которые не являются настоящими промисами.
+
+Рекурсии нужен **выход**: ветка, которая не вызывает тип снова (здесь это `: T`). Без неё, или если вход слишком глубокий, TypeScript сдаётся, а не подвешивает редактор:
+
+```ts
+type Forever<T> = T extends unknown ? Forever<[T]> : never;
+// ❌ Error: Type instantiation is excessively deep and possibly infinite.
+```
+
+Ограничения щедрые, но реальные. Когда рекурсивный вызов — это **весь** результат ветки (как `Unwrap<V>` выше; это называется **хвостовой рекурсией**, tail recursion), TypeScript может уйти примерно на 1000 уровней вглубь. Когда результат строится вокруг рекурсивного вызова (как `[0, ...Repeat<N>]`), предел — около 50. Типы данных редко бывают такими глубокими, но «циклы» на уровне типов, которые что-то считают (построить кортеж длиной 100, разобрать длинную строку посимвольно), упираются в эти пределы быстро, а каждый уровень стоит времени компиляции в каждом файле, где используется тип.
+
+## Когда условные типы становятся нечитаемыми
+
+Теперь часть для senior-разработчиков: **стоит ли** вообще писать такие типы? Вот версия `readParam` с **перегрузками** (overloads) вместо условного типа:
+
+<CodeExample output="4 true">
+
+```ts
+type ParamKind = "string" | "number" | "boolean";
+
+function readParam(raw: string, kind: "number"): number;
+function readParam(raw: string, kind: "boolean"): boolean;
+function readParam(raw: string, kind: "string"): string;
+function readParam(
+  raw: string,
+  kind: ParamKind,
+): string | number | boolean {
+  if (kind === "number") return Number(raw);
+  if (kind === "boolean") return raw === "true";
+  return raw;
+}
+
+const page = readParam("3", "number"); // number
+const debug = readParam("true", "boolean"); // boolean
+console.log(page + 1, debug);
+```
+
+</CodeExample>
+
+Никаких приведений, и прочитать это может любой. Разница проявляется, когда аргумент сам является объединением. Условная версия распределяется (`readParam(raw, kind)` с `kind: "number" | "boolean"` возвращает `number | boolean`), а перегрузки перебираются по одной, и ни одна не подходит:
+
+```ts
+function fromForm(raw: string, kind: "number" | "boolean") {
+  return readParam(raw, kind);
+  // ❌ Error: No overload matches this call.
+}
+```
+
+А приведения в условной версии — реальная цена. TypeScript **не может проверить** тело функции против условного возвращаемого типа, поэтому без `as` получится:
+
+```ts
+function readParam<K extends ParamKind>(
+  raw: string,
+  kind: K,
+): ParamValue<K> {
+  if (kind === "number") return Number(raw);
+  // ❌ Error: Type 'number' is not assignable to type 'ParamValue<K>'.
+  ...
+}
+```
+
+С приведениями же ничто не помешает вернуть число в ветке `"boolean"`. Типы обещают больше, чем доказывает код, так что эту функцию защищают только тесты.
+
+В одной команде, с которой мне довелось работать, был условный тип на 60 строк, который вычислял формы ответов API по параметрам запроса. Он был хитроумным и почти всегда правильным. Но сообщения об ошибках растягивались на 30 строк, подсказки в редакторе показывали неразвёрнутую формулу вместо формы, а менять его решалась только его автор. Когда она ушла, команда за один день заменила его четырьмя именованными типами ответов и несколькими перегрузками, и никто о нём не пожалел.
+
+Мои практические правила:
+
+- **Библиотека или приложение?** Тип, на котором держатся сотни мест вызова (роутер, библиотека форм, SDK), может быть сложным: его пользователи никогда его не читают. Тип, который используется в двух местах, должен быть скучным.
+- **Несколько фиксированных случаев?** Предпочтите перегрузки или обычные именованные типы. Беритесь за условный тип, когда случаи подчиняются **правилу** (любое объединение, любой массив, любая функция) или когда важны аргументы-объединения.
+- **Можно захватить, а не извлекать?** Отдельные параметры типа (`<A, R>`) лучше, чем `infer` из целого типа функции.
+- **Давайте шагам имена.** `User = Unpromise<ReturnOf<Client["getUser"]>>` читается как предложение. Один вложенный тернарный оператор на 15 строк — нет.
+- **У каждого хитрого типа должны быть тесты типов**, в том числе с объединениями, `never` и пустыми кортежами. Это и его документация, и его страховка.
+- **Проверяйте сообщения об ошибках.** Нарочно вызовите тип неправильно и прочитайте, что скажет TypeScript. Если junior-коллега не поймёт, что делать с этим сообщением, — упрощайте.
+
+<Callout type="warning" title="Лживые типы хуже свободных">
+
+Приведение внутри функции с условным типом — это обещание, которое компилятор проверить не может. Держите такие функции крошечными, делайте приведение в одном месте (`return result as ParamValue<K>`) и покрывайте их тестами времени выполнения **и** тестами типов. Широкий, но честный возвращаемый тип (`string | number | boolean`) лучше точного, который иногда врёт.
+
+</Callout>
+
+<Exercise
+  title="Типизированные помощники для списков"
+  language="typescript"
+  starter={`type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+// Первый элемент списка: для кортежа хотя бы с одним
+// элементом — тип этого элемента; иначе тип элемента
+// | undefined (а для пустого кортежа — просто undefined)
+type First<T extends readonly unknown[]> = unknown;
+
+// То же самое для последнего элемента
+type Last<T extends readonly unknown[]> = unknown;
+
+// Что остаётся, если развернуть вложенные массивы до самого дна:
+// number[][][] -> number, (string | number[])[] -> string | number
+type DeepItem<T> = unknown;
+
+function first<T extends readonly unknown[]>(items: T): First<T> {
+  throw new Error("Ещё не написано");
+}
+
+function last<T extends readonly unknown[]>(items: T): Last<T> {
+  throw new Error("Ещё не написано");
+}
+
+// Новый массив со всеми вложенными элементами по порядку, на любой глубине.
+// Входной массив не меняйте.
+function flattenDeep<T>(items: readonly T[]): DeepItem<T>[] {
+  throw new Error("Ещё не написано");
+}
+
+// ===== Тесты типов: не меняйте их =====
+type _tests = [
+  Expect<Equal<First<[1, 2, 3]>, 1>>,
+  Expect<Equal<First<readonly ["a", "b"]>, "a">>,
+  Expect<Equal<First<string[]>, string | undefined>>,
+  Expect<Equal<First<[]>, undefined>>,
+  Expect<Equal<Last<[1, 2, 3]>, 3>>,
+  Expect<Equal<Last<readonly [boolean, string]>, string>>,
+  Expect<Equal<Last<number[]>, number | undefined>>,
+  Expect<Equal<DeepItem<number[][][]>, number>>,
+  Expect<Equal<DeepItem<(string | number[])[]>, string | number>>,
+  Expect<Equal<DeepItem<boolean>, boolean>>,
+];
+
+function typeTests(scores: number[]) {
+  const best: number = first([9, 7] as const);
+  // @ts-expect-error: массив может быть пустым
+  const top: number = first(scores);
+  const all: number[] = flattenDeep([1, [2, [3]]]);
+  // @ts-expect-error: элементы — числа, а не строки
+  const words: string[] = flattenDeep([[1], [2]]);
+}
+
+// ===== Попробуйте =====
+const podium = ["Mei", "Sam", "Ana"] as const;
+const winner = first(podium); // "Mei"
+console.log(\`Золото: \${winner}, бронза: \${last(podium)}\`);
+
+const scores: number[] = [];
+console.log(first(scores) ?? "результатов пока нет");
+
+const grid = [[1, 2], [3, [4, [5]]]];
+const cells = flattenDeep(grid); // number[]
+console.log(cells, cells.reduce((a, b) => a + b, 0));
+`}
+  tests={[
+    { name: "first возвращает первый элемент", check: "first([5, 6]) === 5 && first(['x']) === 'x'" },
+    { name: "last возвращает последний элемент", check: "last([1, 2, 3]) === 3 && last(['a']) === 'a'" },
+    { name: "first и last пустого списка — undefined", check: "first([]) === undefined && last([]) === undefined" },
+    { name: "flattenDeep разворачивает любую глубину, сохраняя порядок", check: "flattenDeep([1, [2, [3, [4, [5]]]]]).join() === '1,2,3,4,5' && flattenDeep(['a', ['b'], []]).join() === 'a,b'" },
+    { name: "flattenDeep не меняет входной массив", check: "(() => { const input = [[1], [2, [3]]]; const out = flattenDeep(input); return out.join() === '1,2,3' && input[1].length === 2 && Array.isArray(input[1][1]) && flattenDeep([]).length === 0; })()" },
+  ]}
+>
+
+Напишите три небольших помощника для списков, типы которых настолько точны, насколько позволяют значения: `first`, `last` и `flattenDeep`. Поведение — лёгкая часть; настоящая задача — типы.
+
+**Типы.** Замените каждый `unknown` условным типом:
+
+- `First<T>`: для кортежа хотя бы с одним элементом — тип этого элемента (`First<[1, 2, 3]>` — это `1`). Для всего остального — тип элемента `| undefined`, потому что массив может быть пустым (`First<string[]>` — это `string | undefined`, `First<[]>` — `undefined`).
+- `Last<T>`: то же самое для последнего элемента.
+- `DeepItem<T>`: рекурсивно разворачивайте массивы, пока не доберётесь до чего-то, что массивом не является. Тип должен распределяться по объединениям: `DeepItem<(string | number[])[]>` — это `string | number`.
+
+Строки `Expect<Equal<...>>` и строки `// @ts-expect-error` — это тесты типов: первые компилируются, только если ваш тип в точности верен, вторые — только если строка под ними **является** ошибкой. Заготовка их все проваливает, поэтому не запустится, пока ваши типы не станут правильными.
+
+**Поведение.** Затем заставьте функции работать: `first` и `last` возвращают первый и последний элемент (или `undefined` для пустого списка), а `flattenDeep` возвращает **новый** массив со всеми вложенными элементами по порядку, на любой глубине.
+
+<Hint>
+
+**Типы:** сначала сопоставьте с образцом кортежа, а затем откатитесь к «любому массиву». Для `First`: `T extends readonly [infer F, ...unknown[]] ? F : T extends readonly (infer U)[] ? U | undefined : never`. `Last` — то же самое, но spread стоит в начале: `readonly [...unknown[], infer L]`. Не забудьте `readonly`, иначе кортежи с `as const` не совпадут с образцом. `DeepItem` вызывает сам себя: `T extends readonly (infer U)[] ? DeepItem<U> : T`.
+
+**Поведение:** `items[0]` и `items[items.length - 1]` равны `undefined` для пустого массива. TypeScript не может проверить их против условного возвращаемого типа, поэтому сделайте одно приведение: `return items[0] as First<T>;`. Во `flattenDeep` собирайте элементы в `const result: unknown[] = []`: пройдите по элементам циклом и, если `Array.isArray(item)`, добавьте элементы `flattenDeep(item)` (через spread); иначе добавьте сам элемент. В конце — `return result as DeepItem<T>[];`.
+
+</Hint>
+
+<Solution>
+
+```ts
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type First<T extends readonly unknown[]> =
+  T extends readonly [infer F, ...unknown[]]
+    ? F
+    : T extends readonly (infer U)[]
+      ? U | undefined
+      : never;
+
+type Last<T extends readonly unknown[]> =
+  T extends readonly [...unknown[], infer L]
+    ? L
+    : T extends readonly (infer U)[]
+      ? U | undefined
+      : never;
+
+type DeepItem<T> = T extends readonly (infer U)[] ? DeepItem<U> : T;
+
+function first<T extends readonly unknown[]>(items: T): First<T> {
+  return items[0] as First<T>;
+}
+
+function last<T extends readonly unknown[]>(items: T): Last<T> {
+  return items[items.length - 1] as Last<T>;
+}
+
+function flattenDeep<T>(items: readonly T[]): DeepItem<T>[] {
+  const result: unknown[] = [];
+  for (const item of items) {
+    if (Array.isArray(item)) {
+      result.push(...flattenDeep(item));
+    } else {
+      result.push(item);
+    }
+  }
+  return result as DeepItem<T>[];
+}
+
+// ===== Тесты типов: не меняйте их =====
+type _tests = [
+  Expect<Equal<First<[1, 2, 3]>, 1>>,
+  Expect<Equal<First<readonly ["a", "b"]>, "a">>,
+  Expect<Equal<First<string[]>, string | undefined>>,
+  Expect<Equal<First<[]>, undefined>>,
+  Expect<Equal<Last<[1, 2, 3]>, 3>>,
+  Expect<Equal<Last<readonly [boolean, string]>, string>>,
+  Expect<Equal<Last<number[]>, number | undefined>>,
+  Expect<Equal<DeepItem<number[][][]>, number>>,
+  Expect<Equal<DeepItem<(string | number[])[]>, string | number>>,
+  Expect<Equal<DeepItem<boolean>, boolean>>,
+];
+
+function typeTests(scores: number[]) {
+  const best: number = first([9, 7] as const);
+  // @ts-expect-error: массив может быть пустым
+  const top: number = first(scores);
+  const all: number[] = flattenDeep([1, [2, [3]]]);
+  // @ts-expect-error: элементы — числа, а не строки
+  const words: string[] = flattenDeep([[1], [2]]);
+}
+
+// ===== Попробуйте =====
+const podium = ["Mei", "Sam", "Ana"] as const;
+const winner = first(podium); // "Mei"
+console.log(`Золото: ${winner}, бронза: ${last(podium)}`);
+
+const scores: number[] = [];
+console.log(first(scores) ?? "результатов пока нет");
+
+const grid = [[1, 2], [3, [4, [5]]]];
+const cells = flattenDeep(grid); // number[]
+console.log(cells, cells.reduce((a, b) => a + b, 0));
+// Золото: Mei, бронза: Ana
+// результатов пока нет
+// [ 1, 2, 3, 4, 5 ] 15
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Условный тип** `T extends U ? X : Y` выбирает тип в зависимости от того, помещается ли `T` в `U`. Используйте его, когда выходной тип зависит от входного.
+- **Тесты типов** (`Expect<Equal<A, B>>`, `// @ts-expect-error`) доказывают, что делает тип, и не дают ему сломаться.
+- С **«голым» параметром типа** условные типы **распределяются** по объединениям: по одному результату на член, а члены `never` исчезают. Так фильтруют `Exclude` и `Extract`. Оберните в `[T]`, чтобы рассматривать объединение (или `never`) целиком.
+- **`infer`** захватывает часть типа сопоставлением с образцом: элементы массивов, возвращаемые типы, параметры, голову и хвост кортежа, значения промисов. Так можно добраться до типов, которые никто не экспортировал.
+- Условные типы могут быть **рекурсивными** (`Unwrap`, `DeepItem`) — с веткой выхода и пределами глубины (около 1000 уровней для хвостовой рекурсии, около 50 в остальных случаях).
+- TypeScript не может проверять тела функций против условных возвращаемых типов, поэтому там нужны приведения. Для нескольких фиксированных случаев предпочитайте **перегрузки** или обычные именованные типы, оставляйте хитрые типы для правил, от которых выигрывают многие места вызова, и снабжайте каждый хитрый тип тестами и понятными сообщениями об ошибках.

@@ -1,0 +1,860 @@
+---
+title: Внедрение зависимостей и фейки
+description: Делайте код тестируемым, завися от интерфейсов, внедряйте их через конструкторы или фабрики и тестируйте с типизированными фейками, фейковыми часами, фикстурами через satisfies и поддельным fetch.
+duration: 20
+xp: 25
+---
+
+Некоторый код тестировать одно удовольствие: значения на входе, значения на выходе. А другой код сам тянется во внешний мир: читает часы, обращается к серверу, пишет в базу данных и отправляет письма. Чтобы его протестировать, понадобились бы настоящая база данных, настоящий почтовый сервер и способ сделать так, чтобы «сейчас» было 1 марта. В этом уроке вы освоите привычку проектирования, которая это исправляет, — **внедрение зависимостей** (dependency injection), — и узнаете, как TypeScript следит за честностью ваших тестовых двойников. 🔌
+
+## Скрытые зависимости
+
+Вот функция, которая запускает бесплатный пробный период. Она работает, но протестировать её почти невозможно:
+
+```ts
+import { db } from "./db";
+import { mailer } from "./mailer";
+
+export async function startTrial(userId: string) {
+  const user = await db.users.findById(userId);   // настоящая база данных
+  user.trialEndsAt = Date.now() + 14 * DAY;       // настоящие часы
+  await db.users.save(user);
+  await mailer.send(user.email, "Trial started"); // настоящее письмо!
+}
+```
+
+Её **зависимости спрятаны** внутри. Тест не может подменить базу данных тестовой, не может управлять `Date.now()`, а каждый прогон отправляет настоящее письмо. Можно было бы взяться за мокирование модулей (`vi.mock("./db")`) и подменить импорты за спиной у функции, но есть дизайн попроще и понадёжнее: пусть функция **говорит, что ей нужно**, и **получает** это снаружи.
+
+## Зависьте от интерфейсов и внедряйте их
+
+Приём состоит из двух шагов:
+
+1. Опишите каждую зависимость маленьким **интерфейсом** (interface): не «база данных Postgres», а «что-то, что умеет находить и сохранять пользователей». Не `Date.now()`, а «что-то, что знает время».
+2. Передавайте зависимости **внутрь** (это и есть «внедрение»), здесь — через конструктор класса.
+
+Боевое приложение передаёт настоящие реализации. Тесты передают **фейки** (fakes): маленькие работающие заменители, написанные для тестов, например репозиторий, который хранит пользователей в `Map`:
+
+<CodeExample output={`2026-03-15T00:00:00.000Z
+✓ TrialService > запускает 14-дневный пробный период
+✓ TrialService > отправляет пользователю письмо
+✓ TrialService > отказывает во втором пробном периоде
+
+Tests  3 passed (3)`}>
+
+```ts
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ---- Что нужно сервису ----
+interface User {
+  id: string;
+  email: string;
+  plan: "free" | "trial" | "pro";
+  trialEndsAt: number | null; // миллисекунды с 1970 года
+}
+
+interface UserRepo {
+  findById(id: string): Promise<User | undefined>;
+  save(user: User): Promise<void>;
+}
+
+interface Clock {
+  now(): number;
+}
+
+interface Mailer {
+  send(to: string, subject: string): Promise<void>;
+}
+
+// ---- Тестируемый код ----
+const DAY = 24 * 60 * 60 * 1000;
+
+class TrialService {
+  constructor(
+    private readonly users: UserRepo,
+    private readonly clock: Clock,
+    private readonly mailer: Mailer,
+  ) {}
+
+  async startTrial(userId: string): Promise<User> {
+    const user = await this.users.findById(userId);
+    if (!user) throw new Error(`Нет пользователя ${userId}`);
+    if (user.plan !== "free") throw new Error("Тариф уже повышен");
+    const updated: User = {
+      ...user,
+      plan: "trial",
+      trialEndsAt: this.clock.now() + 14 * DAY,
+    };
+    await this.users.save(updated);
+    await this.mailer.send(user.email, "Ваш пробный период начался");
+    return updated;
+  }
+}
+
+// ---- Фейки, написанные вручную ----
+class InMemoryUserRepo implements UserRepo {
+  private readonly users = new Map<string, User>();
+
+  async findById(id: string): Promise<User | undefined> {
+    return this.users.get(id);
+  }
+
+  async save(user: User): Promise<void> {
+    this.users.set(user.id, user);
+  }
+}
+
+class FakeClock implements Clock {
+  constructor(private time: number) {}
+
+  now(): number {
+    return this.time;
+  }
+
+  advance(ms: number): void {
+    this.time += ms;
+  }
+}
+
+class FakeMailer implements Mailer {
+  readonly sent: { to: string; subject: string }[] = [];
+
+  async send(to: string, subject: string): Promise<void> {
+    this.sent.push({ to, subject });
+  }
+}
+
+// ---- Тесты ----
+describe("TrialService", () => {
+  let users: InMemoryUserRepo;
+  let clock: FakeClock;
+  let mailer: FakeMailer;
+  let service: TrialService;
+
+  beforeEach(async () => {
+    users = new InMemoryUserRepo();
+    clock = new FakeClock(Date.UTC(2026, 2, 1)); // 1 марта 2026 года
+    mailer = new FakeMailer();
+    service = new TrialService(users, clock, mailer);
+    await users.save({
+      id: "u1",
+      email: "mei@pandadev.test",
+      plan: "free",
+      trialEndsAt: null,
+    });
+  });
+
+  it("запускает 14-дневный пробный период", async () => {
+    await service.startTrial("u1");
+    const saved = await users.findById("u1");
+    expect(saved?.plan).toBe("trial");
+    console.log(new Date(saved?.trialEndsAt ?? 0).toISOString());
+  });
+
+  it("отправляет пользователю письмо", async () => {
+    await service.startTrial("u1");
+    expect(mailer.sent).toEqual([
+      {
+        to: "mei@pandadev.test",
+        subject: "Ваш пробный период начался",
+      },
+    ]);
+  });
+
+  it("отказывает во втором пробном периоде", async () => {
+    await service.startTrial("u1");
+    await expect(service.startTrial("u1")).rejects.toThrow("уже");
+    expect(mailer.sent).toHaveLength(1);
+  });
+});
+```
+
+</CodeExample>
+
+Обратите внимание, чего `TrialService` **не** знает: живут ли пользователи в Postgres или в `Map`, настоящее ли время, уходят ли куда-то письма. Он знает только интерфейсы. Поскольку фейковые часы всегда показывают 1 марта 2026 года, дата окончания пробного периода одинакова при каждом прогоне, на любой машине и в любом часовом поясе.
+
+Каждый фейк — несколько строк, и каждый `implements` свой интерфейс. Фейковый почтальон ничего не отправляет: он **записывает**, что было бы отправлено, так что тест проверяет результат обычным `toEqual`.
+
+### Конструктор или фабрика?
+
+Класс с параметрами конструктора — один стиль. Другой — **фабричная функция**, которая принимает объект `deps` и возвращает сервис. Оба — внедрение зависимостей, так что выбирайте тот, что уже принят в вашем проекте:
+
+```ts
+type TrialDeps = { users: UserRepo; clock: Clock; mailer: Mailer };
+
+function createTrialService({ users, clock, mailer }: TrialDeps) {
+  return {
+    async startTrial(userId: string): Promise<User> {
+      const user = await users.findById(userId);
+      // ...то же, что выше, с clock.now() и mailer.send()
+    },
+  };
+}
+```
+
+Объект `deps` хорошо масштабируется: когда зависимостей пять, именованные свойства лучше пяти позиционных параметров. В любом случае настоящие реализации создаются в **одном месте** при старте приложения, которое часто называют **корнем композиции** (composition root):
+
+```ts title="main.ts"
+const trials = new TrialService(
+  new PostgresUserRepo(pool),
+  { now: () => Date.now() }, // настоящие часы: одна строка
+  new SmtpMailer(config.smtpUrl),
+);
+```
+
+<Callout type="tip" title="Внедряйте только края">
+
+Интерфейс нужен не для всего. Внедряйте то, что **медленно, случайно или находится вне программы**: сеть, базу данных, часы, случайность, почту, хранилище. Ваши собственные чистые функции (форматирование, правила цен) можно просто импортировать и использовать в тестах по-настоящему.
+
+</Callout>
+
+## Фейки, моки и их синхронизация
+
+**Фейк** — это работающая реализация, просто упрощённая. **Мок** (из `vi.fn()`) — функция, ответы которой вы прописываете в каждом тесте и которая записывает свои вызовы. Полезны оба:
+
+- **Фейки хороши для всего, у чего есть состояние**: репозиториев, хранилищ, кешей, часов. Тесты проверяют **результат** («пользователь теперь на пробном периоде»), а не точные вызовы, поэтому не ломаются при реорганизации кода. Напишите фейк один раз — и его переиспользуют все тесты.
+- **Моки хороши для разовых ответов и для выходных эффектов**: «пусть этот вызов один раз упадёт», «отправилось ли событие аналитики с этими свойствами?». Им не нужен отдельный класс.
+
+В обычном JavaScript у рукописного фейка есть слабость: он может незаметно отстать от настоящей реализации. В TypeScript [`implements`](/learn/typescript/inheritance-interfaces-and-abstract-classes) поручает следить за этим компилятору. Добавьте метод в `UserRepo` — и каждый фейк, который не успел за ним, перестанет компилироваться:
+
+```ts
+interface UserRepo {
+  findById(id: string): Promise<User | undefined>;
+  save(user: User): Promise<void>;
+  findTrialsEndingBefore(time: number): Promise<User[]>; // новый!
+}
+
+class InMemoryUserRepo implements UserRepo {
+// ❌ Error: Class 'InMemoryUserRepo' incorrectly implements interface 'UserRepo'.
+```
+
+Когда нужны моки для целого интерфейса, соберите объект из типизированных `vi.fn` и проверьте его через **`satisfies`**. Этот оператор пишется после значения: `{ ... } satisfies Mailer` заставляет компилятор проверить, что объект подходит под интерфейс, **не** меняя его тип на `Mailer`. Поэтому `mailer.send` остаётся моком, и `mailer.send.mock.calls` по-прежнему работает:
+
+<CodeExample output={`[ 'bao@pandadev.test', 'Пробный период кончится завтра' ]
+✓ напоминает всем
+
+Tests  1 passed (1)`}>
+
+```ts
+import { it, expect, vi } from "vitest";
+
+interface Mailer {
+  send(to: string, subject: string): Promise<void>;
+}
+
+async function remindAll(emails: string[], mailer: Mailer) {
+  for (const email of emails) {
+    await mailer.send(email, "Пробный период кончится завтра");
+  }
+}
+
+it("напоминает всем", async () => {
+  const mailer = {
+    send: vi.fn<Mailer["send"]>().mockResolvedValue(),
+  } satisfies Mailer;
+
+  await remindAll(["mei@pandadev.test", "bao@pandadev.test"], mailer);
+
+  expect(mailer.send).toHaveBeenCalledTimes(2);
+  console.log(mailer.send.mock.calls[1]);
+});
+```
+
+</CodeExample>
+
+Сравните с двумя другими способами записи:
+
+```ts
+// Аннотация типа проверяет форму, но забывает, что send — мок:
+const mailer: Mailer = { send: vi.fn<Mailer["send"]>() };
+mailer.send.mock.calls;
+// ❌ Error: Property 'mock' does not exist on type '(to: string, subject: string) => Promise<void>'.
+
+// satisfies проверяет форму И сохраняет тип мока:
+const typo = { sned: vi.fn<Mailer["send"]>() } satisfies Mailer;
+// ❌ Error: Object literal may only specify known properties, and 'sned' does not exist in type 'Mailer'.
+```
+
+Без того и другого опечатка или пропущенный метод проявятся позже — ошибкой в строке, где вы передаёте объект, далеко от места, где вы ошиблись.
+
+## Подделываем время
+
+Время — самая частая скрытая зависимость, и вы уже видели два способа им управлять:
+
+- **Внедрите часы** (`Clock` с `now()`), когда коду нужно текущее время. `FakeClock` с `advance(ms)` позволяет тесту сказать «через 14 дней» одной строкой.
+- **Внедрите функцию ожидания (sleep)**, когда коду нужно **ждать**: повторы, экспоненциальная задержка (backoff), опрос. Настоящая оборачивает `setTimeout`; фейковая не ждёт вовсе, а только записывает, сколько ждала бы.
+
+<CodeExample output={`200
+✓ withRetry > делает паузы между попытками, затем успешно завершается
+✓ withRetry > сдаётся после последней попытки
+
+Tests  2 passed (2)`}>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+type Sleep = (ms: number) => Promise<void>;
+
+async function withRetry<T>(
+  task: () => Promise<T>,
+  options: { attempts: number; sleep: Sleep },
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await task();
+    } catch (error) {
+      if (attempt >= options.attempts) throw error;
+      await options.sleep(100 * 2 ** (attempt - 1)); // 100, 200, 400…
+    }
+  }
+}
+
+// Приложение использует настоящий sleep (здесь — с эндпоинтом
+// /flaky учебного API, который дважды падает с 503, а потом работает)
+const realSleep: Sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+const status = await withRetry(
+  async () => {
+    const res = await fetch("https://api.pandadev.test/flaky");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.status;
+  },
+  { attempts: 3, sleep: realSleep },
+);
+console.log(status);
+
+// Тесты используют фейковый sleep, который только записывает паузы
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep: Sleep = async (ms) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+describe("withRetry", () => {
+  it("делает паузы между попытками, затем успешно завершается", async () => {
+    const task = vi.fn<() => Promise<string>>()
+      .mockRejectedValueOnce(new Error("503"))
+      .mockRejectedValueOnce(new Error("503"))
+      .mockResolvedValue("ok");
+    const { sleep, waits } = fakeSleep();
+
+    expect(await withRetry(task, { attempts: 3, sleep })).toBe("ok");
+    expect(waits).toEqual([100, 200]);
+  });
+
+  it("сдаётся после последней попытки", async () => {
+    const task = vi.fn<() => Promise<string>>()
+      .mockRejectedValue(new Error("503"));
+    const { sleep, waits } = fakeSleep();
+
+    await expect(withRetry(task, { attempts: 4, sleep })).rejects
+      .toThrow("503");
+    expect(task).toHaveBeenCalledTimes(4);
+    expect(waits).toEqual([100, 200, 400]);
+  });
+});
+```
+
+</CodeExample>
+
+В PandaDev встроено учебное API, поэтому пример работает без интернета и каждый раз даёт одинаковые ответы; настоящие API работают так же. Настоящий прогон ждёт в сумме 300 мс. Тесты ждут **ноль** миллисекунд и проверяют точное расписание пауз, чего настоящее ожидание надёжно сделать никогда бы не смогло.
+
+Для кода, который вызывает `setTimeout` напрямую и который вы не можете изменить, есть другой вариант — **фейковые таймеры** (fake timers) Vitest: `vi.useFakeTimers()`, затем `vi.advanceTimersByTime(ms)` (или `await vi.advanceTimersByTimeAsync(ms)`, когда замешаны промисы), как в уроке JavaScript [Моки и асинхронные тесты](/learn/javascript/mocks-and-async-tests). Для кода, который вы проектируете сами, внедрённые часы или sleep проще и нагляднее.
+
+## Тестовые фикстуры через satisfies
+
+**Фикстуры** (fixtures) — готовые тестовые данные, общие для набора тестов: несколько именованных пользователей, образец ответа API. То, как вы их типизируете, важнее, чем кажется. Аннотация `Record<string, User>` проверяет каждого пользователя, но выбрасывает имена:
+
+```ts
+const users: Record<string, User> = {
+  mei: { id: "u1", name: "Mei", plan: "pro" },
+};
+users.meii.name; // компилируется... и падает при запуске теста
+```
+
+`satisfies` проверяет каждую запись **и** сохраняет точные ключи, так что опечатка в имени фикстуры становится ошибкой компиляции с полезной подсказкой:
+
+<CodeExample output="Mei free">
+
+```ts
+interface User {
+  id: string;
+  name: string;
+  plan: "free" | "pro";
+}
+
+const users = {
+  mei: { id: "u1", name: "Mei", plan: "pro" },
+  bao: { id: "u2", name: "Bao", plan: "free" },
+} satisfies Record<string, User>;
+
+console.log(users.mei.name, users.bao.plan);
+```
+
+</CodeExample>
+
+```ts
+users.meii;
+// ❌ Error: Property 'meii' does not exist on type '{ mei: { id: string; name: string; plan: "pro"; }; bao: { id: string; name: string; plan: "free"; }; }'. Did you mean 'mei'?
+
+const broken = {
+  bao: { id: "u2", name: "Bao", plna: "free" },
+} satisfies Record<string, User>;
+// ❌ Error: Object literal may only specify known properties, and 'plna' does not exist in type 'User'.
+```
+
+То же касается образцов ответов API. Запись `const movieJson = { ... } satisfies Movie` гарантирует, что у фикстуры действительно та форма, которую ожидает клиент, так что при изменении типа `Movie` фикстура не может незаметно устареть.
+
+## Подделываем fetch, с типами
+
+API-клиенты тоже должны получать `fetch` снаружи (и базовый URL) — точно так же, как часы; вы уже делали это в уроке [Валидация во время выполнения](/learn/typescript/runtime-validation). Если тип зависимости — `typeof fetch`, подделка обязана возвращать настоящий `Promise<Response>`. Быстрый трюк из JavaScript — обычный объект только с `ok` и `json()` — больше не компилируется:
+
+```ts
+const fakeFetch = vi.fn<typeof fetch>();
+fakeFetch.mockResolvedValue({
+  ok: true,
+  status: 200,
+  json: async () => movie,
+});
+// ❌ Error: Argument of type '{ ok: true; status: number; json: () => Promise<{ id: number; title: string; year: number; }>; }' is not assignable to parameter of type 'Response'.
+```
+
+Не глушите ошибку через `as unknown as Response`. Это приведение — обман: в тот день, когда клиент прочитает `res.headers`, тест упадёт с непонятной ошибкой, вместо того чтобы вас предупредил компилятор. Есть два честных решения.
+
+**Решение 1: создавайте настоящие ответы.** `Response` — стандартный класс, доступный в браузерах, в Node и здесь, так что крошечный помощник создаёт настоящий объект (встроенный короткий путь `Response.json(body, { status })` тоже работает):
+
+<CodeExample output={`The Bamboo Heist 2019
+✓ movie client > запрашивает правильный URL и возвращает фильм
+✓ movie client > превращает 404 в ошибку
+✓ movie client > отвергает данные, которые не являются фильмом
+
+Tests  3 passed (3)`}>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+interface Movie {
+  id: number;
+  title: string;
+  year: number;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+type ApiError = { status: number };
+
+function isMovie(data: unknown): data is Movie {
+  return (
+    typeof data === "object" && data !== null &&
+    "id" in data && typeof data.id === "number" &&
+    "title" in data && typeof data.title === "string" &&
+    "year" in data && typeof data.year === "number"
+  );
+}
+
+function createMovieClient(fetchFn: typeof fetch, baseUrl: string) {
+  return {
+    async getMovie(id: number): Promise<Result<Movie, ApiError>> {
+      const res = await fetchFn(`${baseUrl}/movies/${id}`);
+      const data: unknown = await res.json();
+      if (!res.ok || !isMovie(data)) {
+        return { ok: false, error: { status: res.status } };
+      }
+      return { ok: true, value: data };
+    },
+  };
+}
+
+// Настоящий объект Response, так что подделке не нужны приведения
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+describe("movie client", () => {
+  const baseUrl = "https://movies.test";
+
+  it("запрашивает правильный URL и возвращает фильм", async () => {
+    const movie = { id: 7, title: "Test Film", year: 2001 };
+    const fakeFetch = vi.fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse(movie));
+    const client = createMovieClient(fakeFetch, baseUrl);
+
+    expect(await client.getMovie(7)).toEqual({ ok: true, value: movie });
+    expect(fakeFetch).toHaveBeenCalledWith(
+      "https://movies.test/movies/7",
+    );
+  });
+
+  it("превращает 404 в ошибку", async () => {
+    const fakeFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({ error: "Movie not found" }, 404),
+    );
+    const client = createMovieClient(fakeFetch, baseUrl);
+
+    expect(await client.getMovie(99)).toEqual({
+      ok: false,
+      error: { status: 404 },
+    });
+  });
+
+  it("отвергает данные, которые не являются фильмом", async () => {
+    const fakeFetch = vi.fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ id: "7", name: "Oops" }));
+    const client = createMovieClient(fakeFetch, baseUrl);
+
+    expect((await client.getMovie(7)).ok).toBe(false);
+  });
+});
+
+// Приложение передаёт настоящий fetch
+const movies = createMovieClient(fetch, "https://api.pandadev.test");
+const result = await movies.getMovie(1);
+if (result.ok) {
+  console.log(result.value.title, result.value.year);
+}
+```
+
+</CodeExample>
+
+Последний тест легко устроить только с подделкой: сервер отвечает 200, но данными не той формы. Фейки делают редкие случаи дешёвыми для тестирования.
+
+<Callout type="warning" title="Тело Response можно прочитать только один раз">
+
+`mockResolvedValue(jsonResponse(movie))` при каждом вызове отдаёт **один и тот же** объект `Response`. Первый `res.json()` читает его тело; второй вызов мока вернёт уже прочитанный ответ, и `json()` бросит `TypeError`. Если тест делает несколько запросов, создавайте свежий ответ на каждый вызов:
+
+```ts
+const fakeFetch = vi.fn<typeof fetch>()
+  .mockImplementation(async () => jsonResponse(movie));
+```
+
+</Callout>
+
+**Решение 2: зависьте от меньшего.** `typeof fetch` — большое обещание: запросы, заголовки, потоки, десяток свойств у `Response`. Если клиент использует только `ok`, `status` и `json()`, так и скажите в типе его зависимости. Благодаря [структурной типизации](/learn/typescript/structural-typing-and-class-design) настоящий `fetch` всё равно подходит, а подделка занимает несколько строк:
+
+<CodeExample output={`14
+✓ читает температуру
+
+Tests  1 passed (1)`}>
+
+```ts
+import { it, expect } from "vitest";
+
+// Зависим только от того, что клиент действительно использует
+type HttpResponse = {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+};
+type HttpGet = (url: string) => Promise<HttpResponse>;
+
+function createWeatherClient(get: HttpGet, baseUrl: string) {
+  return {
+    async temperature(city: string): Promise<number | null> {
+      const params = new URLSearchParams({ city });
+      const res = await get(`${baseUrl}/weather?${params}`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (
+        typeof data === "object" && data !== null &&
+        "temperature" in data && typeof data.temperature === "number"
+      ) {
+        return data.temperature;
+      }
+      return null;
+    },
+  };
+}
+
+it("читает температуру", async () => {
+  const urls: string[] = [];
+  const fakeGet: HttpGet = async (url) => {
+    urls.push(url);
+    const body = { temperature: 21 };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const client = createWeatherClient(fakeGet, "https://weather.test");
+
+  expect(await client.temperature("New York")).toBe(21);
+  expect(urls).toEqual(["https://weather.test/weather?city=New+York"]);
+});
+
+// Настоящий fetch подходит под HttpGet, и приложение передаёт его как есть
+const weather = createWeatherClient(fetch, "https://api.pandadev.test");
+console.log(await weather.temperature("London"));
+```
+
+</CodeExample>
+
+Какое решение выбрать? Настоящие объекты `Response` лучше, когда код использует больше возможностей `fetch` (заголовки, методы, тела запросов) или когда одна подделка общая для многих тестов. Узкий тип зависимости лучше для небольших клиентов, к тому же он точно документирует, на что клиент опирается. Оба варианта лучше приведения типа.
+
+<Quiz
+  question="Тесту нужен мок Mailer, вызовы метода send которого можно изучить. Какая строка и проверяет объект на соответствие интерфейсу Mailer, и оставляет доступным mailer.send.mock?"
+  options={[
+    "const mailer: Mailer = { send: vi.fn<Mailer['send']>() };",
+    "const mailer = { send: vi.fn<Mailer['send']>() } satisfies Mailer;",
+    "const mailer = { send: vi.fn() } as Mailer;",
+    "const mailer = { send: vi.fn() };",
+  ]}
+  answer={1}
+  explanation="satisfies проверяет объект на соответствие Mailer, но сохраняет его собственный, более точный тип, так что send остаётся Mock. Аннотация превращает send в обычный тип функции (без .mock), приведение вообще пропускает проверку, а последняя строка не проверяется и не типизирована как следует."
+/>
+
+<Quiz
+  question="В UserRepo появился новый метод deleteById. Что произойдёт с классом InMemoryUserRepo implements UserRepo, в котором его ещё нет?"
+  options={[
+    "Ничего, пока тест не вызовет deleteById — тогда он упадёт",
+    "Тесты, которые его используют, упадут во время выполнения с 'not a function'",
+    "Он перестанет компилироваться: класс неправильно реализует интерфейс",
+    "TypeScript автоматически добавит пустой deleteById",
+  ]}
+  answer={2}
+  explanation="implements заставляет компилятор сравнить класс с интерфейсом. Пропущенный метод — ошибка компиляции, указывающая на фейк, так что типизированные фейки не могут незаметно отстать от настоящей реализации."
+/>
+
+<Exercise
+  title="Фейки для сервиса напоминаний"
+  language="typescript"
+  starter={`import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
+
+// ---- Тестируемый код (не меняйте его) ----
+interface Reminder {
+  id: string;
+  to: string;
+  text: string;
+  dueAt: number; // миллисекунды
+  sent: boolean;
+}
+
+interface ReminderStore {
+  add(reminder: Omit<Reminder, "id">): Promise<Reminder>;
+  list(): Promise<Reminder[]>;
+  update(id: string, changes: Partial<Reminder>): Promise<void>;
+}
+
+interface Clock {
+  now(): number;
+}
+
+type Notify = (to: string, text: string) => Promise<void>;
+
+const MINUTE = 60_000;
+
+class Reminders {
+  constructor(
+    private readonly store: ReminderStore,
+    private readonly clock: Clock,
+    private readonly notify: Notify,
+  ) {}
+
+  schedule(to: string, text: string, inMinutes: number) {
+    const dueAt = this.clock.now() + inMinutes * MINUTE;
+    return this.store.add({ to, text, dueAt, sent: false });
+  }
+
+  async sendDue(): Promise<number> {
+    const now = this.clock.now();
+    const all = await this.store.list();
+    const due = all.filter((r) => !r.sent && r.dueAt <= now);
+    for (const reminder of due) {
+      await this.notify(reminder.to, reminder.text);
+      await this.store.update(reminder.id, { sent: true });
+    }
+    return due.length;
+  }
+}
+
+// ---- Ваши фейки ----
+class FakeClock implements Clock {
+  constructor(private time: number) {}
+  // now() и advance(ms)
+}
+
+class InMemoryReminderStore implements ReminderStore {
+  // add, list и update, напоминания хранятся в Map
+}
+
+// ---- Ваши тесты ----
+describe("Reminders", () => {
+  // beforeEach: свежие фейки и типизированный мок notify
+});
+`}
+  tests={[
+    { name: "FakeClock сообщает время и умеет идти вперёд", check: `new FakeClock(5).now() === 5 && (() => { const c = new FakeClock(5); c.advance(10); return c.now() === 15; })()` },
+    { name: "InMemoryReminderStore добавляет, перечисляет и обновляет напоминания", check: `await (async () => { const s = new InMemoryReminderStore(); const a = await s.add({ to: "a", text: "x", dueAt: 1, sent: false }); const b = await s.add({ to: "b", text: "y", dueAt: 2, sent: false }); await s.update(a.id, { sent: true }); const all = await s.list(); return a.id !== b.id && all.length === 2 && all.find((r) => r.id === a.id).sent === true && all.find((r) => r.id === a.id).text === "x" && all.find((r) => r.id === b.id).sent === false; })()` },
+    { name: "Тестируемый код не изменён", check: `Reminders.toString().includes("r.dueAt <= now") && Reminders.toString().includes("inMinutes * MINUTE")` },
+    { name: "Вы написали не меньше 4 тестов, и все они проходят", check: `__vitest.failed === 0 && __vitest.passed >= 4` },
+    { name: "Ваши тесты ловят время в секундах вместо минут", check: `(await __retest([["inMinutes * MINUTE", "inMinutes * 1000"]])).failed > 0` },
+    { name: "Ваши тесты ловят напоминание, опоздавшее на один тик", check: `(await __retest([["r.dueAt <= now", "r.dueAt < now"]])).failed > 0` },
+    { name: "Ваши тесты ловят отправку напоминаний, срок которых ещё не наступил", check: `(await __retest([["const now = this.clock.now();", "const now = Infinity;"]])).failed > 0` },
+    { name: "Ваши тесты ловят отправку не того сообщения", check: `(await __retest([["await this.notify(reminder.to, reminder.text);", "await this.notify(reminder.to, reminder.to);"]])).failed > 0` },
+    { name: "Ваши тесты ловят повторную отправку напоминаний", check: `(await __retest([["!r.sent && r.dueAt", "r.dueAt"]])).failed > 0` },
+    { name: "Ваши тесты ловят напоминания, которые не помечаются отправленными", check: `(await __retest([["{ sent: true }", "{ sent: false }"]])).failed > 0` },
+  ]}
+>
+
+Сервис `Reminders` планирует напоминания и отправляет те, срок которых наступил. Он зависит от `ReminderStore`, `Clock` и функции `notify` — все они внедряются снаружи. Ваша задача — написать фейки и тесты (тестируемый код не меняйте). Два фейковых класса пока не компилируются, потому что не реализуют свои интерфейсы.
+
+1. **`FakeClock`**: `now()` возвращает сохранённое время, а `advance(ms)` сдвигает его вперёд.
+2. **`InMemoryReminderStore`**: хранит напоминания в `Map<string, Reminder>`. `add` даёт каждому новому напоминанию **уникальный** id (подойдёт счётчик) и возвращает напоминание целиком; `list` возвращает все напоминания; `update` вливает изменения в сохранённое напоминание.
+3. **Тесты** (не меньше 4) со свежими фейками в `beforeEach` и типизированным моком `vi.fn<Notify>()` (храните его в `let notify: Mock<Notify>`):
+   - `schedule` устанавливает `dueAt` равным времени часов плюс минуты, а `sent` — равным `false`;
+   - напоминание, срок которого ещё не наступил (на одну миллисекунду раньше), **не** отправляется;
+   - напоминание отправляется **ровно** в свой срок, с правильными `to` и `text`;
+   - двойной вызов `sendDue` отправляет напоминание только **один раз**, а хранилище помечает его как отправленное.
+
+<Hint>
+
+Часы: `now(): number { return this.time; }` и `advance(ms: number): void { this.time += ms; }`. Хранилище: `private readonly reminders = new Map<string, Reminder>()` и `private nextId = 1`; в `add` соберите `{ id: "r" + this.nextId++, ...data }`, сохраните и верните; `list` возвращает `[...this.reminders.values()]`; `update` достаёт напоминание и записывает `{ ...reminder, ...changes }`. В тестах запустите часы, например, с `1_000_000`, запланируйте на `5` минут, затем вызовите `clock.advance(5 * 60_000 - 1)` перед `sendDue()` для случая «ещё рано» или `clock.advance(5 * 60_000)` для случая «ровно сейчас».
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
+
+// ---- Тестируемый код (не меняйте его) ----
+interface Reminder {
+  id: string;
+  to: string;
+  text: string;
+  dueAt: number; // миллисекунды
+  sent: boolean;
+}
+
+interface ReminderStore {
+  add(reminder: Omit<Reminder, "id">): Promise<Reminder>;
+  list(): Promise<Reminder[]>;
+  update(id: string, changes: Partial<Reminder>): Promise<void>;
+}
+
+interface Clock {
+  now(): number;
+}
+
+type Notify = (to: string, text: string) => Promise<void>;
+
+const MINUTE = 60_000;
+
+class Reminders {
+  constructor(
+    private readonly store: ReminderStore,
+    private readonly clock: Clock,
+    private readonly notify: Notify,
+  ) {}
+
+  schedule(to: string, text: string, inMinutes: number) {
+    const dueAt = this.clock.now() + inMinutes * MINUTE;
+    return this.store.add({ to, text, dueAt, sent: false });
+  }
+
+  async sendDue(): Promise<number> {
+    const now = this.clock.now();
+    const all = await this.store.list();
+    const due = all.filter((r) => !r.sent && r.dueAt <= now);
+    for (const reminder of due) {
+      await this.notify(reminder.to, reminder.text);
+      await this.store.update(reminder.id, { sent: true });
+    }
+    return due.length;
+  }
+}
+
+// ---- Ваши фейки ----
+class FakeClock implements Clock {
+  constructor(private time: number) {}
+
+  now(): number {
+    return this.time;
+  }
+
+  advance(ms: number): void {
+    this.time += ms;
+  }
+}
+
+class InMemoryReminderStore implements ReminderStore {
+  private readonly reminders = new Map<string, Reminder>();
+  private nextId = 1;
+
+  async add(data: Omit<Reminder, "id">): Promise<Reminder> {
+    const reminder = { id: `r${this.nextId++}`, ...data };
+    this.reminders.set(reminder.id, reminder);
+    return reminder;
+  }
+
+  async list(): Promise<Reminder[]> {
+    return [...this.reminders.values()];
+  }
+
+  async update(id: string, changes: Partial<Reminder>): Promise<void> {
+    const reminder = this.reminders.get(id);
+    if (reminder) {
+      this.reminders.set(id, { ...reminder, ...changes });
+    }
+  }
+}
+
+// ---- Ваши тесты ----
+describe("Reminders", () => {
+  let store: InMemoryReminderStore;
+  let clock: FakeClock;
+  let notify: Mock<Notify>;
+  let reminders: Reminders;
+
+  beforeEach(() => {
+    store = new InMemoryReminderStore();
+    clock = new FakeClock(1_000_000);
+    notify = vi.fn<Notify>().mockResolvedValue();
+    reminders = new Reminders(store, clock, notify);
+  });
+
+  it("планирует напоминание от времени часов", async () => {
+    const reminder = await reminders.schedule("mei", "Разомнитесь!", 5);
+    expect(reminder.dueAt).toBe(1_000_000 + 5 * 60_000);
+    expect(reminder.sent).toBe(false);
+  });
+
+  it("не отправляет напоминания раньше срока", async () => {
+    await reminders.schedule("mei", "Разомнитесь!", 5);
+    clock.advance(5 * 60_000 - 1);
+    expect(await reminders.sendDue()).toBe(0);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("отправляет напоминание ровно в срок", async () => {
+    await reminders.schedule("mei", "Разомнитесь!", 5);
+    clock.advance(5 * 60_000);
+    expect(await reminders.sendDue()).toBe(1);
+    expect(notify).toHaveBeenCalledWith("mei", "Разомнитесь!");
+  });
+
+  it("отправляет каждое напоминание только один раз", async () => {
+    await reminders.schedule("bao", "Выпейте воды", 1);
+    clock.advance(60_000);
+    await reminders.sendDue();
+    await reminders.sendDue();
+    expect(notify).toHaveBeenCalledTimes(1);
+    const [saved] = await store.list();
+    expect(saved.sent).toBe(true);
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Код со **скрытыми зависимостями** (часы, сеть, база данных, почта) трудно тестировать. Опишите каждую зависимость маленьким **интерфейсом** и **внедряйте** её — через конструктор или объект `deps` фабрики. Настоящие реализации соединяйте в одном месте — корне композиции.
+- **Фейк** — простая работающая реализация (репозиторий в памяти, фейковые часы, почтальон, который записывает письма). Он подходит для зависимостей с состоянием и тестов, проверяющих результат. **Моки** подходят для прописанных ответов и проверки выходных эффектов.
+- `implements` держит фейки **синхронизированными**: когда интерфейс растёт, фейк перестаёт компилироваться.
+- `{ send: vi.fn<Mailer["send"]>() } satisfies Mailer` проверяет объект с моками на соответствие интерфейсу и сохраняет типы `Mock`.
+- Управляйте временем через внедрённые `Clock` или `Sleep`; для кода, который вызывает `setTimeout` напрямую, используйте `vi.useFakeTimers()`.
+- Типизируйте фикстуры через `satisfies Record<string, User>`, чтобы проверить каждую запись **и** сохранить точные ключи.
+- Подделывайте `fetch` честно: создавайте настоящие объекты `Response` (свежие на каждый вызов) или зависьте от более узкого типа, под который подходит и настоящий `fetch`. Никогда не пишите `as unknown as Response`.

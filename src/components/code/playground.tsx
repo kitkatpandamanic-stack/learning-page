@@ -103,6 +103,47 @@ function Counter() {
 
 createRoot(document.getElementById("root")).render(<Counter />);
 `,
+    tsx: ru
+      ? `// React + TypeScript: пропсы и состояние с типами, а компонент — в окне ниже.
+import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+type CounterProps = { label: string; step?: number };
+
+function Counter({ label, step = 1 }: CounterProps) {
+  const [count, setCount] = useState(0);
+  return (
+    <button onClick={() => setCount(count + step)}>
+      🐼 {label}: {count}
+    </button>
+  );
+}
+
+// Попробуйте step="2" — TypeScript заметит ошибку до запуска.
+createRoot(document.getElementById("root")!).render(
+  <Counter label="Нажато" step={2} />,
+);
+`
+      : `// React + TypeScript: typed props and state; the component appears below.
+import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+type CounterProps = { label: string; step?: number };
+
+function Counter({ label, step = 1 }: CounterProps) {
+  const [count, setCount] = useState(0);
+  return (
+    <button onClick={() => setCount(count + step)}>
+      🐼 {label}: {count}
+    </button>
+  );
+}
+
+// Try step="2": TypeScript catches the mistake before anything runs.
+createRoot(document.getElementById("root")!).render(
+  <Counter label="Clicks" step={2} />,
+);
+`,
   };
 }
 
@@ -116,9 +157,9 @@ export function Playground() {
       <div
         role="group"
         aria-label={t("language")}
-        className="inline-flex self-start rounded-full p-1 glass"
+        className="inline-flex max-w-full self-start overflow-x-auto rounded-full p-1 glass"
       >
-        {(["javascript", "python", "typescript", "react"] as const).map(
+        {(["javascript", "python", "typescript", "react", "tsx"] as const).map(
           (lang) => (
             <button
               key={lang}
@@ -126,7 +167,7 @@ export function Playground() {
               aria-pressed={language === lang}
               onClick={() => setLanguage(lang)}
               className={cn(
-                "rounded-full px-4 py-1.5 text-sm font-medium text-white/70 transition hover:text-white",
+                "shrink-0 rounded-full px-4 py-1.5 text-sm font-medium text-white/70 transition hover:text-white",
                 language === lang &&
                   "bg-gradient-brand text-white shadow-glow-violet",
               )}
@@ -137,6 +178,7 @@ export function Playground() {
                   python: "Python",
                   typescript: "TypeScript",
                   react: "React",
+                  tsx: "React + TS",
                 }[lang]
               }
             </button>

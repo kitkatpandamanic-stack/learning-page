@@ -44,7 +44,7 @@ export async function runDomInNode(
   tests: TestSpec[] = [],
   /** localStorage before the run; updated in place as the page saves */
   storage?: Record<string, string>,
-  options: { react?: boolean } = {},
+  options: { react?: boolean; typescript?: boolean } = {},
 ): Promise<ExecuteResult> {
   const dom = openPreview(html, options);
   const api = createFakeApi();

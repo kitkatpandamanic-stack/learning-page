@@ -1,0 +1,2265 @@
+---
+title: "Часть 2: Клиент"
+description: "Превратите описание API в работающий клиент: методы с типами из описания, типизированные ошибки, повторы с backoff и внедрённым sleep, пагинация через for await, хуки и быстрые тесты."
+duration: 25
+xp: 30
+---
+
+В части 1 вы спроектировали `@pandadev/sdk` и заложили его фундамент: `pandaApi` описывает каждый эндпоинт, `Client<A>` выводит из него тип каждого метода, а `buildRequest` превращает проверенный ввод в запрос. Но с сетью пока ничего не общается. В этой части описание становится **работающим клиентом**. 🔌
+
+Мы напишем `createClient(api, options)`, а вместе с ним всё, что настоящий SDK делает между «пользователь вызвал метод» и «пользователь получил `Result`»:
+
+- **по методу на эндпоинт**, созданному во время выполнения из описания, с типами из части 1,
+- **типизированные ошибки**: каждый способ, которым запрос может не удаться, становится одним из трёх видов `ApiError`,
+- **повторы (retries) с backoff и джиттером** для запросов, которые безопасно повторять, с внедрённым `sleep`, чтобы тесты никогда не ждали,
+- **пагинацию как асинхронный итератор**: `for await (const movie of paginate(panda.searchMovies))`,
+- **хуки**, чтобы добавлять заголовки и следить за каждой попыткой, — для авторизации, логов и метрик,
+- и **тесты** с фейковым `fetch`, плюс несколько тестов на учебном API.
+
+Здесь сходятся стратегия ошибок из урока [Проектирование типов для больших кодовых баз](/learn/typescript/designing-types-for-large-codebases), `Result` из [Типизированного fetch](/learn/typescript/typed-fetch), внедрённые часы и фейки из [Внедрения зависимостей и фейков](/learn/typescript/dependency-injection-and-fakes) и backoff с джиттером из урока JavaScript [Реальное время и устойчивость](/learn/javascript/real-time-and-resilience).
+
+## Типы снаружи, одно приведение внутри
+
+`Client<A>` — это обещание про объект: «для каждого ключа описания есть метод с такими типами». `createClient` должен **выполнить** это обещание во время выполнения, и проще всего сделать это циклом по ключам описания. Вот идея в миниатюре, с двумя эндпоинтами и схемами-заглушками:
+
+<CodeExample output={`The Bamboo Heist
+[ 'Learn fetch', 'Build the movie app', 'Eat some bamboo' ]
+[ 'firstMovie', 'todos' ]`}>
+
+```ts
+type Schema<T> = { parse: (value: unknown) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+// Схемы-заглушки, ровно на этот пример
+const titled: Schema<{ title: string }> = {
+  parse(value) {
+    if (
+      typeof value === "object" && value !== null &&
+      "title" in value && typeof value.title === "string"
+    ) {
+      return { title: value.title };
+    }
+    throw new Error("ожидался объект с title");
+  },
+};
+const titledList: Schema<{ title: string }[]> = {
+  parse(value) {
+    if (!Array.isArray(value)) throw new Error("ожидался массив");
+    return value.map((item) => titled.parse(item));
+  },
+};
+
+interface Endpoint {
+  path: string;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// Обещание: по методу на эндпоинт
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: () => Promise<Infer<A[K]["response"]>>;
+};
+
+function createClient<A extends ApiDescription>(
+  api: A,
+  baseUrl: string,
+): Client<A> {
+  // Выполняем обещание: цикл по описанию
+  const client: Record<string, () => Promise<unknown>> = {};
+  for (const name of Object.keys(api)) {
+    const endpoint = api[name];
+    client[name] = async () => {
+      const res = await fetch(baseUrl + endpoint.path);
+      return endpoint.response.parse(await res.json());
+    };
+  }
+  return client as Client<A>; // то самое единственное приведение
+}
+
+const panda = createClient(
+  {
+    firstMovie: { path: "/movies/1", response: titled },
+    todos: { path: "/todos", response: titledList },
+  },
+  "https://api.pandadev.test",
+);
+
+const movie = await panda.firstMovie(); // { title: string }
+const todos = await panda.todos(); // { title: string }[]
+console.log(movie.title);
+console.log(todos.map((todo) => todo.title));
+console.log(Object.keys(panda));
+```
+
+</CodeExample>
+
+TypeScript не может проследить за циклом. Он видит, что заполняется `Record<string, ...>`, и без приведения отказывается:
+
+```ts
+return client;
+// ❌ Error: Type 'Record<string, () => Promise<unknown>>' is not assignable to type 'Client<A>'.
+```
+
+Это та же сделка, что вы заключили в уроке [Сопоставленные типы](/learn/typescript/mapped-types) с `makeGetters`: когда тип и код времени выполнения следуют одному правилу («по методу на ключ»), тип не может проверить код, поэтому вы записываете правило дважды, держите обе половины рядом, делаете приведение **один раз** и доказываете тестами, что код держит обещание. Одно приведение в одном месте внутри SDK покупает точные типы в каждом месте вызова снаружи.
+
+Почему не `Proxy` из урока [Прокси, Reflect и символы](/learn/javascript/proxies-reflect-and-symbols), чья ловушка `get` могла бы придумывать каждый метод в момент вызова? Некоторые SDK так и делают, но мы знаем все методы заранее, а обычный объект дружелюбнее: `Object.keys(panda)` перечисляет методы, `console.log(panda)` их показывает, а отладчику не приходится шагать через ловушки прокси. Выбирайте скучный код времени выполнения, когда хитрую часть уже делают типы.
+
+### Всё медленное, случайное и внешнее внедряется
+
+Настоящий `createClient` принимает объект настроек. В нём всё, что клиенту нужно от внешнего мира, у каждого пункта разумное значение по умолчанию, так что обычные пользователи ничего не передают, а тесты передают фейки:
+
+```ts
+interface ClientOptions {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+  retry?: Partial<RetryOptions>;
+  hooks?: Hooks;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  now?: () => number;
+}
+```
+
+`fetch` — это сеть, `sleep` — ожидание, `random` — джиттер в backoff, а `now` — часы, которые засекают время каждой попытки. Это список из урока [Внедрение зависимостей и фейки](/learn/typescript/dependency-injection-and-fakes): внедряйте то, что медленно, случайно или находится вне вашей программы. `retry` — это `Partial`, чтобы пользователи могли поменять одну настройку и оставить остальные по умолчанию: `{ ...DEFAULT_RETRY, ...options.retry }`.
+
+## У каждого сбоя есть вид
+
+`attemptOnce` отправляет один запрос и сообщает, как всё прошло, в виде `Result`. Именно он решает, какой `ApiError` станет каждый сбой, поэтому его стоит прочитать внимательно:
+
+<CodeExample output={`/movies/1   ok, тело в JSON
+/status/204 ok, без содержимого
+/movies/99  HTTP 404: Movie not found
+/status/503 HTTP 503: Service Unavailable
+/offline    нет ответа (Failed to fetch)`}>
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+// Result<never, ...> подходит к Result с ЛЮБЫМ типом значения
+function fail(error: ApiError): Result<never, ApiError> {
+  return { ok: false, error };
+}
+
+function apiMessage(body: unknown): string | undefined {
+  return typeof body === "object" && body !== null &&
+    "error" in body && typeof body.error === "string"
+    ? body.error
+    : undefined;
+}
+
+async function attemptOnce(
+  url: string,
+): Promise<Result<unknown, ApiError>> {
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch (error) {
+    // fetch отклоняется, только когда ответа нет вообще
+    const message =
+      error instanceof Error ? error.message : String(error);
+    return fail({ kind: "network", message });
+  }
+  const body: unknown =
+    res.status === 204 ? null : await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = apiMessage(body) ?? `HTTP ${res.status}`;
+    return fail({ kind: "http", status: res.status, message });
+  }
+  return { ok: true, value: body };
+}
+
+function describeError(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return `нет ответа (${error.message})`;
+    case "http":
+      return `HTTP ${error.status}: ${error.message}`;
+    case "invalid-response":
+      return `странный ответ: ${error.message}`;
+  }
+}
+
+const API = "https://api.pandadev.test";
+for (const path of [
+  "/movies/1",
+  "/status/204",
+  "/movies/99",
+  "/status/503",
+  "/offline",
+]) {
+  const result = await attemptOnce(API + path);
+  const text = result.ok
+    ? `ok, ${result.value === null ? "без содержимого" : "тело в JSON"}`
+    : describeError(result.error);
+  console.log(path.padEnd(11), text);
+}
+```
+
+</CodeExample>
+
+| Что произошло | Чем становится | Повторять? |
+| --- | --- | --- |
+| `fetch` отклонён: нет сети, сбой DNS, сброс соединения | `{ kind: "network" }` | да |
+| 429 Too Many Requests или любой 5xx | `{ kind: "http", status }` | да |
+| Любой другой 4xx: 400, 401, 404… | `{ kind: "http", status }` | нет: повторный запрос получит тот же ответ |
+| 2xx, тело которого нарушает схему | `{ kind: "invalid-response" }` | нет: изменился API, а не сеть |
+| Ввод вызывающего кода нарушает свою схему | брошенная `ValidationError` | вообще не отправляется |
+
+В нескольких деталях легко ошибиться:
+
+- **`fetch` отклоняется, только когда ответа нет вообще.** 404 или 503 — вполне нормальный `Response`, так что решает `res.ok`.
+- **Тела ошибок могут быть не JSON.** Прокси перед API может ответить HTML-страницей с ошибкой, поэтому `res.json().catch(() => null)` не даёт сломанному телу превратиться в исключение, а сообщение откатывается к `HTTP 503`.
+- **У ответа 204 нет тела**, и вызов `res.json()` на нём бросил бы исключение. Он превращается в `null`, а это ровно то, чего ждёт `nothing()` из части 1.
+- **`fail` возвращает `Result<never, ApiError>`** — результат, успешная сторона которого невозможна, поэтому он подходит к `Result` с любым типом значения, как в уроке [Проектирование типов для больших кодовых баз](/learn/typescript/designing-types-for-large-codebases).
+
+`describeError` обрабатывает каждый вид в `switch` без `default`, и это сделано нарочно. Если в 1.1 появится `{ kind: "timeout" }`, каждая такая функция перестанет компилироваться, пока кто-нибудь не решит, что в ней означает тайм-аут:
+
+```ts
+function describeError(error: ApiError): string {
+// ❌ Error: Function lacks ending return statement and return type does not include 'undefined'.
+```
+
+Внутри SDK это отлично. Но для **пользователей** SDK это значит, что новый вид ошибки ломает их сборки, то есть это ломающее изменение. Что с этим делать, решим в части 3.
+
+## Повторы, которые не делают хуже
+
+Повторять запросы кажется простым делом: не вышло — попробуй ещё раз. Но небрежные повторы превращают маленький сбой в большой или списывают деньги с клиента дважды. Политика повторов уровня Senior отвечает на три вопроса.
+
+**Какие запросы?** Только те, которые безопасно отправить дважды. `GET`, `PUT` и `DELETE` **идемпотентны** (idempotent): если выполнить их дважды, сервер окажется в том же состоянии, что и после одного раза. `POST` — нет: если `POST /todos` отвалился по тайм-ауту, сервер вполне мог создать задачу до того, как соединение оборвалось, и повтор создаст вторую. Одна знакомая мне платёжная компания усвоила это дорогой ценой: автоматический повтор вызова «создать платёж» во время сетевого сбоя списал деньги дважды с нескольких сотен клиентов. API, которым нужны безопасные повторы `POST`, принимают заголовок с **ключом идемпотентности** (idempotency key) — например, `Idempotency-Key` у Stripe, — чтобы сервер мог распознать повтор; наш API так не умеет, поэтому SDK никогда не повторяет `POST` и `PATCH`:
+
+```ts
+// Повторная отправка этих методов безвредна, их можно повторять
+const IDEMPOTENT = new Set<Method>(["GET", "PUT", "DELETE"]);
+```
+
+**Какие сбои?** Только те, что могут пройти сами: сетевые ошибки, 429 и 5xx, как в таблице выше.
+
+**Сколько ждать?** Достаточно долго, чтобы сервер успел восстановиться, и не всем одновременно:
+
+<CodeExample output={`после попытки 1: ждать 100-200 мс
+после попытки 2: ждать 200-400 мс
+после попытки 3: ждать 400-800 мс
+после попытки 4: ждать 800-1600 мс
+после попытки 5: ждать 1000-2000 мс
+после попытки 6: ждать 1000-2000 мс
+без джиттера: 200, 200, 200, 200, 200
+с джиттером:  100, 192, 129, 121, 173`}>
+
+```ts
+interface RetryOptions {
+  attempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+// Экспонента с потолком и «equal jitter»: половина фиксирована, половина случайна
+function backoff(
+  attempt: number,
+  retry: RetryOptions,
+  random: () => number,
+): number {
+  const exp = Math.min(
+    retry.maxDelayMs,
+    retry.baseDelayMs * 2 ** (attempt - 1),
+  );
+  return Math.round(exp / 2 + (exp / 2) * random());
+}
+
+const retry = { attempts: 7, baseDelayMs: 200, maxDelayMs: 2_000 };
+for (let attempt = 1; attempt < retry.attempts; attempt++) {
+  const low = backoff(attempt, retry, () => 0);
+  const high = backoff(attempt, retry, () => 1);
+  console.log(`после попытки ${attempt}: ждать ${low}-${high} мс`);
+}
+
+// 5 клиентов получают ошибку в один момент. Когда они вернутся?
+// (Предсказуемый «random», чтобы пример всегда печатал одно и то же)
+let seed = 7;
+function fakeRandom(): number {
+  seed = (seed * 16807) % 2147483647;
+  return seed / 2147483647;
+}
+const noJitter = [1, 2, 3, 4, 5].map(() => backoff(1, retry, () => 1));
+const jitter = [1, 2, 3, 4, 5].map(() => backoff(1, retry, fakeRandom));
+console.log("без джиттера:", noJitter.join(", "));
+console.log("с джиттером: ", jitter.join(", "));
+```
+
+</CodeExample>
+
+- **Экспоненциальный backoff** (exponential backoff): каждое ожидание вдвое дольше предыдущего (100–200 мс, затем 200–400, 400–800), так что перегруженный сервер получает всё больше передышки.
+- **Потолок** (`maxDelayMs`) не даёт ожиданиям расти бесконечно.
+- **Джиттер** (jitter) разносит клиентов во времени. Посмотрите на две последние строки: когда сервер перезапускается, тысячи клиентов получают ошибку в один и тот же момент. Без джиттера все они возвращаются ровно через 200 мс и снова его роняют (эффект **thundering herd**, «топот стада»). С джиттером они приходят вразнобой. В уроке JavaScript использовался «full jitter» (что угодно от 0 до максимума); мы используем **«equal jitter»**: половина ожидания фиксирована, а половина случайна, так что ни один клиент не повторяет запрос мгновенно.
+
+Функция `random` внедряется по той же причине, что и `sleep`: чтобы тест мог сказать «random всегда возвращает 1» и ожидать ровно `[200, 400]`. Настоящие SDK также учитывают заголовок **`Retry-After`**, когда сервер присылает его с 429 или 503; у нас это в списке «Что дальше».
+
+Если собрать всё вместе, `send` (его вы напишете в упражнении) — это цикл: собрать запрос, запустить хук `onRequest`, затем вызвать `attemptOnce`. При успехе разобрать тело схемой ответа эндпоинта. При сбое, если попытки ещё остались, **и** метод идемпотентен, **и** ошибку стоит повторить, — `await sleep(backoff(...))` и пойти на новый круг; иначе вернуть ошибку.
+
+<Callout type="tip" title="Повторы перемножаются">
+
+Если ваше приложение повторяет запрос 3 раза, SDK под ним — 3 раза, и балансировщик нагрузки — тоже 3 раза, то один клик может превратиться в 27 запросов к серверу, который и так лежит. Повторяйте на **одном** уровне (SDK — хороший кандидат), держите число попыток маленьким и делайте его настраиваемым, чтобы приложения, которые повторяют запросы сами, могли выключить повторы SDK.
+
+</Callout>
+
+<Quiz
+  question="SDK получает 503 на каждый из этих запросов. Какой из них он может повторить автоматически?"
+  options={[
+    "POST /todos с { title: 'Nap' }",
+    "PATCH /todos/3 с { done: true }",
+    "GET /movies?page=2",
+    "Все: 503 значит, что сервер ничего не сделал",
+  ]}
+  answer={2}
+  explanation="Вслепую повторять можно только идемпотентные запросы. GET идемпотентен. POST — нет: 503 от прокси не доказывает, что сервер ничего не сделал, и без ключа идемпотентности повторный POST может создать дубликат. PATCH тоже не обязательно идемпотентен (изменение вида «прибавить 1 к likes» — нет), поэтому SDK не повторяет ни тот, ни другой."
+/>
+
+## Пагинация как асинхронный итератор
+
+`searchMovies` возвращает по одной **странице** за раз: `{ page, totalPages, total, results }`. Пользователям почти всегда нужно «все фильмы» или «фильмы, пока не найду нужный», а писать цикл по страницам каждый раз скучно, и в нём легко ошибиться (сдвиг на единицу, забытая последняя страница). **Асинхронный генератор** (async generator) прячет страницы: `async function*` может делать `await` между элементами и отдавать их по одному через `yield`, а `for await` их потребляет. Возможно, вы помните `allMovies` из урока JavaScript [Цикл событий в деталях](/learn/javascript/the-event-loop-in-depth); вот он же с типами:
+
+<CodeExample output={`Первый фильм до 2017 года: Midnight in the Forest
+Запросов на этот момент: 1
+Фильмов: 12, всего запросов: 5`}>
+
+```ts
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+type Movie = { title: string; year: number };
+
+let requests = 0;
+async function moviePage(page: number): Promise<Page<Movie>> {
+  requests++;
+  const url = `https://api.pandadev.test/movies?limit=3&page=${page}`;
+  const res = await fetch(url);
+  return (await res.json()) as Page<Movie>; // SDK вместо этого проверяет данные
+}
+
+async function* allMovies(): AsyncGenerator<Movie, void, undefined> {
+  for (let page = 1; ; page++) {
+    const { results, totalPages } = await moviePage(page);
+    yield* results; // отдаём фильмы этой страницы по одному
+    if (page >= totalPages) return;
+  }
+}
+
+for await (const movie of allMovies()) {
+  if (movie.year < 2017) {
+    console.log(`Первый фильм до 2017 года: ${movie.title}`);
+    break; // генератор останавливается: больше страниц не загружается
+  }
+}
+console.log(`Запросов на этот момент: ${requests}`);
+
+const titles: string[] = [];
+for await (const movie of allMovies()) {
+  titles.push(movie.title);
+}
+console.log(`Фильмов: ${titles.length}, всего запросов: ${requests}`);
+```
+
+</CodeExample>
+
+Два свойства делают генераторы идеальными для этой задачи:
+
+- **Они ленивые.** Первый цикл нашёл свой фильм на странице 1 и сделал `break`, что завершает генератор, поэтому страницы 2–4 так и не загрузились. Функция, возвращающая большой массив, сначала загрузила бы все четыре страницы.
+- **`yield*` отдаёт целый массив** поэлементно, так что тело генератора остаётся крошечным циклом по страницам.
+
+Версия в SDK работает с **любым** методом, ответ которого — страница. В её сигнатуре и вступают в игру типы:
+
+```ts
+async function* paginate<Q extends { page?: number }, T>(
+  method: (input: { query?: Q }) => Promise<Result<Page<T>, ApiError>>,
+  query?: NoInfer<Q>,
+): AsyncGenerator<T, void, undefined>
+```
+
+- **Ограничение — это параметр `method`.** `T` выводится из результата метода, так что `paginate(panda.searchMovies)` отдаёт `Movie`. Метод, который не возвращает страницы, не подходит; сообщение заканчивается понятной строкой: `Property 'params' is missing in type '{ query?: { page?: number | undefined; } | undefined; }' but required in type '{ params: { id: Brand<number, "MovieId">; }; }'.`
+- **`NoInfer<Q>`** (из урока [Вариантность и вывод типов](/learn/typescript/variance-and-inference)) заставляет `Q` выводиться только из метода. Без него опечатка в настройке `query` просто расширила бы `Q`. С ним вы получаете нужную ошибку:
+
+```ts
+paginate(panda.searchMovies, { genr: "drama" });
+// ❌ Error: Object literal may only specify known properties, but 'genr' does not exist in type '{ page?: number | undefined; search?: string | undefined; genre?: string | undefined; limit?: number | undefined; }'. Did you mean to write 'genre'?
+```
+
+- **`AsyncGenerator<T, void, undefined>`** прямо говорит, что получает `for await` (`T`), что генератор возвращает в конце (ничего) и что вызывающие могут передать в `next()` (ничего).
+
+Внутри запрос каждой страницы становится `method({ query: { ...query, page } as Q })`. Это приведение просит сам TypeScript, и стоит понять почему: spread от `Q`, который может быть `undefined`, даёт `{ page: number }`, а TypeScript не может доказать, что это в общем случае допустимый `Q` (`'{ page: number; }' is assignable to the constraint of type 'Q', but 'Q' could be instantiated with a different subtype of constraint '{ page?: number | undefined; }'.`). И он прав: `Q` с **обязательным** полем сломался бы. У постраничных эндпоинтов поля query только необязательные, а если бы это было не так, `buildRequest` бросил бы `ValidationError`, поэтому здесь приведение безопасно.
+
+А что с ошибками? В цикле `for await` нет места для `Result`: когда падает страница 3, нечего вернуть. Поэтому `paginate` **бросает** исключение — `ApiFailure`, которое несёт `ApiError`, так что `catch` всё равно получает типизированную ошибку:
+
+```ts
+try {
+  for await (const movie of paginate(panda.searchMovies)) {
+    show(movie);
+  }
+} catch (error) {
+  if (error instanceof ApiFailure) report(error.error); // ApiError
+  else throw error;
+}
+```
+
+`ApiFailure` объявляет поле `error` и присваивает его в конструкторе, а не использует свойство-параметр вроде `constructor(readonly error: ApiError)`. Так исходный код SDK остаётся **стираемым** (erasable, см. урок [Как работает компилятор](/learn/typescript/how-the-compiler-works)), и он работает как есть при удалении типов в Node и в любом инструменте, который только транспилирует.
+
+## Хуки для авторизации, логов и метрик
+
+Каждый настоящий SDK в течение месяца получает одни и те же запросы на фичи: «как добавить мой API-ключ?», «как логировать запросы?», «как измерить задержку?». Вместо настройки под каждый случай мы предлагаем два **хука**:
+
+```ts
+interface Hooks {
+  onRequest?: (request: SdkRequest) => SdkRequest;
+  onResponse?: (info: ResponseInfo) => void;
+}
+
+interface ResponseInfo {
+  request: SdkRequest;
+  attempt: number;
+  status: number | null; // null: на запрос так и не ответили
+  ms: number;
+}
+```
+
+`onRequest` запускается **один раз** на вызов, перед первой попыткой, и возвращает запрос, который нужно отправить, так что может добавлять заголовки, ничего не изменяя в том, что держит SDK. `onResponse` запускается после **каждой** попытки, включая неудачные, с номером попытки и затраченным временем (измеренным внедрёнными `now`). Вот как приложение могло бы ими пользоваться:
+
+```ts
+const panda = createClient(pandaApi, {
+  hooks: {
+    onRequest: (request) => ({
+      ...request,
+      headers: { ...request.headers, Authorization: `Bearer ${key}` },
+    }),
+    onResponse: ({ request, status, attempt, ms }) => {
+      metrics.timing("panda.request", ms, { status, attempt });
+      if (status === null || status >= 500) {
+        log.warn(`${request.method} ${request.url} -> ${status}`);
+      }
+    },
+  },
+});
+```
+
+Библиотеки вроде ky и axios предлагают полноценные цепочки middleware (сколько угодно перехватчиков, которые могут ещё и менять ответы). Два хука покрывают запросы, которые мы реально получаем, а добавить третий потом — минорный релиз, тогда как удалить один — мажорный. Начинайте с малого. И одно правило для всего, что логирует запросы: **никогда не логируйте заголовок `Authorization`**. Хуки видят всё, включая секреты.
+
+## Тестируем клиент
+
+Клиент — та часть SDK, которая общается с внешним миром, поэтому именно здесь окупаются внедрённые фейки. Два крошечных помощника покрывают почти каждый тест. `fakeFetch` отвечает списком заготовленных ответов (или бросает `Error` из списка) и использует настоящие объекты `Response`, так что ему не нужны приведения, — вы видели это в уроке [Внедрение зависимостей и фейки](/learn/typescript/dependency-injection-and-fakes):
+
+```ts
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep = async (ms: number) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+// fetch, который отдаёт эти ответы по порядку (Error бросается)
+function fakeFetch(...answers: (Response | Error)[]) {
+  return vi.fn<typeof fetch>(async () => {
+    const next = answers.shift();
+    if (next === undefined) throw new Error("Ответы закончились");
+    if (next instanceof Error) throw next;
+    return next;
+  });
+}
+```
+
+С ними расписание backoff проверяется одной строкой, и тест совсем не ждёт (`busy()` создаёт ответ 503, а `movieJson` — фильм в том виде, в каком его присылает API):
+
+```ts
+it("повторяет GET с backoff, а потом получает ответ", async () => {
+  const { sleep, waits } = fakeSleep();
+  const fetch = fakeFetch(busy(), busy(), Response.json(movieJson));
+  const panda = createClient(pandaApi, {
+    fetch,
+    sleep,
+    random: () => 1,
+  });
+  const result = await panda.getMovie({
+    params: { id: MovieId.parse(1) },
+  });
+  expect(result.ok).toBe(true);
+  expect(fetch).toHaveBeenCalledTimes(3);
+  expect(waits).toEqual([200, 400]);
+});
+```
+
+Фейки тестируют редкие случаи, которые не получить по запросу (оборванное соединение, сломанное тело). Несколько тестов также ходят в **учебный API**, который заменяет настоящий сервис: они проверяют, что наше описание совпадает с тем, что API присылает на самом деле. Один из них демонстрирует свойство дизайна: `createClient` работает с **любым** описанием, так что тест может описать эндпоинт учебного API `/flaky` (он дважды падает с 503, а потом работает), не добавляя его в SDK:
+
+```ts
+const testApi = defineApi({
+  flaky: {
+    method: "GET",
+    path: "/flaky",
+    response: object({ ok: boolean(), attempt: number() }),
+  },
+});
+const client = createClient(testApi, { sleep });
+expect(await client.flaky()).toEqual({
+  ok: true,
+  value: { ok: true, attempt: 3 },
+});
+```
+
+<Callout type="note" title="Тесты на живом API">
+
+В настоящем репозитории тесты, которые обращаются к живому API, — это **контрактные тесты** (contract tests): они медленнее и могут упасть из-за сети, а не из-за вашего кода. Держите их немного, запускайте по расписанию или перед релизами, а быстрые тесты на фейках оставьте для каждого пуша. Учебный API PandaDev отвечает в пределах 100 мс и каждый раз одинаково, так что здесь они могут работать вместе с остальными.
+
+</Callout>
+
+<Quiz
+  question="Пользователь пишет: for await (const movie of paginate(panda.searchMovies)) { if (movie.rating > 8) { show(movie); break; } }. Первый фильм с рейтингом выше 8 — на странице 1 из 3. Сколько запросов страниц сделает paginate?"
+  options={[
+    "3: сначала он загружает все страницы",
+    "1: генератор загружает следующую страницу, только когда цикл просит ещё, а break его завершает",
+    "2: он всегда загружает одну страницу наперёд",
+    "0: асинхронные генераторы не умеют пользоваться fetch",
+  ]}
+  answer={1}
+  explanation="Асинхронный генератор работает только тогда, когда потребитель просит следующий элемент. После фильмов страницы 1 цикл делает break, который вызывает return() генератора и завершает его, так и не запросив страницу 2."
+/>
+
+<Exercise
+  title="Соберите: клиент"
+  language="typescript"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ---------- схемы: библиотека из Уровня 2, повзрослевшая ----------
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = {
+  parse: (value: unknown, path?: string) => T;
+  optional?: true;
+};
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+// 204 No Content: клиент читает это как null
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function optional<T>(
+  schema: Schema<T>,
+): Schema<T | undefined> & { optional: true } {
+  return {
+    optional: true,
+    parse: (value, path) =>
+      value === undefined ? undefined : schema.parse(value, path),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+// Ключи, чья схема — optional(...)
+type OptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K] extends { optional: true } ? K : never;
+}[keyof S];
+type ObjectOf<S extends Shape> = Simplify<
+  { [K in Exclude<keyof S, OptionalKeys<S>>]: Infer<S[K]> } & {
+    [K in OptionalKeys<S>]?: Infer<S[K]>;
+  }
+>;
+
+function object<S extends Shape>(shape: S): Schema<ObjectOf<S>> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        const parsed = shape[key].parse(value[key], where);
+        if (parsed !== undefined) result[key] = parsed;
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as ObjectOf<S>;
+    },
+  };
+}
+
+// ---------- брендированные id ----------
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+// Схема для id и единственный способ его создать
+function brandedId<Name extends string>(
+  name: Name,
+): Schema<Brand<number, Name>> {
+  return primitive(
+    \`a \${name}\`,
+    (v): v is Brand<number, Name> =>
+      typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+  );
+}
+
+// ---------- данные учебного API ----------
+const MovieId = brandedId("MovieId");
+type MovieId = Infer<typeof MovieId>;
+const TodoId = brandedId("TodoId");
+type TodoId = Infer<typeof TodoId>;
+const UserId = brandedId("UserId");
+type UserId = Infer<typeof UserId>;
+const PostId = brandedId("PostId");
+type PostId = Infer<typeof PostId>;
+
+const Movie = object({
+  id: MovieId,
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof Movie>;
+
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+function page<T>(item: Schema<T>): Schema<Page<T>> {
+  return object({
+    page: number(),
+    totalPages: number(),
+    total: number(),
+    results: array(item),
+  });
+}
+
+const User = object({
+  id: UserId,
+  name: string(),
+  username: string(),
+  email: string(),
+});
+type User = Infer<typeof User>;
+
+const Post = object({
+  id: PostId,
+  userId: UserId,
+  title: string(),
+  likes: number(),
+});
+type Post = Infer<typeof Post>;
+
+const Todo = object({ id: TodoId, title: string(), done: boolean() });
+type Todo = Infer<typeof Todo>;
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+const TodoPatch = object({
+  title: optional(string()),
+  done: optional(boolean()),
+});
+
+// ---------- описание API ----------
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface Endpoint {
+  method: Method;
+  path: \`/\${string}\`;
+  params?: Shape;
+  query?: Schema<object>;
+  body?: Schema<unknown>;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// "/users/:userId/posts/:postId" -> "userId" | "postId"
+type ParamNames<P extends string> =
+  P extends \`\${string}:\${infer Name}/\${infer Rest}\`
+    ? Name | ParamNames<Rest>
+    : P extends \`\${string}:\${infer Name}\`
+      ? Name
+      : never;
+
+// Путь с :params требует по схеме на каждый параметр
+type ParamsFor<P extends string> = [ParamNames<P>] extends [never]
+  ? {}
+  : { params: Record<ParamNames<P>, Schema<string | number>> };
+
+type CheckParams<A extends ApiDescription> = {
+  [K in keyof A]: ParamsFor<A[K]["path"]>;
+};
+
+function defineApi<const A extends ApiDescription>(
+  api: A & CheckParams<A>,
+): A {
+  return api;
+}
+
+const pandaApi = defineApi({
+  getMovie: {
+    method: "GET",
+    path: "/movies/:id",
+    params: { id: MovieId },
+    response: Movie,
+  },
+  searchMovies: {
+    method: "GET",
+    path: "/movies",
+    query: object({
+      search: optional(string()),
+      genre: optional(string()),
+      page: optional(number()),
+      limit: optional(number()),
+    }),
+    response: page(Movie),
+  },
+  getUser: {
+    method: "GET",
+    path: "/users/:id",
+    params: { id: UserId },
+    response: User,
+  },
+  listPosts: {
+    method: "GET",
+    path: "/posts",
+    query: object({ userId: optional(UserId) }),
+    response: array(Post),
+  },
+  listTodos: {
+    method: "GET",
+    path: "/todos",
+    response: array(Todo),
+  },
+  createTodo: {
+    method: "POST",
+    path: "/todos",
+    body: NewTodo,
+    response: Todo,
+  },
+  updateTodo: {
+    method: "PATCH",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    body: TodoPatch,
+    response: Todo,
+  },
+  deleteTodo: {
+    method: "DELETE",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    response: nothing(),
+  },
+});
+type PandaApi = typeof pandaApi;
+
+// ---------- типы, выведенные из описания ----------
+type ParamsInput<E> = E extends { params: infer P extends Shape }
+  ? { params: ObjectOf<P> }
+  : {};
+type QueryInput<E> = E extends { query: infer Q extends Schema<object> }
+  ? {} extends Infer<Q>
+    ? { query?: Infer<Q> } // все поля query необязательные
+    : { query: Infer<Q> }
+  : {};
+type BodyInput<E> = E extends { body: infer B extends Schema<unknown> }
+  ? { body: Infer<B> }
+  : {};
+
+type Input<E extends Endpoint> = Simplify<
+  ParamsInput<E> & QueryInput<E> & BodyInput<E>
+>;
+type Output<E extends Endpoint> = Infer<E["response"]>;
+// Нет обязательного ввода: аргумент можно не передавать
+type InputArgs<E extends Endpoint> = {} extends Input<E>
+  ? [input?: Input<E>]
+  : [input: Input<E>];
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: (
+    ...input: InputArgs<A[K]>
+  ) => Promise<Result<Output<A[K]>, ApiError>>;
+};
+
+// ---------- от ввода к запросу ----------
+interface SdkRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+// Внутри SDK ввод типизирован свободно (и проверяется в рантайме)
+type RawInput = {
+  params?: Record<string, unknown>;
+  query?: unknown;
+  body?: unknown;
+};
+
+function buildRequest(
+  baseUrl: string,
+  endpoint: Endpoint,
+  input: RawInput = {},
+): SdkRequest {
+  const path = endpoint.path.replace(/:(\\w+)/g, (_, name: string) => {
+    const schema = endpoint.params?.[name];
+    if (!schema) throw new Error(\`Нет схемы для :\${name}\`);
+    const value = schema.parse(input.params?.[name], \`params.\${name}\`);
+    return encodeURIComponent(String(value));
+  });
+  let url = baseUrl.replace(/\\/+$/, "") + path;
+  if (endpoint.query) {
+    const query = endpoint.query.parse(input.query ?? {}, "query");
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      search.set(key, String(value));
+    }
+    if (search.size > 0) url += \`?\${search}\`;
+  }
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  const request: SdkRequest = { method: endpoint.method, url, headers };
+  if (endpoint.body) {
+    const body = endpoint.body.parse(input.body, "body");
+    request.body = JSON.stringify(body);
+    headers["Content-Type"] = "application/json";
+  }
+  return request;
+}
+
+// ---------- клиент: настройки ----------
+interface RetryOptions {
+  attempts: number; // всего, включая первую
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+interface ResponseInfo {
+  request: SdkRequest;
+  attempt: number;
+  status: number | null; // null: на запрос так и не ответили
+  ms: number;
+}
+
+interface Hooks {
+  onRequest?: (request: SdkRequest) => SdkRequest;
+  onResponse?: (info: ResponseInfo) => void;
+}
+
+interface ClientOptions {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+  retry?: Partial<RetryOptions>;
+  hooks?: Hooks;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  now?: () => number;
+}
+
+const DEFAULT_RETRY: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 200,
+  maxDelayMs: 2_000,
+};
+
+// Повторная отправка этих методов безвредна, их можно повторять
+const IDEMPOTENT = new Set<Method>(["GET", "PUT", "DELETE"]);
+
+function fail(error: ApiError): Result<never, ApiError> {
+  return { ok: false, error };
+}
+
+function apiMessage(body: unknown): string | undefined {
+  return isRecord(body) && typeof body.error === "string"
+    ? body.error
+    : undefined;
+}
+
+// ---------- повторы ----------
+// TODO: сетевые ошибки, 429 и 5xx стоят ещё одной попытки,
+// всё остальное — нет
+function isRetryable(error: ApiError): boolean {
+  return false;
+}
+
+// TODO: baseDelayMs, удваивается с каждой попыткой, но не больше
+// maxDelayMs; затем половина фиксирована, а половина случайна
+function backoff(
+  attempt: number,
+  retry: RetryOptions,
+  random: () => number,
+): number {
+  return 0;
+}
+
+// ---------- клиент ----------
+function createClient<A extends ApiDescription>(
+  api: A,
+  options: ClientOptions = {},
+): Client<A> {
+  const {
+    baseUrl = "https://api.pandadev.test",
+    fetch: fetchFn = fetch,
+    hooks = {},
+    sleep = (ms: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    random = Math.random,
+    now = Date.now,
+  } = options;
+  const retry: RetryOptions = { ...DEFAULT_RETRY, ...options.retry };
+
+  // Одна попытка: fetch, прочитать тело и сообщить, как всё прошло
+  async function attemptOnce(
+    request: SdkRequest,
+    attempt: number,
+  ): Promise<Result<unknown, ApiError>> {
+    const started = now();
+    const report = (status: number | null) => {
+      const ms = now() - started;
+      hooks.onResponse?.({ request, attempt, status, ms });
+    };
+    let res: Response;
+    try {
+      res = await fetchFn(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      });
+    } catch (error) {
+      report(null);
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return fail({ kind: "network", message });
+    }
+    const body: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    report(res.status);
+    if (!res.ok) {
+      const message = apiMessage(body) ?? \`HTTP \${res.status}\`;
+      return fail({ kind: "http", status: res.status, message });
+    }
+    return { ok: true, value: body };
+  }
+
+  // Собрать запрос, отправить (повторно), проверить ответ
+  async function send(
+    endpoint: Endpoint,
+    input: RawInput,
+  ): Promise<Result<unknown, ApiError>> {
+    // TODO: соберите запрос (buildRequest, затем hooks.onRequest).
+    // Отправьте его через attemptOnce: до retry.attempts раз для
+    // методов из IDEMPOTENT и один раз для остальных. Повторяйте
+    // только ошибки, которые стоит повторить, ожидая backoff(...) мс.
+    // Успешное тело разберите схемой endpoint.response;
+    // ValidationError превращается в ошибку "invalid-response".
+    throw new Error("Ещё не написано");
+  }
+
+  // По методу на эндпоинт: Client<A> — это обещание, цикл его
+  // выполняет, а приведение говорит об этом ровно в одном месте
+  const client: Record<string, (input?: RawInput) => unknown> = {};
+  for (const name of Object.keys(api)) {
+    const endpoint = api[name];
+    client[name] = (input = {}) => send(endpoint, input);
+  }
+  return client as Client<A>;
+}
+
+// ---------- пагинация ----------
+// Для API без канала Result, например асинхронной итерации
+class ApiFailure extends Error {
+  readonly error: ApiError;
+  constructor(error: ApiError) {
+    super(error.message);
+    this.name = "ApiFailure";
+    this.error = error;
+  }
+}
+
+// Каждый элемент каждой страницы, страницы загружаются по одной
+async function* paginate<Q extends { page?: number }, T>(
+  method: (input: { query?: Q }) => Promise<Result<Page<T>, ApiError>>,
+  query?: NoInfer<Q>,
+): AsyncGenerator<T, void, undefined> {
+  // TODO: запрашивайте по одной странице, от query.page (или 1)
+  // до последней, и отдавайте (yield) каждый элемент. Неудачная
+  // страница бросает ApiFailure.
+  throw new Error("Ещё не написано");
+}
+
+// ---------- тесты ----------
+const BASE = "https://api.pandadev.test";
+
+describe("buildRequest", () => {
+  it("подставляет параметры пути", () => {
+    const request = buildRequest(BASE, pandaApi.getMovie, {
+      params: { id: 7 },
+    });
+    expect(request).toEqual({
+      method: "GET",
+      url: \`\${BASE}/movies/7\`,
+      headers: { Accept: "application/json" },
+    });
+  });
+
+  it("добавляет в query только заданные значения", () => {
+    const request = buildRequest(BASE, pandaApi.searchMovies, {
+      query: { search: "bamboo & tea", page: undefined, limit: 2 },
+    });
+    expect(request.url).toBe(
+      \`\${BASE}/movies?search=bamboo+%26+tea&limit=2\`,
+    );
+    const all = buildRequest(BASE, pandaApi.searchMovies);
+    expect(all.url).toBe(\`\${BASE}/movies\`);
+  });
+
+  it("отправляет тело в JSON", () => {
+    const request = buildRequest(BASE, pandaApi.updateTodo, {
+      params: { id: 2 },
+      body: { done: true },
+    });
+    expect(request.method).toBe("PATCH");
+    expect(request.url).toBe(\`\${BASE}/todos/2\`);
+    expect(request.body).toBe('{"done":true}');
+    expect(request.headers["Content-Type"]).toBe("application/json");
+  });
+
+  it("проверяет каждую часть ввода до отправки", () => {
+    expect(() =>
+      buildRequest(BASE, pandaApi.getMovie, { params: { id: "7" } }),
+    ).toThrow('params.id: expected a MovieId, got "7"');
+    expect(() =>
+      buildRequest(BASE, pandaApi.createTodo, { body: { title: 5 } }),
+    ).toThrow("body.title: expected a string, got 5");
+  });
+});
+
+describe("brandedId", () => {
+  it("принимает положительное целое число", () => {
+    expect(MovieId.parse(7)).toBe(7);
+  });
+
+  it.each([0, -3, 1.5])("отклоняет %s", (value) => {
+    expect(() => MovieId.parse(value)).toThrow(ValidationError);
+  });
+
+  it("отклоняет строки", () => {
+    expect(() => MovieId.parse("7")).toThrow('expected a MovieId');
+  });
+});
+
+// ---------- тесты клиента ----------
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep = async (ms: number) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+// fetch, который отдаёт эти ответы по порядку (Error бросается)
+function fakeFetch(...answers: (Response | Error)[]) {
+  return vi.fn<typeof fetch>(async () => {
+    const next = answers.shift();
+    if (next === undefined) throw new Error("Ответы закончились");
+    if (next instanceof Error) throw next;
+    return next;
+  });
+}
+
+const movieJson = {
+  id: 1,
+  title: "The Bamboo Heist",
+  year: 2019,
+  director: "Mei Lin",
+  genres: ["comedy", "crime"],
+  rating: 7.8,
+  minutes: 104,
+};
+const busy = () => Response.json({ error: "busy" }, { status: 503 });
+
+describe("createClient", () => {
+  it("получает фильм из учебного API", async () => {
+    const panda = createClient(pandaApi);
+    const id = MovieId.parse(1);
+    expect(await panda.getMovie({ params: { id } })).toEqual({
+      ok: true,
+      value: movieJson,
+    });
+  });
+
+  it("превращает 404 в ошибку http без повторов", async () => {
+    const { sleep, waits } = fakeSleep();
+    const panda = createClient(pandaApi, { sleep });
+    const id = MovieId.parse(99);
+    expect(await panda.getMovie({ params: { id } })).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Movie not found" },
+    });
+    expect(waits).toEqual([]);
+  });
+
+  it("повторяет GET с backoff, а потом получает ответ", async () => {
+    const { sleep, waits } = fakeSleep();
+    const fetch = fakeFetch(busy(), busy(), Response.json(movieJson));
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep,
+      random: () => 1,
+    });
+    const result = await panda.getMovie({
+      params: { id: MovieId.parse(1) },
+    });
+    expect(result.ok).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(waits).toEqual([200, 400]);
+  });
+
+  it("сдаётся после последней попытки", async () => {
+    const { sleep, waits } = fakeSleep();
+    const offline = () => new TypeError("Failed to fetch");
+    const fetch = fakeFetch(offline(), offline(), offline());
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep,
+      random: () => 0,
+    });
+    expect(await panda.listTodos()).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+    expect(waits).toEqual([100, 200]);
+  });
+
+  it("сообщает о теле, которое не подходит под схему", async () => {
+    const wrong = { ...movieJson, year: "2019" };
+    const fetch = fakeFetch(Response.json(wrong));
+    const panda = createClient(pandaApi, { fetch });
+    const result = await panda.getMovie({
+      params: { id: MovieId.parse(1) },
+    });
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "invalid-response",
+        message: 'year: expected a number, got "2019"',
+      },
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("даёт хукам менять запросы и видеть каждую попытку", async () => {
+    const log: string[] = [];
+    const fetch = fakeFetch(busy(), Response.json([]));
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep: fakeSleep().sleep,
+      hooks: {
+        onRequest: (request) => ({
+          ...request,
+          headers: { ...request.headers, Authorization: "Bearer abc" },
+        }),
+        onResponse: ({ request, status, attempt }) => {
+          log.push(\`\${request.method} \${status} #\${attempt}\`);
+        },
+      },
+    });
+    await panda.listTodos();
+    expect(log).toEqual(["GET 503 #1", "GET 200 #2"]);
+    expect(fetch).toHaveBeenLastCalledWith(
+      "https://api.pandadev.test/todos",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: "Bearer abc",
+        }),
+      }),
+    );
+  });
+
+  it("работает с любым описанием: /flaky требует повторов", async () => {
+    const testApi = defineApi({
+      flaky: {
+        method: "GET",
+        path: "/flaky",
+        response: object({ ok: boolean(), attempt: number() }),
+      },
+    });
+    const { sleep, waits } = fakeSleep();
+    const client = createClient(testApi, { sleep });
+    expect(await client.flaky()).toEqual({
+      ok: true,
+      value: { ok: true, attempt: 3 },
+    });
+    expect(waits).toHaveLength(2);
+  });
+
+  // TODO: ваш тест: POST, упавший с 503, НЕ повторяется
+  // (создать задачу дважды — настоящий баг)
+});
+
+describe("paginate", () => {
+  it("проходит все страницы учебного API", async () => {
+    const spy = vi.fn<typeof fetch>((url, init) => fetch(url, init));
+    const panda = createClient(pandaApi, { fetch: spy });
+    const titles: string[] = [];
+    for await (const movie of paginate(panda.searchMovies, {})) {
+      titles.push(movie.title);
+    }
+    expect(titles).toHaveLength(12);
+    expect(titles[11]).toBe("The Great Bamboo Race");
+    expect(spy).toHaveBeenCalledTimes(3);
+  });
+});
+
+// ---------- тесты типов: не меняйте их ----------
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamNames<"/users/:userId/posts/:postId">,
+    "userId" | "postId">>,
+  Expect<Equal<ParamNames<"/todos">, never>>,
+  Expect<Equal<Input<PandaApi["getMovie"]>,
+    { params: { id: MovieId } }>>,
+  Expect<Equal<Input<PandaApi["listPosts"]>,
+    { query?: { userId?: UserId } }>>,
+  Expect<Equal<Input<PandaApi["updateTodo"]>, {
+    params: { id: TodoId };
+    body: { title?: string; done?: boolean };
+  }>>,
+  Expect<Equal<Input<PandaApi["listTodos"]>, {}>>,
+  Expect<Equal<Output<PandaApi["getUser"]>, User>>,
+  Expect<Equal<Output<PandaApi["deleteTodo"]>, null>>,
+];
+
+async function typeTests(
+  panda: Client<PandaApi>,
+  todo: Todo,
+  post: Post,
+) {
+  await panda.listTodos(); // ничего не обязательно, поэтому без аргумента
+  await panda.getUser({ params: { id: post.userId } });
+  await panda.createTodo({ body: { title: "Nap" } });
+  // @ts-expect-error: TodoId — это не MovieId
+  await panda.getMovie({ params: { id: todo.id } });
+  // @ts-expect-error: простое число — не проверенный id
+  await panda.getMovie({ params: { id: 1 } });
+  // @ts-expect-error: getMovie нужны его params
+  await panda.getMovie();
+  // @ts-expect-error: limit — это число
+  await panda.searchMovies({ query: { limit: "5" } });
+  // @ts-expect-error: новой задаче нужен title
+  await panda.createTodo({ body: { done: true } });
+  const id = MovieId.parse(1);
+  const movie = await panda.getMovie({ params: { id } });
+  // @ts-expect-error: проверьте ok, прежде чем читать value
+  movie.value;
+}
+
+async function typeTests2(panda: Client<PandaApi>) {
+  const client: Client<PandaApi> = createClient(pandaApi);
+  for await (const movie of paginate(panda.searchMovies)) {
+    const title: string = movie.title;
+  }
+  // @ts-expect-error: getMovie не возвращает страницы
+  paginate(panda.getMovie);
+  // @ts-expect-error: в query фильмов нет "genr"
+  paginate(panda.searchMovies, { genr: "drama" });
+}
+
+// ---------- попробуйте ----------
+const panda = createClient(pandaApi, {
+  hooks: {
+    onResponse: ({ request, status, attempt }) => {
+      const { method, url } = request;
+      console.log(\`\${method} \${url} -> \${status} (попытка \${attempt})\`);
+    },
+  },
+});
+const todo = await panda.createTodo({
+  body: { title: "Выпустить SDK" },
+});
+console.log(todo);
+if (todo.ok) {
+  const done = await panda.updateTodo({
+    params: { id: todo.value.id },
+    body: { done: true },
+  });
+  console.log(done);
+}
+for await (const movie of paginate(panda.searchMovies, { limit: 2 })) {
+  if (movie.year < 2016) {
+    console.log(\`Нашёлся старый фильм: \${movie.title} (\${movie.year})\`);
+    break; // больше страниц не загружается
+  }
+}`}
+  tests={[
+    { name: "Код компилируется, вместе с тестами типов", check: "true" },
+    { name: "Все тесты проходят: из части 1, из части 2 и ваш новый", check: "__vitest.failed === 0 && __vitest.passed >= 18" },
+    { name: "isRetryable: сетевые ошибки, 429 и 5xx — да; остальные — нет", check: "isRetryable({ kind: 'network', message: 'x' }) === true && [429, 500, 502, 503].every((status) => isRetryable({ kind: 'http', status, message: 'x' }) === true) && [400, 401, 404, 409, 422].every((status) => isRetryable({ kind: 'http', status, message: 'x' }) === false) && isRetryable({ kind: 'invalid-response', message: 'x' }) === false" },
+    { name: "backoff удваивается, упирается в максимум и наполовину случаен", check: "(() => { const r = { attempts: 9, baseDelayMs: 100, maxDelayMs: 1000 }; const top = [1, 2, 3, 4, 5, 6].map((a) => backoff(a, r, () => 1)).join(); const low = [1, 2, 3, 4, 5].map((a) => backoff(a, r, () => 0)).join(); return top === '100,200,400,800,1000,1000' && low === '50,100,200,400,500' && backoff(1, r, () => 0.5) === 75 && backoff(2, { attempts: 3, baseDelayMs: 300, maxDelayMs: 5000 }, () => 1) === 600; })()" },
+    { name: "GET повторяются после сетевых ошибок и 5xx, с ожиданием между попытками", check: "await (async () => { const answers = [...[new TypeError('Failed to fetch'), () => Response.json({ error: 'busy' }, { status: 503 }), () => Response.json([{ id: 1, title: 'A', done: false }])]]; const calls = []; const fetchFn = async (url, init) => { calls.push({ url, init }); const next = answers.shift(); if (next === undefined) throw new Error('No more answers'); if (next instanceof Error) throw next; return next(); }; const waits = []; const c = createClient(pandaApi, { fetch: fetchFn, sleep: async (ms) => { waits.push(ms); }, random: () => 1, retry: { baseDelayMs: 10 } }); const r = await c.listTodos(); return r.ok === true && r.value[0].title === 'A' && calls.length === 3 && waits.join() === '10,20'; })()" },
+    { name: "Повторы останавливаются на retry.attempts и возвращают последнюю ошибку", check: "await (async () => { const answers = [...[() => Response.json({ error: 'a' }, { status: 500 }), () => Response.json({ error: 'b' }, { status: 502 }), () => Response.json({ error: 'c' }, { status: 503 }), () => Response.json({ error: 'd' }, { status: 504 })]]; const calls = []; const fetchFn = async (url, init) => { calls.push({ url, init }); const next = answers.shift(); if (next === undefined) throw new Error('No more answers'); if (next instanceof Error) throw next; return next(); }; const waits = []; const c = createClient(pandaApi, { fetch: fetchFn, sleep: async (ms) => { waits.push(ms); }, random: () => 0, retry: { attempts: 4, baseDelayMs: 100, maxDelayMs: 300 } }); const r = await c.searchMovies(); return r.ok === false && r.error.kind === 'http' && r.error.status === 504 && r.error.message === 'd' && calls.length === 4 && waits.join() === '50,100,150'; })()" },
+    { name: "Нет повторов для 4xx, неверных тел, POST и PATCH", check: "await (async () => { const run = async (call, answer) => { let n = 0; const waits = []; const c = createClient(pandaApi, { fetch: async () => { n++; return answer(); }, sleep: async (ms) => { waits.push(ms); } }); const r = await call(c); return r.ok === false && n === 1 && waits.length === 0; }; const busy = () => Response.json({ error: 'busy' }, { status: 503 }); return await run((c) => c.getUser({ params: { id: 1 } }), () => Response.json({ error: 'nope' }, { status: 404 })) && await run((c) => c.getUser({ params: { id: 1 } }), () => Response.json({ id: 1 })) && await run((c) => c.createTodo({ body: { title: 'x' } }), busy) && await run((c) => c.updateTodo({ params: { id: 1 }, body: {} }), busy); })()" },
+    { name: "Результаты: ошибки http берут сообщение из тела, неверные тела объясняют причину, 204 — это null", check: "await (async () => { const one = (answer) => createClient(pandaApi, { fetch: async () => answer(), sleep: async () => {} }); const a = await one(() => Response.json({ error: 'Movie not found' }, { status: 404 })).getMovie({ params: { id: 5 } }); const b = await one(() => new Response('oops', { status: 400 })).getMovie({ params: { id: 5 } }); const c = await one(() => Response.json({ id: 1, name: 'Mei' })).getUser({ params: { id: 1 } }); const d = await one(() => new Response(null, { status: 204 })).deleteTodo({ params: { id: 3 } }); return JSON.stringify(a) === JSON.stringify({ ok: false, error: { kind: 'http', status: 404, message: 'Movie not found' } }) && JSON.stringify(b) === JSON.stringify({ ok: false, error: { kind: 'http', status: 400, message: 'HTTP 400' } }) && c.ok === false && c.error.kind === 'invalid-response' && c.error.message === 'username: expected a string, got undefined' && JSON.stringify(d) === JSON.stringify({ ok: true, value: null }); })()" },
+    { name: "Плохой ввод бросает ValidationError ещё до отправки", check: "await (async () => { let n = 0; const c = createClient(pandaApi, { fetch: async () => { n++; return Response.json({}); } }); try { await c.getMovie({ params: { id: 'one' } }); return false; } catch (e) { return e instanceof ValidationError && e.message === 'params.id: expected a MovieId, got \"one\"' && n === 0; } })()" },
+    { name: "onRequest меняет запрос один раз; onResponse видит каждую попытку", check: "await (async () => { let t = 1000; const answers = [...[new TypeError('down'), () => { t += 40; return Response.json({ error: 'busy' }, { status: 503 }); }, () => { t += 25; return Response.json([]); }]]; const calls = []; const fetchFn = async (url, init) => { calls.push({ url, init }); const next = answers.shift(); if (next === undefined) throw new Error('No more answers'); if (next instanceof Error) throw next; return next(); }; const seen = []; let changed = 0; const c = createClient(pandaApi, { fetch: fetchFn, sleep: async () => {}, now: () => t, hooks: { onRequest: (req) => { changed++; return { ...req, headers: { ...req.headers, 'X-Trace': 't-1' } }; }, onResponse: (info) => seen.push(info.attempt + ':' + info.status + ':' + info.ms + ':' + info.request.headers['X-Trace']) } }); const r = await c.listPosts({ query: { userId: 2 } }); return r.ok === true && changed === 1 && seen.join() === '1:null:0:t-1,2:503:40:t-1,3:200:25:t-1' && calls.every((call) => call.url === 'https://api.pandadev.test/posts?userId=2' && call.init.headers['X-Trace'] === 't-1' && call.init.method === 'GET'); })()" },
+    { name: "paginate отдаёт каждый элемент, страница за страницей, начиная с query.page", check: "await (async () => { const urls = []; const pageOf = (page, totalPages) => Response.json({ page, totalPages, total: 9, results: [{ id: page, title: 'M' + page, year: 2000, director: 'D', genres: [], rating: 5, minutes: 90 }] }); const c = createClient(pandaApi, { fetch: async (url) => { urls.push(url); const page = Number(new URL(url).searchParams.get('page')); return pageOf(page, 4); } }); const titles = []; for await (const m of paginate(c.searchMovies, { genre: 'drama', page: 2 })) titles.push(m.title); return titles.join() === 'M2,M3,M4' && urls.length === 3 && urls[0] === 'https://api.pandadev.test/movies?genre=drama&page=2'; })()" },
+    { name: "paginate ленивый, а неудачная страница бросает ApiFailure", check: "await (async () => { let n = 0; const ok = (page) => Response.json({ page, totalPages: 5, total: 5, results: [{ id: page, title: 'M' + page, year: 2000, director: 'D', genres: [], rating: 5, minutes: 90 }] }); const c = createClient(pandaApi, { fetch: async () => { n++; return n === 3 ? Response.json({ error: 'gone' }, { status: 410 }) : ok(n); } }); for await (const m of paginate(c.searchMovies)) { break; } const lazy = n === 1; n = 0; const got = []; try { for await (const m of paginate(c.searchMovies)) got.push(m.title); return false; } catch (e) { return lazy && e instanceof ApiFailure && e.error.kind === 'http' && e.error.status === 410 && got.join() === 'M1,M2'; } })()" },
+    { name: "Ваш тест ловит клиент, который повторяет POST", check: "(await __retest([['[\"GET\", \"PUT\", \"DELETE\"]', '[\"GET\", \"PUT\", \"DELETE\", \"POST\"]']])).failed > __vitest.failed" },
+  ]}
+>
+
+Превратите описание в работающий клиент. Весь код части 1 на месте, за ним идут настройки клиента, `fail`, `apiMessage`, `attemptOnce`, цикл методов и `ApiFailure` — они готовы. Ваши задачи помечены `TODO`:
+
+1. **`isRetryable(error)`**: `true` для сетевых ошибок, 429 и 5xx; `false` для остальных HTTP-ошибок и неверных ответов. Используйте `switch` по `error.kind` без `default`, чтобы новый вид нельзя было забыть.
+2. **`backoff(attempt, retry, random)`**: `baseDelayMs`, удвоенный для каждой попытки после первой, но не больше `maxDelayMs`; затем половина этого значения фиксирована, а другая половина умножается на `random()`, с округлением.
+3. **`send(endpoint, input)`** внутри `createClient`: соберите запрос, пропустите его через `hooks.onRequest` (один раз) и отправьте через `attemptOnce`. Повторяйте только методы из `IDEMPOTENT`, всего не больше `retry.attempts` попыток, только для ошибок, которые стоит повторять, и перед каждой новой попыткой ждите `backoff(...)` мс. При успехе разберите тело схемой `endpoint.response`; `ValidationError` превращается в ошибку `invalid-response`. Плохой ввод по-прежнему должен бросать исключение до какой-либо отправки.
+4. **`paginate(method, query)`**: запрашивайте по одной странице, начиная с `query.page` (или 1), отдавайте каждый элемент и остановитесь после последней страницы. Неудачная страница бросает `ApiFailure`.
+5. **Ваш тест**: в `describe("createClient")` проверьте, что `POST`, упавший с 503, **не** повторяется: один вызов fetch, никаких ожиданий и 503 в результате.
+
+Все тесты части 1 и большая часть тестов части 2 уже на месте: это ваш список дел.
+
+<Hint>
+
+**`isRetryable`**: `case "network": return true;`, `case "http": return error.status === 429 || error.status >= 500;`, `case "invalid-response": return false;`.
+
+**`backoff`**: `const exp = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** (attempt - 1));`, затем `Math.round(exp / 2 + (exp / 2) * random())`.
+
+**`send`**: начните с `let request = buildRequest(baseUrl, endpoint, input);` и `if (hooks.onRequest) request = hooks.onRequest(request);`. Вычислите `const attempts = IDEMPOTENT.has(endpoint.method) ? retry.attempts : 1;`, затем цикл `for (let attempt = 1; ; attempt++)`. Внутри: `const result = await attemptOnce(request, attempt);`. Если `!result.ok`: когда `attempt < attempts && isRetryable(result.error)`, сделайте `await sleep(backoff(attempt, retry, random))` и `continue`; иначе `return result`. Если всё ok, в `try` верните `{ ok: true, value: endpoint.response.parse(result.value) }`, а в `catch` превратите `ValidationError` в `fail({ kind: "invalid-response", message })` (всё остальное бросьте дальше).
+
+**`paginate`**: `for (let page = query?.page ?? 1; ; page++)`, затем `const result = await method({ query: { ...query, page } as Q });`, бросьте `new ApiFailure(result.error)`, если не получилось, `yield* result.value.results` и `return`, как только `page >= result.value.totalPages`.
+
+**Ваш тест**: `fakeFetch(busy(), busy())`, `createClient(pandaApi, { fetch, sleep })`, затем `panda.createTodo({ body: { title: "Nap" } })`, и ожидайте один вызов и ни одного ожидания.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+// ---------- схемы: библиотека из Уровня 2, повзрослевшая ----------
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = {
+  parse: (value: unknown, path?: string) => T;
+  optional?: true;
+};
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+// 204 No Content: клиент читает это как null
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function optional<T>(
+  schema: Schema<T>,
+): Schema<T | undefined> & { optional: true } {
+  return {
+    optional: true,
+    parse: (value, path) =>
+      value === undefined ? undefined : schema.parse(value, path),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+// Ключи, чья схема — optional(...)
+type OptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K] extends { optional: true } ? K : never;
+}[keyof S];
+type ObjectOf<S extends Shape> = Simplify<
+  { [K in Exclude<keyof S, OptionalKeys<S>>]: Infer<S[K]> } & {
+    [K in OptionalKeys<S>]?: Infer<S[K]>;
+  }
+>;
+
+function object<S extends Shape>(shape: S): Schema<ObjectOf<S>> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        const parsed = shape[key].parse(value[key], where);
+        if (parsed !== undefined) result[key] = parsed;
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as ObjectOf<S>;
+    },
+  };
+}
+
+// ---------- брендированные id ----------
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+// Схема для id и единственный способ его создать
+function brandedId<Name extends string>(
+  name: Name,
+): Schema<Brand<number, Name>> {
+  return primitive(
+    `a ${name}`,
+    (v): v is Brand<number, Name> =>
+      typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+  );
+}
+
+// ---------- данные учебного API ----------
+const MovieId = brandedId("MovieId");
+type MovieId = Infer<typeof MovieId>;
+const TodoId = brandedId("TodoId");
+type TodoId = Infer<typeof TodoId>;
+const UserId = brandedId("UserId");
+type UserId = Infer<typeof UserId>;
+const PostId = brandedId("PostId");
+type PostId = Infer<typeof PostId>;
+
+const Movie = object({
+  id: MovieId,
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof Movie>;
+
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+function page<T>(item: Schema<T>): Schema<Page<T>> {
+  return object({
+    page: number(),
+    totalPages: number(),
+    total: number(),
+    results: array(item),
+  });
+}
+
+const User = object({
+  id: UserId,
+  name: string(),
+  username: string(),
+  email: string(),
+});
+type User = Infer<typeof User>;
+
+const Post = object({
+  id: PostId,
+  userId: UserId,
+  title: string(),
+  likes: number(),
+});
+type Post = Infer<typeof Post>;
+
+const Todo = object({ id: TodoId, title: string(), done: boolean() });
+type Todo = Infer<typeof Todo>;
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+const TodoPatch = object({
+  title: optional(string()),
+  done: optional(boolean()),
+});
+
+// ---------- описание API ----------
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface Endpoint {
+  method: Method;
+  path: `/${string}`;
+  params?: Shape;
+  query?: Schema<object>;
+  body?: Schema<unknown>;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// "/users/:userId/posts/:postId" -> "userId" | "postId"
+type ParamNames<P extends string> =
+  P extends `${string}:${infer Name}/${infer Rest}`
+    ? Name | ParamNames<Rest>
+    : P extends `${string}:${infer Name}`
+      ? Name
+      : never;
+
+// Путь с :params требует по схеме на каждый параметр
+type ParamsFor<P extends string> = [ParamNames<P>] extends [never]
+  ? {}
+  : { params: Record<ParamNames<P>, Schema<string | number>> };
+
+type CheckParams<A extends ApiDescription> = {
+  [K in keyof A]: ParamsFor<A[K]["path"]>;
+};
+
+function defineApi<const A extends ApiDescription>(
+  api: A & CheckParams<A>,
+): A {
+  return api;
+}
+
+const pandaApi = defineApi({
+  getMovie: {
+    method: "GET",
+    path: "/movies/:id",
+    params: { id: MovieId },
+    response: Movie,
+  },
+  searchMovies: {
+    method: "GET",
+    path: "/movies",
+    query: object({
+      search: optional(string()),
+      genre: optional(string()),
+      page: optional(number()),
+      limit: optional(number()),
+    }),
+    response: page(Movie),
+  },
+  getUser: {
+    method: "GET",
+    path: "/users/:id",
+    params: { id: UserId },
+    response: User,
+  },
+  listPosts: {
+    method: "GET",
+    path: "/posts",
+    query: object({ userId: optional(UserId) }),
+    response: array(Post),
+  },
+  listTodos: {
+    method: "GET",
+    path: "/todos",
+    response: array(Todo),
+  },
+  createTodo: {
+    method: "POST",
+    path: "/todos",
+    body: NewTodo,
+    response: Todo,
+  },
+  updateTodo: {
+    method: "PATCH",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    body: TodoPatch,
+    response: Todo,
+  },
+  deleteTodo: {
+    method: "DELETE",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    response: nothing(),
+  },
+});
+type PandaApi = typeof pandaApi;
+
+// ---------- типы, выведенные из описания ----------
+type ParamsInput<E> = E extends { params: infer P extends Shape }
+  ? { params: ObjectOf<P> }
+  : {};
+type QueryInput<E> = E extends { query: infer Q extends Schema<object> }
+  ? {} extends Infer<Q>
+    ? { query?: Infer<Q> } // все поля query необязательные
+    : { query: Infer<Q> }
+  : {};
+type BodyInput<E> = E extends { body: infer B extends Schema<unknown> }
+  ? { body: Infer<B> }
+  : {};
+
+type Input<E extends Endpoint> = Simplify<
+  ParamsInput<E> & QueryInput<E> & BodyInput<E>
+>;
+type Output<E extends Endpoint> = Infer<E["response"]>;
+// Нет обязательного ввода: аргумент можно не передавать
+type InputArgs<E extends Endpoint> = {} extends Input<E>
+  ? [input?: Input<E>]
+  : [input: Input<E>];
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: (
+    ...input: InputArgs<A[K]>
+  ) => Promise<Result<Output<A[K]>, ApiError>>;
+};
+
+// ---------- от ввода к запросу ----------
+interface SdkRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+// Внутри SDK ввод типизирован свободно (и проверяется в рантайме)
+type RawInput = {
+  params?: Record<string, unknown>;
+  query?: unknown;
+  body?: unknown;
+};
+
+function buildRequest(
+  baseUrl: string,
+  endpoint: Endpoint,
+  input: RawInput = {},
+): SdkRequest {
+  const path = endpoint.path.replace(/:(\w+)/g, (_, name: string) => {
+    const schema = endpoint.params?.[name];
+    if (!schema) throw new Error(`Нет схемы для :${name}`);
+    const value = schema.parse(input.params?.[name], `params.${name}`);
+    return encodeURIComponent(String(value));
+  });
+  let url = baseUrl.replace(/\/+$/, "") + path;
+  if (endpoint.query) {
+    const query = endpoint.query.parse(input.query ?? {}, "query");
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      search.set(key, String(value));
+    }
+    if (search.size > 0) url += `?${search}`;
+  }
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  const request: SdkRequest = { method: endpoint.method, url, headers };
+  if (endpoint.body) {
+    const body = endpoint.body.parse(input.body, "body");
+    request.body = JSON.stringify(body);
+    headers["Content-Type"] = "application/json";
+  }
+  return request;
+}
+
+// ---------- клиент: настройки ----------
+interface RetryOptions {
+  attempts: number; // всего, включая первую
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+interface ResponseInfo {
+  request: SdkRequest;
+  attempt: number;
+  status: number | null; // null: на запрос так и не ответили
+  ms: number;
+}
+
+interface Hooks {
+  onRequest?: (request: SdkRequest) => SdkRequest;
+  onResponse?: (info: ResponseInfo) => void;
+}
+
+interface ClientOptions {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+  retry?: Partial<RetryOptions>;
+  hooks?: Hooks;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  now?: () => number;
+}
+
+const DEFAULT_RETRY: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 200,
+  maxDelayMs: 2_000,
+};
+
+// Повторная отправка этих методов безвредна, их можно повторять
+const IDEMPOTENT = new Set<Method>(["GET", "PUT", "DELETE"]);
+
+function fail(error: ApiError): Result<never, ApiError> {
+  return { ok: false, error };
+}
+
+function apiMessage(body: unknown): string | undefined {
+  return isRecord(body) && typeof body.error === "string"
+    ? body.error
+    : undefined;
+}
+
+// ---------- повторы ----------
+function isRetryable(error: ApiError): boolean {
+  switch (error.kind) {
+    case "network":
+      return true;
+    case "http":
+      return error.status === 429 || error.status >= 500;
+    case "invalid-response":
+      return false;
+  }
+}
+
+// Экспонента с потолком и «equal jitter»: половина фиксирована, половина случайна
+function backoff(
+  attempt: number,
+  retry: RetryOptions,
+  random: () => number,
+): number {
+  const exp = Math.min(
+    retry.maxDelayMs,
+    retry.baseDelayMs * 2 ** (attempt - 1),
+  );
+  return Math.round(exp / 2 + (exp / 2) * random());
+}
+
+// ---------- клиент ----------
+function createClient<A extends ApiDescription>(
+  api: A,
+  options: ClientOptions = {},
+): Client<A> {
+  const {
+    baseUrl = "https://api.pandadev.test",
+    fetch: fetchFn = fetch,
+    hooks = {},
+    sleep = (ms: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    random = Math.random,
+    now = Date.now,
+  } = options;
+  const retry: RetryOptions = { ...DEFAULT_RETRY, ...options.retry };
+
+  // Одна попытка: fetch, прочитать тело и сообщить, как всё прошло
+  async function attemptOnce(
+    request: SdkRequest,
+    attempt: number,
+  ): Promise<Result<unknown, ApiError>> {
+    const started = now();
+    const report = (status: number | null) => {
+      const ms = now() - started;
+      hooks.onResponse?.({ request, attempt, status, ms });
+    };
+    let res: Response;
+    try {
+      res = await fetchFn(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      });
+    } catch (error) {
+      report(null);
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return fail({ kind: "network", message });
+    }
+    const body: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    report(res.status);
+    if (!res.ok) {
+      const message = apiMessage(body) ?? `HTTP ${res.status}`;
+      return fail({ kind: "http", status: res.status, message });
+    }
+    return { ok: true, value: body };
+  }
+
+  // Собрать запрос, отправить (повторно), проверить ответ
+  async function send(
+    endpoint: Endpoint,
+    input: RawInput,
+  ): Promise<Result<unknown, ApiError>> {
+    let request = buildRequest(baseUrl, endpoint, input);
+    if (hooks.onRequest) request = hooks.onRequest(request);
+    const attempts = IDEMPOTENT.has(endpoint.method)
+      ? retry.attempts
+      : 1;
+    for (let attempt = 1; ; attempt++) {
+      const result = await attemptOnce(request, attempt);
+      if (!result.ok) {
+        if (attempt < attempts && isRetryable(result.error)) {
+          await sleep(backoff(attempt, retry, random));
+          continue;
+        }
+        return result;
+      }
+      try {
+        const value = endpoint.response.parse(result.value);
+        return { ok: true, value };
+      } catch (error) {
+        if (!(error instanceof ValidationError)) throw error;
+        const { message } = error;
+        return fail({ kind: "invalid-response", message });
+      }
+    }
+  }
+
+  // По методу на эндпоинт: Client<A> — это обещание, цикл его
+  // выполняет, а приведение говорит об этом ровно в одном месте
+  const client: Record<string, (input?: RawInput) => unknown> = {};
+  for (const name of Object.keys(api)) {
+    const endpoint = api[name];
+    client[name] = (input = {}) => send(endpoint, input);
+  }
+  return client as Client<A>;
+}
+
+// ---------- пагинация ----------
+// Для API без канала Result, например асинхронной итерации
+class ApiFailure extends Error {
+  readonly error: ApiError;
+  constructor(error: ApiError) {
+    super(error.message);
+    this.name = "ApiFailure";
+    this.error = error;
+  }
+}
+
+// Каждый элемент каждой страницы, страницы загружаются по одной
+async function* paginate<Q extends { page?: number }, T>(
+  method: (input: { query?: Q }) => Promise<Result<Page<T>, ApiError>>,
+  query?: NoInfer<Q>,
+): AsyncGenerator<T, void, undefined> {
+  for (let page = query?.page ?? 1; ; page++) {
+    const result = await method({ query: { ...query, page } as Q });
+    if (!result.ok) throw new ApiFailure(result.error);
+    yield* result.value.results;
+    if (page >= result.value.totalPages) return;
+  }
+}
+
+// ---------- тесты ----------
+const BASE = "https://api.pandadev.test";
+
+describe("buildRequest", () => {
+  it("подставляет параметры пути", () => {
+    const request = buildRequest(BASE, pandaApi.getMovie, {
+      params: { id: 7 },
+    });
+    expect(request).toEqual({
+      method: "GET",
+      url: `${BASE}/movies/7`,
+      headers: { Accept: "application/json" },
+    });
+  });
+
+  it("добавляет в query только заданные значения", () => {
+    const request = buildRequest(BASE, pandaApi.searchMovies, {
+      query: { search: "bamboo & tea", page: undefined, limit: 2 },
+    });
+    expect(request.url).toBe(
+      `${BASE}/movies?search=bamboo+%26+tea&limit=2`,
+    );
+    const all = buildRequest(BASE, pandaApi.searchMovies);
+    expect(all.url).toBe(`${BASE}/movies`);
+  });
+
+  it("отправляет тело в JSON", () => {
+    const request = buildRequest(BASE, pandaApi.updateTodo, {
+      params: { id: 2 },
+      body: { done: true },
+    });
+    expect(request.method).toBe("PATCH");
+    expect(request.url).toBe(`${BASE}/todos/2`);
+    expect(request.body).toBe('{"done":true}');
+    expect(request.headers["Content-Type"]).toBe("application/json");
+  });
+
+  it("проверяет каждую часть ввода до отправки", () => {
+    expect(() =>
+      buildRequest(BASE, pandaApi.getMovie, { params: { id: "7" } }),
+    ).toThrow('params.id: expected a MovieId, got "7"');
+    expect(() =>
+      buildRequest(BASE, pandaApi.createTodo, { body: { title: 5 } }),
+    ).toThrow("body.title: expected a string, got 5");
+  });
+});
+
+describe("brandedId", () => {
+  it("принимает положительное целое число", () => {
+    expect(MovieId.parse(7)).toBe(7);
+  });
+
+  it.each([0, -3, 1.5])("отклоняет %s", (value) => {
+    expect(() => MovieId.parse(value)).toThrow(ValidationError);
+  });
+
+  it("отклоняет строки", () => {
+    expect(() => MovieId.parse("7")).toThrow('expected a MovieId');
+  });
+});
+
+// ---------- тесты клиента ----------
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep = async (ms: number) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+// fetch, который отдаёт эти ответы по порядку (Error бросается)
+function fakeFetch(...answers: (Response | Error)[]) {
+  return vi.fn<typeof fetch>(async () => {
+    const next = answers.shift();
+    if (next === undefined) throw new Error("Ответы закончились");
+    if (next instanceof Error) throw next;
+    return next;
+  });
+}
+
+const movieJson = {
+  id: 1,
+  title: "The Bamboo Heist",
+  year: 2019,
+  director: "Mei Lin",
+  genres: ["comedy", "crime"],
+  rating: 7.8,
+  minutes: 104,
+};
+const busy = () => Response.json({ error: "busy" }, { status: 503 });
+
+describe("createClient", () => {
+  it("получает фильм из учебного API", async () => {
+    const panda = createClient(pandaApi);
+    const id = MovieId.parse(1);
+    expect(await panda.getMovie({ params: { id } })).toEqual({
+      ok: true,
+      value: movieJson,
+    });
+  });
+
+  it("превращает 404 в ошибку http без повторов", async () => {
+    const { sleep, waits } = fakeSleep();
+    const panda = createClient(pandaApi, { sleep });
+    const id = MovieId.parse(99);
+    expect(await panda.getMovie({ params: { id } })).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Movie not found" },
+    });
+    expect(waits).toEqual([]);
+  });
+
+  it("повторяет GET с backoff, а потом получает ответ", async () => {
+    const { sleep, waits } = fakeSleep();
+    const fetch = fakeFetch(busy(), busy(), Response.json(movieJson));
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep,
+      random: () => 1,
+    });
+    const result = await panda.getMovie({
+      params: { id: MovieId.parse(1) },
+    });
+    expect(result.ok).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(waits).toEqual([200, 400]);
+  });
+
+  it("сдаётся после последней попытки", async () => {
+    const { sleep, waits } = fakeSleep();
+    const offline = () => new TypeError("Failed to fetch");
+    const fetch = fakeFetch(offline(), offline(), offline());
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep,
+      random: () => 0,
+    });
+    expect(await panda.listTodos()).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+    expect(waits).toEqual([100, 200]);
+  });
+
+  it("сообщает о теле, которое не подходит под схему", async () => {
+    const wrong = { ...movieJson, year: "2019" };
+    const fetch = fakeFetch(Response.json(wrong));
+    const panda = createClient(pandaApi, { fetch });
+    const result = await panda.getMovie({
+      params: { id: MovieId.parse(1) },
+    });
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "invalid-response",
+        message: 'year: expected a number, got "2019"',
+      },
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("даёт хукам менять запросы и видеть каждую попытку", async () => {
+    const log: string[] = [];
+    const fetch = fakeFetch(busy(), Response.json([]));
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep: fakeSleep().sleep,
+      hooks: {
+        onRequest: (request) => ({
+          ...request,
+          headers: { ...request.headers, Authorization: "Bearer abc" },
+        }),
+        onResponse: ({ request, status, attempt }) => {
+          log.push(`${request.method} ${status} #${attempt}`);
+        },
+      },
+    });
+    await panda.listTodos();
+    expect(log).toEqual(["GET 503 #1", "GET 200 #2"]);
+    expect(fetch).toHaveBeenLastCalledWith(
+      "https://api.pandadev.test/todos",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: "Bearer abc",
+        }),
+      }),
+    );
+  });
+
+  it("работает с любым описанием: /flaky требует повторов", async () => {
+    const testApi = defineApi({
+      flaky: {
+        method: "GET",
+        path: "/flaky",
+        response: object({ ok: boolean(), attempt: number() }),
+      },
+    });
+    const { sleep, waits } = fakeSleep();
+    const client = createClient(testApi, { sleep });
+    expect(await client.flaky()).toEqual({
+      ok: true,
+      value: { ok: true, attempt: 3 },
+    });
+    expect(waits).toHaveLength(2);
+  });
+
+  it("никогда не повторяет POST", async () => {
+    const { sleep, waits } = fakeSleep();
+    const fetch = fakeFetch(busy(), busy());
+    const panda = createClient(pandaApi, { fetch, sleep });
+    const result = await panda.createTodo({ body: { title: "Nap" } });
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "http", status: 503, message: "busy" },
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(waits).toEqual([]);
+  });
+});
+
+describe("paginate", () => {
+  it("проходит все страницы учебного API", async () => {
+    const spy = vi.fn<typeof fetch>((url, init) => fetch(url, init));
+    const panda = createClient(pandaApi, { fetch: spy });
+    const titles: string[] = [];
+    for await (const movie of paginate(panda.searchMovies, {})) {
+      titles.push(movie.title);
+    }
+    expect(titles).toHaveLength(12);
+    expect(titles[11]).toBe("The Great Bamboo Race");
+    expect(spy).toHaveBeenCalledTimes(3);
+  });
+});
+
+// ---------- тесты типов: не меняйте их ----------
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamNames<"/users/:userId/posts/:postId">,
+    "userId" | "postId">>,
+  Expect<Equal<ParamNames<"/todos">, never>>,
+  Expect<Equal<Input<PandaApi["getMovie"]>,
+    { params: { id: MovieId } }>>,
+  Expect<Equal<Input<PandaApi["listPosts"]>,
+    { query?: { userId?: UserId } }>>,
+  Expect<Equal<Input<PandaApi["updateTodo"]>, {
+    params: { id: TodoId };
+    body: { title?: string; done?: boolean };
+  }>>,
+  Expect<Equal<Input<PandaApi["listTodos"]>, {}>>,
+  Expect<Equal<Output<PandaApi["getUser"]>, User>>,
+  Expect<Equal<Output<PandaApi["deleteTodo"]>, null>>,
+];
+
+async function typeTests(
+  panda: Client<PandaApi>,
+  todo: Todo,
+  post: Post,
+) {
+  await panda.listTodos(); // ничего не обязательно, поэтому без аргумента
+  await panda.getUser({ params: { id: post.userId } });
+  await panda.createTodo({ body: { title: "Nap" } });
+  // @ts-expect-error: TodoId — это не MovieId
+  await panda.getMovie({ params: { id: todo.id } });
+  // @ts-expect-error: простое число — не проверенный id
+  await panda.getMovie({ params: { id: 1 } });
+  // @ts-expect-error: getMovie нужны его params
+  await panda.getMovie();
+  // @ts-expect-error: limit — это число
+  await panda.searchMovies({ query: { limit: "5" } });
+  // @ts-expect-error: новой задаче нужен title
+  await panda.createTodo({ body: { done: true } });
+  const id = MovieId.parse(1);
+  const movie = await panda.getMovie({ params: { id } });
+  // @ts-expect-error: проверьте ok, прежде чем читать value
+  movie.value;
+}
+
+async function typeTests2(panda: Client<PandaApi>) {
+  const client: Client<PandaApi> = createClient(pandaApi);
+  for await (const movie of paginate(panda.searchMovies)) {
+    const title: string = movie.title;
+  }
+  // @ts-expect-error: getMovie не возвращает страницы
+  paginate(panda.getMovie);
+  // @ts-expect-error: в query фильмов нет "genr"
+  paginate(panda.searchMovies, { genr: "drama" });
+}
+
+// ---------- попробуйте ----------
+const panda = createClient(pandaApi, {
+  hooks: {
+    onResponse: ({ request, status, attempt }) => {
+      const { method, url } = request;
+      console.log(`${method} ${url} -> ${status} (попытка ${attempt})`);
+    },
+  },
+});
+const todo = await panda.createTodo({
+  body: { title: "Выпустить SDK" },
+});
+console.log(todo);
+if (todo.ok) {
+  const done = await panda.updateTodo({
+    params: { id: todo.value.id },
+    body: { done: true },
+  });
+  console.log(done);
+}
+for await (const movie of paginate(panda.searchMovies, { limit: 2 })) {
+  if (movie.year < 2016) {
+    console.log(`Нашёлся старый фильм: ${movie.title} (${movie.year})`);
+    break; // больше страниц не загружается
+  }
+}
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- **`createClient(api, options)`**: по методу на эндпоинт, созданному циклом и типизированному через `Client<A>` с единственным приведением, а каждая зависимость (fetch, sleep, random, часы) внедряется и имеет значение по умолчанию.
+- **Типизированные ошибки**: `attemptOnce` превращает любой исход в `Result` с ошибками `network`, `http` и `invalid-response`, а плохой ввод по-прежнему бросает `ValidationError` до какой-либо отправки.
+- **Повторы, которые не делают хуже**: только идемпотентные методы, только ошибки, которые стоит повторять, экспоненциальный backoff с потолком и equal jitter.
+- **`paginate`**: асинхронный генератор, который лениво обходит страницы, принимает только методы, возвращающие страницы, и бросает `ApiFailure`, когда страница не загрузилась.
+- **Хуки** для заголовков, логов и метрик и быстрый **набор тестов** с фейками, плюс несколько тестов на учебном API.
+
+SDK работает. В **части 3** мы сделаем из него то, на что могут положиться другие люди: отшлифованный публичный API, тесты типов для всего этого и пакет, готовый к npm. 📦

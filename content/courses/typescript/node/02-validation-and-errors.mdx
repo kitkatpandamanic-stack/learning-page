@@ -1,0 +1,1065 @@
+---
+title: Validation & Error Handling
+description: Turn unknown request data into typed values, throw typed HTTP errors, format every error in one typed middleware, and decide when a service should return a Result instead.
+duration: 20
+xp: 25
+---
+
+Last lesson ended with a warning: `req.body` is whatever the client sent, and a body type is only a promise. This lesson makes that promise true. You'll **parse** unknown input into typed data, describe failures with **typed errors**, format every error in **one** error middleware, and see when a service should **return** its failures instead of throwing them. These are the parts that decide whether an API is pleasant to use, or a source of mysterious 500s. 🛡️
+
+## Types vanish at runtime
+
+The TypeScript compiler checks your code, then removes every type before Node runs it. So no type can protect you from data that arrives **while the program runs**: request bodies, query strings, headers, files, other services' responses. For those, the honest type is `unknown`, and you need code that checks the data.
+
+In real projects this rule has a name: **parse at the edges**. Data from outside is `unknown` until one function checks it and hands back a properly typed value. Everything after that point, your services, your repository, the rest of the route, can trust the type completely.
+
+## Parse, don't just validate
+
+A validator answers "is this OK?" with yes or no. A **parser** does more: it gives back either the clean, typed data, or a list of everything that's wrong. The result type is the `Result<T, E>` [discriminated union](/learn/typescript/discriminated-unions) you already know:
+
+<CodeExample output={`valid: { title: 'Buy bamboo', pinned: true }
+invalid: [
+  'title is required',
+  'text must be a string',
+  'pinned must be true or false'
+]
+invalid: [ 'body must be a JSON object' ]`}>
+
+```ts
+interface NewNote {
+  title: string;
+  text?: string;
+  pinned?: boolean;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+function parseNewNote(input: unknown): Result<NewNote, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+
+  let title: string | undefined;
+  if (typeof input.title !== "string" || input.title.trim() === "") {
+    errors.push("title is required");
+  } else if (input.title.length > 100) {
+    errors.push("title must be at most 100 characters");
+  } else {
+    title = input.title.trim();
+  }
+  if (input.text !== undefined && typeof input.text !== "string") {
+    errors.push("text must be a string");
+  }
+  if (input.pinned !== undefined && typeof input.pinned !== "boolean") {
+    errors.push("pinned must be true or false");
+  }
+
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  // Copy only the fields we know: anything else is dropped
+  const note: NewNote = { title };
+  if (typeof input.text === "string") note.text = input.text;
+  if (typeof input.pinned === "boolean") note.pinned = input.pinned;
+  return { ok: true, value: note };
+}
+
+const inputs: unknown[] = [
+  { title: " Buy bamboo ", pinned: true, id: 99, isAdmin: true },
+  { text: 42, pinned: "yes" },
+  "just a string",
+];
+for (const input of inputs) {
+  const result = parseNewNote(input);
+  if (result.ok) {
+    console.log("valid:", result.value); // result.value: NewNote
+  } else {
+    console.log("invalid:", result.error); // result.error: string[]
+  }
+}
+```
+
+</CodeExample>
+
+What makes this a good parser:
+
+- **It takes `unknown`.** It can be called with anything, including `"just a string"`, and never crashes. `isRecord` narrows the input to `Record<string, unknown>`, so each field is still `unknown` and must be checked before use.
+- **It collects every problem.** The second input has three mistakes and the client hears about all three at once, instead of fixing them one request at a time.
+- **It returns only known fields.** The client sent `id: 99` and `isAdmin: true`; they're gone. Copying `req.body` into your data would let clients overwrite ids or grant themselves rights (a bug called **mass assignment**).
+- **The output is typed.** After `if (result.ok)`, `result.value` is a `NewNote`. The code after the parser never sees `unknown` again.
+
+Notice one awkward thing: `text` and `pinned` are checked once to collect a message and **again** to copy them into `note`, because TypeScript needs a check right where it narrows. Hand-written parsers always end up with some of this repetition, and that's exactly the problem schema libraries solve.
+
+## Schemas: one source of truth
+
+So far there are **two** descriptions of a note: the `NewNote` interface for the compiler and `parseNewNote` for runtime, and nothing stops them drifting apart. In [Runtime Validation](/learn/typescript/runtime-validation) you fixed exactly this problem with a **schema**: a value that checks data at runtime, with the type derived from it by `Infer<typeof schema>`.
+
+Your mini library stops at the **first** problem and throws a `ValidationError`, which is perfect for checking a server's responses. For request bodies, clients prefer to hear about every problem at once, and that's one reason real projects use a library such as **Zod** or **Valibot**, which collects them all:
+
+```ts title="Zod (in a real project: npm install zod)"
+import { z } from "zod";
+
+const NewNoteSchema = z.object({
+  title: z.string().trim().min(1, "must not be empty").max(100),
+  text: z.string().optional(),
+  pinned: z.boolean().optional(),
+});
+
+// The type comes FROM the schema: one source of truth
+type NewNote = z.infer<typeof NewNoteSchema>;
+
+function parseNewNote(input: unknown): Result<NewNote, string[]> {
+  const result = NewNoteSchema.safeParse(input);
+  if (result.success) return { ok: true, value: result.data };
+  const messages = result.error.issues.map(
+    (issue) => `${issue.path.join(".")}: ${issue.message}`,
+  );
+  return { ok: false, error: messages };
+}
+```
+
+Change the schema and the type changes with it, so they can't disagree, and unknown fields are stripped for you. Your own schemas fit in just as well, wrapped in a function with the same shape:
+
+```ts
+function fromSchema<T>(schema: Schema<T>) {
+  return (input: unknown): Result<T, string[]> => {
+    try {
+      return { ok: true, value: schema.parse(input) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return { ok: false, error: [error.message] };
+      }
+      throw error; // a bug, not bad input
+    }
+  };
+}
+
+const parseMovie = fromSchema(MovieSchema);
+```
+
+Whichever you use, a hand-written parser, your own schemas or a library, the rest of this lesson works the same: all that matters is **a function from `unknown` to `Result<T, string[]>`**.
+
+<Callout type="tip" title="Validate the query and params too">
+
+The same idea applies to `req.query` and `req.params`. `?limit=abc` should be a 400 with a clear message, not a `NaN` that quietly breaks your pagination. Write small parsers such as `parseLimit(value: unknown): Result<number, string[]>`, or a schema for the whole query object.
+
+</Callout>
+
+## Typed errors with an `HttpError` class
+
+When a route can't continue (the note doesn't exist, the input is invalid) it's simplest to **throw**, and let one place turn the error into a response. To make that work, the error needs to carry HTTP information. A small class does it, and a union of **error codes** keeps the responses consistent:
+
+<CodeExample output={`404 {"error":"Note not found","code":"not_found"}
+400 {"error":"Invalid note","code":"bad_request","details":["title is required"]}
+400 {"error":"Unexpected end of JSON input","code":"bad_request"}
+500 {"error":"Something went wrong","code":"internal"}
+500 {"error":"Something went wrong","code":"internal"}`}>
+
+```ts
+type ErrorCode =
+  | "bad_request"
+  | "unauthorized"
+  | "not_found"
+  | "conflict"
+  | "internal";
+
+// One status per code, so the two can never disagree
+const STATUS: Record<ErrorCode, number> = {
+  bad_request: 400,
+  unauthorized: 401,
+  not_found: 404,
+  conflict: 409,
+  internal: 500,
+};
+
+// Every error response in the API has this shape
+interface ErrorBody {
+  error: string; // a message for people
+  code: ErrorCode; // a stable code for programs
+  details?: string[];
+}
+
+class HttpError extends Error {
+  readonly status: number;
+  readonly code: ErrorCode;
+  readonly details?: string[];
+
+  constructor(code: ErrorCode, message: string, details?: string[]) {
+    super(message);
+    this.name = "HttpError";
+    this.code = code;
+    this.status = STATUS[code];
+    this.details = details;
+  }
+}
+
+// Express's own errors (e.g. broken JSON) carry a 4xx status
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return (
+    err instanceof Error &&
+    "status" in err &&
+    typeof err.status === "number" &&
+    err.status < 500
+  );
+}
+
+function toErrorResponse(err: unknown): {
+  status: number;
+  body: ErrorBody;
+} {
+  if (err instanceof HttpError) {
+    const { status, code, message, details } = err;
+    return { status, body: { error: message, code, details } };
+  }
+  if (isClientError(err)) {
+    const { status, message } = err;
+    return { status, body: { error: message, code: "bad_request" } };
+  }
+  // Anything else is a bug or an outage: say nothing specific
+  const message = "Something went wrong";
+  return { status: 500, body: { error: message, code: "internal" } };
+}
+
+const errors: unknown[] = [
+  new HttpError("not_found", "Note not found"),
+  new HttpError("bad_request", "Invalid note", ["title is required"]),
+  Object.assign(new SyntaxError("Unexpected end of JSON input"), {
+    status: 400,
+  }),
+  new Error("Database connection lost"),
+  "not even an Error",
+];
+for (const err of errors) {
+  const { status, body } = toErrorResponse(err);
+  console.log(status, JSON.stringify(body));
+}
+```
+
+</CodeExample>
+
+The design decisions here are the important part:
+
+- **One `ErrorBody` shape for the whole API.** Clients write their error handling once: check `code`, show `error` to the user, list `details` if there are any. It's the same `{ error: "..." }` the routes in the last lesson sent, plus a code.
+- **A `code` union, not just a message.** Messages are for people and may change ("Note not found" might become "This note was deleted"). Codes like `"not_found"` are for programs: a front end can `switch` on them, and because `ErrorCode` is a union of literals, a typo like `"not_fonud"` doesn't compile.
+- **`Record<ErrorCode, number>`** makes TypeScript check that every code has a status. Add `"rate_limited"` to the union and the `STATUS` object is an error until you give it one.
+- **`toErrorResponse` takes `unknown`.** Anything can be thrown in JavaScript, even a string (as you saw in [Typing Promises & Async Code](/learn/typescript/typing-promises-and-async)), so it narrows with `instanceof HttpError` and the `isClientError` guard, and treats everything else as a 500 that reveals nothing. It's a pure function, so you can unit test every branch without starting a server.
+- **Errors from other code are handled too.** When `express.json()` receives broken JSON, it throws a `SyntaxError` with `status: 400`. That's not your `HttpError`, so an error handler that only checks `instanceof HttpError` would wrongly answer 500.
+
+<Callout type="note" title="Why no parameter properties?">
+
+You may know the shortcut `constructor(readonly code: ErrorCode, ...)` from [Classes & Access Modifiers](/learn/typescript/classes-and-access-modifiers). It's deliberately avoided here: Node's built-in type stripping (`node server.ts`) only removes types and can't run parameter properties, enums or namespaces, because they generate JavaScript. Plain fields work everywhere.
+
+</Callout>
+
+## One error handler for the whole app
+
+Now plug `toErrorResponse` into Express. The error middleware has one TypeScript catch. Written like in JavaScript, it doesn't compile:
+
+```ts
+app.use((err, req, res, next) => {
+  // ❌ Error: Parameter 'err' implicitly has an 'any' type.
+  // (and the same for 'req', 'res' and 'next')
+  res.status(500).json({ error: "Something went wrong" });
+});
+```
+
+`app.use` accepts both normal middleware `(req, res, next)` and error middleware `(err, req, res, next)`, so TypeScript can't tell which one you mean and gives the parameters no type at all. Annotate all four yourself, and type `err` as **`unknown`**, just like the variable in a `catch` block: anything can be thrown.
+
+You'll also meet the ready-made `ErrorRequestHandler` type. It works, but it types the error as `any`:
+
+```ts
+const handleErrors: ErrorRequestHandler = (err, req, res, next) => {
+  res.status(err.statusCode).json({ error: err.mesage });
+  // no errors at all: err is any, so both typos compile
+};
+```
+
+With `err: unknown`, TypeScript forces you to narrow first, which is exactly what `toErrorResponse` does. Here is the whole picture: routes that throw, a parser behind a one-line helper, a 404 handler and the error handler:
+
+<CodeExample output={`404 {"error":"Note not found","code":"not_found"}
+400 {"error":"Invalid body","code":"bad_request","details":["title is required"]}
+400 {"error":"Unexpected token in JSON","code":"bad_request"}
+Unexpected: Error: Stats database is down
+500 {"error":"Something went wrong","code":"internal"}
+404 {"error":"Cannot DELETE /api/notes","code":"not_found"}`}>
+
+```ts
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import request from "supertest";
+
+// ----- errors (from the previous example) -----
+type ErrorCode = "bad_request" | "not_found" | "internal";
+const STATUS: Record<ErrorCode, number> = {
+  bad_request: 400,
+  not_found: 404,
+  internal: 500,
+};
+interface ErrorBody {
+  error: string; // a message for people
+  code: ErrorCode; // a stable code for programs
+  details?: string[];
+}
+
+class HttpError extends Error {
+  readonly status: number;
+  readonly code: ErrorCode;
+  readonly details?: string[];
+  constructor(code: ErrorCode, message: string, details?: string[]) {
+    super(message);
+    this.name = "HttpError";
+    this.code = code;
+    this.status = STATUS[code];
+    this.details = details;
+  }
+}
+
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+function toErrorResponse(err: unknown): {
+  status: number;
+  body: ErrorBody;
+} {
+  if (err instanceof HttpError) {
+    const { status, code, message, details } = err;
+    return { status, body: { error: message, code, details } };
+  }
+  if (isClientError(err)) {
+    const { status, message } = err;
+    return { status, body: { error: message, code: "bad_request" } };
+  }
+  const message = "Something went wrong";
+  return { status: 500, body: { error: message, code: "internal" } };
+}
+
+// ----- validation -----
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+function parseOrThrow<T>(
+  parse: (input: unknown) => Result<T, string[]>,
+  input: unknown,
+): T {
+  const result = parse(input);
+  if (!result.ok) {
+    throw new HttpError("bad_request", "Invalid body", result.error);
+  }
+  return result.value;
+}
+
+type NewNote = { title: string };
+
+function parseNewNote(input: unknown): Result<NewNote, string[]> {
+  const title =
+    typeof input === "object" && input !== null && "title" in input
+      ? input.title
+      : undefined;
+  if (typeof title !== "string" || title.trim() === "") {
+    return { ok: false, error: ["title is required"] };
+  }
+  return { ok: true, value: { title: title.trim() } };
+}
+
+// ----- the app -----
+interface Note {
+  id: number;
+  title: string;
+}
+const notes: Note[] = [{ id: 1, title: "Buy bamboo" }];
+
+const app = express();
+app.use(express.json());
+
+app.get("/api/notes/:id", (req, res: Response<Note>) => {
+  const note = notes.find((n) => n.id === Number(req.params.id));
+  if (!note) throw new HttpError("not_found", "Note not found");
+  res.json(note);
+});
+
+app.post("/api/notes", (req, res: Response<Note>) => {
+  const { title } = parseOrThrow(parseNewNote, req.body);
+  const note: Note = { id: notes.length + 1, title };
+  notes.push(note);
+  res.status(201).json(note);
+});
+
+app.get("/api/stats", async () => {
+  throw new Error("Stats database is down"); // a real crash
+});
+
+// 404 handler: no route matched
+app.use((req, res: Response<ErrorBody>) => {
+  const message = `Cannot ${req.method} ${req.path}`;
+  res.status(404).json({ error: message, code: "not_found" });
+});
+
+// Error handler: four annotated parameters, registered last
+app.use(
+  (err: unknown, req: Request, res: Response<ErrorBody>,
+   _next: NextFunction) => {
+    const { status, body } = toErrorResponse(err);
+    if (status >= 500) console.error("Unexpected:", String(err));
+    res.status(status).json(body);
+  },
+);
+
+type Answer = { status: number; body: unknown };
+async function show(test: PromiseLike<Answer>) {
+  const res = await test;
+  console.log(res.status, JSON.stringify(res.body));
+}
+const api = request(app);
+await show(api.get("/api/notes/7"));
+await show(api.post("/api/notes").send({ title: "  " }));
+await show(
+  api
+    .post("/api/notes")
+    .set("Content-Type", "application/json")
+    .send('{ "title": '), // broken JSON
+);
+await show(api.get("/api/stats"));
+await show(api.delete("/api/notes"));
+```
+
+</CodeExample>
+
+Look at how little the routes contain. `GET /api/notes/:id` throws a 404, `POST /api/notes` validates in one line with `parseOrThrow`, and the crashing `/api/stats` route doesn't handle anything: Express 5 passes its rejected promise to the error handler. Every failure ends up in the same `ErrorBody` shape, and only the 500 is logged, with details that stay on the server.
+
+<Callout type="warning" title="Keep all four parameters">
+
+Express recognises error middleware **by counting its parameters**. Written with three, `(err, req, res)`, it's treated as normal middleware and never receives an error. That's why the example keeps `next` even though it doesn't use it; the `_` prefix in `_next` tells readers (and linters) that it's unused on purpose. And register the error handler **last**, after all routes and the 404 handler.
+
+</Callout>
+
+## Throwing or returning a `Result`?
+
+Throwing `HttpError` is convenient in the HTTP layer, but should a **service**, the code with your business rules, throw HTTP errors too? Compare the two styles honestly:
+
+- **Throwing** keeps code short: errors fly up to the one handler automatically. But they're **invisible in the types**. Nothing in `rename(id, title): Note` tells a caller that it can fail with "title taken", and nothing forces them to handle it.
+- **Returning a `Result`** puts the failures **in the return type**. Callers can't reach the note without checking `ok`, and with a discriminated union of failures, [`assertNever`](/learn/typescript/discriminated-unions) can check that every kind of failure is handled.
+
+Here's a service that returns its expected failures, and an HTTP layer that decides what they mean for a client:
+
+<CodeExample output={`200 {"id":2,"title":"Long nap"}
+409 A note called "Long nap" already exists
+404 Note not found`}>
+
+```ts
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Note {
+  id: number;
+  title: string;
+}
+
+// The failures a caller must think about, written as data
+type RenameError =
+  | { kind: "not_found" }
+  | { kind: "title_taken"; title: string };
+
+function createNotesService(notes: Note[]) {
+  return {
+    rename(id: number, title: string): Result<Note, RenameError> {
+      const note = notes.find((n) => n.id === id);
+      if (!note) return { ok: false, error: { kind: "not_found" } };
+      if (notes.some((n) => n.id !== id && n.title === title)) {
+        return { ok: false, error: { kind: "title_taken", title } };
+      }
+      note.title = title;
+      return { ok: true, value: note };
+    },
+  };
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected value: ${JSON.stringify(value)}`);
+}
+
+type HttpAnswer = { status: number; message: string };
+
+// The HTTP layer decides what each failure means for a client
+function toHttp(error: RenameError): HttpAnswer {
+  switch (error.kind) {
+    case "not_found":
+      return { status: 404, message: "Note not found" };
+    case "title_taken":
+      return {
+        status: 409,
+        message: `A note called "${error.title}" already exists`,
+      };
+    default:
+      return assertNever(error);
+  }
+}
+
+function respond(result: Result<Note, RenameError>): string {
+  if (result.ok) return `200 ${JSON.stringify(result.value)}`;
+  const { status, message } = toHttp(result.error);
+  return `${status} ${message}`;
+}
+
+const service = createNotesService([
+  { id: 1, title: "Buy bamboo" },
+  { id: 2, title: "Nap" },
+]);
+console.log(respond(service.rename(2, "Long nap")));
+console.log(respond(service.rename(1, "Long nap")));
+console.log(respond(service.rename(9, "Anything")));
+```
+
+</CodeExample>
+
+The payoff comes later. A teammate adds a new failure, `{ kind: "locked"; by: string }`, to `RenameError`. Every `switch` that maps rename errors now fails to compile until someone decides what "locked" means for a client:
+
+```ts
+    default:
+      return assertNever(error);
+      // ❌ Error: Argument of type '{ kind: "locked"; by: string; }' is not assignable to parameter of type 'never'.
+```
+
+With throwing, the new error would have reached the error handler as an unknown 500, and you'd find out from your users.
+
+A split that works well in real projects:
+
+- **Services return `Result`s for expected outcomes**: not found, conflicts, business rules ("you can't book a table in the past"). They know nothing about HTTP, so a CLI script or a background job can reuse them.
+- **The HTTP layer translates** those failures into status codes and `ErrorBody`s, often by throwing an `HttpError` that the middleware formats.
+- **Truly unexpected problems are thrown**: a lost database connection, a bug. Nobody can handle them sensibly mid-request, so they go straight to the error handler and become a logged 500.
+
+A team that threw `new HttpError(404)` from deep inside its services learned this the hard way when a nightly import job started failing with "HttpError: Note not found", in a program without any HTTP at all.
+
+<Quiz
+  question="An app registers app.use((err: unknown, req: Request, res: Response) => { ... }) as its error handler. A route throws. What happens?"
+  options={["The handler runs and formats the error", "Express treats it as normal middleware because it has three parameters, so the error never reaches it", "TypeScript reports that err must be any", "Express crashes the whole server"]}
+  answer={1}
+  explanation="Express recognises error middleware by its four parameters. With three, it's normal middleware and is skipped for errors, so the default handler answers instead. Keep next (or _next) as the fourth parameter."
+/>
+
+<Quiz
+  question="A service returns Result<Order, OrderError>, where OrderError is a union with a kind field, and a switch ends with return assertNever(error). A new kind 'payment_failed' is added to OrderError. What happens?"
+  options={["Nothing until a customer's payment fails, then a 500", "The switch fails to compile until the new kind gets a case", "TypeScript removes the new kind automatically", "The new kind is handled by the first case"]}
+  answer={1}
+  explanation="In the default branch, error should have the type never. With an unhandled kind, it doesn't, so passing it to assertNever(value: never) is a compile error that points straight at the switch to update."
+/>
+
+<Exercise
+  title="Bamboo shop orders"
+  language="typescript"
+  starter={`import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import request from "supertest";
+
+// ---------- ready-made: don't change this part ----------
+
+type Item = "bamboo" | "dumplings" | "tea";
+const ITEMS: readonly Item[] = ["bamboo", "dumplings", "tea"];
+const PRICES: Record<Item, number> = {
+  bamboo: 3,
+  dumplings: 5,
+  tea: 2,
+};
+
+interface NewOrder {
+  item: Item;
+  quantity: number;
+  note?: string;
+}
+interface Order {
+  id: number;
+  item: Item;
+  quantity: number;
+  note: string;
+  total: number;
+}
+
+type ErrorCode =
+  | "bad_request"
+  | "not_found"
+  | "out_of_stock"
+  | "shop_closed"
+  | "internal";
+const STATUS: Record<ErrorCode, number> = {
+  bad_request: 400,
+  not_found: 404,
+  out_of_stock: 409,
+  shop_closed: 503,
+  internal: 500,
+};
+interface ErrorBody {
+  error: string; // a message for people
+  code: ErrorCode; // a stable code for programs
+  details?: string[];
+}
+
+class HttpError extends Error {
+  readonly status: number;
+  readonly code: ErrorCode;
+  readonly details?: string[];
+  constructor(code: ErrorCode, message: string, details?: string[]) {
+    super(message);
+    this.name = "HttpError";
+    this.code = code;
+    this.status = STATUS[code];
+    this.details = details;
+  }
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+type OrderError =
+  | { kind: "out_of_stock"; item: Item; left: number }
+  | { kind: "shop_closed"; opensAt: string };
+
+interface ShopOptions {
+  stock: Record<Item, number>;
+  isOpen: () => boolean;
+}
+
+function createShop({ stock, isOpen }: ShopOptions) {
+  const left = { ...stock };
+  const opensAt = "09:00";
+  const orders: Order[] = [];
+  return {
+    placeOrder(input: NewOrder): Result<Order, OrderError> {
+      if (!isOpen()) {
+        return { ok: false, error: { kind: "shop_closed", opensAt } };
+      }
+      const available = left[input.item];
+      if (available < input.quantity) {
+        const error: OrderError = {
+          kind: "out_of_stock",
+          item: input.item,
+          left: available,
+        };
+        return { ok: false, error };
+      }
+      left[input.item] -= input.quantity;
+      const order: Order = {
+        id: orders.length + 1,
+        item: input.item,
+        quantity: input.quantity,
+        note: input.note ?? "",
+        total: PRICES[input.item] * input.quantity,
+      };
+      orders.push(order);
+      return { ok: true, value: order };
+    },
+    getOrder(id: number): Order | undefined {
+      return orders.find((o) => o.id === id);
+    },
+  };
+}
+
+function assertNever(value: never): never {
+  throw new Error(\`Unexpected value: \${JSON.stringify(value)}\`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+// Express's own errors (e.g. broken JSON) carry a 4xx status
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+// ---------- your code ----------
+
+// TODO 1: true only for "bamboo", "dumplings" or "tea"
+function isItem(value: unknown): value is Item {
+  return false;
+}
+
+// TODO 2: turn unknown input into a NewOrder, collecting every problem
+function parseNewOrder(input: unknown): Result<NewOrder, string[]> {
+  return { ok: false, error: ["not written yet"] };
+}
+
+// TODO 3: one HttpError for each kind of OrderError
+function toHttpError(error: OrderError): HttpError {
+  switch (error.kind) {
+    case "out_of_stock":
+      return new HttpError(
+        "out_of_stock",
+        \`Only \${error.left} \${error.item} left\`,
+      );
+    default:
+      return assertNever(error);
+  }
+}
+
+function createApp(options: ShopOptions): Application {
+  const shop = createShop(options);
+  const app = express();
+  app.use(express.json());
+
+  app.post("/api/orders", (req, res: Response<Order>) => {
+    // TODO 4: parse the body (400 "Invalid order" + details),
+    //         place the order (toHttpError on failure), answer 201
+  });
+
+  app.get("/api/orders/:id", (req, res: Response<Order>) => {
+    const order = shop.getOrder(Number(req.params.id));
+    if (!order) throw new HttpError("not_found", "Order not found");
+    res.json(order);
+  });
+
+  app.get("/api/report", async () => {
+    throw new Error("Report service is down");
+  });
+
+  app.use((req, res: Response<ErrorBody>) => {
+    const message = \`Cannot \${req.method} \${req.path}\`;
+    res.status(404).json({ error: message, code: "not_found" });
+  });
+
+  // TODO 5: annotate the four parameters, then answer HttpErrors
+  //         and client errors properly; everything else is a 500
+  app.use((err, req, res, next) => {
+    res.status(500).json({
+      error: "Something went wrong",
+      code: "internal",
+    });
+  });
+
+  return app;
+}
+
+const app = createApp({
+  stock: { bamboo: 20, dumplings: 6, tea: 2 },
+  isOpen: () => true,
+});
+const order = (body: object) =>
+  request(app).post("/api/orders").send(body);
+
+const ok = await order({ item: "tea", quantity: 2 });
+console.log(ok.status, ok.body);
+const bad = await order({ item: "cake", quantity: 0 });
+console.log(bad.status, JSON.stringify(bad.body));
+const gone = await order({ item: "tea", quantity: 1 });
+console.log(gone.status, JSON.stringify(gone.body));
+`}
+  tests={[
+    { name: "parseNewOrder returns only the known fields", check: `(() => { const same = (x, y) => JSON.stringify(Object.entries(x).sort()) === JSON.stringify(Object.entries(y).sort()); const a = parseNewOrder({ item: 'tea', quantity: 2 }); const b = parseNewOrder({ item: 'bamboo', quantity: 10, note: 'Extra leafy', price: 0, id: 7 }); const c = parseNewOrder({ item: 'dumplings', quantity: 1, note: '' }); return a.ok && same(a.value, { item: 'tea', quantity: 2 }) && b.ok && same(b.value, { item: 'bamboo', quantity: 10, note: 'Extra leafy' }) && c.ok && same(c.value, { item: 'dumplings', quantity: 1, note: '' }); })()` },
+    { name: "parseNewOrder collects every problem, in order", check: `(() => { const errs = (input) => { const r = parseNewOrder(input); return r.ok ? 'OK' : r.error.join('|'); }; const I = 'item must be one of: bamboo, dumplings, tea'; const Q = 'quantity must be a whole number from 1 to 10'; const N = 'note must be a string of at most 200 characters'; return errs({}) === I + '|' + Q && errs({ item: 'cake', quantity: 1.5, note: 7 }) === [I, Q, N].join('|') && errs({ item: 'tea', quantity: 11 }) === Q && errs({ item: 'tea', quantity: 0 }) === Q && errs({ item: 'tea', quantity: '2' }) === Q && errs({ item: 'Tea', quantity: 2 }) === I && errs({ item: 'tea', quantity: 1, note: 'x'.repeat(201) }) === N && errs({ item: 'tea', quantity: 1, note: 'x'.repeat(200) }) === 'OK' && [null, [], 'tea', 42].every((v) => errs(v) === 'body must be a JSON object'); })()` },
+    { name: "toHttpError handles every kind of OrderError", check: `(() => { const a = toHttpError({ kind: 'out_of_stock', item: 'dumplings', left: 1 }); const b = toHttpError({ kind: 'shop_closed', opensAt: '08:30' }); return a instanceof HttpError && a.status === 409 && a.code === 'out_of_stock' && a.message === 'Only 1 dumplings left' && b instanceof HttpError && b.status === 503 && b.code === 'shop_closed' && b.message === 'The shop opens at 08:30'; })()` },
+    { name: "POST /api/orders creates an order (201) that GET can find", check: `await (async () => { const api = require('supertest')(createApp({ stock: { bamboo: 5, dumplings: 5, tea: 5 }, isOpen: () => true })); const r = await api.post('/api/orders').send({ item: 'dumplings', quantity: 3, note: 'Hot!', id: 50, total: 0 }); const again = await api.get('/api/orders/1'); return r.status === 201 && r.body.id === 1 && r.body.item === 'dumplings' && r.body.quantity === 3 && r.body.note === 'Hot!' && r.body.total === 15 && again.status === 200 && again.body.total === 15; })()` },
+    { name: "An invalid order answers 400 with details and saves nothing", check: `await (async () => { const api = require('supertest')(createApp({ stock: { bamboo: 5, dumplings: 5, tea: 5 }, isOpen: () => true })); const r = await api.post('/api/orders').send({ item: 'tea', quantity: 99 }); const none = await api.post('/api/orders'); const saved = await api.get('/api/orders/1'); return r.status === 400 && r.body.code === 'bad_request' && r.body.error === 'Invalid order' && JSON.stringify(r.body.details) === JSON.stringify(['quantity must be a whole number from 1 to 10']) && none.status === 400 && none.body.code === 'bad_request' && saved.status === 404 && saved.body.error === 'Order not found' && saved.body.code === 'not_found'; })()` },
+    { name: "Out of stock answers 409, a closed shop 503", check: `await (async () => { const open = require('supertest')(createApp({ stock: { bamboo: 5, dumplings: 5, tea: 1 }, isOpen: () => true })); const a = await open.post('/api/orders').send({ item: 'tea', quantity: 2 }); const closed = require('supertest')(createApp({ stock: { bamboo: 5, dumplings: 5, tea: 5 }, isOpen: () => false })); const b = await closed.post('/api/orders').send({ item: 'tea', quantity: 1 }); return a.status === 409 && a.body.error === 'Only 1 tea left' && a.body.code === 'out_of_stock' && a.body.details === undefined && b.status === 503 && b.body.code === 'shop_closed' && b.body.error === 'The shop opens at 09:00'; })()` },
+    { name: "The error handler: broken JSON 400, crashes 500, unknown routes 404", check: `await (async () => { const api = require('supertest')(createApp({ stock: { bamboo: 5, dumplings: 5, tea: 5 }, isOpen: () => true })); const broken = await api.post('/api/orders').set('Content-Type', 'application/json').send('{ "item": '); const crash = await api.get('/api/report'); const lost = await api.get('/api/nope'); return broken.status === 400 && broken.body.code === 'bad_request' && typeof broken.body.error === 'string' && crash.status === 500 && crash.body.error === 'Something went wrong' && crash.body.code === 'internal' && Object.keys(crash.body).length === 2 && lost.status === 404 && lost.body.code === 'not_found'; })()` },
+  ]}
+>
+
+The panda bamboo shop takes orders over an API. The shop logic (`createShop`), the error types and `HttpError` are ready-made. Press **Run**: TypeScript finds problems in two places before anything runs. Finish the API:
+
+1. **`isItem(value)`**: a type guard that's `true` only for `"bamboo"`, `"dumplings"` and `"tea"`.
+2. **`parseNewOrder(input)`** returns `{ ok: true, value }` with only `item`, `quantity` and (if sent) `note`, or `{ ok: false, error }` with **every** problem, in this order:
+   - not an object (or `null`, or an array): only `"body must be a JSON object"`;
+   - `item` isn't one of the items: `"item must be one of: bamboo, dumplings, tea"`;
+   - `quantity` isn't a whole number from 1 to 10: `"quantity must be a whole number from 1 to 10"`;
+   - `note` is present but isn't a string of at most 200 characters: `"note must be a string of at most 200 characters"`.
+3. **`toHttpError(error)`**: TypeScript says the `switch` is missing a case. `"shop_closed"` becomes an `HttpError` with the code `"shop_closed"` and a message like `"The shop opens at 09:00"` (the time is `error.opensAt`).
+4. **`POST /api/orders`**: parse the body; if it's invalid, throw `HttpError("bad_request", "Invalid order", errors)`. Otherwise call `shop.placeOrder(...)`; if that fails, throw `toHttpError(result.error)`. If it works, answer **201** with the order.
+5. **The error handler**: annotate its four parameters (`err: unknown`). An `HttpError` is answered with its status and `{ error: message, code, details }`. A client error (use the ready-made `isClientError`, e.g. broken JSON) gets its own status and `{ error: message, code: "bad_request" }`. Everything else stays a 500 with `"Something went wrong"`.
+
+<Hint>
+
+1. `ITEMS.includes(value)` doesn't compile, because `includes` on a `readonly Item[]` only accepts an `Item`, and `value` is `unknown`. Use `ITEMS.some((item) => item === value)` instead.
+2. Start with `if (!isRecord(input)) return { ok: false, error: [...] };`, then check each field. Keep the good values in variables such as `let item: Item | undefined;` and finish with `if (item === undefined || quantity === undefined || errors.length > 0)`. `Number.isInteger(q)` is only `true` for whole numbers.
+3. Add `case "shop_closed": return new HttpError("shop_closed", ...);` before the `default`.
+4. Express 5 sends errors thrown in a route to the error handler, so the route is just: `parse`, `throw` on failure, `placeOrder`, `throw` on failure, `res.status(201).json(...)`.
+5. The signature is `(err: unknown, req: Request, res: Response<ErrorBody>, _next: NextFunction)`. Check `err instanceof HttpError` first, then `isClientError(err)`, and `return;` after each answer.
+
+</Hint>
+
+<Solution>
+
+```ts
+import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import request from "supertest";
+
+// ---------- ready-made: don't change this part ----------
+
+type Item = "bamboo" | "dumplings" | "tea";
+const ITEMS: readonly Item[] = ["bamboo", "dumplings", "tea"];
+const PRICES: Record<Item, number> = {
+  bamboo: 3,
+  dumplings: 5,
+  tea: 2,
+};
+
+interface NewOrder {
+  item: Item;
+  quantity: number;
+  note?: string;
+}
+interface Order {
+  id: number;
+  item: Item;
+  quantity: number;
+  note: string;
+  total: number;
+}
+
+type ErrorCode =
+  | "bad_request"
+  | "not_found"
+  | "out_of_stock"
+  | "shop_closed"
+  | "internal";
+const STATUS: Record<ErrorCode, number> = {
+  bad_request: 400,
+  not_found: 404,
+  out_of_stock: 409,
+  shop_closed: 503,
+  internal: 500,
+};
+interface ErrorBody {
+  error: string; // a message for people
+  code: ErrorCode; // a stable code for programs
+  details?: string[];
+}
+
+class HttpError extends Error {
+  readonly status: number;
+  readonly code: ErrorCode;
+  readonly details?: string[];
+  constructor(code: ErrorCode, message: string, details?: string[]) {
+    super(message);
+    this.name = "HttpError";
+    this.code = code;
+    this.status = STATUS[code];
+    this.details = details;
+  }
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+type OrderError =
+  | { kind: "out_of_stock"; item: Item; left: number }
+  | { kind: "shop_closed"; opensAt: string };
+
+interface ShopOptions {
+  stock: Record<Item, number>;
+  isOpen: () => boolean;
+}
+
+function createShop({ stock, isOpen }: ShopOptions) {
+  const left = { ...stock };
+  const opensAt = "09:00";
+  const orders: Order[] = [];
+  return {
+    placeOrder(input: NewOrder): Result<Order, OrderError> {
+      if (!isOpen()) {
+        return { ok: false, error: { kind: "shop_closed", opensAt } };
+      }
+      const available = left[input.item];
+      if (available < input.quantity) {
+        const error: OrderError = {
+          kind: "out_of_stock",
+          item: input.item,
+          left: available,
+        };
+        return { ok: false, error };
+      }
+      left[input.item] -= input.quantity;
+      const order: Order = {
+        id: orders.length + 1,
+        item: input.item,
+        quantity: input.quantity,
+        note: input.note ?? "",
+        total: PRICES[input.item] * input.quantity,
+      };
+      orders.push(order);
+      return { ok: true, value: order };
+    },
+    getOrder(id: number): Order | undefined {
+      return orders.find((o) => o.id === id);
+    },
+  };
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected value: ${JSON.stringify(value)}`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+// Express's own errors (e.g. broken JSON) carry a 4xx status
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+// ---------- your code ----------
+
+function isItem(value: unknown): value is Item {
+  return ITEMS.some((item) => item === value);
+}
+
+function parseNewOrder(input: unknown): Result<NewOrder, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+
+  let item: Item | undefined;
+  if (isItem(input.item)) {
+    item = input.item;
+  } else {
+    errors.push("item must be one of: bamboo, dumplings, tea");
+  }
+
+  let quantity: number | undefined;
+  const q = input.quantity;
+  if (typeof q === "number" && Number.isInteger(q) &&
+      q >= 1 && q <= 10) {
+    quantity = q;
+  } else {
+    errors.push("quantity must be a whole number from 1 to 10");
+  }
+
+  const note = input.note;
+  if (note !== undefined &&
+      (typeof note !== "string" || note.length > 200)) {
+    errors.push("note must be a string of at most 200 characters");
+  }
+
+  if (item === undefined || quantity === undefined || errors.length) {
+    return { ok: false, error: errors };
+  }
+  const order: NewOrder = { item, quantity };
+  if (typeof note === "string") order.note = note;
+  return { ok: true, value: order };
+}
+
+function toHttpError(error: OrderError): HttpError {
+  switch (error.kind) {
+    case "out_of_stock":
+      return new HttpError(
+        "out_of_stock",
+        `Only ${error.left} ${error.item} left`,
+      );
+    case "shop_closed":
+      return new HttpError(
+        "shop_closed",
+        `The shop opens at ${error.opensAt}`,
+      );
+    default:
+      return assertNever(error);
+  }
+}
+
+function createApp(options: ShopOptions): Application {
+  const shop = createShop(options);
+  const app = express();
+  app.use(express.json());
+
+  app.post("/api/orders", (req, res: Response<Order>) => {
+    const parsed = parseNewOrder(req.body);
+    if (!parsed.ok) {
+      throw new HttpError("bad_request", "Invalid order", parsed.error);
+    }
+    const result = shop.placeOrder(parsed.value);
+    if (!result.ok) throw toHttpError(result.error);
+    res.status(201).json(result.value);
+  });
+
+  app.get("/api/orders/:id", (req, res: Response<Order>) => {
+    const order = shop.getOrder(Number(req.params.id));
+    if (!order) throw new HttpError("not_found", "Order not found");
+    res.json(order);
+  });
+
+  app.get("/api/report", async () => {
+    throw new Error("Report service is down");
+  });
+
+  app.use((req, res: Response<ErrorBody>) => {
+    const message = `Cannot ${req.method} ${req.path}`;
+    res.status(404).json({ error: message, code: "not_found" });
+  });
+
+  app.use(
+    (err: unknown, req: Request, res: Response<ErrorBody>,
+     _next: NextFunction) => {
+      if (err instanceof HttpError) {
+        const { status, code, message, details } = err;
+        res.status(status).json({ error: message, code, details });
+        return;
+      }
+      if (isClientError(err)) {
+        const { status, message } = err;
+        res.status(status).json({ error: message, code: "bad_request" });
+        return;
+      }
+      console.error("Unexpected:", String(err));
+      res.status(500).json({
+        error: "Something went wrong",
+        code: "internal",
+      });
+    },
+  );
+
+  return app;
+}
+
+const app = createApp({
+  stock: { bamboo: 20, dumplings: 6, tea: 2 },
+  isOpen: () => true,
+});
+const order = (body: object) =>
+  request(app).post("/api/orders").send(body);
+
+const ok = await order({ item: "tea", quantity: 2 });
+console.log(ok.status, ok.body);
+const bad = await order({ item: "cake", quantity: 0 });
+console.log(bad.status, JSON.stringify(bad.body));
+const gone = await order({ item: "tea", quantity: 1 });
+console.log(gone.status, JSON.stringify(gone.body));
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Types are erased before the code runs, so data from outside is **`unknown`** until a parser checks it: **parse at the edges**.
+- A **parser** takes `unknown` and returns `Result<T, string[]>`: clean, typed data with only the known fields, or **every** problem at once.
+- **Schemas** (Zod, Valibot) describe the data once and derive the type with `z.infer`, so the check and the type can't drift apart.
+- Model failures with an **`HttpError`** class, a **union of error codes**, `Record<ErrorCode, number>` for statuses and **one `ErrorBody` shape** for every error response.
+- Error middleware needs **four annotated parameters**: `(err: unknown, req: Request, res: Response<ErrorBody>, _next: NextFunction)`. Narrow `err` with `instanceof` and guards; remember errors that aren't yours, like broken JSON.
+- Hide the details of 500s from clients and log them on the server.
+- **Services return `Result`s** for expected failures (with an exhaustive `switch` + `assertNever` when mapping them); the HTTP layer turns them into status codes; unexpected problems are thrown and become 500s.

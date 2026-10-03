@@ -1,0 +1,860 @@
+---
+title: Dependency Injection and Fakes
+description: Make code testable by depending on interfaces, inject them through constructors or factories, and test with typed fakes, fake clocks, satisfies fixtures and a fake fetch.
+duration: 20
+xp: 25
+---
+
+Some code is a pleasure to test: values in, values out. Other code reaches out into the world by itself. It reads the clock, calls a server, writes to a database and sends emails. To test it you'd need a real database, a real mail server, and a way to make "now" be 1 March. In this lesson you'll learn the design habit that fixes this, **dependency injection**, and how TypeScript keeps your test doubles honest. 🔌
+
+## Hidden dependencies
+
+Here's a function that starts a free trial. It works, but it's almost impossible to test:
+
+```ts
+import { db } from "./db";
+import { mailer } from "./mailer";
+
+export async function startTrial(userId: string) {
+  const user = await db.users.findById(userId);   // a real database
+  user.trialEndsAt = Date.now() + 14 * DAY;       // the real clock
+  await db.users.save(user);
+  await mailer.send(user.email, "Trial started"); // a real email!
+}
+```
+
+Its **dependencies are hidden** inside it. A test can't swap the database for a test one, can't control `Date.now()`, and every run sends a real email. You could reach for module mocking (`vi.mock("./db")`) to patch the imports behind the function's back, but there's a simpler, sturdier design: let the function **say what it needs** and **receive** it.
+
+## Depend on interfaces, then inject them
+
+The trick has two steps:
+
+1. Describe each dependency as a small **interface**: not "the Postgres database", but "something that can find and save users". Not `Date.now()`, but "something that knows the time".
+2. Pass the dependencies **in** (that's the "injection"), here through a class constructor.
+
+The production app passes the real implementations. The tests pass **fakes**: small, working stand-ins written for testing, like a repository that keeps users in a `Map`:
+
+<CodeExample output={`2026-03-15T00:00:00.000Z
+✓ TrialService > starts a 14-day trial
+✓ TrialService > emails the user
+✓ TrialService > refuses a second trial
+
+Tests  3 passed (3)`}>
+
+```ts
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ---- What the service needs ----
+interface User {
+  id: string;
+  email: string;
+  plan: "free" | "trial" | "pro";
+  trialEndsAt: number | null; // milliseconds since 1970
+}
+
+interface UserRepo {
+  findById(id: string): Promise<User | undefined>;
+  save(user: User): Promise<void>;
+}
+
+interface Clock {
+  now(): number;
+}
+
+interface Mailer {
+  send(to: string, subject: string): Promise<void>;
+}
+
+// ---- The code under test ----
+const DAY = 24 * 60 * 60 * 1000;
+
+class TrialService {
+  constructor(
+    private readonly users: UserRepo,
+    private readonly clock: Clock,
+    private readonly mailer: Mailer,
+  ) {}
+
+  async startTrial(userId: string): Promise<User> {
+    const user = await this.users.findById(userId);
+    if (!user) throw new Error(`No user ${userId}`);
+    if (user.plan !== "free") throw new Error("Already upgraded");
+    const updated: User = {
+      ...user,
+      plan: "trial",
+      trialEndsAt: this.clock.now() + 14 * DAY,
+    };
+    await this.users.save(updated);
+    await this.mailer.send(user.email, "Your 14-day trial has started");
+    return updated;
+  }
+}
+
+// ---- Hand-written fakes ----
+class InMemoryUserRepo implements UserRepo {
+  private readonly users = new Map<string, User>();
+
+  async findById(id: string): Promise<User | undefined> {
+    return this.users.get(id);
+  }
+
+  async save(user: User): Promise<void> {
+    this.users.set(user.id, user);
+  }
+}
+
+class FakeClock implements Clock {
+  constructor(private time: number) {}
+
+  now(): number {
+    return this.time;
+  }
+
+  advance(ms: number): void {
+    this.time += ms;
+  }
+}
+
+class FakeMailer implements Mailer {
+  readonly sent: { to: string; subject: string }[] = [];
+
+  async send(to: string, subject: string): Promise<void> {
+    this.sent.push({ to, subject });
+  }
+}
+
+// ---- Tests ----
+describe("TrialService", () => {
+  let users: InMemoryUserRepo;
+  let clock: FakeClock;
+  let mailer: FakeMailer;
+  let service: TrialService;
+
+  beforeEach(async () => {
+    users = new InMemoryUserRepo();
+    clock = new FakeClock(Date.UTC(2026, 2, 1)); // 1 March 2026
+    mailer = new FakeMailer();
+    service = new TrialService(users, clock, mailer);
+    await users.save({
+      id: "u1",
+      email: "mei@pandadev.test",
+      plan: "free",
+      trialEndsAt: null,
+    });
+  });
+
+  it("starts a 14-day trial", async () => {
+    await service.startTrial("u1");
+    const saved = await users.findById("u1");
+    expect(saved?.plan).toBe("trial");
+    console.log(new Date(saved?.trialEndsAt ?? 0).toISOString());
+  });
+
+  it("emails the user", async () => {
+    await service.startTrial("u1");
+    expect(mailer.sent).toEqual([
+      {
+        to: "mei@pandadev.test",
+        subject: "Your 14-day trial has started",
+      },
+    ]);
+  });
+
+  it("refuses a second trial", async () => {
+    await service.startTrial("u1");
+    await expect(service.startTrial("u1")).rejects.toThrow("Already");
+    expect(mailer.sent).toHaveLength(1);
+  });
+});
+```
+
+</CodeExample>
+
+Notice what `TrialService` **doesn't** know: whether users live in Postgres or in a `Map`, whether the time is real, whether emails go anywhere. It only knows the interfaces. Because the fake clock always says 1 March 2026, the trial end date is the same on every run, on every machine, in every time zone.
+
+Each fake is a few lines, and each one `implements` its interface. The fake mailer doesn't send anything: it **records** what would have been sent, so the test checks the outcome with a plain `toEqual`.
+
+### Constructor or factory?
+
+A class with constructor parameters is one style. The other is a **factory function** that takes a `deps` object and returns the service. Both are dependency injection, so pick whichever your codebase already uses:
+
+```ts
+type TrialDeps = { users: UserRepo; clock: Clock; mailer: Mailer };
+
+function createTrialService({ users, clock, mailer }: TrialDeps) {
+  return {
+    async startTrial(userId: string): Promise<User> {
+      const user = await users.findById(userId);
+      // ...same as above, using clock.now() and mailer.send()
+    },
+  };
+}
+```
+
+A `deps` object scales nicely: with five dependencies, named properties beat five positional parameters. Either way, the real implementations are created in **one place** at the start of the app, often called the **composition root**:
+
+```ts title="main.ts"
+const trials = new TrialService(
+  new PostgresUserRepo(pool),
+  { now: () => Date.now() }, // the real clock: one line
+  new SmtpMailer(config.smtpUrl),
+);
+```
+
+<Callout type="tip" title="Inject only the edges">
+
+You don't need an interface for everything. Inject the things that are **slow, random or outside your program**: the network, the database, the clock, randomness, email, storage. Your own pure functions (formatting, price rules) can simply be imported and used for real in tests.
+
+</Callout>
+
+## Fakes, mocks, and keeping them in sync
+
+A **fake** is a working implementation, just a simple one. A **mock** (from `vi.fn()`) is a function whose answers you script per test, and which records its calls. Both are useful:
+
+- **Fakes shine for things with state**: repositories, storage, caches, clocks. Tests check the **outcome** ("the user is now on a trial") instead of the exact calls, so they don't break when you reorganise the code. Write the fake once, and every test reuses it.
+- **Mocks shine for one-off answers and for outputs**: "make this call fail once", "was the analytics event sent with these properties?". They need no extra class.
+
+In plain JavaScript, a hand-written fake has a weakness: it can quietly fall behind the real thing. In TypeScript, [`implements`](/learn/typescript/inheritance-interfaces-and-abstract-classes) makes the compiler watch it for you. Add a method to `UserRepo`, and every fake that hasn't caught up stops compiling:
+
+```ts
+interface UserRepo {
+  findById(id: string): Promise<User | undefined>;
+  save(user: User): Promise<void>;
+  findTrialsEndingBefore(time: number): Promise<User[]>; // new!
+}
+
+class InMemoryUserRepo implements UserRepo {
+// ❌ Error: Class 'InMemoryUserRepo' incorrectly implements interface 'UserRepo'.
+```
+
+When you want mocks for a whole interface, build the object from typed `vi.fn`s and check it with **`satisfies`**. This operator goes after a value: `{ ... } satisfies Mailer` makes the compiler check that the object fits the interface, **without** changing its type to `Mailer`. So `mailer.send` stays a mock, and `mailer.send.mock.calls` still works:
+
+<CodeExample output={`[ 'bao@pandadev.test', 'Your trial ends tomorrow' ]
+✓ reminds everyone
+
+Tests  1 passed (1)`}>
+
+```ts
+import { it, expect, vi } from "vitest";
+
+interface Mailer {
+  send(to: string, subject: string): Promise<void>;
+}
+
+async function remindAll(emails: string[], mailer: Mailer) {
+  for (const email of emails) {
+    await mailer.send(email, "Your trial ends tomorrow");
+  }
+}
+
+it("reminds everyone", async () => {
+  const mailer = {
+    send: vi.fn<Mailer["send"]>().mockResolvedValue(),
+  } satisfies Mailer;
+
+  await remindAll(["mei@pandadev.test", "bao@pandadev.test"], mailer);
+
+  expect(mailer.send).toHaveBeenCalledTimes(2);
+  console.log(mailer.send.mock.calls[1]);
+});
+```
+
+</CodeExample>
+
+Compare the two other ways of writing it:
+
+```ts
+// A type annotation checks the shape, but forgets that send is a mock:
+const mailer: Mailer = { send: vi.fn<Mailer["send"]>() };
+mailer.send.mock.calls;
+// ❌ Error: Property 'mock' does not exist on type '(to: string, subject: string) => Promise<void>'.
+
+// satisfies checks the shape AND keeps the mock type:
+const typo = { sned: vi.fn<Mailer["send"]>() } satisfies Mailer;
+// ❌ Error: Object literal may only specify known properties, and 'sned' does not exist in type 'Mailer'.
+```
+
+Without either, a typo or a missing method only shows up later, as an error at the line where you pass the object in, far from where you made the mistake.
+
+## Faking time
+
+Time is the most common hidden dependency, and you've now seen two ways to control it:
+
+- **Inject a clock** (`Clock` with `now()`) when your code needs the current time. A `FakeClock` with `advance(ms)` lets a test say "14 days later" in one line.
+- **Inject a sleep** when your code needs to **wait**: retries, backoff, polling. The real one wraps `setTimeout`; the fake one doesn't wait at all, it just records how long it would have waited.
+
+<CodeExample output={`200
+✓ withRetry > backs off between attempts, then succeeds
+✓ withRetry > gives up after the last attempt
+
+Tests  2 passed (2)`}>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+type Sleep = (ms: number) => Promise<void>;
+
+async function withRetry<T>(
+  task: () => Promise<T>,
+  options: { attempts: number; sleep: Sleep },
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await task();
+    } catch (error) {
+      if (attempt >= options.attempts) throw error;
+      await options.sleep(100 * 2 ** (attempt - 1)); // 100, 200, 400…
+    }
+  }
+}
+
+// The app uses a real sleep (here against the practice API's
+// /flaky endpoint, which fails twice with 503 and then works)
+const realSleep: Sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+const status = await withRetry(
+  async () => {
+    const res = await fetch("https://api.pandadev.test/flaky");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.status;
+  },
+  { attempts: 3, sleep: realSleep },
+);
+console.log(status);
+
+// The tests use a fake sleep that only records the waits
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep: Sleep = async (ms) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+describe("withRetry", () => {
+  it("backs off between attempts, then succeeds", async () => {
+    const task = vi.fn<() => Promise<string>>()
+      .mockRejectedValueOnce(new Error("503"))
+      .mockRejectedValueOnce(new Error("503"))
+      .mockResolvedValue("ok");
+    const { sleep, waits } = fakeSleep();
+
+    expect(await withRetry(task, { attempts: 3, sleep })).toBe("ok");
+    expect(waits).toEqual([100, 200]);
+  });
+
+  it("gives up after the last attempt", async () => {
+    const task = vi.fn<() => Promise<string>>()
+      .mockRejectedValue(new Error("503"));
+    const { sleep, waits } = fakeSleep();
+
+    await expect(withRetry(task, { attempts: 4, sleep })).rejects
+      .toThrow("503");
+    expect(task).toHaveBeenCalledTimes(4);
+    expect(waits).toEqual([100, 200, 400]);
+  });
+});
+```
+
+</CodeExample>
+
+PandaDev has a practice API built in, so this works offline and gives the same answers every time; real APIs work the same way. The real run waits 300 ms in total. The tests wait **zero** milliseconds, and they check the exact backoff schedule, which real waiting could never do reliably.
+
+For code that calls `setTimeout` directly and that you can't change, Vitest's **fake timers** are the other option: `vi.useFakeTimers()`, then `vi.advanceTimersByTime(ms)` (or `await vi.advanceTimersByTimeAsync(ms)` when promises are involved), as in the JavaScript lesson [Mocks and Async Tests](/learn/javascript/mocks-and-async-tests). For code you design yourself, an injected clock or sleep is simpler and more explicit.
+
+## Test fixtures with satisfies
+
+**Fixtures** are the ready-made test data a suite shares: a few named users, a sample API response. How you type them matters more than you'd think. Annotating them as `Record<string, User>` checks each user, but throws away the names:
+
+```ts
+const users: Record<string, User> = {
+  mei: { id: "u1", name: "Mei", plan: "pro" },
+};
+users.meii.name; // compiles... and crashes when the test runs
+```
+
+`satisfies` checks every entry **and** keeps the exact keys, so a misspelt fixture name is a compile error with a helpful suggestion:
+
+<CodeExample output="Mei free">
+
+```ts
+interface User {
+  id: string;
+  name: string;
+  plan: "free" | "pro";
+}
+
+const users = {
+  mei: { id: "u1", name: "Mei", plan: "pro" },
+  bao: { id: "u2", name: "Bao", plan: "free" },
+} satisfies Record<string, User>;
+
+console.log(users.mei.name, users.bao.plan);
+```
+
+</CodeExample>
+
+```ts
+users.meii;
+// ❌ Error: Property 'meii' does not exist on type '{ mei: { id: string; name: string; plan: "pro"; }; bao: { id: string; name: string; plan: "free"; }; }'. Did you mean 'mei'?
+
+const broken = {
+  bao: { id: "u2", name: "Bao", plna: "free" },
+} satisfies Record<string, User>;
+// ❌ Error: Object literal may only specify known properties, and 'plna' does not exist in type 'User'.
+```
+
+The same goes for sample API responses. Writing `const movieJson = { ... } satisfies Movie` guarantees the fixture really has the shape your client expects, so when the `Movie` type changes, the fixture can't silently go stale.
+
+## Faking fetch, with types
+
+API clients should receive `fetch` too (and a base URL), exactly like the clock, as you did in [Runtime Validation](/learn/typescript/runtime-validation). With `typeof fetch` as the dependency's type, the fake must return a real `Promise<Response>`. The quick JavaScript trick of a plain object with just `ok` and `json()` no longer compiles:
+
+```ts
+const fakeFetch = vi.fn<typeof fetch>();
+fakeFetch.mockResolvedValue({
+  ok: true,
+  status: 200,
+  json: async () => movie,
+});
+// ❌ Error: Argument of type '{ ok: true; status: number; json: () => Promise<{ id: number; title: string; year: number; }>; }' is not assignable to parameter of type 'Response'.
+```
+
+Don't silence it with `as unknown as Response`. That cast is a lie: the day the client reads `res.headers`, the test crashes with a confusing error instead of the compiler telling you. There are two honest fixes.
+
+**Fix 1: build real responses.** `Response` is a standard class, available in browsers, Node and here, so a tiny helper creates the real thing (the built-in shortcut `Response.json(body, { status })` works too):
+
+<CodeExample output={`The Bamboo Heist 2019
+✓ movie client > asks for the right URL and returns the movie
+✓ movie client > turns a 404 into an error
+✓ movie client > rejects data that isn't a movie
+
+Tests  3 passed (3)`}>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+interface Movie {
+  id: number;
+  title: string;
+  year: number;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+type ApiError = { status: number };
+
+function isMovie(data: unknown): data is Movie {
+  return (
+    typeof data === "object" && data !== null &&
+    "id" in data && typeof data.id === "number" &&
+    "title" in data && typeof data.title === "string" &&
+    "year" in data && typeof data.year === "number"
+  );
+}
+
+function createMovieClient(fetchFn: typeof fetch, baseUrl: string) {
+  return {
+    async getMovie(id: number): Promise<Result<Movie, ApiError>> {
+      const res = await fetchFn(`${baseUrl}/movies/${id}`);
+      const data: unknown = await res.json();
+      if (!res.ok || !isMovie(data)) {
+        return { ok: false, error: { status: res.status } };
+      }
+      return { ok: true, value: data };
+    },
+  };
+}
+
+// A real Response object, so the fake needs no casts
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+describe("movie client", () => {
+  const baseUrl = "https://movies.test";
+
+  it("asks for the right URL and returns the movie", async () => {
+    const movie = { id: 7, title: "Test Film", year: 2001 };
+    const fakeFetch = vi.fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse(movie));
+    const client = createMovieClient(fakeFetch, baseUrl);
+
+    expect(await client.getMovie(7)).toEqual({ ok: true, value: movie });
+    expect(fakeFetch).toHaveBeenCalledWith(
+      "https://movies.test/movies/7",
+    );
+  });
+
+  it("turns a 404 into an error", async () => {
+    const fakeFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({ error: "Movie not found" }, 404),
+    );
+    const client = createMovieClient(fakeFetch, baseUrl);
+
+    expect(await client.getMovie(99)).toEqual({
+      ok: false,
+      error: { status: 404 },
+    });
+  });
+
+  it("rejects data that isn't a movie", async () => {
+    const fakeFetch = vi.fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ id: "7", name: "Oops" }));
+    const client = createMovieClient(fakeFetch, baseUrl);
+
+    expect((await client.getMovie(7)).ok).toBe(false);
+  });
+});
+
+// The app passes the real fetch
+const movies = createMovieClient(fetch, "https://api.pandadev.test");
+const result = await movies.getMovie(1);
+if (result.ok) {
+  console.log(result.value.title, result.value.year);
+}
+```
+
+</CodeExample>
+
+The last test is one only a fake can easily arrange: the server answers 200, but with data of the wrong shape. Fakes make the rare cases cheap to test.
+
+<Callout type="warning" title="A Response body can only be read once">
+
+`mockResolvedValue(jsonResponse(movie))` hands out the **same** `Response` object on every call. The first `res.json()` reads its body; a second call to the mock returns the already-read response, and `json()` throws a `TypeError`. When a test makes several requests, create a fresh response per call:
+
+```ts
+const fakeFetch = vi.fn<typeof fetch>()
+  .mockImplementation(async () => jsonResponse(movie));
+```
+
+</Callout>
+
+**Fix 2: depend on less.** `typeof fetch` is a big promise: requests, headers, streams, a dozen properties on `Response`. If your client only uses `ok`, `status` and `json()`, say so in its dependency type. Thanks to [structural typing](/learn/typescript/structural-typing-and-class-design), the real `fetch` still fits, and a fake is a few lines:
+
+<CodeExample output={`14
+✓ reads the temperature
+
+Tests  1 passed (1)`}>
+
+```ts
+import { it, expect } from "vitest";
+
+// Depend only on what the client really uses
+type HttpResponse = {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+};
+type HttpGet = (url: string) => Promise<HttpResponse>;
+
+function createWeatherClient(get: HttpGet, baseUrl: string) {
+  return {
+    async temperature(city: string): Promise<number | null> {
+      const params = new URLSearchParams({ city });
+      const res = await get(`${baseUrl}/weather?${params}`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (
+        typeof data === "object" && data !== null &&
+        "temperature" in data && typeof data.temperature === "number"
+      ) {
+        return data.temperature;
+      }
+      return null;
+    },
+  };
+}
+
+it("reads the temperature", async () => {
+  const urls: string[] = [];
+  const fakeGet: HttpGet = async (url) => {
+    urls.push(url);
+    const body = { temperature: 21 };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const client = createWeatherClient(fakeGet, "https://weather.test");
+
+  expect(await client.temperature("New York")).toBe(21);
+  expect(urls).toEqual(["https://weather.test/weather?city=New+York"]);
+});
+
+// The real fetch fits HttpGet, so the app passes it in unchanged
+const weather = createWeatherClient(fetch, "https://api.pandadev.test");
+console.log(await weather.temperature("London"));
+```
+
+</CodeExample>
+
+Which fix to choose? Real `Response` objects are best when the code uses more of the `fetch` API (headers, methods, request bodies) or when you share one fake across many tests. A narrow dependency type is best for small clients, and it documents exactly what the client relies on. Both beat a cast.
+
+<Quiz
+  question="A test needs a mock Mailer whose send method's calls it can inspect. Which line both checks the object against the Mailer interface and keeps mailer.send.mock available?"
+  options={[
+    "const mailer: Mailer = { send: vi.fn<Mailer['send']>() };",
+    "const mailer = { send: vi.fn<Mailer['send']>() } satisfies Mailer;",
+    "const mailer = { send: vi.fn() } as Mailer;",
+    "const mailer = { send: vi.fn() };",
+  ]}
+  answer={1}
+  explanation="satisfies checks the object against Mailer but keeps its own, more precise type, so send is still a Mock. The annotation turns send into a plain function type (no .mock), the cast skips the check entirely, and the last line isn't checked or typed at all."
+/>
+
+<Quiz
+  question="UserRepo gets a new method, deleteById. What happens to class InMemoryUserRepo implements UserRepo, which doesn't have it yet?"
+  options={[
+    "Nothing until a test calls deleteById, which then crashes",
+    "The tests that use it fail at runtime with 'not a function'",
+    "It stops compiling: the class incorrectly implements the interface",
+    "TypeScript adds an empty deleteById automatically",
+  ]}
+  answer={2}
+  explanation="implements makes the compiler compare the class with the interface. A missing method is a compile error pointing at the fake, so typed fakes can't silently fall behind the real implementation."
+/>
+
+<Exercise
+  title="Fakes for a reminder service"
+  language="typescript"
+  starter={`import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
+
+// ---- The code under test (don't change it) ----
+interface Reminder {
+  id: string;
+  to: string;
+  text: string;
+  dueAt: number; // milliseconds
+  sent: boolean;
+}
+
+interface ReminderStore {
+  add(reminder: Omit<Reminder, "id">): Promise<Reminder>;
+  list(): Promise<Reminder[]>;
+  update(id: string, changes: Partial<Reminder>): Promise<void>;
+}
+
+interface Clock {
+  now(): number;
+}
+
+type Notify = (to: string, text: string) => Promise<void>;
+
+const MINUTE = 60_000;
+
+class Reminders {
+  constructor(
+    private readonly store: ReminderStore,
+    private readonly clock: Clock,
+    private readonly notify: Notify,
+  ) {}
+
+  schedule(to: string, text: string, inMinutes: number) {
+    const dueAt = this.clock.now() + inMinutes * MINUTE;
+    return this.store.add({ to, text, dueAt, sent: false });
+  }
+
+  async sendDue(): Promise<number> {
+    const now = this.clock.now();
+    const all = await this.store.list();
+    const due = all.filter((r) => !r.sent && r.dueAt <= now);
+    for (const reminder of due) {
+      await this.notify(reminder.to, reminder.text);
+      await this.store.update(reminder.id, { sent: true });
+    }
+    return due.length;
+  }
+}
+
+// ---- Your fakes ----
+class FakeClock implements Clock {
+  constructor(private time: number) {}
+  // now() and advance(ms)
+}
+
+class InMemoryReminderStore implements ReminderStore {
+  // add, list and update, with the reminders in a Map
+}
+
+// ---- Your tests ----
+describe("Reminders", () => {
+  // beforeEach: fresh fakes and a typed notify mock
+});
+`}
+  tests={[
+    { name: "FakeClock tells the time and can advance", check: `new FakeClock(5).now() === 5 && (() => { const c = new FakeClock(5); c.advance(10); return c.now() === 15; })()` },
+    { name: "InMemoryReminderStore adds, lists and updates reminders", check: `await (async () => { const s = new InMemoryReminderStore(); const a = await s.add({ to: "a", text: "x", dueAt: 1, sent: false }); const b = await s.add({ to: "b", text: "y", dueAt: 2, sent: false }); await s.update(a.id, { sent: true }); const all = await s.list(); return a.id !== b.id && all.length === 2 && all.find((r) => r.id === a.id).sent === true && all.find((r) => r.id === a.id).text === "x" && all.find((r) => r.id === b.id).sent === false; })()` },
+    { name: "The code under test is unchanged", check: `Reminders.toString().includes("r.dueAt <= now") && Reminders.toString().includes("inMinutes * MINUTE")` },
+    { name: "You wrote at least 4 tests and they all pass", check: `__vitest.failed === 0 && __vitest.passed >= 4` },
+    { name: "Your tests catch due times in seconds instead of minutes", check: `(await __retest([["inMinutes * MINUTE", "inMinutes * 1000"]])).failed > 0` },
+    { name: "Your tests catch a reminder that's late by one tick", check: `(await __retest([["r.dueAt <= now", "r.dueAt < now"]])).failed > 0` },
+    { name: "Your tests catch sending reminders that aren't due yet", check: `(await __retest([["const now = this.clock.now();", "const now = Infinity;"]])).failed > 0` },
+    { name: "Your tests catch the wrong message being sent", check: `(await __retest([["await this.notify(reminder.to, reminder.text);", "await this.notify(reminder.to, reminder.to);"]])).failed > 0` },
+    { name: "Your tests catch reminders sent twice", check: `(await __retest([["!r.sent && r.dueAt", "r.dueAt"]])).failed > 0` },
+    { name: "Your tests catch reminders never marked as sent", check: `(await __retest([["{ sent: true }", "{ sent: false }"]])).failed > 0` },
+  ]}
+>
+
+The `Reminders` service schedules reminders and sends the ones that are due. It depends on a `ReminderStore`, a `Clock` and a `notify` function, all injected. Your job: write the fakes and the tests (don't change the code under test). The two fake classes don't compile yet, because they don't implement their interfaces.
+
+1. **`FakeClock`**: `now()` returns the stored time, and `advance(ms)` moves it forward.
+2. **`InMemoryReminderStore`**: keeps reminders in a `Map<string, Reminder>`. `add` gives each new reminder a **unique** id (a counter is fine) and returns the full reminder; `list` returns all of them; `update` merges the changes into the stored reminder.
+3. **Tests** (at least 4), using fresh fakes in `beforeEach` and a typed mock `vi.fn<Notify>()` (store it in a `let notify: Mock<Notify>`):
+   - `schedule` sets `dueAt` to the clock's time plus the minutes, and `sent` to `false`;
+   - a reminder that isn't due yet (one millisecond early) is **not** sent;
+   - a reminder is sent **exactly** at its due time, with the right `to` and `text`;
+   - calling `sendDue` twice sends a reminder only **once**, and the store marks it as sent.
+
+<Hint>
+
+The clock: `now(): number { return this.time; }` and `advance(ms: number): void { this.time += ms; }`. The store: a `private readonly reminders = new Map<string, Reminder>()` and a `private nextId = 1`; in `add`, build `{ id: "r" + this.nextId++, ...data }`, save it and return it; `list` returns `[...this.reminders.values()]`; `update` gets the reminder and sets `{ ...reminder, ...changes }`. In the tests, start the clock at e.g. `1_000_000`, schedule with `5` minutes, then `clock.advance(5 * 60_000 - 1)` before `sendDue()` for "not yet", or `clock.advance(5 * 60_000)` for "exactly now".
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
+
+// ---- The code under test (don't change it) ----
+interface Reminder {
+  id: string;
+  to: string;
+  text: string;
+  dueAt: number; // milliseconds
+  sent: boolean;
+}
+
+interface ReminderStore {
+  add(reminder: Omit<Reminder, "id">): Promise<Reminder>;
+  list(): Promise<Reminder[]>;
+  update(id: string, changes: Partial<Reminder>): Promise<void>;
+}
+
+interface Clock {
+  now(): number;
+}
+
+type Notify = (to: string, text: string) => Promise<void>;
+
+const MINUTE = 60_000;
+
+class Reminders {
+  constructor(
+    private readonly store: ReminderStore,
+    private readonly clock: Clock,
+    private readonly notify: Notify,
+  ) {}
+
+  schedule(to: string, text: string, inMinutes: number) {
+    const dueAt = this.clock.now() + inMinutes * MINUTE;
+    return this.store.add({ to, text, dueAt, sent: false });
+  }
+
+  async sendDue(): Promise<number> {
+    const now = this.clock.now();
+    const all = await this.store.list();
+    const due = all.filter((r) => !r.sent && r.dueAt <= now);
+    for (const reminder of due) {
+      await this.notify(reminder.to, reminder.text);
+      await this.store.update(reminder.id, { sent: true });
+    }
+    return due.length;
+  }
+}
+
+// ---- Your fakes ----
+class FakeClock implements Clock {
+  constructor(private time: number) {}
+
+  now(): number {
+    return this.time;
+  }
+
+  advance(ms: number): void {
+    this.time += ms;
+  }
+}
+
+class InMemoryReminderStore implements ReminderStore {
+  private readonly reminders = new Map<string, Reminder>();
+  private nextId = 1;
+
+  async add(data: Omit<Reminder, "id">): Promise<Reminder> {
+    const reminder = { id: `r${this.nextId++}`, ...data };
+    this.reminders.set(reminder.id, reminder);
+    return reminder;
+  }
+
+  async list(): Promise<Reminder[]> {
+    return [...this.reminders.values()];
+  }
+
+  async update(id: string, changes: Partial<Reminder>): Promise<void> {
+    const reminder = this.reminders.get(id);
+    if (reminder) {
+      this.reminders.set(id, { ...reminder, ...changes });
+    }
+  }
+}
+
+// ---- Your tests ----
+describe("Reminders", () => {
+  let store: InMemoryReminderStore;
+  let clock: FakeClock;
+  let notify: Mock<Notify>;
+  let reminders: Reminders;
+
+  beforeEach(() => {
+    store = new InMemoryReminderStore();
+    clock = new FakeClock(1_000_000);
+    notify = vi.fn<Notify>().mockResolvedValue();
+    reminders = new Reminders(store, clock, notify);
+  });
+
+  it("schedules a reminder from the clock's time", async () => {
+    const reminder = await reminders.schedule("mei", "Stretch!", 5);
+    expect(reminder.dueAt).toBe(1_000_000 + 5 * 60_000);
+    expect(reminder.sent).toBe(false);
+  });
+
+  it("doesn't send reminders that aren't due", async () => {
+    await reminders.schedule("mei", "Stretch!", 5);
+    clock.advance(5 * 60_000 - 1);
+    expect(await reminders.sendDue()).toBe(0);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("sends a reminder exactly when it's due", async () => {
+    await reminders.schedule("mei", "Stretch!", 5);
+    clock.advance(5 * 60_000);
+    expect(await reminders.sendDue()).toBe(1);
+    expect(notify).toHaveBeenCalledWith("mei", "Stretch!");
+  });
+
+  it("sends each reminder only once", async () => {
+    await reminders.schedule("bao", "Drink water", 1);
+    clock.advance(60_000);
+    await reminders.sendDue();
+    await reminders.sendDue();
+    expect(notify).toHaveBeenCalledTimes(1);
+    const [saved] = await store.list();
+    expect(saved.sent).toBe(true);
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Code with **hidden dependencies** (the clock, the network, a database, email) is hard to test. Describe each dependency as a small **interface** and **inject** it, through a constructor or a factory's `deps` object. Wire the real ones together in one place, the composition root.
+- A **fake** is a simple working implementation (an in-memory repository, a fake clock, a recording mailer). It suits stateful dependencies and outcome-based tests. **Mocks** suit scripted answers and checking outputs.
+- `implements` keeps fakes **in sync**: when the interface grows, the fake stops compiling.
+- `{ send: vi.fn<Mailer["send"]>() } satisfies Mailer` checks a mock object against its interface and keeps the `Mock` types.
+- Control time with an injected `Clock` or `Sleep`; use `vi.useFakeTimers()` for code that calls `setTimeout` directly.
+- Type fixtures with `satisfies Record<string, User>` to check every entry **and** keep the exact keys.
+- Fake `fetch` honestly: build real `Response` objects (fresh ones per call), or depend on a narrower type that the real `fetch` also fits. Never `as unknown as Response`.

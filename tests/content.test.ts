@@ -6,7 +6,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { loadPyodide, type PyodideInterface } from "pyodide";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   compareOutput,
@@ -24,22 +24,46 @@ import { checkTypes } from "./node-typecheck";
 /** The first lesson that imports pandas or FastAPI downloads it (cached after). */
 const PACKAGE_TIMEOUT_MS = 120_000;
 
-let pyodide: PyodideInterface;
-beforeAll(async () => {
-  pyodide = await loadPyodide();
-}, 60_000);
+// Loaded on first use, so checking only other languages stays light.
+let pyodide: Promise<PyodideInterface> | undefined;
 
 /**
  * Runs lesson code the same way the browser does, in the right language.
  * TypeScript with type errors doesn't run, just like in the browser.
  */
 async function run(code: string, language: RunLanguage, tests?: TestSpec[]) {
-  if (language === "python") return executePython(pyodide, code, { tests });
+  if (language === "python") {
+    pyodide ??= loadPyodide();
+    return executePython(await pyodide, code, { tests });
+  }
   if (language === "typescript") {
     const diagnostics = checkTypes(code);
     if (diagnostics.length) return typeErrorResult(diagnostics, tests);
   }
   return execute(code, { language, tests });
+}
+
+/**
+ * Runs an exercise or demo like the browser does: pages and React run in a
+ * preview, and TypeScript is type-checked first for where it runs.
+ */
+async function runAnywhere(
+  code: string,
+  language: RunLanguage,
+  html: string | undefined,
+  tests: TestSpec[] = [],
+) {
+  const react = language === "react" || language === "tsx";
+  const typescript = language === "typescript" || language === "tsx";
+  if (!react && html === undefined) return run(code, language, tests);
+  if (typescript) {
+    const diagnostics = checkTypes(code, react ? "react" : "page");
+    if (diagnostics.length) return typeErrorResult(diagnostics, tests);
+  }
+  return runDomInNode(code, html ?? REACT_HTML, tests, undefined, {
+    react,
+    typescript,
+  });
 }
 
 const ROOT = join(__dirname, "..", "content", "courses");
@@ -120,7 +144,7 @@ function exercisesIn(file: string): Exercise[] {
     if (typeof attrs.starter !== "string") return [];
     const body = block.slice(0, block.indexOf("</Exercise>"));
     const solution =
-      /<Solution>\s*```(?:js|jsx|ts|python)[^\n]*\n([\s\S]*?)```/.exec(
+      /<Solution>\s*```(?:js|jsx|ts|tsx|python)[^\n]*\n([\s\S]*?)```/.exec(
         body,
       )?.[1];
     return [
@@ -139,14 +163,7 @@ function exercisesIn(file: string): Exercise[] {
 }
 
 async function solves(code: string, ex: Exercise) {
-  const result =
-    ex.language === "react"
-      ? await runDomInNode(code, ex.html ?? REACT_HTML, ex.tests, undefined, {
-          react: true,
-        })
-      : ex.html !== undefined
-        ? await runDomInNode(code, ex.html, ex.tests)
-        : await run(code, ex.language, ex.tests);
+  const result = await runAnywhere(code, ex.language, ex.html, ex.tests);
   const output =
     ex.expectedOutput !== undefined
       ? compareOutput(result.output, ex.expectedOutput)
@@ -271,14 +288,7 @@ describe("TryIt live previews", () => {
     "%s runs without errors",
     async (_name, b) => {
       expect(typeof b.code, "TryIt needs code").toBe("string");
-      const result =
-        b.language === "react"
-          ? await runDomInNode(b.code, b.html ?? REACT_HTML, [], undefined, {
-              react: true,
-            })
-          : b.html !== undefined
-            ? await runDomInNode(b.code, b.html)
-            : await run(b.code, b.language);
+      const result = await runAnywhere(b.code, b.language, b.html);
       expect(result.error, JSON.stringify(result.output)).toBeUndefined();
     },
     PACKAGE_TIMEOUT_MS,

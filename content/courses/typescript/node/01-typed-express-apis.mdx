@@ -1,0 +1,881 @@
+---
+title: Typed Express APIs
+description: Type Express routes like real projects do, with inferred route params, typed bodies, queries and responses, routers, async handlers, req.user and supertest tests.
+duration: 18
+xp: 25
+---
+
+Express is the most popular way to build a web API with Node, and almost every new Express project today is written in TypeScript. The code looks just like JavaScript Express, but the compiler now knows what `req.params` holds, what each route is allowed to send back and what your middleware added to the request. It also has one famous blind spot, `req.body`, and part of being good at typed Express is knowing exactly where the types are telling the truth and where they're only guessing. 🚂
+
+## Express, now with types
+
+If Express is new to you, the [JavaScript Express lesson](/learn/javascript/node-and-express-basics) explains it from scratch. Here's the short version: `express()` creates an app, `app.get(path, handler)` adds a route, and the handler gets a request `req` and a response `res`. On PandaDev, supertest's `request(app)` sends requests to the app without a network, so a whole API and its client fit in one snippet:
+
+<CodeExample output={`200 2
+200 { id: 2, title: 'Nap', pinned: false }
+404 { error: 'Note not found' }`}>
+
+```ts
+import express from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+  pinned: boolean;
+}
+
+const notes: Note[] = [
+  { id: 1, title: "Buy bamboo", pinned: true },
+  { id: 2, title: "Nap", pinned: false },
+];
+
+const app = express();
+
+app.get("/api/notes", (req, res) => {
+  res.json(notes);
+});
+
+app.get("/api/notes/:id", (req, res) => {
+  const id = Number(req.params.id); // params: { id: string }
+  const note = notes.find((n) => n.id === id);
+  if (note === undefined) {
+    res.status(404).json({ error: "Note not found" });
+    return;
+  }
+  res.json(note);
+});
+
+const list = await request(app).get("/api/notes");
+console.log(list.status, list.body.length);
+const one = await request(app).get("/api/notes/2");
+console.log(one.status, one.body);
+const missing = await request(app).get("/api/notes/9");
+console.log(missing.status, missing.body);
+```
+
+</CodeExample>
+
+There isn't a single type annotation on `req` or `res`, yet both are fully typed. Like the callbacks you passed to `map` and `filter` in [Arrow Functions & Callbacks](/learn/typescript/arrow-functions-and-callbacks), an inline handler gets its parameter types **from the context**: `app.get` says what kind of function it expects, so TypeScript knows `req` is an Express `Request` and `res` a `Response`.
+
+Express itself is written in JavaScript. Its types come from the separate **`@types/express`** package, which describes the library for the compiler. On your machine a typed Express project starts like this:
+
+```bash
+npm install express
+npm install -D typescript tsx @types/node @types/express
+npm install -D vitest supertest @types/supertest
+npx tsx watch src/server.ts   # run the server, restart on save
+npx tsc --noEmit              # type-check everything (also in CI)
+```
+
+Keep `@types/express` on the same major version as Express (5 with 5). Recent Node versions can also run a `.ts` file directly with `node src/server.ts`: Node simply strips the types, so it doesn't check them. That's why `tsc --noEmit` stays in your workflow.
+
+## Route params come from the path
+
+Look at the comment in the example: `req.params` is `{ id: string }`. Express's types read the **path string** `"/api/notes/:id"`, find every `:name` in it and build the params type from them. A typo in a param name is caught at once:
+
+```ts
+app.get("/api/notes/:id", (req, res) => {
+  const note = notes.find((n) => n.id === Number(req.params.noteId));
+  // ❌ Error: Property 'noteId' does not exist on type '{ id: string; }'.
+});
+```
+
+Several params work too: in `app.get("/users/:userId/notes/:noteId", …)`, `req.params` is `{ userId: string; noteId: string }`. (It's done with **template literal types**, which you'll take apart yourself in Level 3.)
+
+Notice the type of each param: always `string`. A URL is text, so `/api/notes/2` gives you `"2"`, never the number `2`, and TypeScript won't let you pretend otherwise:
+
+```ts
+app.get("/api/notes/:id", (req, res) => {
+  const id: number = req.params.id;
+  // ❌ Error: Type 'string' is not assignable to type 'number'.
+});
+```
+
+Convert it with `Number(...)` as the example does. `Number("abc")` is `NaN`, which matches no note, so a silly id simply ends in the 404.
+
+## Typing responses
+
+By default `res.json()` accepts anything at all, so nothing stops a route from sending back the wrong shape. Real APIs have a **contract**: this route answers with a `Note` or an error body, and nothing else. Write that down by annotating `res` with **`Response<Body>`**; `req` keeps its inferred type:
+
+```ts
+import { type Response } from "express";
+
+type ErrorBody = { error: string };
+
+app.get("/api/notes/:id", (req, res: Response<Note | ErrorBody>) => {
+  const note = notes.find((n) => n.id === Number(req.params.id));
+  if (!note) {
+    res.status(404).json({ message: "Note not found" });
+    // ❌ Error: Object literal may only specify known properties, and 'message' does not exist in type 'Note | ErrorBody'.
+    return;
+  }
+  res.json({ id: note.id, title: note.title });
+  // ❌ Error: Argument of type '{ id: number; title: string; }' is not assignable to parameter of type 'Note | ErrorBody | undefined'.
+});
+```
+
+The second error is the one that saves you in real projects: someone adds `pinned` to `Note`, and every route that builds notes by hand lights up red, instead of quietly sending incomplete data to the app on your phone.
+
+### Don't `return res.json(...)`
+
+In JavaScript Express you'll see `return res.status(404).json(...)` everywhere, as a short way to answer and stop. With Express 5's types it's an error:
+
+```ts
+app.get("/api/notes/:id", (req, res) => {
+  const note = notes.find((n) => n.id === Number(req.params.id));
+  if (!note) {
+    return res.status(404).json({ error: "Note not found" });
+  }
+  res.json(note);
+});
+// ❌ Error: Type 'Response<any, Record<string, any>>' is not assignable to type 'void | Promise<void>'.
+```
+
+A handler's type says it returns `void` (or a `Promise<void>` when it's `async`), and `res.json()` returns the response object. Express ignores whatever a handler returns, so the types ask you to be clear about it: answer on one line, then `return;` on the next, as in all the examples here.
+
+### The four type arguments
+
+`Request` and `Response` are generic types. Their type arguments always come in the same order:
+
+| Type | Describes |
+| --- | --- |
+| `Request<Params, ResBody, ReqBody, Query>` | route params, the response body, the request body, the query string |
+| `Response<ResBody>` | what `res.json()` and `res.send()` accept |
+| `RequestHandler<Params, ResBody, ReqBody, Query>` | a whole handler function |
+
+You need them most when a handler is **not** written inline. A function declared on its own has no context, so its parameters would be implicitly `any`. Give it a type instead:
+
+```ts
+import { type RequestHandler } from "express";
+
+const getNote: RequestHandler<{ id: string }, Note | ErrorBody> = (
+  req,
+  res,
+) => {
+  // req.params: { id: string }, res: Response<Note | ErrorBody>
+};
+
+app.get("/api/notes/:id", getNote);
+```
+
+## `req.body` is `any`
+
+Now the blind spot. When a client sends JSON, `express.json()` parses it into `req.body`, and its type is **`any`**. TypeScript has no idea what a client will send, and `any` switches checking off completely, so this compiles without a word and quietly gives `undefined`:
+
+```ts
+app.post("/api/notes", (req, res) => {
+  const title: string = req.body.titel; // a typo, and no error!
+});
+```
+
+The third type argument of `Request` types the body. With `req: Request<{}, Note, NewNote>` (`{}` because this route has no params), a typo like `titel` is caught. But watch what happens when a client sends a `title` that isn't a string:
+
+<CodeExample output={`201 { id: 1, title: 'Buy bamboo', pinned: false }
+500 Internal Server Error`}>
+
+```ts
+import express, { type Request } from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+  pinned: boolean;
+}
+interface NewNote {
+  title: string;
+  pinned?: boolean;
+}
+
+const notes: Note[] = [];
+let nextId = 1;
+
+const app = express();
+app.use(express.json());
+
+// ReqBody (3rd type argument) = NewNote
+app.post("/api/notes", (req: Request<{}, Note, NewNote>, res) => {
+  const note: Note = {
+    id: nextId++,
+    title: req.body.title.trim(), // title: string, says TypeScript
+    pinned: req.body.pinned ?? false,
+  };
+  notes.push(note);
+  res.status(201).json(note);
+});
+
+const good = await request(app)
+  .post("/api/notes")
+  .send({ title: " Buy bamboo " });
+console.log(good.status, good.body);
+
+const bad = await request(app).post("/api/notes").send({ title: 42 });
+console.log(bad.status, bad.text);
+```
+
+</CodeExample>
+
+TypeScript promised `title` was a string, the client sent `42`, `42.trim()` crashed, and the server answered 500. Types are removed before the code runs, so `Request<{}, Note, NewNote>` can't check anything at runtime.
+
+<Callout type="danger" title="A body type is a promise, not a check">
+
+Writing `NewNote` as the body type is exactly like writing `req.body as NewNote`: you tell the compiler to trust data that arrived from the internet. Anyone can call your API with `curl` and send whatever they like. Use these types only for data you have **already checked**.
+
+</Callout>
+
+The honest type for data from outside is **`unknown`**: TypeScript then makes you prove what it is before you touch it. You did exactly that with [type guards](/learn/typescript/type-guards-and-unknown) in Level 1, and it works on `req.body` too:
+
+<CodeExample output={`201 { id: 1, title: 'Nap', pinned: false }
+400 { error: 'Invalid note' }
+400 { error: 'Invalid note' }`}>
+
+```ts
+import express, { type Request } from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+  pinned: boolean;
+}
+interface NewNote {
+  title: string;
+  pinned?: boolean;
+}
+type ErrorBody = { error: string };
+
+function isNewNote(value: unknown): value is NewNote {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("title" in value) || typeof value.title !== "string") {
+    return false;
+  }
+  if ("pinned" in value && typeof value.pinned !== "boolean") {
+    return false;
+  }
+  return true;
+}
+
+const notes: Note[] = [];
+let nextId = 1;
+
+const app = express();
+app.use(express.json());
+
+app.post(
+  "/api/notes",
+  (req: Request<{}, Note | ErrorBody, unknown>, res) => {
+    const input = req.body; // unknown: we must check it
+    if (!isNewNote(input) || input.title.trim() === "") {
+      res.status(400).json({ error: "Invalid note" });
+      return;
+    }
+    const note: Note = {
+      id: nextId++,
+      title: input.title.trim(), // input: NewNote here
+      pinned: input.pinned ?? false,
+    };
+    notes.push(note);
+    res.status(201).json(note);
+  },
+);
+
+for (const body of [{ title: "Nap" }, { title: 42 }, {}]) {
+  const res = await request(app).post("/api/notes").send(body);
+  console.log(res.status, res.body);
+}
+```
+
+</CodeExample>
+
+With `unknown`, forgetting the check is a compile error (`'req.body' is of type 'unknown'.`) instead of a 500 in production. Next lesson turns this into a proper system, with validation that lists every problem and one place that formats all errors.
+
+## Query strings aren't just strings
+
+`req.query` holds the query string: for `/api/notes?search=bamboo` it's `{ search: "bamboo" }`. You might expect `req.query.search` to be a `string`, but its type is much wider:
+
+```ts
+app.get("/api/notes", (req, res) => {
+  const text = req.query.search.toLowerCase();
+  // ❌ Error: 'req.query.search' is possibly 'undefined'.
+  // ❌ Error: Property 'toLowerCase' does not exist on type 'string | ParsedQs | string[] | ParsedQs[]'.
+});
+```
+
+The types are right to be careful. The client controls the URL: the parameter can be missing, repeated (`?search=a&search=b` gives an **array**), and some query parsers even build nested objects (`ParsedQs`). Narrow it like any other union:
+
+<CodeExample output={`search is bamboo
+[ 1, 2 ]
+search is [ 'nap', 'bamboo' ]
+[ 1, 2, 3 ]
+search is undefined
+[ 1, 2, 3 ]`}>
+
+```ts
+import express, { type Response } from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+}
+
+const notes: Note[] = [
+  { id: 1, title: "Buy bamboo" },
+  { id: 2, title: "Bamboo recipes" },
+  { id: 3, title: "Nap" },
+];
+
+const app = express();
+
+app.get("/api/notes", (req, res: Response<Note[]>) => {
+  const search = req.query.search;
+  console.log("search is", search);
+  if (typeof search !== "string") {
+    res.json(notes); // missing, repeated or nested: ignore it
+    return;
+  }
+  const text = search.toLowerCase(); // search: string here
+  res.json(notes.filter((n) => n.title.toLowerCase().includes(text)));
+});
+
+for (const url of [
+  "/api/notes?search=bamboo",
+  "/api/notes?search=nap&search=bamboo",
+  "/api/notes",
+]) {
+  const res = await request(app).get(url);
+  console.log(res.body.map((n: Note) => n.id));
+}
+```
+
+</CodeExample>
+
+The fourth type argument, `Request<{}, any, any, { search?: string }>`, makes the error go away too, but it's the same promise-not-a-check as the body type: the repeated `?search=` above would still arrive as an array. Narrowing costs one `if` and never lies.
+
+## Routers, async handlers and a repository
+
+Real APIs group routes with `express.Router()` and keep storage behind a **repository**, an object with methods like `list` and `get`, so the routes don't care whether notes live in a `Map` or a database. TypeScript adds the missing piece: an **interface** for the repository. Any storage that has these methods fits, and the routes are checked against it:
+
+<CodeExample output={`[ { id: 1, title: 'Buy bamboo' } ]
+{ id: 1, title: 'Buy bamboo' }
+404`}>
+
+```ts
+import express, { type Application, type Response } from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+}
+type ErrorBody = { error: string };
+
+// What the routes need from storage: async, like a database
+interface NotesRepository {
+  list(): Promise<Note[]>;
+  get(id: number): Promise<Note | undefined>;
+}
+
+function createMemoryRepository(start: Note[]): NotesRepository {
+  const notes = new Map(start.map((n) => [n.id, n]));
+  return {
+    async list() {
+      return [...notes.values()];
+    },
+    async get(id) {
+      return notes.get(id);
+    },
+  };
+}
+
+function createApp(notes: NotesRepository): Application {
+  const router = express.Router();
+
+  router.get("/", async (req, res: Response<Note[]>) => {
+    res.json(await notes.list());
+  });
+
+  router.get("/:id", async (req, res: Response<Note | ErrorBody>) => {
+    const note = await notes.get(Number(req.params.id));
+    if (!note) {
+      res.status(404).json({ error: "Note not found" });
+      return;
+    }
+    res.json(note);
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use("/api/notes", router);
+  return app;
+}
+
+const app = createApp(
+  createMemoryRepository([{ id: 1, title: "Buy bamboo" }]),
+);
+console.log((await request(app).get("/api/notes")).body);
+console.log((await request(app).get("/api/notes/1")).body);
+console.log((await request(app).get("/api/notes/7")).status);
+```
+
+</CodeExample>
+
+A few things to notice:
+
+- **Router routes infer params too.** Inside the router, `"/:id"` gives `req.params.id: string`, even though the full URL is `/api/notes/:id`.
+- **Async handlers are fine.** An `async` handler returns `Promise<void>`, which is exactly what the handler type allows. In Express 5, if it throws or an `await` rejects, the error goes to your error middleware (next lesson).
+- **The repository's methods return promises.** `notes.get` gives `Promise<Note | undefined>`, so after `await` TypeScript makes you handle the missing note before `res.json(note)`.
+- **`createApp` takes its dependencies as a parameter.** Tests pass an in-memory repository; the real server passes one backed by a database. The interface guarantees both have the same methods.
+
+## Adding `req.user` with `declare global`
+
+An authentication middleware usually checks a token and **adds the user** to the request, so later handlers can read `req.user`. But `Request` has no `user` property, so TypeScript rejects it. The fix is **declaration merging**, which you met in [Modules & Declaration Files](/learn/typescript/modules-and-declaration-files): Express's types put `Request` in a global `Express` namespace on purpose, so your project can add fields to it:
+
+<CodeExample output={`200 { name: 'Mei' }
+401 { error: 'Sign in first' }`}>
+
+```ts
+import express, { type RequestHandler } from "express";
+import request from "supertest";
+
+interface User {
+  id: number;
+  name: string;
+}
+
+// Declaration merging: every Express Request now has user?: User
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+    }
+  }
+}
+
+const users = new Map<string, User>([
+  ["token-mei", { id: 1, name: "Mei" }],
+]);
+
+// Reads "Authorization: Bearer <token>" and fills in req.user
+const authenticate: RequestHandler = (req, res, next) => {
+  const token = req.get("Authorization")?.replace("Bearer ", "");
+  req.user = token === undefined ? undefined : users.get(token);
+  next();
+};
+
+const app = express();
+app.use(authenticate);
+
+app.get("/api/me", (req, res) => {
+  if (!req.user) {
+    res.status(401).json({ error: "Sign in first" });
+    return;
+  }
+  res.json({ name: req.user.name }); // req.user: User here
+});
+
+const me = await request(app)
+  .get("/api/me")
+  .set("Authorization", "Bearer token-mei");
+console.log(me.status, me.body);
+const anonymous = await request(app).get("/api/me");
+console.log(anonymous.status, anonymous.body);
+```
+
+</CodeExample>
+
+The `?` in `user?: User` matters. The declaration is **global**: it adds `user` to every request in the app, including routes that run without `authenticate`. So TypeScript treats it as possibly missing and makes every route check:
+
+```ts
+app.get("/api/me", (req, res) => {
+  res.json({ name: req.user.name });
+  // ❌ Error: 'req.user' is possibly 'undefined'.
+});
+```
+
+<Callout type="note" title="Where the declaration lives">
+
+In a real project, put the `declare global` block in its own file, such as `src/types/express.d.ts`, and make sure your `tsconfig.json` includes it. It's a type-only declaration: nothing about it exists at runtime, which is why the middleware still has to actually set `req.user`. Some teams prefer not to touch the global type at all and pass the user along explicitly, for example with a helper `requireUser(req)` that returns a `User` or throws a 401.
+
+</Callout>
+
+## Testing typed routes
+
+Tests look just like the JavaScript ones: a fresh app per test, supertest for the requests, `expect` for the details. One typing detail: supertest's `res.body` is `any` (it can't know what your API sends), so give it a type where it helps, or just compare it with `toEqual`:
+
+<CodeExample output={`✓ GET /api/notes/:id > returns the note
+✓ GET /api/notes/:id > answers 404 with an ErrorBody
+
+Tests  2 passed (2)`}>
+
+```ts
+import express, { type Application, type Response } from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+interface Note {
+  id: number;
+  title: string;
+}
+type ErrorBody = { error: string };
+
+function createApp(start: Note[]): Application {
+  const notes = [...start];
+  const app = express();
+  app.get("/api/notes/:id", (req, res: Response<Note | ErrorBody>) => {
+    const note = notes.find((n) => n.id === Number(req.params.id));
+    if (!note) {
+      res.status(404).json({ error: "Note not found" });
+      return;
+    }
+    res.json(note);
+  });
+  return app;
+}
+
+describe("GET /api/notes/:id", () => {
+  let api: ReturnType<typeof request>;
+
+  beforeEach(() => {
+    api = request(createApp([{ id: 1, title: "Nap" }]));
+  });
+
+  it("returns the note", async () => {
+    const res = await api.get("/api/notes/1").expect(200);
+    const note: Note = res.body; // res.body is any
+    expect(note).toEqual({ id: 1, title: "Nap" });
+  });
+
+  it("answers 404 with an ErrorBody", async () => {
+    const res = await api.get("/api/notes/2").expect(404);
+    const body: ErrorBody = res.body;
+    expect(body).toEqual({ error: "Note not found" });
+  });
+});
+```
+
+</CodeExample>
+
+`ReturnType<typeof request>`, a [utility type](/learn/typescript/utility-types), means "whatever `request(app)` returns", so the `api` variable is typed without importing supertest's internal type names. Annotating `res.body` doesn't check anything (it's `any`), but `toEqual` does, and the annotation gives you autocompletion while writing the test.
+
+<Quiz
+  question="A route is registered as app.get('/shops/:shopId/items/:itemId', (req, res) => { ... }). What is the type of req.params?"
+  options={["{ shopId: number; itemId: number }", "{ shopId: string; itemId: string }", "Record<string, string>", "any"]}
+  answer={1}
+  explanation="Express's types read every :name in the path and build the params type from it. Values from a URL are always text, so both are string; convert them with Number() yourself."
+/>
+
+<Quiz
+  question="A handler is typed as (req: Request<{}, Note, NewNote>, res) => { ... } and a client sends { title: 42 }. What happens?"
+  options={["TypeScript rejects the request with a compile error", "Express answers 400 automatically", "The handler runs with req.body.title set to 42, even though its type says string", "req.body.title is converted to the string '42'"]}
+  answer={2}
+  explanation="Types are erased before the code runs, so the body type is only a promise to the compiler. The handler sees whatever the client sent. Type the body as unknown and check it, or the first string method you call on it will crash."
+/>
+
+<Exercise
+  title="Typed bookmarks API"
+  language="typescript"
+  starter={`import express, {
+  type Application,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from "express";
+import request from "supertest";
+
+interface Bookmark {
+  id: number;
+  url: string;
+  title: string;
+  tags: string[];
+  addedBy: string;
+}
+interface NewBookmark {
+  url: string;
+  title: string;
+  tags?: string[];
+}
+type ErrorBody = { error: string };
+
+interface User {
+  name: string;
+}
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+    }
+  }
+}
+
+// ---------- ready-made: don't change this part ----------
+
+const sessions = new Map<string, User>([
+  ["token-mei", { name: "Mei" }],
+  ["token-sam", { name: "Sam" }],
+]);
+
+const authenticate: RequestHandler = (req, res, next) => {
+  const token = req.get("Authorization")?.replace("Bearer ", "");
+  req.user = token === undefined ? undefined : sessions.get(token);
+  next();
+};
+
+const starterBookmarks: Bookmark[] = [
+  { id: 1, url: "https://typescriptlang.org", title: "TypeScript",
+    tags: ["ts", "docs"], addedBy: "Mei" },
+  { id: 2, url: "https://expressjs.com", title: "Express",
+    tags: ["node", "docs"], addedBy: "Sam" },
+  { id: 3, url: "https://vitest.dev", title: "Vitest",
+    tags: ["ts", "testing"], addedBy: "Mei" },
+];
+
+// ---------- your code ----------
+
+// TODO 3a: return true only for a valid NewBookmark
+function isNewBookmark(value: unknown): value is NewBookmark {
+  return false;
+}
+
+function createApp(): Application {
+  const bookmarks = starterBookmarks.map((b) => ({ ...b }));
+  let nextId = 4;
+
+  // TODO 1: give this handler a type, then fix what TypeScript finds
+  function getBookmark(req, res) {
+    const id = Number(req.params.bookmarkId);
+    const bookmark = bookmarks.find((b) => b.id === id);
+    if (!bookmark) {
+      return res.status(404).json({ error: "Bookmark not found" });
+    }
+    res.json(bookmark);
+  }
+
+  const router = express.Router();
+
+  router.get("/", (req, res: Response<Bookmark[]>) => {
+    // TODO 2: filter by ?tag= (one tag, or several)
+    res.json(bookmarks);
+  });
+
+  router.get("/:id", getBookmark);
+
+  router.post(
+    "/",
+    (req: Request<{}, Bookmark | ErrorBody, unknown>, res) => {
+      // TODO 3b: 401 without a user, 400 for an invalid body,
+      //          otherwise save the bookmark and answer 201
+    },
+  );
+
+  const app = express();
+  app.use(express.json());
+  app.use(authenticate);
+  app.use("/api/bookmarks", router);
+  return app;
+}
+
+const api = request(createApp());
+const docs = await api.get("/api/bookmarks?tag=docs");
+console.log(docs.body.map((b: Bookmark) => b.title));
+const created = await api
+  .post("/api/bookmarks")
+  .set("Authorization", "Bearer token-sam")
+  .send({ url: "https://nodejs.org", title: " Node.js " });
+console.log(created.status, created.body);
+`}
+  tests={[
+    { name: "GET /api/bookmarks/:id returns the bookmark, or 404", check: `await (async () => { const api = require('supertest')(createApp()); const a = await api.get('/api/bookmarks/2'); const b = await api.get('/api/bookmarks/9'); return a.status === 200 && a.body.title === 'Express' && a.body.addedBy === 'Sam' && b.status === 404 && b.body.error === 'Bookmark not found'; })()` },
+    { name: "?tag= keeps the bookmarks with that tag", check: `await (async () => { const api = require('supertest')(createApp()); const t = (q) => api.get('/api/bookmarks' + q).then((r) => r.body.map((b) => b.id).join(',')); return (await t('')) === '1,2,3' && (await t('?tag=docs')) === '1,2' && (await t('?tag=testing')) === '3' && (await t('?tag=rust')) === ''; })()` },
+    { name: "A repeated ?tag= keeps bookmarks that have all the tags", check: `await (async () => { const api = require('supertest')(createApp()); const t = (q) => api.get('/api/bookmarks' + q).then((r) => r.body.map((b) => b.id).join(',')); return (await t('?tag=ts&tag=docs')) === '1' && (await t('?tag=docs&tag=node')) === '2' && (await t('?tag=ts&tag=node')) === ''; })()` },
+    { name: "isNewBookmark accepts valid input and rejects everything else", check: `isNewBookmark({ url: 'https://a.dev', title: 'A' }) && isNewBookmark({ url: 'https://a.dev', title: 'A', tags: ['x', 'y'] }) && ![null, 'https://a.dev', {}, { url: 'https://a.dev' }, { url: 'http://a.dev', title: 'A' }, { url: 42, title: 'A' }, { url: 'https://a.dev', title: '   ' }, { url: 'https://a.dev', title: 7 }, { url: 'https://a.dev', title: 'A', tags: 'x' }, { url: 'https://a.dev', title: 'A', tags: ['x', 3] }].some((v) => isNewBookmark(v))` },
+    { name: "POST without a signed-in user answers 401 and saves nothing", check: `await (async () => { const api = require('supertest')(createApp()); const a = await api.post('/api/bookmarks').send({ url: 'https://a.dev', title: 'A' }); const b = await api.post('/api/bookmarks').set('Authorization', 'Bearer nope').send({ url: 'https://a.dev', title: 'A' }); const list = await api.get('/api/bookmarks'); return a.status === 401 && a.body.error === 'Sign in first' && b.status === 401 && list.body.length === 3; })()` },
+    { name: "POST with an invalid body answers 400 and saves nothing", check: `await (async () => { const api = require('supertest')(createApp()); const bad = await api.post('/api/bookmarks').set('Authorization', 'Bearer token-mei').send({ url: 'ftp://a.dev', title: 'A' }); const none = await api.post('/api/bookmarks').set('Authorization', 'Bearer token-mei'); const list = await api.get('/api/bookmarks'); return bad.status === 400 && bad.body.error === 'Invalid bookmark' && none.status === 400 && list.body.length === 3; })()` },
+    { name: "POST creates the bookmark (201) with addedBy and default tags", check: `await (async () => { const api = require('supertest')(createApp()); const r = await api.post('/api/bookmarks').set('Authorization', 'Bearer token-mei').send({ url: 'https://deno.com', title: '  Deno ', tags: ['ts'], id: 99, addedBy: 'Hacker' }); const r2 = await api.post('/api/bookmarks').set('Authorization', 'Bearer token-sam').send({ url: 'https://bun.sh', title: 'Bun' }); const ts = (await api.get('/api/bookmarks?tag=ts')).body.map((b) => b.id).join(','); const one = (await api.get('/api/bookmarks/5')).body; const b = r.body; return r.status === 201 && b.id === 4 && b.url === 'https://deno.com' && b.title === 'Deno' && JSON.stringify(b.tags) === '["ts"]' && b.addedBy === 'Mei' && Object.keys(b).length === 5 && r2.status === 201 && r2.body.id === 5 && r2.body.addedBy === 'Sam' && JSON.stringify(r2.body.tags) === '[]' && ts === '1,3,4' && one.title === 'Bun'; })()` },
+  ]}
+>
+
+A team's bookmarks API is half typed and half finished. Press **Run**: TypeScript refuses to run it yet. Make it type-safe and complete:
+
+1. **Fix the types.** `getBookmark` is declared on its own, so its `req` and `res` are implicitly `any`. Give it a type with `RequestHandler<Params, ResBody>`: the params of the `/:id` route, and `Bookmark | ErrorBody` as the response body. Then fix the two problems TypeScript reveals inside it.
+2. **Filter by tag.** `GET /api/bookmarks?tag=docs` returns only the bookmarks that have that tag. The parameter can be repeated: `?tag=ts&tag=docs` returns the bookmarks that have **all** of those tags. Without `tag`, return everything.
+3. **Create bookmarks.** First write `isNewBookmark(value)`: `url` must be a string starting with `"https://"`, `title` a string that isn't empty after trimming, and `tags`, if present, an array of strings. Then finish `POST /api/bookmarks`:
+   - no signed-in user (`req.user` is missing): **401** `{ error: "Sign in first" }`;
+   - an invalid body: **400** `{ error: "Invalid bookmark" }`;
+   - otherwise: **201** with the new bookmark `{ id, url, title, tags, addedBy }`. The id comes from `nextId`, the title is trimmed, `tags` defaults to `[]` and `addedBy` is the signed-in user's name. Build it from the fields you expect, so a client can't sneak in its own `id` or `addedBy`.
+
+<Hint>
+
+1. `const getBookmark: RequestHandler<{ id: string }, Bookmark | ErrorBody> = (req, res) => { ... };` Then use `req.params.id`, and replace `return res.status(404)...` with the response on one line and `return;` on the next.
+2. `req.query.tag` is `string | string[] | ParsedQs | ParsedQs[] | undefined`. Turn it into a `string[]` of wanted tags: `[tag]` if `typeof tag === "string"`, the strings in it if `Array.isArray(tag)`, otherwise `[]`. Then keep bookmarks where `wanted.every((t) => b.tags.includes(t))`.
+3. In the guard, start with `typeof value !== "object" || value === null`, then use `"url" in value && typeof value.url === "string"` and so on. For tags: `Array.isArray(value.tags) && value.tags.every((t) => typeof t === "string")`. In the route, check `req.user` first, then `isNewBookmark(req.body)`; after that, both are narrowed.
+
+</Hint>
+
+<Solution>
+
+```ts
+import express, {
+  type Application,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from "express";
+import request from "supertest";
+
+interface Bookmark {
+  id: number;
+  url: string;
+  title: string;
+  tags: string[];
+  addedBy: string;
+}
+interface NewBookmark {
+  url: string;
+  title: string;
+  tags?: string[];
+}
+type ErrorBody = { error: string };
+
+interface User {
+  name: string;
+}
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+    }
+  }
+}
+
+// ---------- ready-made: don't change this part ----------
+
+const sessions = new Map<string, User>([
+  ["token-mei", { name: "Mei" }],
+  ["token-sam", { name: "Sam" }],
+]);
+
+const authenticate: RequestHandler = (req, res, next) => {
+  const token = req.get("Authorization")?.replace("Bearer ", "");
+  req.user = token === undefined ? undefined : sessions.get(token);
+  next();
+};
+
+const starterBookmarks: Bookmark[] = [
+  { id: 1, url: "https://typescriptlang.org", title: "TypeScript",
+    tags: ["ts", "docs"], addedBy: "Mei" },
+  { id: 2, url: "https://expressjs.com", title: "Express",
+    tags: ["node", "docs"], addedBy: "Sam" },
+  { id: 3, url: "https://vitest.dev", title: "Vitest",
+    tags: ["ts", "testing"], addedBy: "Mei" },
+];
+
+// ---------- your code ----------
+
+function isNewBookmark(value: unknown): value is NewBookmark {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("url" in value) || typeof value.url !== "string" ||
+      !value.url.startsWith("https://")) {
+    return false;
+  }
+  if (!("title" in value) || typeof value.title !== "string" ||
+      value.title.trim() === "") {
+    return false;
+  }
+  if ("tags" in value && value.tags !== undefined) {
+    if (!Array.isArray(value.tags)) return false;
+    return value.tags.every((tag) => typeof tag === "string");
+  }
+  return true;
+}
+
+function createApp(): Application {
+  const bookmarks = starterBookmarks.map((b) => ({ ...b }));
+  let nextId = 4;
+
+  const getBookmark: RequestHandler<
+    { id: string },
+    Bookmark | ErrorBody
+  > = (req, res) => {
+    const id = Number(req.params.id);
+    const bookmark = bookmarks.find((b) => b.id === id);
+    if (!bookmark) {
+      res.status(404).json({ error: "Bookmark not found" });
+      return;
+    }
+    res.json(bookmark);
+  };
+
+  const router = express.Router();
+
+  router.get("/", (req, res: Response<Bookmark[]>) => {
+    const tag = req.query.tag;
+    let wanted: string[] = [];
+    if (typeof tag === "string") {
+      wanted = [tag];
+    } else if (Array.isArray(tag)) {
+      wanted = tag.filter((t) => typeof t === "string");
+    }
+    res.json(
+      bookmarks.filter((b) => wanted.every((t) => b.tags.includes(t))),
+    );
+  });
+
+  router.get("/:id", getBookmark);
+
+  router.post(
+    "/",
+    (req: Request<{}, Bookmark | ErrorBody, unknown>, res) => {
+      if (!req.user) {
+        res.status(401).json({ error: "Sign in first" });
+        return;
+      }
+      const input = req.body;
+      if (!isNewBookmark(input)) {
+        res.status(400).json({ error: "Invalid bookmark" });
+        return;
+      }
+      const bookmark: Bookmark = {
+        id: nextId++,
+        url: input.url,
+        title: input.title.trim(),
+        tags: input.tags ?? [],
+        addedBy: req.user.name,
+      };
+      bookmarks.push(bookmark);
+      res.status(201).json(bookmark);
+    },
+  );
+
+  const app = express();
+  app.use(express.json());
+  app.use(authenticate);
+  app.use("/api/bookmarks", router);
+  return app;
+}
+
+const api = request(createApp());
+const docs = await api.get("/api/bookmarks?tag=docs");
+console.log(docs.body.map((b: Bookmark) => b.title));
+const created = await api
+  .post("/api/bookmarks")
+  .set("Authorization", "Bearer token-sam")
+  .send({ url: "https://nodejs.org", title: " Node.js " });
+console.log(created.status, created.body);
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Inline handlers get `req` and `res` types **from the context**. Handlers declared on their own need a type: `RequestHandler<Params, ResBody, ReqBody, Query>`.
+- **Route params are inferred from the path**: `"/notes/:id"` gives `req.params: { id: string }`. They're always strings; convert them yourself.
+- Annotate `res: Response<Note | ErrorBody>` so every route can only send the shapes in its contract. Answer, then `return;`: don't `return res.json(...)`.
+- **`req.body` is `any`**, and a body type like `Request<{}, Note, NewNote>` is a promise, not a check. Type it as `unknown` and validate it with a type guard.
+- `req.query` values can be missing, repeated (arrays) or nested: narrow them with `typeof` and `Array.isArray`.
+- Put storage behind a repository **interface** with async methods, and pass it to `createApp` so tests can use an in-memory one.
+- Add `req.user` with `declare global { namespace Express { interface Request { user?: User } } }`, and check it before use.
+- Test with Vitest + supertest; `res.body` is `any`, so annotate it where it helps and let `toEqual` do the checking.

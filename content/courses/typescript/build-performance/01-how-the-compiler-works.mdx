@@ -1,0 +1,539 @@
+---
+title: How the Compiler Works
+description: Follow your code through the scanner, parser, binder, checker and emitter, and see why type-stripping tools need isolatedModules, verbatimModuleSyntax and erasableSyntaxOnly.
+duration: 22
+xp: 25
+---
+
+Three puzzles every TypeScript team runs into sooner or later. Vite happily runs your app while `tsc` reports five type errors. Node.js runs `server.ts` directly, until someone adds an `enum` and it refuses to start. And esbuild builds the whole project in half a second, while the type check in CI takes four minutes. ⚙️
+
+All three have the same explanation, and it's worth having in your head as a senior: what the compiler actually does with your code, which parts are expensive, and which parts other tools skip. This module is about that machinery. This lesson takes the compiler apart, the next one makes type checking fast, and the last one ships a package.
+
+## Five stages from text to JavaScript
+
+`tsc` runs your code through five stages. Each one has its own job, and they are also the names you'll see in performance reports:
+
+```text
+source text ──scanner──▶ tokens ──parser──▶ syntax tree (AST)
+syntax tree ──binder───▶ symbols and scopes
+symbols     ──checker──▶ types and errors
+syntax tree ──emitter──▶ .js, .d.ts and .map files
+```
+
+**1. The scanner** reads the text character by character and cuts it into **tokens**: keywords, names, punctuation, literals. For `const total: number = price * 2;` that's the keyword `const`, the name `total`, a `:`, the keyword `number`, `=`, the name `price`, `*`, the number `2` and `;`. Spaces and comments aren't tokens (comments are kept on the side, so they can be copied into the output).
+
+**2. The parser** turns the tokens into a tree, the **abstract syntax tree** (AST). Every construct becomes a node with children:
+
+```text
+SourceFile
+  VariableStatement
+    VariableDeclarationList (const)
+      VariableDeclaration
+        Identifier: total
+        NumberKeyword            ← the type annotation
+        BinaryExpression
+          Identifier: price
+          AsteriskToken
+          NumericLiteral: 2
+```
+
+Syntax errors such as `';' expected.` come from here. JavaScript engines start the same way (see [How Engines Run Code](/learn/javascript/how-engines-run-code)), and so does every tool in this lesson: Babel, esbuild and swc all parse your file into a tree of their own first.
+
+**3. The binder** walks each tree and creates a **symbol** for every declaration: every variable, function, class, interface, type alias and parameter, sorted into scopes. It also merges declarations that share a name, like two `interface Window` blocks, and it notes that one name can have a **value meaning** and a **type meaning** at the same time (you'll use that in a minute). Finally, it draws the **control-flow graph** of `if`s, `return`s and loops that narrowing uses later. Binding is fast, and like parsing, it works on one file at a time.
+
+**4. The checker** answers one question, over and over: "what is the type of this?" For every expression, call, assignment and `return` it infers types, instantiates generics, picks overloads, narrows unions and compares types for assignability. It works lazily, computing a type only when something asks for it, and caches every answer. The checker is the biggest part of the compiler by far, and it's where almost all the time goes. It also **needs the whole program**: to check `import { total } from "./prices"`, it has to understand `prices.ts`, everything `prices.ts` imports, the standard library and the types of your npm packages.
+
+**5. The emitter** writes the output: the JavaScript (types removed, newer syntax rewritten for your `target`, `import`/`export` rewritten for your `module` setting), the **declaration files** (`.d.ts`) and source maps. One detail that surprises people: `tsc` writes the JavaScript **even when there are type errors**, unless you turn on `noEmitOnError`.
+
+### The same stages from code
+
+The `typescript` npm package exposes all of this as the **compiler API**, which is what typescript-eslint, codemods and code generators are built on. This can't run in the PandaDev editor, but on your machine a script like this drives the whole pipeline:
+
+```ts title="compile.ts"
+import ts from "typescript";
+
+const program = ts.createProgram(["src/prices.ts"], {
+  strict: true,
+  declaration: true,
+  outDir: "dist",
+});
+
+// createProgram parsed every file; now ask the checker
+const checker = program.getTypeChecker();
+for (const d of ts.getPreEmitDiagnostics(program)) {
+  console.log(ts.flattenDiagnosticMessageText(d.messageText, "\n"));
+}
+
+// What did the checker infer for total()?
+const file = program.getSourceFile("src/prices.ts")!;
+const fn = file.statements[0] as ts.FunctionDeclaration;
+const signature = checker.getSignatureFromDeclaration(fn)!;
+console.log(checker.signatureToString(signature));
+
+// The emitter writes dist/prices.js and dist/prices.d.ts
+program.emit();
+```
+
+```ts title="src/prices.ts"
+export function total(prices: number[]) {
+  return prices.reduce((sum, p) => sum + p, 0);
+}
+const t: string = total([1, 2]);
+```
+
+```bash
+$ npx tsx compile.ts
+Type 'number' is not assignable to type 'string'.
+(prices: number[]): number
+```
+
+The checker inferred the return type `number` (nobody wrote it), reported the bad assignment, and the emitter still wrote both files.
+
+## What the emitter has to write
+
+Most TypeScript is **erasable**: delete the type annotations, interfaces and type aliases, and what's left is ordinary JavaScript that means exactly the same thing. But a few TypeScript features **generate code**. Run this and look at what exists at runtime:
+
+<CodeExample output={`{ '0': 'Debug', '1': 'Info', '2': 'Warn', Debug: 0, Info: 1, Warn: 2 }
+2 Warn
+Panda { name: 'Mei' } u1`}>
+
+```ts
+// Erased: these exist only for the checker
+interface User {
+  name: string;
+}
+type UserId = string;
+
+// Not erased: each of these becomes real JavaScript
+enum Level {
+  Debug,
+  Info,
+  Warn,
+}
+
+class Panda {
+  constructor(readonly name: string) {}
+}
+
+const id: UserId = "u1";
+const user: User = { name: "Mei" };
+
+console.log(Level);
+console.log(Level.Warn, Level[2]);
+console.log(new Panda(user.name), id);
+```
+
+</CodeExample>
+
+`User` and `UserId` left no trace. But `Level` is a real object, with a **reverse mapping** from numbers back to names, and the `Panda` constructor copies `name` into a field that nobody wrote. Here is what `tsc` emits for those two:
+
+```js
+var Level;
+(function (Level) {
+    Level[Level["Debug"] = 0] = "Debug";
+    Level[Level["Info"] = 1] = "Info";
+    Level[Level["Warn"] = 2] = "Warn";
+})(Level || (Level = {}));
+
+class Panda {
+    name;
+    constructor(name) {
+        this.name = name;
+    }
+}
+```
+
+The full list of code-generating features is short: **enums** (including `const enum`), **namespaces** that contain values, **parameter properties**, the CommonJS-only `import x = require("x")` and `export =`, and the old `experimentalDecorators` with `emitDecoratorMetadata`, which even writes type information into the JavaScript. Everything else is erasable. Keep that list in mind; it's the key to the rest of the lesson.
+
+## Transpile-only tools
+
+`tsc` is not the only program that reads TypeScript. Most of the time your code is actually run or bundled by a **transpile-only** tool, one that turns TypeScript into JavaScript **without type checking**:
+
+- **esbuild** (written in Go) and **swc** (written in Rust): used inside Vite, Next.js, tsup, Vitest and many more.
+- **Babel** with `@babel/preset-typescript`, common in older setups and React Native.
+- **Node.js** itself: in current versions (22.18 and later), `node server.ts` works out of the box. Node replaces the types with blank space and runs what's left.
+- **Sucrase**, which is what the PandaDev editor uses. The editor type-checks your code with the real TypeScript compiler first (it runs in your browser), then hands it to Sucrase to strip the types and run, the same split as `tsc` plus Vite in a real project.
+
+They are much faster than `tsc` (that's the third puzzle), for two reasons: they skip the checker completely, and they look at **one file at a time**, so they never load the rest of your program and can process files in parallel. Both shortcuts have consequences.
+
+**They don't report type errors.** A transpile-only tool turns a file full of type errors into JavaScript without a word. That's the answer to the first puzzle: Vite runs your app because nobody asked it to check anything. As you saw in [tsconfig & the Compiler](/learn/typescript/tsconfig-and-the-compiler), the checker runs separately, in your editor and in CI:
+
+```bash
+npx tsc --noEmit    # check everything, write nothing
+```
+
+**They can't see other files.** When a one-file-at-a-time tool reads `export { User } from "./user"`, it can't tell whether `User` is an interface (delete the line) or a function (keep it) without opening `user.ts`, which it never does. You met this problem with imports in [Modules & Declaration Files](/learn/typescript/modules-and-declaration-files); the fix is to say it in the code, with `type`.
+
+**Some refuse to generate code.** Node only strips; it doesn't generate. That's the answer to the second puzzle:
+
+```text
+$ node src/levels.ts
+SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript enum is not supported in strip-only mode
+```
+
+Parameter properties and namespaces get the same treatment (`TypeScript parameter property is not supported in strip-only mode`), and so does the old `<number>value` style of type assertion (Node suggests `value as number` instead).
+
+<Callout type="warning" title="Two tools, two jobs">
+
+In a modern project, one tool **runs** your code (Vite, Vitest, Node, tsx) and another **checks** it (`tsc --noEmit` or your editor). If only the first one is wired into CI, type errors reach production. A green `vite build` proves nothing about types.
+
+</Callout>
+
+## Flags that keep files independent
+
+Three `tsconfig.json` options make the checker warn you about code that a one-file-at-a-time tool would get wrong. They don't change what's legal TypeScript; they make the checker **stricter**, so you find out in the editor rather than at runtime.
+
+**`isolatedModules`** reports anything that can't be compiled from one file alone, for example re-exporting a type without saying so:
+
+```ts title="src/index.ts"
+export { User } from "./user.js";
+// ❌ Error: Re-exporting a type when 'isolatedModules' is enabled requires using 'export type'.
+```
+
+```ts title="src/index.ts"
+export type { User } from "./user.js"; // ✅ deleted from the JavaScript
+```
+
+**`verbatimModuleSyntax`** is the newer, simpler rule that most projects now use instead (it includes those `isolatedModules` checks): an import or export **without** `type` is kept exactly as written, and one **with** `type` is deleted. No guessing in either direction. That even decides whether a module is loaded at all:
+
+```ts
+import type { Point } from "./geometry.js";
+// emitted: nothing
+
+import { type Point } from "./geometry.js";
+// emitted: import {} from "./geometry.js";
+// (geometry.js still runs, in case it has side effects)
+```
+
+**`erasableSyntaxOnly`** (TypeScript 5.8 and later), which you met briefly in the tsconfig lesson, forbids the code-generating features from the list above, so every file can be stripped rather than compiled:
+
+```ts
+enum Level { Debug, Info }
+// ❌ Error: This syntax is not allowed when 'erasableSyntaxOnly' is enabled.
+```
+
+The message is the same for each of them. Here's what to write instead:
+
+| Instead of | Write |
+| --- | --- |
+| `enum Level { … }` | an `as const` object plus a union type (below) |
+| a `namespace` with values | a module (its own file), or a plain object |
+| `constructor(private name: string)` | a field and an assignment in the constructor |
+| `<number>value` | `value as number` |
+| `import fs = require("fs")` and `export =` | ES `import` and `export` |
+
+Type-only namespaces and `declare enum` are still fine, because they have nothing to erase.
+
+### The enum replacement
+
+The standard replacement for an enum is an object marked `as const` plus a type **with the same name**. That's the binder's "two meanings" from earlier: one name with a value meaning and a type meaning, and TypeScript always knows which one you mean from where you use it.
+
+<CodeExample output={`true
+{ Debug: 'debug', Info: 'info', Warn: 'warn' }
+false`}>
+
+```ts
+// The value: a plain object, read-only thanks to as const
+const Level = {
+  Debug: "debug",
+  Info: "info",
+  Warn: "warn",
+} as const;
+
+// The type, same name: "debug" | "info" | "warn"
+type Level = (typeof Level)[keyof typeof Level];
+
+const LEVELS: readonly string[] = Object.values(Level);
+
+function isLevel(value: string): value is Level {
+  return LEVELS.includes(value);
+}
+
+const fromConfig: string = "warn"; // e.g. read from a JSON file
+if (isLevel(fromConfig)) {
+  const level: Level = fromConfig; // narrowed: fine
+  console.log(level === Level.Warn);
+}
+console.log(Level);
+console.log(isLevel("verbose"));
+```
+
+</CodeExample>
+
+You keep `Level.Warn` for readable code, and you gain something an enum doesn't give you: plain strings from JSON fit the type. With an enum, they don't, so every value from the outside world needs a cast:
+
+```ts
+enum Level { Debug = "debug", Info = "info", Warn = "warn" }
+
+const fromConfig: Level = "warn";
+// ❌ Error: Type '"warn"' is not assignable to type 'Level'.
+```
+
+### Parameter properties have a second problem
+
+In [Classes & Access Modifiers](/learn/typescript/classes-and-access-modifiers) you were promised an explanation of why some tools reject parameter properties. Besides being generated code, they also run at a surprising **moment**. Class field initialisers run **before** the constructor body, and the generated `this.service = service` lives in the constructor body:
+
+```ts
+class Logger {
+  private readonly prefix = `[${this.service}]`;
+  // ❌ Error: Property 'service' is used before its initialization.
+  constructor(private readonly service: string) {}
+}
+```
+
+The checker catches this one, which is lucky, because the emitted JavaScript would happily build the prefix `[undefined]`. Explicit fields put every assignment where you can see it, in the order it runs:
+
+```ts
+class Logger {
+  private readonly prefix: string;
+
+  constructor(service: string) {
+    this.prefix = `[${service}]`;
+  }
+}
+```
+
+### A tsconfig for running TypeScript directly
+
+If your code runs with `node file.ts`, this is the combination that makes the editor warn you about everything Node would reject:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true
+  }
+}
+```
+
+`allowImportingTsExtensions` lets you write `import { total } from "./prices.ts"`, which is what Node needs when there's no build step creating `.js` files.
+
+<Callout type="tip" title="Should your team ban enums?">
+
+It depends on where the code runs. If it runs through Node's type stripping, or you want "what you see is the JavaScript" everywhere, yes: turn on `erasableSyntaxOnly` and use `as const` objects. If everything goes through `tsc`, esbuild or swc, regular enums compile fine, and an existing codebase full of them isn't worth a big-bang rewrite. New code in most teams today leans towards unions of string literals: they're erasable, they fit JSON, and they print as readable strings in logs.
+
+</Callout>
+
+<Quiz
+  question="Your Vite app starts and works even though npx tsc --noEmit reports three type errors. Why?"
+  options={[
+    "Vite uses an older version of TypeScript that allows those errors",
+    "Vite strips the types file by file and never runs the type checker",
+    "Vite only checks types in production builds",
+    "The errors are only warnings until strict mode is turned on",
+  ]}
+  answer={1}
+  explanation="Vite hands each file to a transpile-only tool that deletes the types without checking them. Type checking is a separate job, done by tsc --noEmit or the editor, so it has to be part of CI on its own."
+/>
+
+## Declaration files need the checker too
+
+Remember the `.d.ts` files from [Modules & Declaration Files](/learn/typescript/modules-and-declaration-files): the emitter writes one next to each `.js` file when `declaration` is on, and they're how a library's users get its types. Writing them is the one part of emitting that isn't a simple deletion. Look at this function:
+
+```ts
+export function double(p: Point) {
+  return { x: p.x * 2, y: p.y * 2 };
+}
+```
+
+The declaration file must say what `double` returns, and nobody wrote it down. Only the checker can work out `{ x: number; y: number }`, which is why fast tools could strip types but couldn't produce `.d.ts` files. **`isolatedDeclarations`** (TypeScript 5.5 and later) fixes that the same way `isolatedModules` did for JavaScript: it requires every export to carry enough annotations that a declaration file can be written from that one file alone, by any tool, in parallel:
+
+```ts
+export function double(p: Point) {
+  return { x: p.x * 2, y: p.y * 2 };
+  // ❌ Error: Expression type can't be inferred with --isolatedDeclarations.
+}
+
+export function double(p: Point): Point { // ✅
+  return { x: p.x * 2, y: p.y * 2 };
+}
+```
+
+Simple cases are still allowed without annotations (`export const VERSION = "1.0.0"` is obviously a string). You'll use this flag for real when publishing a package in lesson 3.
+
+## TypeScript 7: the same compiler, in Go
+
+The compiler you've been reading about is written in TypeScript and runs on Node. **TypeScript 7** (code name **Project Corsa**) is a **native port** of it to Go. It's a port rather than a rewrite: the same scanner, parser, binder, checker and emitter, translated file by file so that it reports the same errors. Native code and real parallelism (parsing and checking several files at once with shared memory) make it dramatically faster; the TypeScript team reports around 10 times on large codebases.
+
+**TypeScript 6**, which this site runs (6.0.3), is the bridge between the two: the last version written in TypeScript. It changes some defaults (`strict` is now on by default) and deprecates old options that TypeScript 7 drops, with an error that tells you so:
+
+```text
+error TS5101: Option 'baseUrl' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '"ignoreDeprecations": "6.0"' to silence this error.
+```
+
+One practical difference: TypeScript 7 doesn't come with the JavaScript compiler API from the start of this lesson. Tools built on it, such as type-aware lint rules, codemods and code generators, can't simply switch over, which is one reason TypeScript 6 stays around next to it. Your code, your `tsconfig.json` and everything in this course work the same in both.
+
+<Quiz
+  question="Which line makes Node.js refuse to run a .ts file in its default strip-only mode?"
+  options={[
+    "const n = input as number;",
+    "import type { User } from './user.ts';",
+    "constructor(private name: string) {}",
+    "function isUser(x: unknown): x is User { return true; }",
+  ]}
+  answer={2}
+  explanation="A parameter property generates code (a field and an assignment in the constructor), so it can't simply be deleted. The other three are pure type syntax: as casts, type-only imports and type predicates disappear completely when the types are stripped."
+/>
+
+<Exercise
+  title="Make the logger erasable"
+  language="typescript"
+  starter={`enum Level {
+  Debug,
+  Info,
+  Warn,
+  Error,
+}
+
+class Logger {
+  private readonly prefix = \`[\${this.service}]\`;
+  private lines: string[] = [];
+
+  constructor(
+    private readonly service: string,
+    private readonly minLevel: Level,
+  ) {}
+
+  log(level: Level, message: string): void {
+    if (level < this.minLevel) return;
+    const name = Level[level].toUpperCase();
+    this.lines.push(\`\${this.prefix} \${name}: \${message}\`);
+  }
+
+  history(): readonly string[] {
+    return this.lines;
+  }
+}
+
+// Type tests: never called, only type-checked. The line
+// under the expect-error comment MUST be a type error.
+function typeTests(logger: Logger): void {
+  // Levels arrive as plain strings from a JSON config file
+  const fromConfig: Level = "warn";
+  logger.log("error", "Disk full");
+  // The named constants must keep working
+  logger.log(Level.Info, "Listening");
+  // @ts-expect-error: "verbose" is not a level
+  logger.log("verbose", "Nope");
+}
+
+const logger = new Logger("api", "info");
+logger.log("debug", "Connecting to the database");
+logger.log("info", "Listening on port 3000");
+logger.log("error", "Disk full");
+console.log(logger.history());
+`}
+  tests={[
+    { name: "Level is a plain object of the four level names, in order", check: 'JSON.stringify(Object.values(Level)) === JSON.stringify(["debug", "info", "warn", "error"])' },
+    { name: "The named constants still work (Level.Warn is \"warn\")", check: 'Level.Warn === "warn" && Level.Error === "error" && Level.Debug === "debug"' },
+    { name: "A warn logger skips info and keeps warn and error", check: '(() => { const l = new Logger("db", "warn"); l.log("info", "a"); l.log("warn", "b"); l.log("error", "c"); return JSON.stringify(l.history()) === JSON.stringify(["[db] WARN: b", "[db] ERROR: c"]); })()' },
+    { name: "A debug logger keeps everything", check: '(() => { const l = new Logger("jobs", "debug"); l.log("debug", "tick"); return JSON.stringify(l.history()) === JSON.stringify(["[jobs] DEBUG: tick"]); })()' },
+    { name: "An error logger drops everything below error", check: '(() => { const l = new Logger("x", "error"); l.log("warn", "w"); l.log("debug", "d"); return l.history().length === 0; })()' },
+  ]}
+>
+
+Your team is moving this service to `node server.ts` with `erasableSyntaxOnly` turned on, and the logger uses both features Node can't strip. Rewrite it so it's **erasable** and keeps working:
+
+1. Replace the numeric `enum Level` with an `as const` object (`Debug: "debug"`, `Info: "info"`, `Warn: "warn"`, `Error: "error"`) plus a `Level` type of the same name.
+2. Replace the parameter properties with explicit fields assigned in the constructor. That also fixes the `prefix` bug from the lesson.
+3. Levels are strings now, so `level < this.minLevel` no longer compares severity. Rank them, for example with a `Record<Level, number>`.
+
+The log lines stay the same: `[api] INFO: Listening on port 3000`. The **type tests** in `typeTests()` describe the goal: config strings like `"warn"` must fit `Level` (they don't with an enum), `Level.Info` must keep working, and `"verbose"` must still be rejected, so `type Level = string` won't do (`Unused '@ts-expect-error' directive.`).
+
+<Hint>
+
+The pattern from the lesson:
+
+```ts
+const Level = {
+  Debug: "debug",
+  // …
+} as const;
+
+type Level = (typeof Level)[keyof typeof Level];
+
+const SEVERITY: Record<Level, number> = {
+  debug: 0,
+  // …
+};
+```
+
+`Record<Level, number>` makes TypeScript complain if a level is missing from the table. In `log`, compare `SEVERITY[level]` with `SEVERITY[this.minLevel]`, and the level's name is simply `level.toUpperCase()`. For the class, declare `private readonly prefix: string;` and `private readonly minLevel: Level;` as fields and assign both in the constructor.
+
+</Hint>
+
+<Solution>
+
+```ts
+const Level = {
+  Debug: "debug",
+  Info: "info",
+  Warn: "warn",
+  Error: "error",
+} as const;
+
+type Level = (typeof Level)[keyof typeof Level];
+
+// Record<Level, number>: TypeScript checks every level is ranked
+const SEVERITY: Record<Level, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
+
+class Logger {
+  private readonly prefix: string;
+  private readonly minLevel: Level;
+  private lines: string[] = [];
+
+  constructor(service: string, minLevel: Level) {
+    this.prefix = `[${service}]`;
+    this.minLevel = minLevel;
+  }
+
+  log(level: Level, message: string): void {
+    if (SEVERITY[level] < SEVERITY[this.minLevel]) return;
+    const name = level.toUpperCase();
+    this.lines.push(`${this.prefix} ${name}: ${message}`);
+  }
+
+  history(): readonly string[] {
+    return this.lines;
+  }
+}
+
+// Type tests: never called, only type-checked. The line
+// under the expect-error comment MUST be a type error.
+function typeTests(logger: Logger): void {
+  // Levels arrive as plain strings from a JSON config file
+  const fromConfig: Level = "warn";
+  logger.log("error", "Disk full");
+  // The named constants must keep working
+  logger.log(Level.Info, "Listening");
+  // @ts-expect-error: "verbose" is not a level
+  logger.log("verbose", "Nope");
+}
+
+const logger = new Logger("api", "info");
+logger.log("debug", "Connecting to the database");
+logger.log("info", "Listening on port 3000");
+logger.log("error", "Disk full");
+console.log(logger.history());
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- `tsc` works in five stages: the **scanner** makes tokens, the **parser** builds the AST, the **binder** creates symbols and scopes, the **checker** works out every type (the expensive part, and the only one that needs the whole program), and the **emitter** writes `.js`, `.d.ts` and source maps, even when there are type errors.
+- Most TypeScript is **erasable**. Enums, namespaces with values, parameter properties, `import = require` / `export =` and legacy decorator metadata **generate code**.
+- **Transpile-only tools** (esbuild, swc, Babel, Sucrase, Node's type stripping) are fast because they skip checking and see one file at a time. So run `tsc --noEmit` separately, mark type-only imports and exports with `type`, and expect Node to reject code-generating syntax.
+- `isolatedModules` and `verbatimModuleSyntax` warn about code that needs other files to compile; `erasableSyntaxOnly` bans code-generating syntax. Replace enums with an `as const` object plus a same-named union type.
+- Declaration emit needs the checker for inferred types; `isolatedDeclarations` requires annotations on exports so any tool can write `.d.ts` files.
+- **TypeScript 7** (Project Corsa) is the same compiler ported to Go, about 10 times faster, without the old JavaScript compiler API. TypeScript 6 is the bridge release that deprecates what 7 removes.

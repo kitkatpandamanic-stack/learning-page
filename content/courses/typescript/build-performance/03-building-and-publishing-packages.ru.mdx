@@ -1,0 +1,588 @@
+---
+title: Сборка и публикация пакетов
+description: Соберите библиотеку на TypeScript через tsc или бандлер, опишите её полем exports в package.json и файлами объявлений, убедитесь, что типы находятся у всех пользователей, и опубликуйте её в npm.
+duration: 25
+xp: 30
+---
+
+В уроке [Модули и файлы объявлений](/learn/typescript/modules-and-declaration-files) вы были по ту сторону: у `panda-slug` не было типов, и вы сами написали для него `declare module`. В этом уроке вы окажетесь на другой стороне. Вы выпустите типизированный `panda-slug`, чтобы каждый, кто его установит, автоматически получал типы — в проекте любого вида. 📦
+
+У публикации есть неприятное свойство: **ваш собственный проект никогда не показывает ошибок**. В репозитории, где вы собираете пакет, всё работает. Баги появляются в редакторах ваших пользователей: как `Could not find a declaration file`, как типы, которые работают только при одной настройке модулей, или как пакет, который импортируется без проблем, но падает в Node. Почти все они берутся из трёх мест: результата сборки, файлов объявлений и поля `exports` в `package.json`.
+
+## Что на самом деле внутри пакета
+
+Опубликованный пакет (package) — это tarball (сжатая папка), который npm скачивает в `node_modules`. `npm pack --dry-run` точно показывает, что в него попадёт, ничего не публикуя:
+
+```bash
+$ npm pack --dry-run
+npm notice package: panda-slug@1.0.0
+npm notice Tarball Contents
+npm notice 286B dist/index.d.ts
+npm notice 291B dist/index.d.ts.map
+npm notice 421B dist/index.js
+npm notice 554B dist/index.js.map
+npm notice 409B package.json
+npm notice 557B src/index.ts
+npm notice total files: 6
+```
+
+- `dist/index.js`: **JavaScript**, который выполняется. Инструменты пользователей никогда не компилируют ваш TypeScript — они получают JavaScript.
+- `dist/index.d.ts`: **файл объявлений** (declaration file), который читает их TypeScript, чтобы проверить их код на совместимость с вашим.
+- **Карты**: `index.js.map` позволяет отладчикам показывать ваш исходный код; `index.d.ts.map` (**карта объявлений**, declaration map) заставляет «Go to Definition» в редакторе пользователя переходить к вашему настоящему коду `.ts`, а не к `.d.ts`. Поэтому `src/` тоже публикуется.
+- `package.json`: инструкции, которые говорят Node, бандлерам и TypeScript, какой файл для чего.
+
+## Публичный API — это обещание
+
+Всё, что экспортирует пакет, — обещание его пользователям, а файл `.d.ts` — это обещание, записанное на бумаге. Точка входа пакета должна быть маленькой и продуманной: явные типы параметров и возвращаемых значений, каждый тип из сигнатур экспортирован по имени, а комментарии JSDoc попадают в файл объявлений и видны в редакторах пользователей. Тесты типов с парой `Equal`/`Expect` из урока [Тестирование типов](/learn/typescript/testing-types) закрепляют обещание, чтобы рефакторинг не мог случайно его изменить:
+
+<CodeExample output={`hello-panda-world
+creme_brulee_recipes
+ten-tips-for`}>
+
+```ts
+export interface SlugOptions {
+  /** Ставится между словами. По умолчанию: "-" */
+  separator?: string;
+  /** Обрезать slug до этого числа символов. */
+  maxLength?: number;
+}
+
+export function slugify(
+  text: string,
+  options: SlugOptions = {},
+): string {
+  const { separator = "-", maxLength } = options;
+  const words = text
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "") // убираем диакритику
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word !== "");
+  const slug = words.join(separator);
+  return maxLength === undefined ? slug : slug.slice(0, maxLength);
+}
+
+// Тесты типов закрепляют публичный интерфейс: если рефакторинг
+// случайно его изменит, этот файл перестанет компилироваться.
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _Params = Expect<Equal<
+  Parameters<typeof slugify>,
+  [text: string, options?: SlugOptions]
+>>;
+type _Returns = Expect<Equal<ReturnType<typeof slugify>, string>>;
+
+console.log(slugify("Hello, Panda World!"));
+console.log(slugify("Crème Brûlée Recipes", { separator: "_" }));
+console.log(slugify("Ten tips for bamboo lovers", { maxLength: 12 }));
+```
+
+</CodeExample>
+
+Замените `text: string` на `text: string | number` — и строка `_Params` упадёт с ошибкой `Type 'false' does not satisfy the constraint 'true'.`: вы изменили обещание, и теперь придётся решить, хотели ли вы этого. Из этого файла компилятор пишет вот такой файл объявлений — и это всё, что когда-либо увидит TypeScript ваших пользователей:
+
+```ts title="dist/index.d.ts"
+export interface SlugOptions {
+    /** Ставится между словами. По умолчанию: "-" */
+    separator?: string;
+    /** Обрезать slug до этого числа символов. */
+    maxLength?: number;
+}
+export declare function slugify(text: string, options?: SlugOptions): string;
+```
+
+Две привычки поддерживают этот файл в порядке. **Экспортируйте каждый тип, который встречается в публичной сигнатуре.** Если бы `SlugOptions` не был экспортирован, файл объявлений всё равно описывал бы его, но пользователи не смогли бы импортировать его по имени, чтобы типизировать свои переменные, — им пришлось бы писать `Parameters<typeof slugify>[1]`. И **аннотируйте экспортируемые функции**: тогда файл объявлений говорит ровно то, что написали вы, а не то, что случайно вывелось из тела, а `isolatedDeclarations` (из [урока 1](/learn/typescript/how-the-compiler-works)) может это обеспечить.
+
+## Сборка: tsc или бандлер
+
+### Только tsc
+
+Для многих библиотек `tsc` — это вся сборка (build): по одному `.js`, одному `.d.ts` и их картам на каждый файл `.ts`. Держите настройки сборки в отдельном файле, чтобы тесты и скрипты не попали в пакет:
+
+```json title="tsconfig.build.json"
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "isolatedDeclarations": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}
+```
+
+```bash
+npx tsc -p tsconfig.build.json
+```
+
+`"module": "nodenext"` заставляет TypeScript проверять импорты так, как их будет выполнять Node, — для библиотеки это самый безопасный вариант, ведь кто-то из пользователей будет запускать её прямо в Node. Это значит, что относительные импорты содержат расширение **результата**: `import { x } from "./words.js"` (или пишите `.ts` и включите `rewriteRelativeImportExtensions`). А TypeScript 6 требует явный `rootDir`, когда задан `outDir`, чтобы структура папок в `dist` никогда не зависела от того, какие файлы оказались в проекте.
+
+Одного `tsc` достаточно, когда вы публикуете **только ESM**: результат похож на исходный код, лишних инструментов нет, а всю сборку в бандлы делают бандлеры ваших пользователей. Но за один запуск он пишет только один формат модулей и не работает с CSS и картинками.
+
+### Бандлеры
+
+Когда нужно больше, бандлер (bundler) для библиотек строится на инструментах только для транспиляции из урока 1:
+
+- **tsup** и его более новый преемник **tsdown**: одна команда создаёт сборки ESM **и** CommonJS плюс файлы объявлений.
+- **Режим библиотеки Vite** (`build.lib` в `vite.config.ts`), обычно с плагином вроде `vite-plugin-dts` для объявлений: естественный выбор для библиотек UI-компонентов с CSS и ресурсами.
+
+```bash
+npx tsup src/index.ts --format esm,cjs --dts
+```
+
+Помните, что вы узнали об этих инструментах: они очень быстро превращают TypeScript в JavaScript, но **не проверяют типы**. Оставьте `tsc --noEmit` в CI. Файлам объявлений по-прежнему нужен проверщик типов — если только код не соответствует `isolatedDeclarations`: тогда новые инструменты генерируют их файл за файлом, гораздо быстрее.
+
+## package.json: где что лежит
+
+Вот полный `package.json` для `panda-slug`, который публикуется только как ESM:
+
+```json title="package.json"
+{
+  "name": "panda-slug",
+  "version": "1.0.0",
+  "description": "Turn any text into a URL-friendly slug",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "src"],
+  "sideEffects": false,
+  "engines": { "node": ">=20.19" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build"
+  }
+}
+```
+
+- **`"type": "module"`**: файлы `.js` в этом пакете — ES-модули (`.cjs` были бы CommonJS).
+- **`exports`**: точки входа пакета. `"."` — это то, что получает `import { slugify } from "panda-slug"`. Кроме того, это **стена**: всё, что не перечислено, импортировать нельзя, поэтому `panda-slug/dist/internal.js` остаётся приватным, и вы можете перестраивать `dist`, никому ничего не ломая.
+- **`files`**: что попадает в tarball. Список того, что включить, безопаснее `.npmignore` (списка того, что исключить): новые файлы вроде `.env` не опубликуются случайно.
+- **`sideEffects: false`** сообщает бандлерам, что пакет можно выбросить, если из него ничего не используется (см. [Сборка и кэширование](/learn/javascript/bundling-and-caching)).
+- **`prepublishOnly`** выполняется перед `npm publish`, поэтому опубликовать устаревший `dist` не получится.
+
+В старых руководствах встречаются ещё поля верхнего уровня **`main`** (точка входа CommonJS), **`module`** (точка входа ESM для старых бандлеров) и **`types`**. Современные Node, бандлеры и TypeScript (с `moduleResolution`, равным `bundler`, `node16` или `nodenext`) используют `exports` и игнорируют эти поля, если `exports` есть. Добавляйте их, только если нужно поддерживать совсем старые инструменты.
+
+### Как инструменты читают exports
+
+Каждая запись в `exports` может быть объектом **условий** (conditions): с именами вроде `"import"`, `"require"`, `"node"`, `"browser"`, `"types"` и `"default"`. Каждый инструмент разрешает импорт со своим списком **активных** условий. Node использует `"node"` плюс `"import"` или `"require"` (в зависимости от того, как загружается пакет); бандлеры добавляют свои, например `"browser"` или `"development"`; TypeScript добавляет `"types"`. `"default"` подходит всегда. А вот правило, из-за которого ломается большинство пакетов: ключи перебираются **в том порядке, в котором они записаны в объекте**, и побеждает первое совпадение. Порядок в списке активных условий не имеет никакого значения:
+
+<CodeExample output={`./dist/index.js
+./dist/index.cjs
+./dist/index.js`}>
+
+```ts
+// Одна запись "exports" — так, как она записана в package.json
+const entry: Record<string, string> = JSON.parse(`{
+  "import": "./dist/index.js",
+  "types": "./dist/types/index.d.ts",
+  "default": "./dist/index.cjs"
+}`);
+
+// Как Node, бандлеры и TypeScript выбирают цель:
+// перебираем ключи В ПОРЯДКЕ ОБЪЕКТА и берём первый, который
+// равен "default" или входит в активные условия.
+function pick(
+  conditions: Record<string, string>,
+  active: readonly string[],
+): string | undefined {
+  for (const [key, target] of Object.entries(conditions)) {
+    if (key === "default" || active.includes(key)) {
+      return target;
+    }
+  }
+  return undefined;
+}
+
+console.log(pick(entry, ["node", "import"])); // Node, import
+console.log(pick(entry, ["node", "require"])); // Node, require
+console.log(pick(entry, ["types", "import"])); // TypeScript
+```
+
+</CodeExample>
+
+TypeScript просил `"types"`, а попал на `./dist/index.js`, потому что `"import"` стоит раньше. Затем TypeScript ищет файл объявлений **рядом** с этим файлом JavaScript (`index.js` → `index.d.ts`) и только если его нет, переходит к следующему условию. Так что то, какие типы получат пользователи, зависит от того, что ещё случайно лежит в `dist`. Ставьте **`"types"` первым** в каждом объекте условий — и никому не придётся гадать.
+
+## ESM, CommonJS и двойные пакеты
+
+В мире JavaScript два формата модулей: ES-модули (`import`/`export`) и более старый CommonJS (`require`/`module.exports`). Долгое время пакетам приходилось поставлять оба, потому что код на CommonJS не мог сделать `require()` для ES-модуля. Это изменилось: Node 20.19 и 22.12 (и новее) умеют делать `require()` для ES-модулей, которые не используют `await` верхнего уровня. Для нового пакета **только ESM** теперь разумный выбор по умолчанию — именно так и устроен `package.json` выше.
+
+Если вам всё же нужны оба формата, например для пользователей, застрявших на старых версиях Node, вы собираете дважды и описываете обе сборки. Ключевая деталь: **каждому файлу JavaScript нужен файл объявлений того же формата**. TypeScript определяет формат файла объявлений так же, как Node — формат файла JavaScript: `.d.mts` — это ESM, как `.mjs`, `.d.cts` — CommonJS, как `.cjs`, а `.d.ts` следует полю `"type"`, как `.js`:
+
+```json title="package.json (dual package)"
+{
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  }
+}
+```
+
+Направьте ветку `"require"` на `index.d.ts` — и TypeScript решит, что файл CommonJS — это ES-модуль. Импорты, которые проходят проверку типов, могут тогда упасть во время выполнения — в коде ваших пользователей, а не в вашем. Инструменты проверки называют это **«masquerading as ESM»** («маскировка под ESM», или под CJS — в обратном случае).
+
+<Callout type="warning" title="Опасность двойного пакета">
+
+Двойной пакет может загрузиться в одном приложении **дважды**: один раз как ESM через одну зависимость и ещё раз как CommonJS через другую. Тогда существуют две копии каждого класса и каждого фрагмента состояния модуля: `error instanceof PandaError` даёт `false` для ошибки из другой копии, а «единственный» кэш существует в двух экземплярах. Если в пакете есть классы или состояние, это ещё один довод публиковать только ESM.
+
+</Callout>
+
+## Зависимости: кто что устанавливает
+
+Раздел `package.json`, в который попал пакет, решает, получат ли его ваши **пользователи**:
+
+- **`dependencies`**: всё, что нужно опубликованному коду во время выполнения, **а также** каждый пакет `@types`, из которого импортируют ваши опубликованные файлы `.d.ts`. Если в `dist/index.d.ts` написано `import type { Request } from "express"`, пользователям тоже нужен `@types/express`.
+- **`peerDependencies`**: фреймворки, которые у пользователя уже есть и которые должны быть **той же копией**, например React или Express. `"peerDependencies": { "react": "^18.0.0 || ^19.0.0" }` означает «принесите свой React, одной из этих версий».
+- **`devDependencies`**: TypeScript, инструменты сборки и тестирования и типы, которые вы используете только внутри. Пользователи их никогда не устанавливают.
+
+<Callout type="danger" title="А у меня всё работает">
+
+Самый частый баг с типами в опубликованных пакетах: пакет `@types`, который нужен файлам объявлений, лежит в `devDependencies`. В вашем репозитории он установлен, поэтому всё компилируется. Пользователи устанавливают пакет, и их сборка падает внутри вашего файла `.d.ts` с ошибкой, которая указывает на код, написанный не ими.
+
+</Callout>
+
+## Версии — тоже обещания
+
+Публикация превращает правила semver из урока [Проектирование API и миграции](/learn/typescript/api-design-and-migrations) во что-то вполне реальное. Пользователи устанавливают пакеты с диапазонами вроде `^1.4.0`, которые принимают любую `1.x` начиная с 1.4.0, поэтому ломающее изменение, выпущенное как минорный релиз, сломает им сборку при следующей установке — хотя они не поменяли ни строчки. Для типов есть простое правило: то, что пользователи **передают**, может только расширяться, а то, что они **получают**, — только сужаться. Два ломающих изменения, характерных именно для пакетов, легко пропустить: изменение `exports`, после которого путь импорта перестаёт находиться, и файлы `.d.ts`, которым нужна более новая версия TypeScript, чем у ваших пользователей.
+
+Тесты типов `_Params` и `_Returns` из начала урока превращают случайное ломающее изменение в упавшую сборку в **вашем** CI — именно там, где вы и хотите его увидеть.
+
+<Quiz
+  question="В версии 2.3.0 пакета есть: export function find(id: string): User. Какое изменение допустимо в 2.4.0?"
+  options={[
+    "find(id: string): User | undefined",
+    "find(id: string, options?: { cache: boolean }): User",
+    "find(id: string, options: { cache: boolean }): User",
+    "Переименовать экспорт в findUser",
+  ]}
+  answer={1}
+  explanation="Новый необязательный параметр не ломает ни одного существующего вызова. Возврат User | undefined расширяет возвращаемый тип, и код, который использует результат напрямую, перестаёт компилироваться; обязательный параметр ломает все существующие вызовы; переименование ломает все импорты. Всем трём нужна мажорная версия."
+/>
+
+## Проверьте перед публикацией
+
+Раз ваш собственный проект не показывает эти баги, используйте инструменты, которые смотрят на пакет так же, как его увидят пользователи:
+
+```bash
+npm pack --dry-run                    # какие именно файлы публикуются
+npx publint                           # ошибки в package.json и exports
+npx @arethetypeswrong/cli --pack .    # находятся ли типы у всех пользователей?
+```
+
+**publint** проверяет `package.json` по правилам, которые вы только что изучили: файлы, на которые указывает `exports`, но которых нет, несовпадающие форматы, `"types"` не на своём месте. **Are the types wrong?** (`attw`) упаковывает пакет и разрешает его так, как это сделал бы TypeScript при настройках, которые могут быть у пользователей (например, `node16` из ESM и из CommonJS, а также `bundler`), и печатает таблицу проблем вроде «No types», «Masquerading as ESM» и «Resolution failed». Последняя проверка — настоящая: установите tarball в новый проект и импортируйте его.
+
+```bash
+npm pack                               # создаёт panda-slug-1.0.0.tgz
+cd ../try-panda-slug
+npm install ../panda-slug/panda-slug-1.0.0.tgz
+```
+
+## Публикация в npm
+
+В первый раз войдите в аккаунт и опубликуйте пакет; именам со scope вроде `@panda/slug` нужен флаг `--access public`, чтобы стать публичными:
+
+```bash
+npm login
+npm publish                 # сначала prepublishOnly выполнит сборку
+```
+
+Для каждого следующего релиза повысьте версию (это заодно создаёт Git-коммит и тег) и опубликуйте снова:
+
+```bash
+npm version minor           # 1.0.0 → 1.1.0
+git push --follow-tags
+npm publish
+```
+
+В реальных проектах релизы обычно выпускаются из CI, а не с ноутбука: workflow запускает проверку типов, тесты, `publint` и `attw`, а затем публикует через `npm publish --provenance` — к пакету прикрепляется подписанная запись о том, какой репозиторий и какой workflow его собрали. Инструменты вроде **Changesets** собирают заметку к каждому pull request («minor: add maxLength option») и при релизе превращают их в повышение версии и `CHANGELOG.md`. И одно правило не меняется никогда: опубликованную версию нельзя изменить или использовать повторно. Если вы опубликовали ошибку, исправьте её и опубликуйте новую версию.
+
+<Exercise
+  title="Проверка exports перед публикацией"
+  language="typescript"
+  starter={`// В "exports" лежит путь или объект условий
+// ("types", "import", "default"…) или подпутей (".", "./utils"),
+// вложенных на любую глубину
+type Target = string | TargetMap;
+interface TargetMap {
+  [key: string]: Target;
+}
+
+interface PackageJson {
+  name: string;
+  version: string;
+  type?: "module" | "commonjs";
+  exports?: Target;
+}
+
+type Format = "import" | "require";
+type Problem =
+  | "types-not-first"
+  | \`missing-types:\${Format}\`
+  | \`types-mismatch:\${Format}\`;
+
+// Какой файл объявлений соответствует какому файлу JavaScript
+const DECLARATION_FOR: Record<string, string> = {
+  ".js": ".d.ts",
+  ".mjs": ".d.mts",
+  ".cjs": ".d.cts",
+};
+
+// "./dist/index.d.cts" → ".d.cts", "./dist/index.js" → ".js"
+function extensionOf(path: string): string {
+  const match = /(\\.d)?\\.[cm]?[jt]s$/.exec(path);
+  return match ? match[0] : "";
+}
+
+// 1. Файл, который получит инструмент для этого подпути и этих
+//    условий, или null, если ничего не подходит
+function resolveExport(
+  exports: Target,
+  subpath: string,
+  conditions: readonly string[],
+): string | null {
+  return null;
+}
+
+// 2. Всё, что не так с "exports" пакета
+function checkPackage(pkg: PackageJson): Problem[] {
+  return [];
+}
+
+const pkg: PackageJson = {
+  name: "panda-slug",
+  version: "2.0.0",
+  type: "module",
+  exports: {
+    ".": {
+      import: {
+        types: "./dist/index.d.ts",
+        default: "./dist/index.js",
+      },
+      require: {
+        default: "./dist/index.cjs",
+        types: "./dist/index.d.cts",
+      },
+    },
+    "./package.json": "./package.json",
+  },
+};
+
+console.log(resolveExport(pkg.exports!, ".", ["types", "import"]));
+console.log(resolveExport(pkg.exports!, ".", ["require"]));
+console.log(resolveExport(pkg.exports!, "./utils", ["import"]));
+console.log(checkPackage(pkg));
+`}
+  tests={[
+    { name: "Строка — это запись для \".\": она подходит для \".\" и ни для чего больше", check: 'resolveExport("./index.js", ".", ["import"]) === "./index.js" && resolveExport("./index.js", "./utils", ["import"]) === null' },
+    { name: "Подходят только активные условия и \"default\"", check: 'resolveExport({ import: "./a.mjs", require: "./a.cjs" }, ".", ["require"]) === "./a.cjs" && resolveExport({ import: "./a.mjs" }, ".", ["require"]) === null' },
+    { name: "Решает порядок в объекте, а не порядок условий", check: 'resolveExport({ default: "./d.js", import: "./i.js" }, ".", ["import"]) === "./d.js" && resolveExport({ import: "./i.js", types: "./i.d.ts" }, ".", ["types", "import"]) === "./i.js"' },
+    { name: "Карты подпутей: \".\", \"./utils\" и отсутствующие подпути", check: '(e => resolveExport(e, "./utils", ["types", "import"]) === "./u.d.ts" && resolveExport(e, ".", ["import"]) === "./i.js" && resolveExport(e, "./missing", ["import"]) === null)({ ".": { import: "./i.js" }, "./utils": { types: "./u.d.ts", default: "./u.js" } })' },
+    { name: "Вложенный объект без совпадений передаёт ход следующему ключу", check: 'resolveExport({ ".": { node: { import: "./n.mjs" }, default: "./d.js" } }, ".", ["require", "node"]) === "./d.js"' },
+    { name: "У правильных пакетов (только ESM и двойного) нет проблем", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: { ".": { types: "./index.d.ts", default: "./index.js" } } })) === "[]" && JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: { ".": { import: { types: "./i.d.ts", default: "./i.js" }, require: { types: "./i.d.cts", default: "./i.cjs" } } } })) === "[]"' },
+    { name: "Находит types-not-first и вызванное им отсутствие типов", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: { ".": { import: { default: "./i.js", types: "./i.d.ts" } } } })) === JSON.stringify(["types-not-first", "missing-types:import"])' },
+    { name: "Находит типы ESM у файла CommonJS", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: { ".": { import: { types: "./i.d.ts", default: "./i.js" }, require: { types: "./i.d.ts", default: "./i.cjs" } } } })) === JSON.stringify(["types-mismatch:require"])' },
+    { name: "У простого строкового экспорта нет типов ни для одного формата", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: "./index.js" })) === JSON.stringify(["missing-types:import", "missing-types:require"])' },
+    { name: "Без exports проверять нечего; у пакета из примера две проблемы", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0" })) === "[]" && JSON.stringify(checkPackage(pkg)) === JSON.stringify(["types-not-first", "missing-types:require"])' },
+  ]}
+>
+
+Соберите крошечную версию того, что делают publint и attw: функцию, которая разрешает `exports` так же, как Node и TypeScript, и проверку, которая с её помощью находит классические ошибки. Это обычная логика над данными `package.json`; типы в начале описывают эти данные, включая рекурсивный тип `Target`.
+
+**1. `resolveExport(exports, subpath, conditions)`** возвращает путь, который получит инструмент, или `null`:
+
+- Если `exports` — объект с ключами, начинающимися с `"."`, это карта **подпутей** (subpaths): найдите `subpath` точно (`"./utils"`; без шаблонов `*`). Иначе всё значение `exports` — это запись для `"."`. Отсутствующий подпуть даёт `null`.
+- Разрешение записи: строка — это и есть ответ. Для объекта перебирайте его ключи **по порядку**; ключ подходит, если это `"default"` или он есть в `conditions`. Разрешите подходящее значение (это может быть ещё один объект). Если путь нашёлся, верните его; если нет, переходите к следующему ключу. Если ничего не нашлось — `null`.
+
+**2. `checkPackage(pkg)`** возвращает проблемы в таком порядке (и `[]`, если `exports` нет):
+
+- `"types-not-first"`: в каком-нибудь объекте условий, на любой глубине, есть ключ `"types"`, который стоит не первым.
+- Затем для каждого формата, сначала `"import"`, потом `"require"`: если разрешение `"."` с `[format]` даёт `null`, пакет этот формат не предлагает — пропустите его. Иначе разрешите ещё раз с `["types", format]`. Если это не файл объявлений (путь без `.d.`), добавьте `"missing-types:<format>"`. Если файл объявлений, но его расширение не то, что `DECLARATION_FOR` указывает для расширения файла JavaScript, добавьте `"types-mismatch:<format>"`.
+
+Пакет из примера должен напечатать `./dist/index.d.ts`, `./dist/index.cjs`, `null` и `[ 'types-not-first', 'missing-types:require' ]`. Наша проверка не видит файлов на диске, поэтому, в отличие от TypeScript, не может искать файл объявлений рядом с JavaScript. Она доверяет только явным условиям `"types"` — а это как раз та привычка, которая вам и нужна.
+
+<Hint>
+
+Напишите рекурсивную вспомогательную функцию для одной записи:
+
+```ts
+function resolveTarget(
+  target: Target,
+  conditions: readonly string[],
+): string | null {
+  if (typeof target === "string") return target;
+  for (const [key, value] of Object.entries(target)) {
+    // подходит? разрешите value; верните, если это не null
+  }
+  return null;
+}
+```
+
+В `resolveExport` проверьте `typeof exports === "object" && Object.keys(exports).some((key) => key.startsWith("."))`; если это не карта подпутей, используйте `{ ".": exports }`. Для `"types-not-first"` подойдёт ещё одна рекурсивная функция: строка — всё в порядке; для объекта посмотрите на `Object.keys(target)`, а затем проверьте каждое значение через `Object.values(target).every(...)`. Цикл по форматам может использовать массив `Format[]`, а `` `missing-types:${format}` `` имеет в точности тип `Problem`.
+
+</Hint>
+
+<Solution>
+
+```ts
+// В "exports" лежит путь или объект условий
+// ("types", "import", "default"…) или подпутей (".", "./utils"),
+// вложенных на любую глубину
+type Target = string | TargetMap;
+interface TargetMap {
+  [key: string]: Target;
+}
+
+interface PackageJson {
+  name: string;
+  version: string;
+  type?: "module" | "commonjs";
+  exports?: Target;
+}
+
+type Format = "import" | "require";
+type Problem =
+  | "types-not-first"
+  | `missing-types:${Format}`
+  | `types-mismatch:${Format}`;
+
+// Какой файл объявлений соответствует какому файлу JavaScript
+const DECLARATION_FOR: Record<string, string> = {
+  ".js": ".d.ts",
+  ".mjs": ".d.mts",
+  ".cjs": ".d.cts",
+};
+
+// "./dist/index.d.cts" → ".d.cts", "./dist/index.js" → ".js"
+function extensionOf(path: string): string {
+  const match = /(\.d)?\.[cm]?[jt]s$/.exec(path);
+  return match ? match[0] : "";
+}
+
+function resolveTarget(
+  target: Target,
+  conditions: readonly string[],
+): string | null {
+  if (typeof target === "string") return target;
+  // Решает порядок в объекте, а не порядок `conditions`
+  for (const [key, value] of Object.entries(target)) {
+    if (key === "default" || conditions.includes(key)) {
+      const found = resolveTarget(value, conditions);
+      if (found !== null) return found; // иначе ищем дальше
+    }
+  }
+  return null;
+}
+
+// 1. Файл, который получит инструмент для этого подпути и этих
+//    условий, или null, если ничего не подходит
+function resolveExport(
+  exports: Target,
+  subpath: string,
+  conditions: readonly string[],
+): string | null {
+  const isSubpathMap =
+    typeof exports === "object" &&
+    Object.keys(exports).some((key) => key.startsWith("."));
+  const entries: TargetMap = isSubpathMap
+    ? exports
+    : { ".": exports };
+  const target = entries[subpath];
+  return target === undefined
+    ? null
+    : resolveTarget(target, conditions);
+}
+
+function typesComeFirst(target: Target): boolean {
+  if (typeof target === "string") return true;
+  const keys = Object.keys(target);
+  if (keys.includes("types") && keys[0] !== "types") {
+    return false;
+  }
+  return Object.values(target).every(typesComeFirst);
+}
+
+// 2. Всё, что не так с "exports" пакета
+function checkPackage(pkg: PackageJson): Problem[] {
+  const problems: Problem[] = [];
+  const exports = pkg.exports;
+  if (exports === undefined) return problems;
+  if (!typesComeFirst(exports)) {
+    problems.push("types-not-first");
+  }
+  const formats: Format[] = ["import", "require"];
+  for (const format of formats) {
+    const js = resolveExport(exports, ".", [format]);
+    if (js === null) continue; // этот формат не предлагается
+    const types = resolveExport(exports, ".", ["types", format]);
+    if (types === null || !types.includes(".d.")) {
+      problems.push(`missing-types:${format}`);
+    } else if (
+      DECLARATION_FOR[extensionOf(js)] !== extensionOf(types)
+    ) {
+      problems.push(`types-mismatch:${format}`);
+    }
+  }
+  return problems;
+}
+
+const pkg: PackageJson = {
+  name: "panda-slug",
+  version: "2.0.0",
+  type: "module",
+  exports: {
+    ".": {
+      import: {
+        types: "./dist/index.d.ts",
+        default: "./dist/index.js",
+      },
+      require: {
+        default: "./dist/index.cjs",
+        types: "./dist/index.d.cts",
+      },
+    },
+    "./package.json": "./package.json",
+  },
+};
+
+console.log(resolveExport(pkg.exports!, ".", ["types", "import"]));
+console.log(resolveExport(pkg.exports!, ".", ["require"]));
+console.log(resolveExport(pkg.exports!, "./utils", ["import"]));
+console.log(checkPackage(pkg));
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Пакет содержит **JavaScript**, **файлы объявлений** и их карты, а также `package.json`, который сообщает каждому инструменту, какой файл для чего. `npm pack --dry-run` точно показывает, что будет опубликовано.
+- Файл `.d.ts` — ваше публичное обещание: явные сигнатуры, каждый публичный тип экспортирован по имени, JSDoc виден в редакторах пользователей, а тесты типов не дают изменить обещание случайно.
+- Одного **`tsc`** хватает для пакетов только с ESM (`module: nodenext`, явный `rootDir`, `declaration`, `declarationMap`); **tsup/tsdown** или **режим библиотеки Vite** помогают с двойными форматами, CSS и ресурсами, но типы не проверяют.
+- **`exports`** перечисляет точки входа и скрывает всё остальное. Условия перебираются **в порядке объекта**, и побеждает первое совпадение, поэтому ставьте **`"types"` первым**.
+- Только ESM — хороший выбор по умолчанию теперь, когда Node умеет делать `require()` для ES-модулей. Двойным пакетам нужен файл объявлений **того же формата**, что и каждый файл JavaScript (`.d.cts` для `.cjs`), и они рискуют столкнуться с опасностью двойного пакета.
+- Пакеты `@types`, которые импортируют ваши объявления, место в `dependencies`; фреймворкам — в `peerDependencies`. Изменения типов подчиняются semver: входные типы могут только расширяться, выходные — только сужаться.
+- Проверяйте пакет с помощью **publint** и **attw**, попробуйте tarball в новом проекте, затем `npm version` и `npm publish` (из CI с `--provenance`).

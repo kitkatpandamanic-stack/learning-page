@@ -3,7 +3,8 @@ import type { RunLanguage } from "@/lib/runner/execute";
 
 /**
  * An editable live demo: JavaScript running against a small HTML page, a
- * React component (`language="react"`), or, without `html`, code the learner
+ * React component (`language="react"`, or `"tsx"` in TypeScript), or,
+ * without `html`, code the learner
  * runs themselves (e.g. Python that draws a chart, which a static
  * CodeExample can't show).
  */
@@ -18,7 +19,7 @@ export function TryIt({
 }) {
   return (
     <div className="my-6">
-      {html !== undefined || language === "react" ? (
+      {html !== undefined || language === "react" || language === "tsx" ? (
         <LazyCodeRunner
           starter={code}
           html={html}

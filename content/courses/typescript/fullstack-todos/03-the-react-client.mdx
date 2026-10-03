@@ -1,0 +1,1555 @@
+---
+title: "Part 3: The React client"
+description: "Finish the full-stack to-do app with a React front end: a status union in a reducer, optimistic updates that roll back on errors, and the typed client against the practice API."
+duration: 25
+xp: 30
+---
+
+Time for the part people actually see. 🎨 In this last part you'll build the React app on top of the typed client from Part 2. It loads the to-dos, adds, ticks and deletes them, and it feels **instant**: every change shows up before the server has answered, and quietly goes back if the server says no.
+
+You'll use status unions, reducers and custom hooks from [Reducers, Context and Custom Hooks](/learn/typescript/reducers-context-and-hooks), typed forms and events from [State, Events and Forms](/learn/typescript/state-events-and-forms), typed props from [Typed Components and Props](/learn/typescript/typed-components-and-props), and of course the `TodosClient`.
+
+## The plan
+
+```text
+App                 props: client      state: useTodos(client)
+├── (loading)       Loading...
+├── (failed)        😿 the message
+└── (ready)
+    ├── AddTodoForm   state: title      props: onAdd
+    ├── notice        what went wrong, with ✕ to dismiss it
+    ├── TodoItem      props: todo, onToggle, onRemove   (one per to-do)
+    └── Saving...     one per title on its way to the server
+```
+
+The decisions behind it:
+
+- **`App` receives the client as a prop.** That's dependency injection again: the real app passes `createTodosClient()`, while a demo or a test can pass a fake.
+- **All the to-do state lives in one reducer**, inside a custom hook, `useTodos(client)`. Components get the state and four functions: `add`, `toggle`, `remove` and `dismissNotice`.
+- **Changes are optimistic.** The screen changes first, then the request goes out, and only a failure changes it back.
+
+## Step 1: the state and its actions
+
+The screen is in one of three situations, so the state is a **status union**, like `FetchState` in the hooks lesson:
+
+- **`loading`**: nothing to show yet.
+- **`failed`**: the list couldn't load, with a `message`.
+- **`ready`**: the `todos`, plus two extras. `adding` holds the titles that are on their way to the server, and `notice` explains the latest change that failed (or is `null`).
+
+Every change is an action named after what happened, and each **failure** action carries what the reducer needs to undo the change: the to-do as it was before, or the title that never got saved. Since a reducer is plain TypeScript, you can replay a whole session without React:
+
+<CodeExample output={`loaded       [ 'Nap', 'Tea' ] [] null
+changed      [ '✓ Nap', 'Tea' ] [] null
+changeFailed [ 'Nap', 'Tea' ] [] Server is busy
+removed      [ 'Tea' ] [] Server is busy
+removeFailed [ 'Nap', 'Tea' ] [] Still busy
+addStarted   [ 'Nap', 'Tea' ] [ 'Bamboo' ] Still busy`}>
+
+```ts
+// From shared/ (Todo really comes from TodoSchema)
+type Todo = { id: number; title: string; done: boolean };
+
+// ========== web/todos-state.ts ==========
+type TodosState =
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | {
+      status: "ready";
+      todos: Todo[];
+      adding: string[]; // titles on their way to the server
+      notice: string | null; // what went wrong with the last change
+    };
+
+type TodosAction =
+  | { type: "loaded"; todos: Todo[] }
+  | { type: "loadFailed"; message: string }
+  | { type: "addStarted"; title: string }
+  | { type: "added"; title: string; todo: Todo }
+  | { type: "addFailed"; title: string; message: string }
+  | { type: "changed"; todo: Todo }
+  | { type: "changeFailed"; todo: Todo; message: string }
+  | { type: "removed"; id: number }
+  | { type: "removeFailed"; todo: Todo; message: string }
+  | { type: "noticeDismissed" };
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled action: ${JSON.stringify(value)}`);
+}
+
+// Removes the first copy of title (two adds may share a title)
+function withoutFirst(list: string[], title: string): string[] {
+  const index = list.indexOf(title);
+  return index === -1 ? list : list.filter((_, i) => i !== index);
+}
+
+function replaceTodo(todos: Todo[], todo: Todo): Todo[] {
+  return todos.map((t) => (t.id === todo.id ? todo : t));
+}
+
+function todosReducer(
+  state: TodosState,
+  action: TodosAction,
+): TodosState {
+  switch (action.type) {
+    case "loaded":
+      return {
+        status: "ready",
+        todos: action.todos,
+        adding: [],
+        notice: null,
+      };
+    case "loadFailed":
+      return { status: "failed", message: action.message };
+  }
+  // Every other action changes a list that has loaded
+  if (state.status !== "ready") return state;
+
+  switch (action.type) {
+    case "addStarted":
+      return { ...state, adding: [...state.adding, action.title] };
+    case "added":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        todos: [...state.todos, action.todo],
+      };
+    case "addFailed":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        notice: action.message,
+      };
+    case "changed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+      };
+    case "changeFailed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+        notice: action.message,
+      };
+    case "removed":
+      return {
+        ...state,
+        todos: state.todos.filter((t) => t.id !== action.id),
+      };
+    case "removeFailed":
+      return {
+        ...state,
+        // Back where it was: the list is sorted by id
+        todos: [...state.todos, action.todo].sort(
+          (a, b) => a.id - b.id,
+        ),
+        notice: action.message,
+      };
+    case "noticeDismissed":
+      return { ...state, notice: null };
+    default:
+      return assertNever(action);
+  }
+}
+
+// ========== replaying a session ==========
+const nap: Todo = { id: 1, title: "Nap", done: false };
+const tea: Todo = { id: 2, title: "Tea", done: false };
+
+const session: TodosAction[] = [
+  { type: "loaded", todos: [nap, tea] },
+  { type: "changed", todo: { ...nap, done: true } }, // optimistic
+  { type: "changeFailed", todo: nap, message: "Server is busy" },
+  { type: "removed", id: 1 }, // optimistic
+  { type: "removeFailed", todo: nap, message: "Still busy" },
+  { type: "addStarted", title: "Bamboo" },
+];
+
+const show = (t: Todo) => (t.done ? "✓ " : "") + t.title;
+
+let state: TodosState = { status: "loading" };
+for (const action of session) {
+  state = todosReducer(state, action);
+  if (state.status !== "ready") continue;
+  console.log(action.type.padEnd(12), state.todos.map(show),
+    state.adding, state.notice);
+}
+```
+
+</CodeExample>
+
+The replay is an optimistic session in miniature: Nap is ticked at once, the server refuses and `changeFailed` puts it back; Nap is deleted at once, the server refuses again and `removeFailed` puts it back **in its place** (the server's list is sorted by id, so sorting puts it where it was). The notice always shows the latest problem.
+
+A few type details make this reducer safe:
+
+- **Two switches, one narrowing.** The first `switch` handles the actions that work in any state. Then `if (state.status !== "ready") return state;` narrows `state` to the ready shape, so every `case` below can use `state.todos`. TypeScript narrowed `action` too: after the returns in the first `switch`, it knows `action` can't be `"loaded"` or `"loadFailed"`, so the `assertNever` in `default` still compiles.
+- **Pending titles aren't to-dos.** It's tempting to give an unsaved to-do a temporary id like `-1` and put it in `todos`. But then the rest of the code would treat it as saved: tick it, and the app sends `PATCH /todos/-1`. As a plain `string` in a separate list, it can't be ticked or deleted by mistake, because `toggle` and `remove` take a `Todo` and the compiler won't accept a string. That's "make impossible states impossible" again.
+- **`withoutFirst` removes one copy.** Add "Tea" twice quickly and two "Tea"s are pending; when the first one is saved, only one of them may disappear.
+
+## Step 2: loading in a custom hook
+
+`useTodos` owns the reducer and talks to the client. Here's how it loads the list and adds a to-do:
+
+```tsx title="web/use-todos.ts"
+// ========== web/use-todos.ts ==========
+function useTodos(client: TodosClient) {
+  const [state, dispatch] = useReducer(todosReducer, {
+    status: "loading",
+  });
+
+  useEffect(() => {
+    let ignore = false; // true once this effect is cleaned up
+    async function load() {
+      const result = await client.list();
+      if (ignore) return;
+      if (result.ok) {
+        dispatch({ type: "loaded", todos: result.value });
+      } else {
+        const message = errorMessage(result.error);
+        dispatch({ type: "loadFailed", message });
+      }
+    }
+    load();
+    return () => {
+      ignore = true;
+    };
+  }, [client]);
+
+  async function add(title: string) {
+    dispatch({ type: "addStarted", title }); // shown at once
+    const result = await client.create({ title });
+    if (result.ok) {
+      dispatch({ type: "added", title, todo: result.value });
+    } else {
+      const message = errorMessage(result.error);
+      dispatch({ type: "addFailed", title, message });
+    }
+  }
+  // ...toggle, remove and dismissNotice follow
+}
+```
+
+- **`useReducer` is typed by the reducer.** `state` is a `TodosState` and `dispatch` only accepts `TodosAction`s, without a single type argument.
+- **The effect loads the list once per client.** If the component disappears before the answer arrives, its cleanup sets `ignore`, and the late answer is dropped instead of updating a component that's gone. (The [`useFetch` hook](/learn/typescript/reducers-context-and-hooks) did the same with an `AbortController`.)
+- **`client` is a dependency of the effect**, so it must be the **same** object on every render. Create it once, outside any component, as you'll see in Step 4. A client created inside `App` would be new on every render, and the effect would load the list again, and again.
+- **`add` is optimistic too.** `addStarted` makes the title appear at once as "Saving...", and `added` swaps it for the server's to-do, with its real id.
+
+## Step 3: optimistic updates with rollback
+
+A request takes 100 ms on a good connection and several seconds on a train. If the checkbox only ticks when the server has answered, the app feels broken. But most requests **succeed**, so you can show the result straight away and only undo it in the rare case that the request fails. That's an **optimistic update**:
+
+1. Remember how things were.
+2. Change the screen at once.
+3. Send the request.
+4. If it succeeds, take the server's version. If it fails, put back what you remembered, and **tell the user**: a change that silently disappears is worse than a slow one.
+
+Here is the idea on its own, with a fake server that takes 1.5 seconds. Tick a few boxes, then tick **Pretend the server is down** and try again:
+
+<TryIt
+  language="tsx"
+  code={`import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+// ----- from Part 2 (only what this demo needs) -----
+type Todo = { id: number; title: string; done: boolean };
+type TodoPatch = { title?: string; done?: boolean };
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+type ApiError = { kind: "network"; message: string };
+interface TodosClient {
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+}
+
+// ----- a fake server: slow, and down when you say so -----
+let serverDown = false;
+const saved = new Map<number, Todo>([
+  [1, { id: 1, title: "Learn fetch", done: true }],
+  [2, { id: 2, title: "Build the movie app", done: false }],
+]);
+const fakeClient: TodosClient = {
+  async update(id, patch) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const todo = saved.get(id);
+    if (serverDown || todo === undefined) {
+      const message = "Failed to fetch";
+      return { ok: false, error: { kind: "network", message } };
+    }
+    const updated = { ...todo, ...patch };
+    saved.set(id, updated);
+    return { ok: true, value: updated };
+  },
+};
+
+// ----- optimistic updates, with rollback -----
+function TodoList({ client }: { client: TodosClient }) {
+  const [todos, setTodos] = useState<Todo[]>([...saved.values()]);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  function replace(todo: Todo) {
+    setTodos((list) =>
+      list.map((t) => (t.id === todo.id ? todo : t)),
+    );
+  }
+
+  async function toggle(todo: Todo) {
+    replace({ ...todo, done: !todo.done }); // 1. show it at once
+    const result = await client.update(todo.id, { done: !todo.done });
+    if (result.ok) {
+      replace(result.value); // 2a. the server's version wins
+    } else {
+      replace(todo); // 2b. roll back, and explain why
+      const why = result.error.message;
+      setNotice(\`Couldn't save "\${todo.title}": \${why}\`);
+    }
+  }
+
+  return (
+    <>
+      <ul>
+        {todos.map((todo) => (
+          <li key={todo.id}>
+            <label>
+              <input
+                type="checkbox"
+                checked={todo.done}
+                onChange={() => toggle(todo)}
+              />
+              {todo.title}
+            </label>
+          </li>
+        ))}
+      </ul>
+      {notice !== null && <p className="notice">😿 {notice}</p>}
+    </>
+  );
+}
+
+function Playground() {
+  const [down, setDown] = useState(false);
+  return (
+    <>
+      <label>
+        <input
+          type="checkbox"
+          checked={down}
+          onChange={(e) => {
+            serverDown = e.target.checked;
+            setDown(e.target.checked);
+          }}
+        />
+        Pretend the server is down
+      </label>
+      <hr />
+      <TodoList client={fakeClient} />
+    </>
+  );
+}
+
+createRoot(document.getElementById("root")!).render(<Playground />);`}
+/>
+
+`useTodos` does the same thing through reducer actions:
+
+```tsx
+  async function toggle(todo: Todo) {
+    const done = !todo.done;
+    // Optimistic: show the change before the server answers
+    dispatch({ type: "changed", todo: { ...todo, done } });
+    const result = await client.update(todo.id, { done });
+    if (result.ok) {
+      dispatch({ type: "changed", todo: result.value });
+    } else {
+      // Roll back to the to-do as it was, and say why
+      const message = errorMessage(result.error);
+      dispatch({ type: "changeFailed", todo, message });
+    }
+  }
+```
+
+`remove` follows the same steps, and you'll write it in the exercise: dispatch `"removed"` at once, call `client.remove`, and if that fails, dispatch `"removeFailed"` with the to-do, so the reducer can put it back.
+
+<Callout type="warning" title="Not every change should be optimistic">
+
+Optimistic updates suit changes that almost always succeed and are easy to undo: ticks, likes, renames, deletes from a list. Don't use them when the server decides the outcome (a payment, booking the last seat, a username that might be taken), or when a wrong "done!" would cost the user something. Show "Saving..." and wait for the answer instead.
+
+</Callout>
+
+## Step 4: the real client
+
+The components never import `fetch`, URLs or schemas: they only know `TodosClient`. So switching from a fake to the real thing is two lines at the very bottom of the app:
+
+```tsx
+// One client for the whole app, created once (not on every render)
+const client = createTodosClient();
+createRoot(document.getElementById("root")!).render(
+  <App client={client} />,
+);
+```
+
+`createTodosClient()` talks to the practice API, standing in for your deployed server. In a real project, you'd pass your server's address from the build configuration, for example `createTodosClient({ baseUrl: import.meta.env.VITE_API_URL })` in a Vite app. And remember the `!`: `getElementById` returns `HTMLElement | null`, and only you know that `#root` exists.
+
+## Shipping it
+
+On your machine, the three parts become one repository with three **workspaces**, so the shared code is a package that both sides import:
+
+```text
+todo-app/
+├── package.json        "workspaces": ["shared", "server", "web"]
+├── shared/             schemas.ts, contract.ts      (package @todo/shared)
+├── server/             Express API + Vitest tests   (imports @todo/shared)
+└── web/                Vite + React app + tests     (imports @todo/shared)
+```
+
+```ts title="web/src/todos-client.ts"
+import { TodoSchema, array, nothing } from "@todo/shared/schemas";
+import type {
+  NewTodo,
+  TodoPatch,
+  TodosApi,
+} from "@todo/shared/contract";
+```
+
+`import type` disappears from the compiled code, so the contract costs the browser nothing; the schemas are real code that both sides run. Then let CI check the **whole** repository on every push. If someone changes the contract, every place that no longer fits, on either side, fails the build:
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npx tsc --noEmit -p server && npx tsc --noEmit -p web
+      - run: npx vitest run
+```
+
+Two things change when the app goes online:
+
+- **The server and the web app usually live on different addresses** (say `api.example.com` and `todos.example.com`), and browsers block such requests unless the server allows them, with **CORS** headers. The `cors` package does it in one line: `app.use(cors({ origin: "https://todos.example.com" }))`. (Or serve both from the same address, with the API under `/api`.)
+- **The memory repository forgets everything on restart.** Write a `TodoRepository` backed by a real database (SQLite or Postgres, for example) and pass it to `createApp`. Nothing else in the server changes, and the tests keep using the memory one.
+
+<Quiz
+  question="A to-do the user just added is shown as Saving... until the server answers. Why does the app keep it as a title in state.adding, instead of a Todo with a temporary id such as -1 in state.todos?"
+  options={[
+    "Because React can't render negative ids",
+    "Because a fake id would let the rest of the app treat it as saved, for example sending PATCH /todos/-1 when it's ticked; as a string it can't be passed to toggle or remove",
+    "Because the server rejects ids below 1",
+    "Because strings use less memory than objects"
+  ]}
+  answer={1}
+  explanation="Everything that accepts a Todo assumes the server knows about it. A pending title isn't a Todo yet, so giving it its own type (a string in a separate list) makes the compiler stop you from ticking or deleting something the server has never seen."
+/>
+
+<Exercise
+  title="Build it: the finished to-do app"
+  language="tsx"
+  html={`<style>
+  #root { max-width: 440px; }
+  .add { display: flex; gap: 8px; margin-bottom: 12px; }
+  .add input { flex: 1; }
+  .todos { list-style: none; margin: 0; padding: 0; }
+  .todo { display: flex; align-items: center; justify-content: space-between; padding: 6px 4px; border-bottom: 1px solid #ffffff1a; }
+  .todo label { display: flex; gap: 8px; align-items: center; }
+  .done .title { text-decoration: line-through; opacity: 0.6; }
+  .saving { opacity: 0.6; font-style: italic; }
+  .saving small { margin-left: 8px; }
+  .delete { background: none; border: none; color: inherit; cursor: pointer; }
+  .notice { display: flex; justify-content: space-between; gap: 8px; padding: 8px 12px; border-radius: 8px; background: #7f1d1d66; color: #fecaca; }
+  .notice button { background: none; border: none; color: inherit; cursor: pointer; }
+  .error { color: #fca5a5; }
+  .count, .status, .empty { color: #a1a1c2; }
+</style>
+<div id="root"></div>`}
+  starter={`import { useEffect, useReducer, useState } from "react";
+import type { SubmitEvent } from "react";
+import { createRoot } from "react-dom/client";
+
+// ========== shared/schemas.ts ==========
+// The schema library from Runtime Validation
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// What the server sends: the Todo type comes from the schema
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// New in Part 2: the "no content" answer of a 204
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// What clients send
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Every error answer, e.g. { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: a client for ANY contract ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// One schema per route, checked against the contract
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? \`HTTP \${res.status}\`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// What the rest of the app may do with the server
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    update: (id, patch) =>
+      call("PATCH /todos/:id", { params: params(id), body: patch }),
+    remove: (id) => call("DELETE /todos/:id", { params: params(id) }),
+  };
+}
+
+// One friendly sentence for every kind of error
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Can't reach the server. Are you online?";
+    case "http":
+      return \`\${error.message} (HTTP \${error.status})\`;
+    case "invalid":
+      return "The server sent something unexpected.";
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+
+// ========== web/todos-state.ts ==========
+type TodosState =
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | {
+      status: "ready";
+      todos: Todo[];
+      adding: string[]; // titles on their way to the server
+      notice: string | null; // what went wrong with the last change
+    };
+
+type TodosAction =
+  | { type: "loaded"; todos: Todo[] }
+  | { type: "loadFailed"; message: string }
+  | { type: "addStarted"; title: string }
+  | { type: "added"; title: string; todo: Todo }
+  | { type: "addFailed"; title: string; message: string }
+  | { type: "changed"; todo: Todo }
+  | { type: "changeFailed"; todo: Todo; message: string }
+  | { type: "removed"; id: number }
+  | { type: "removeFailed"; todo: Todo; message: string }
+  | { type: "noticeDismissed" };
+
+function assertNever(value: never): never {
+  throw new Error(\`Unhandled action: \${JSON.stringify(value)}\`);
+}
+
+// Removes the first copy of title (two adds may share a title)
+function withoutFirst(list: string[], title: string): string[] {
+  const index = list.indexOf(title);
+  return index === -1 ? list : list.filter((_, i) => i !== index);
+}
+
+function replaceTodo(todos: Todo[], todo: Todo): Todo[] {
+  return todos.map((t) => (t.id === todo.id ? todo : t));
+}
+
+function todosReducer(
+  state: TodosState,
+  action: TodosAction,
+): TodosState {
+  switch (action.type) {
+    case "loaded":
+      return {
+        status: "ready",
+        todos: action.todos,
+        adding: [],
+        notice: null,
+      };
+    case "loadFailed":
+      return { status: "failed", message: action.message };
+  }
+  // Every other action changes a list that has loaded
+  if (state.status !== "ready") return state;
+
+  switch (action.type) {
+    case "addStarted":
+      return { ...state, adding: [...state.adding, action.title] };
+    case "added":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        todos: [...state.todos, action.todo],
+      };
+    case "addFailed":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        notice: action.message,
+      };
+    case "changed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+      };
+    case "changeFailed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+        notice: action.message,
+      };
+    case "removed":
+      return {
+        ...state,
+        todos: state.todos.filter((t) => t.id !== action.id),
+      };
+    case "removeFailed":
+      return {
+        ...state,
+        // Back where it was: the list is sorted by id
+        todos: [...state.todos, action.todo].sort(
+          (a, b) => a.id - b.id,
+        ),
+        notice: action.message,
+      };
+    case "noticeDismissed":
+      return { ...state, notice: null };
+    default:
+      return assertNever(action);
+  }
+}
+
+// ========== web/use-todos.ts ==========
+function useTodos(client: TodosClient) {
+  const [state, dispatch] = useReducer(todosReducer, {
+    status: "loading",
+  });
+
+  useEffect(() => {
+    let ignore = false; // true once this effect is cleaned up
+    async function load() {
+      const result = await client.list();
+      if (ignore) return;
+      if (result.ok) {
+        dispatch({ type: "loaded", todos: result.value });
+      } else {
+        const message = errorMessage(result.error);
+        dispatch({ type: "loadFailed", message });
+      }
+    }
+    load();
+    return () => {
+      ignore = true;
+    };
+  }, [client]);
+
+  async function add(title: string) {
+    dispatch({ type: "addStarted", title }); // shown at once
+    const result = await client.create({ title });
+    if (result.ok) {
+      dispatch({ type: "added", title, todo: result.value });
+    } else {
+      const message = errorMessage(result.error);
+      dispatch({ type: "addFailed", title, message });
+    }
+  }
+
+  async function toggle(todo: Todo) {
+    const done = !todo.done;
+    // Optimistic: show the change before the server answers
+    dispatch({ type: "changed", todo: { ...todo, done } });
+    const result = await client.update(todo.id, { done });
+    if (result.ok) {
+      dispatch({ type: "changed", todo: result.value });
+    } else {
+      // Roll back to the to-do as it was, and say why
+      const message = errorMessage(result.error);
+      dispatch({ type: "changeFailed", todo, message });
+    }
+  }
+
+  // TODO 1: an optimistic remove that rolls back on errors
+  async function remove(todo: Todo) {}
+
+  function dismissNotice() {
+    dispatch({ type: "noticeDismissed" });
+  }
+
+  return { state, add, toggle, remove, dismissNotice };
+}
+
+// ========== web/components.tsx ==========
+function AddTodoForm({ onAdd }: { onAdd: (title: string) => void }) {
+  const [title, setTitle] = useState("");
+
+  function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const clean = title.trim();
+    if (clean === "") return;
+    onAdd(clean);
+    setTitle("");
+  }
+
+  return (
+    <form className="add" onSubmit={handleSubmit}>
+      <input
+        name="title"
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        placeholder="What needs doing?"
+      />
+      <button type="submit">Add</button>
+    </form>
+  );
+}
+
+type TodoItemProps = {
+  todo: Todo;
+  onToggle: (todo: Todo) => void;
+  onRemove: (todo: Todo) => void;
+};
+
+function TodoItem({ todo, onToggle, onRemove }: TodoItemProps) {
+  return (
+    <li className={todo.done ? "todo done" : "todo"}>
+      <label>
+        <input
+          type="checkbox"
+          checked={todo.done}
+          onChange={() => onToggle(todo)}
+        />
+        <span className="title">{todo.title}</span>
+      </label>
+      {/* TODO 2: a delete button */}
+    </li>
+  );
+}
+
+function App({ client }: { client: TodosClient }) {
+  const todos = useTodos(client);
+  const { state } = todos;
+
+  switch (state.status) {
+    // TODO 3: "loading" and "failed"
+    case "ready": {
+      const left = state.todos.filter((t) => !t.done).length;
+      const empty = state.todos.length + state.adding.length === 0;
+      return (
+        <main>
+          <AddTodoForm onAdd={todos.add} />
+          {/* TODO 4: the notice, with a button to dismiss it */}
+          {empty && <p className="empty">Nothing to do 🎉</p>}
+          <ul className="todos">
+            {state.todos.map((todo) => (
+              <TodoItem
+                key={todo.id}
+                todo={todo}
+                onToggle={todos.toggle}
+                onRemove={todos.remove}
+              />
+            ))}
+            {/* TODO 5: the titles in state.adding, as "Saving..." */}
+          </ul>
+          <p className="count">
+            {left} of {state.todos.length} left to do
+          </p>
+        </main>
+      );
+    }
+  }
+}
+
+// One client for the whole app, created once (not on every render)
+const client = createTodosClient();
+createRoot(document.getElementById("root")!).render(
+  <App client={client} />,
+);`}
+  tests={[
+    { name: "Shows the to-dos from the practice API", check: `(await __waitFor(() => document.querySelector('li.todo')), [...document.querySelectorAll('li.todo .title')].map((s) => s.textContent).join('|') === 'Learn fetch|Build the movie app|Eat some bamboo' && [...document.querySelectorAll('li.todo input[type=checkbox]')].map((c) => c.checked).join() === 'true,false,false' && document.querySelector('li.todo').classList.contains('done') && __requests.length === 1 && __requests[0].method === 'GET' && __requests[0].url === 'https://api.pandadev.test/todos')` },
+    { name: "A new to-do appears at once as Saving... and the box is cleared", check: `await (async () => { __hold(); try { await __type('input[name=title]', '  Ship it  '); __click('form.add button[type=submit]'); return await __waitFor(() => { const last = [...document.querySelectorAll('li.todo')].at(-1); return last.classList.contains('saving') && last.querySelector('.title').textContent === 'Ship it' && !last.querySelector('input') && document.querySelector('input[name=title]').value === ''; }); } finally { await __release(); } })()` },
+    { name: "Then the server's to-do takes its place", check: `(() => { const last = [...document.querySelectorAll('li.todo')].at(-1); const sent = __requests.at(-1); return !last.classList.contains('saving') && last.querySelector('.title').textContent === 'Ship it' && last.querySelector('input[type=checkbox]')?.checked === false && document.querySelectorAll('li.todo').length === 4 && sent.method === 'POST' && JSON.stringify(sent.body) === '{"title":"Ship it"}' && document.querySelector('.count')?.textContent === '3 of 4 left to do'; })()` },
+    { name: "A blank title sends nothing", check: `(await __type('input[name=title]', '   '), await __click('form.add button[type=submit]'), __requests.length === 2 && document.querySelectorAll('li.todo').length === 4 && !document.querySelector('.saving'))` },
+    { name: "A tick shows at once, before the server answers", check: `await (async () => { const item = () => [...document.querySelectorAll('li.todo')].find((li) => li.textContent.includes('Build the movie app')); __hold(); try { __click(item().querySelector('input[type=checkbox]')); return await __waitFor(() => item().querySelector('input').checked && item().classList.contains('done')); } finally { await __release(); } })()` },
+    { name: "The tick is saved with PATCH /todos/2", check: `(() => { const li = [...document.querySelectorAll('li.todo')].find((li) => li.textContent.includes('Build the movie app')); const sent = __requests.at(-1); return li.querySelector('input').checked && sent.method === 'PATCH' && sent.url === 'https://api.pandadev.test/todos/2' && JSON.stringify(sent.body) === '{"done":true}' && document.querySelector('.count')?.textContent === '2 of 4 left to do'; })()` },
+    { name: "A deleted to-do disappears at once, and DELETE is sent", check: `await (async () => { let gone = false; __hold(); try { __click([...document.querySelectorAll('li.todo')].find((li) => li.textContent.includes('Eat some bamboo')).querySelector('button.delete')); gone = await __waitFor(() => !document.querySelector('#root').textContent.includes('Eat some bamboo')); } finally { await __release(); } const sent = __requests.at(-1); return gone && sent.method === 'DELETE' && sent.url === 'https://api.pandadev.test/todos/3' && !document.querySelector('#root').textContent.includes('Eat some bamboo') && !document.querySelector('.notice'); })()` },
+    { name: "Every to-do has a \u2715 button with a helpful aria-label", check: `(() => { const b = [...document.querySelectorAll('li.todo button.delete')].map((b) => b.getAttribute('aria-label')).join('|'); return b === 'Delete Learn fetch|Delete Build the movie app|Delete Ship it' && [...document.querySelectorAll('li.todo button.delete')].every((x) => x.textContent === '✕'); })()` },
+    { name: "A change the server refuses rolls back, with a notice", check: `(await fetch('https://api.pandadev.test/todos/1', { method: 'DELETE' }), await __click(document.querySelector('li.todo input[type=checkbox]')), (() => { const li = document.querySelector('li.todo'); return li.querySelector('.title').textContent === 'Learn fetch' && li.querySelector('input').checked === true && li.classList.contains('done') && __requests.at(-1).method === 'PATCH' && __requests.at(-1).url.endsWith('/todos/1') && document.querySelector('.notice')?.textContent.includes('Todo not found (HTTP 404)'); })())` },
+    { name: "The notice can be dismissed", check: `(await __click('.notice button'), !document.querySelector('.notice'))` },
+    { name: "A failed delete puts the to-do back in its place", check: `await (async () => { let open; const gate = new Promise((r) => { open = r; }); const todos = [{ id: 1, title: 'Nap', done: false }, { id: 2, title: 'Tea', done: true }, { id: 3, title: 'Bamboo', done: false }]; const fake = async (url, init) => { if (init.method === 'GET') return Response.json(todos); await gate; return Response.json({ error: 'Server is busy' }, { status: 503 }); }; const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); root.render(require('react').createElement(App, { client: createTodosClient({ fetch: fake }) })); await __waitFor(() => box.querySelector('li.todo')); const titles = () => [...box.querySelectorAll('li.todo .title')].map((s) => s.textContent).join('|'); await __click(box.querySelectorAll('li.todo button.delete')[1]); const gone = titles() === 'Nap|Bamboo'; open(); await __waitFor(() => box.querySelector('.notice')); await __settle(); const ok = gone && titles() === 'Nap|Tea|Bamboo' && box.querySelectorAll('li.todo input')[1].checked === true && box.querySelector('.notice').textContent.includes('Server is busy (HTTP 503)'); root.unmount(); box.remove(); return ok; })()` },
+    { name: "A failed tick rolls back when the server can't be reached", check: `await (async () => { let open; const gate = new Promise((r) => { open = r; }); const fake = async (url, init) => { if (init.method === 'GET') return Response.json([{ id: 1, title: 'Nap', done: false }]); await gate; throw new TypeError('Failed to fetch'); }; const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); root.render(require('react').createElement(App, { client: createTodosClient({ fetch: fake }) })); await __waitFor(() => box.querySelector('li.todo')); await __click(box.querySelector('li.todo input[type=checkbox]')); const flipped = box.querySelector('li.todo input').checked === true && box.querySelector('li.todo').classList.contains('done'); open(); await __waitFor(() => box.querySelector('.notice')); await __settle(); const ok = flipped && box.querySelector('li.todo input').checked === false && !box.querySelector('li.todo').classList.contains('done') && box.querySelector('.notice').textContent.includes("Can't reach the server"); root.unmount(); box.remove(); return ok; })()` },
+    { name: "A failed add removes the pending title and explains why", check: `await (async () => { const fake = async (url, init) => { if (init.method === 'GET') return Response.json([]); throw new TypeError('Failed to fetch'); }; const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); root.render(require('react').createElement(App, { client: createTodosClient({ fetch: fake }) })); await __waitFor(() => box.querySelector('.empty')); const input = box.querySelector('input[name=title]'); await __type(input, 'Tea'); await __click(box.querySelector('form.add button[type=submit]')); await __waitFor(() => box.querySelector('.notice')); const ok = box.querySelector('.empty')?.textContent === 'Nothing to do 🎉' && !box.querySelector('li') && box.querySelector('.notice').textContent.includes("Can't reach the server"); root.unmount(); box.remove(); return ok; })()` },
+    { name: "Shows the error when the list can't load", check: `await (async () => { const fake = async () => { throw new TypeError('Failed to fetch'); }; const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); root.render(require('react').createElement(App, { client: createTodosClient({ fetch: fake }) })); await __waitFor(() => box.querySelector('.error')); const ok = box.querySelector('.error').textContent.includes("Can't reach the server. Are you online?") && !box.querySelector('form') && !box.querySelector('.status'); root.unmount(); box.remove(); return ok; })()` },
+    { name: "Shows Loading... while the list is on its way", check: `await (async () => { const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); let loading = false; __hold(); try { root.render(require('react').createElement(App, { client: createTodosClient() })); loading = await __waitFor(() => box.querySelector('.status')?.textContent === 'Loading...' && !box.querySelector('form')); } finally { await __release(); } await __waitFor(() => box.querySelector('li.todo')); const ok = loading && !box.querySelector('.status') && box.textContent.includes('Build the movie app'); root.unmount(); box.remove(); return ok; })()` },
+  ]}
+>
+
+Put the app together. The starter has the client from Part 2 (its tests stay in Part 2), the reducer from Step 1, and `useTodos` with loading, `add` and `toggle`. It already runs against the practice API: try adding and ticking to-dos in the preview. Then finish it:
+
+1. **`remove(todo)`** in `useTodos`, optimistic like `toggle`: dispatch `"removed"` at once, call `client.remove(todo.id)`, and if that fails, dispatch `"removeFailed"` with the to-do and `errorMessage(result.error)`.
+2. **A delete button** in `TodoItem`: `<button className="delete">✕</button>` with an `aria-label` like `Delete Learn fetch`, which calls `onRemove(todo)`.
+3. **Loading and failed** in `App`: `<p className="status">Loading...</p>` while loading, and `<p className="error">😿 {state.message}</p>` when the list couldn't load.
+4. **The notice**: when `state.notice` isn't `null`, show `<p className="notice" role="alert">` with the message in a `<span>`, and a `<button aria-label="Dismiss">✕</button>` that calls `todos.dismissNotice`.
+5. **Saving...**: after the to-dos, one `<li className="todo saving">` for each title in `state.adding`, with the title in `<span className="title">` and then `<small>Saving...</small>`. No checkbox: it isn't a to-do yet.
+
+The checks hold the practice API's answers to look at the screen before the server replies, delete a to-do behind the app's back (as if from another device), and render your `App` with fake clients whose server fails.
+
+<Hint>
+
+1. Copy the shape of `toggle`: `dispatch({ type: "removed", id: todo.id }); const result = await client.remove(todo.id); if (!result.ok) { const message = errorMessage(result.error); dispatch({ type: "removeFailed", todo, message }); }`.
+2. ``<button className="delete" aria-label={`Delete ${todo.title}`} onClick={() => onRemove(todo)}>✕</button>``, after the `label`.
+3. Add `case "loading": return <p className="status">Loading...</p>;` and a `case "failed"` before `case "ready"`. Inside `case "failed"`, TypeScript knows `state.message` exists.
+4. `{state.notice !== null && (<p className="notice" role="alert">...</p>)}`.
+5. ``{state.adding.map((title, i) => (<li key={`adding-${i}`} className="todo saving">...</li>))}``, inside the `ul`. The index is fine as a key here: these items have no state of their own (no inputs), so nothing gets mixed up when one of them disappears.
+
+</Hint>
+
+<Solution>
+
+```tsx
+import { useEffect, useReducer, useState } from "react";
+import type { SubmitEvent } from "react";
+import { createRoot } from "react-dom/client";
+
+// ========== shared/schemas.ts ==========
+// The schema library from Runtime Validation
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// What the server sends: the Todo type comes from the schema
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// New in Part 2: the "no content" answer of a 204
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// What clients send
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Every error answer, e.g. { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: a client for ANY contract ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// One schema per route, checked against the contract
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? `HTTP ${res.status}`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// What the rest of the app may do with the server
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    update: (id, patch) =>
+      call("PATCH /todos/:id", { params: params(id), body: patch }),
+    remove: (id) => call("DELETE /todos/:id", { params: params(id) }),
+  };
+}
+
+// One friendly sentence for every kind of error
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Can't reach the server. Are you online?";
+    case "http":
+      return `${error.message} (HTTP ${error.status})`;
+    case "invalid":
+      return "The server sent something unexpected.";
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+
+// ========== web/todos-state.ts ==========
+type TodosState =
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | {
+      status: "ready";
+      todos: Todo[];
+      adding: string[]; // titles on their way to the server
+      notice: string | null; // what went wrong with the last change
+    };
+
+type TodosAction =
+  | { type: "loaded"; todos: Todo[] }
+  | { type: "loadFailed"; message: string }
+  | { type: "addStarted"; title: string }
+  | { type: "added"; title: string; todo: Todo }
+  | { type: "addFailed"; title: string; message: string }
+  | { type: "changed"; todo: Todo }
+  | { type: "changeFailed"; todo: Todo; message: string }
+  | { type: "removed"; id: number }
+  | { type: "removeFailed"; todo: Todo; message: string }
+  | { type: "noticeDismissed" };
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled action: ${JSON.stringify(value)}`);
+}
+
+// Removes the first copy of title (two adds may share a title)
+function withoutFirst(list: string[], title: string): string[] {
+  const index = list.indexOf(title);
+  return index === -1 ? list : list.filter((_, i) => i !== index);
+}
+
+function replaceTodo(todos: Todo[], todo: Todo): Todo[] {
+  return todos.map((t) => (t.id === todo.id ? todo : t));
+}
+
+function todosReducer(
+  state: TodosState,
+  action: TodosAction,
+): TodosState {
+  switch (action.type) {
+    case "loaded":
+      return {
+        status: "ready",
+        todos: action.todos,
+        adding: [],
+        notice: null,
+      };
+    case "loadFailed":
+      return { status: "failed", message: action.message };
+  }
+  // Every other action changes a list that has loaded
+  if (state.status !== "ready") return state;
+
+  switch (action.type) {
+    case "addStarted":
+      return { ...state, adding: [...state.adding, action.title] };
+    case "added":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        todos: [...state.todos, action.todo],
+      };
+    case "addFailed":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        notice: action.message,
+      };
+    case "changed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+      };
+    case "changeFailed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+        notice: action.message,
+      };
+    case "removed":
+      return {
+        ...state,
+        todos: state.todos.filter((t) => t.id !== action.id),
+      };
+    case "removeFailed":
+      return {
+        ...state,
+        // Back where it was: the list is sorted by id
+        todos: [...state.todos, action.todo].sort(
+          (a, b) => a.id - b.id,
+        ),
+        notice: action.message,
+      };
+    case "noticeDismissed":
+      return { ...state, notice: null };
+    default:
+      return assertNever(action);
+  }
+}
+
+// ========== web/use-todos.ts ==========
+function useTodos(client: TodosClient) {
+  const [state, dispatch] = useReducer(todosReducer, {
+    status: "loading",
+  });
+
+  useEffect(() => {
+    let ignore = false; // true once this effect is cleaned up
+    async function load() {
+      const result = await client.list();
+      if (ignore) return;
+      if (result.ok) {
+        dispatch({ type: "loaded", todos: result.value });
+      } else {
+        const message = errorMessage(result.error);
+        dispatch({ type: "loadFailed", message });
+      }
+    }
+    load();
+    return () => {
+      ignore = true;
+    };
+  }, [client]);
+
+  async function add(title: string) {
+    dispatch({ type: "addStarted", title }); // shown at once
+    const result = await client.create({ title });
+    if (result.ok) {
+      dispatch({ type: "added", title, todo: result.value });
+    } else {
+      const message = errorMessage(result.error);
+      dispatch({ type: "addFailed", title, message });
+    }
+  }
+
+  async function toggle(todo: Todo) {
+    const done = !todo.done;
+    // Optimistic: show the change before the server answers
+    dispatch({ type: "changed", todo: { ...todo, done } });
+    const result = await client.update(todo.id, { done });
+    if (result.ok) {
+      dispatch({ type: "changed", todo: result.value });
+    } else {
+      // Roll back to the to-do as it was, and say why
+      const message = errorMessage(result.error);
+      dispatch({ type: "changeFailed", todo, message });
+    }
+  }
+
+  async function remove(todo: Todo) {
+    dispatch({ type: "removed", id: todo.id }); // optimistic
+    const result = await client.remove(todo.id);
+    if (!result.ok) {
+      const message = errorMessage(result.error);
+      dispatch({ type: "removeFailed", todo, message });
+    }
+  }
+
+  function dismissNotice() {
+    dispatch({ type: "noticeDismissed" });
+  }
+
+  return { state, add, toggle, remove, dismissNotice };
+}
+
+// ========== web/components.tsx ==========
+function AddTodoForm({ onAdd }: { onAdd: (title: string) => void }) {
+  const [title, setTitle] = useState("");
+
+  function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const clean = title.trim();
+    if (clean === "") return;
+    onAdd(clean);
+    setTitle("");
+  }
+
+  return (
+    <form className="add" onSubmit={handleSubmit}>
+      <input
+        name="title"
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        placeholder="What needs doing?"
+      />
+      <button type="submit">Add</button>
+    </form>
+  );
+}
+
+type TodoItemProps = {
+  todo: Todo;
+  onToggle: (todo: Todo) => void;
+  onRemove: (todo: Todo) => void;
+};
+
+function TodoItem({ todo, onToggle, onRemove }: TodoItemProps) {
+  return (
+    <li className={todo.done ? "todo done" : "todo"}>
+      <label>
+        <input
+          type="checkbox"
+          checked={todo.done}
+          onChange={() => onToggle(todo)}
+        />
+        <span className="title">{todo.title}</span>
+      </label>
+      <button
+        className="delete"
+        aria-label={`Delete ${todo.title}`}
+        onClick={() => onRemove(todo)}
+      >
+        ✕
+      </button>
+    </li>
+  );
+}
+
+function App({ client }: { client: TodosClient }) {
+  const todos = useTodos(client);
+  const { state } = todos;
+
+  switch (state.status) {
+    case "loading":
+      return <p className="status">Loading...</p>;
+    case "failed":
+      return <p className="error">😿 {state.message}</p>;
+    case "ready": {
+      const left = state.todos.filter((t) => !t.done).length;
+      const empty = state.todos.length + state.adding.length === 0;
+      return (
+        <main>
+          <AddTodoForm onAdd={todos.add} />
+          {state.notice !== null && (
+            <p className="notice" role="alert">
+              <span>{state.notice}</span>
+              <button
+                aria-label="Dismiss"
+                onClick={todos.dismissNotice}
+              >
+                ✕
+              </button>
+            </p>
+          )}
+          {empty && <p className="empty">Nothing to do 🎉</p>}
+          <ul className="todos">
+            {state.todos.map((todo) => (
+              <TodoItem
+                key={todo.id}
+                todo={todo}
+                onToggle={todos.toggle}
+                onRemove={todos.remove}
+              />
+            ))}
+            {state.adding.map((title, i) => (
+              <li key={`adding-${i}`} className="todo saving">
+                <span className="title">{title}</span>
+                <small>Saving...</small>
+              </li>
+            ))}
+          </ul>
+          <p className="count">
+            {left} of {state.todos.length} left to do
+          </p>
+        </main>
+      );
+    }
+  }
+}
+
+// One client for the whole app, created once (not on every render)
+const client = createTodosClient();
+createRoot(document.getElementById("root")!).render(
+  <App client={client} />,
+);
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- A **status union** for the screen, and a reducer whose actions carry everything needed to undo a change.
+- **`useTodos`**, a custom hook that loads the list once per client and turns every change into an **optimistic update** with a rollback and a notice.
+- Typed components (`AddTodoForm`, `TodoItem`, `App`) that only know the `TodosClient` interface, so the same app runs on a fake server or the real one.
+- Loading, error, empty and "Saving..." states for every moment of the app's life.
+
+Together with Parts 1 and 2, that's a complete full-stack TypeScript app: one contract shared by an Express API and a React front end, checked by the compiler on both sides, by schemas at runtime, and by tests against fakes and against a real server.
+
+## Take it further
+
+Ideas for your own copy (create the web app with `npm create vite@latest`, choosing React and TypeScript):
+
+- **Edit titles.** Double-click a title to edit it, and send `update(id, { title })` optimistically. The server trims titles, so use its answer (`"changed"` with `result.value`), not your own copy.
+- **Filters.** Add "All", "Open" and "Done" buttons with a `Filter` union, and **derive** the visible list from it instead of storing a second list.
+- **Try again.** Give the failed state a "Try again" button, and retry network errors with backoff, using the `withRetry` helper and its injected `sleep` from [Dependency Injection and Fakes](/learn/typescript/dependency-injection-and-fakes).
+- **Cancel stale requests.** Let `createApi` accept an `AbortSignal` and abort the list request in the effect's cleanup, like `useFetch` did.
+- **Ship it for real.** Set up the workspaces from "Shipping it", put the server on a Node host with a database repository, deploy the web app as static files, and let CI run `tsc --noEmit` and both test suites on every push.
+
+<Callout type="tip" title="Congratulations! 🎉">
+
+You've finished **Level 2** of the TypeScript course! You typed promises and `fetch` calls and validated data at runtime, tested typed code with fakes and type tests, built React components and hooks with precise types, and typed an Express API. This app brings all of it together the way professional teams work: one contract, shared types and schemas, a validated and tested server, a client that trusts nothing it hasn't checked, and a UI that feels instant without ever lying for long. Push it to GitHub and show it off. 🐼🚀
+
+Next comes Level 3, where you'll go deep into the type system itself. You've already written two **mapped types** in this capstone (`Handlers` and `ResponseSchemas`); Level 3 starts with [Conditional Types and infer](/learn/typescript/conditional-types-and-infer) and shows how libraries like Express read route parameters straight out of a path string.
+
+</Callout>

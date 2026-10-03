@@ -1,0 +1,588 @@
+---
+title: Building & Publishing Packages
+description: Build a TypeScript library with tsc or a bundler, describe it with package.json exports and declaration files, check that its types resolve for every user, and publish it to npm.
+duration: 25
+xp: 30
+---
+
+In [Modules & Declaration Files](/learn/typescript/modules-and-declaration-files) you were on the receiving end: `panda-slug` had no types, so you wrote a `declare module` for it yourself. In this lesson you're on the other side. You'll ship a typed `panda-slug`, so that everybody who installs it gets types automatically, in every kind of project. 📦
+
+Publishing has a nasty property: **your own project never shows the mistakes**. Everything works in the repository where you build it. The bugs appear in your users' editors, as `Could not find a declaration file`, as types that only work with one module setting, or as a package that imports fine but crashes in Node. Almost all of them come from three places: the build output, the declaration files, and the `exports` field in `package.json`.
+
+## What a package really contains
+
+A published package is a tarball (a compressed folder) that npm downloads into `node_modules`. `npm pack --dry-run` shows exactly what would go into it, without publishing anything:
+
+```bash
+$ npm pack --dry-run
+npm notice package: panda-slug@1.0.0
+npm notice Tarball Contents
+npm notice 286B dist/index.d.ts
+npm notice 291B dist/index.d.ts.map
+npm notice 421B dist/index.js
+npm notice 554B dist/index.js.map
+npm notice 409B package.json
+npm notice 557B src/index.ts
+npm notice total files: 6
+```
+
+- `dist/index.js`: the **JavaScript** that runs. Users' tools never compile your TypeScript; they get JavaScript.
+- `dist/index.d.ts`: the **declaration file** their TypeScript reads to type-check their code against yours.
+- The **maps**: `index.js.map` lets debuggers show your source; `index.d.ts.map` (a **declaration map**) makes "Go to Definition" in the user's editor jump to your real `.ts` code instead of the `.d.ts`. That's why `src/` is shipped too.
+- `package.json`: the instructions that tell Node, bundlers and TypeScript which file is which.
+
+## The public API is a promise
+
+Everything a package exports is a promise to its users, and the `.d.ts` file is that promise written down. A package entry point should be small and deliberate: explicit parameter and return types, every type that appears in a signature exported by name, and JSDoc comments, which travel into the declaration file and show up in users' editors. Type tests, with the `Equal`/`Expect` pair from [Testing Types](/learn/typescript/testing-types), pin the promise down, so a refactor can't change it by accident:
+
+<CodeExample output={`hello-panda-world
+creme_brulee_recipes
+ten-tips-for`}>
+
+```ts
+export interface SlugOptions {
+  /** Put between words. Default: "-" */
+  separator?: string;
+  /** Cut the slug to this many characters. */
+  maxLength?: number;
+}
+
+export function slugify(
+  text: string,
+  options: SlugOptions = {},
+): string {
+  const { separator = "-", maxLength } = options;
+  const words = text
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "") // drop accents
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word !== "");
+  const slug = words.join(separator);
+  return maxLength === undefined ? slug : slug.slice(0, maxLength);
+}
+
+// Type tests pin the public surface: if a refactor changes
+// it by accident, this file stops compiling.
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _Params = Expect<Equal<
+  Parameters<typeof slugify>,
+  [text: string, options?: SlugOptions]
+>>;
+type _Returns = Expect<Equal<ReturnType<typeof slugify>, string>>;
+
+console.log(slugify("Hello, Panda World!"));
+console.log(slugify("Crème Brûlée Recipes", { separator: "_" }));
+console.log(slugify("Ten tips for bamboo lovers", { maxLength: 12 }));
+```
+
+</CodeExample>
+
+Change `text: string` to `text: string | number` and the `_Params` line fails with `Type 'false' does not satisfy the constraint 'true'.`: you've changed the promise, and now you have to decide whether you meant to. From that file, the compiler writes this declaration file, which is all your users' TypeScript will ever see:
+
+```ts title="dist/index.d.ts"
+export interface SlugOptions {
+    /** Put between words. Default: "-" */
+    separator?: string;
+    /** Cut the slug to this many characters. */
+    maxLength?: number;
+}
+export declare function slugify(text: string, options?: SlugOptions): string;
+```
+
+Two habits keep that file healthy. **Export every type that appears in a public signature.** If `SlugOptions` weren't exported, the declaration file would still describe it, but users couldn't import it by name to type their own variables; they'd be stuck writing `Parameters<typeof slugify>[1]`. And **annotate exported functions**: the declaration file then says exactly what you wrote, instead of whatever the body happened to infer, and `isolatedDeclarations` (from [lesson 1](/learn/typescript/how-the-compiler-works)) can enforce it.
+
+## Building: tsc or a bundler
+
+### tsc on its own
+
+For many libraries, `tsc` is the whole build: one `.js`, one `.d.ts` and their maps for every `.ts` file. Keep the build settings in their own file, so tests and scripts don't end up in the package:
+
+```json title="tsconfig.build.json"
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "isolatedDeclarations": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}
+```
+
+```bash
+npx tsc -p tsconfig.build.json
+```
+
+`"module": "nodenext"` makes TypeScript check your imports the way Node will run them, which is the safest choice for a library, because some users will run it in Node directly. It means relative imports carry the **output** extension, `import { x } from "./words.js"` (or write `.ts` and turn on `rewriteRelativeImportExtensions`). And TypeScript 6 wants an explicit `rootDir` whenever you set `outDir`, so the folder layout of `dist` never depends on which files happen to exist.
+
+`tsc` alone is the right choice when you publish **ESM only**: the output looks like your source, there are no extra tools, and your users' bundlers do any bundling. It writes one module format per run, though, and it doesn't handle CSS or images.
+
+### Bundlers
+
+When you need more, a library bundler builds on the transpile-only tools from lesson 1:
+
+- **tsup**, and its newer successor **tsdown**: one command produces ESM **and** CommonJS builds plus declaration files.
+- **Vite library mode** (`build.lib` in `vite.config.ts`), usually with a plugin such as `vite-plugin-dts` for the declarations: the natural choice for UI component libraries with CSS and assets.
+
+```bash
+npx tsup src/index.ts --format esm,cjs --dts
+```
+
+Remember what you learned about these tools: they turn TypeScript into JavaScript very fast, but they **don't check types**. Keep `tsc --noEmit` in your CI. The declaration files still need the type checker, unless your code follows `isolatedDeclarations`, which lets newer tools generate them file by file, much faster.
+
+## package.json: telling tools where everything is
+
+Here is a complete `package.json` for an ESM-only `panda-slug`:
+
+```json title="package.json"
+{
+  "name": "panda-slug",
+  "version": "1.0.0",
+  "description": "Turn any text into a URL-friendly slug",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "src"],
+  "sideEffects": false,
+  "engines": { "node": ">=20.19" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build"
+  }
+}
+```
+
+- **`"type": "module"`**: `.js` files in this package are ES modules (`.cjs` would be CommonJS).
+- **`exports`**: the package's entry points. `"."` is what `import { slugify } from "panda-slug"` gets. It's also a **wall**: anything not listed can't be imported, so `panda-slug/dist/internal.js` stays private, and you can reorganise `dist` without breaking anyone.
+- **`files`**: what goes into the tarball. A list of what to include is safer than `.npmignore` (a list of what to leave out): new files, like a `.env`, aren't published by accident.
+- **`sideEffects: false`** tells bundlers they may drop the package if nothing from it is used (see [Bundling and Caching](/learn/javascript/bundling-and-caching)).
+- **`prepublishOnly`** runs before `npm publish`, so you can't publish a stale `dist`.
+
+Older guides also use the top-level fields **`main`** (the CommonJS entry), **`module`** (an ESM entry for old bundlers) and **`types`**. Modern Node, bundlers and TypeScript (with `moduleResolution` set to `bundler`, `node16` or `nodenext`) use `exports` and ignore them when it's there. Add them only if you must support very old tools.
+
+### How tools read exports
+
+Each entry in `exports` can be an object of **conditions**: names like `"import"`, `"require"`, `"node"`, `"browser"`, `"types"` and `"default"`. Each tool resolves an import with its own list of **active** conditions. Node uses `"node"` plus `"import"` or `"require"` (depending on how the package is loaded); bundlers add their own, such as `"browser"` or `"development"`; TypeScript adds `"types"`. `"default"` always matches. And here's the rule that causes most broken packages: the keys are tried **in the order they're written in the object**, and the first match wins. The order of the active list doesn't matter at all:
+
+<CodeExample output={`./dist/index.js
+./dist/index.cjs
+./dist/index.js`}>
+
+```ts
+// One entry of "exports", as written in package.json
+const entry: Record<string, string> = JSON.parse(`{
+  "import": "./dist/index.js",
+  "types": "./dist/types/index.d.ts",
+  "default": "./dist/index.cjs"
+}`);
+
+// How Node, bundlers and TypeScript pick a target:
+// walk the keys IN OBJECT ORDER, take the first that
+// is "default" or one of the active conditions.
+function pick(
+  conditions: Record<string, string>,
+  active: readonly string[],
+): string | undefined {
+  for (const [key, target] of Object.entries(conditions)) {
+    if (key === "default" || active.includes(key)) {
+      return target;
+    }
+  }
+  return undefined;
+}
+
+console.log(pick(entry, ["node", "import"])); // Node, import
+console.log(pick(entry, ["node", "require"])); // Node, require
+console.log(pick(entry, ["types", "import"])); // TypeScript
+```
+
+</CodeExample>
+
+TypeScript asked for `"types"` but landed on `./dist/index.js`, because `"import"` comes first. TypeScript then looks for a declaration file **next to** that JavaScript file (`index.js` → `index.d.ts`), and only if there's none does it move on to the next condition. So which types your users get depends on what else happens to be in `dist`. Put **`"types"` first** in every conditions object, and no tool has to guess.
+
+## ESM, CommonJS and dual packages
+
+The JavaScript world has two module formats: ES modules (`import`/`export`) and the older CommonJS (`require`/`module.exports`). For a long time, packages had to ship both, because CommonJS code couldn't `require()` an ES module. That changed: Node 20.19 and 22.12 (and later) can `require()` ES modules that don't use top-level `await`. For a new package, **ESM only** is now a reasonable default, and it's what the `package.json` above does.
+
+If you do need both formats, say for users stuck on older Node versions, you build twice and describe both. The crucial detail: **each JavaScript file needs a declaration file of the same format**. TypeScript decides a declaration file's format the same way Node decides a JavaScript file's: `.d.mts` is ESM like `.mjs`, `.d.cts` is CommonJS like `.cjs`, and `.d.ts` follows the `"type"` field like `.js`:
+
+```json title="package.json (dual package)"
+{
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  }
+}
+```
+
+Point the `"require"` branch at `index.d.ts` instead and TypeScript believes the CommonJS file is an ES module. Imports that type-check can then fail at runtime, in your users' code, not yours. Checking tools call this **"masquerading as ESM"** (or as CJS, the other way round).
+
+<Callout type="warning" title="The dual package hazard">
+
+A dual package can be loaded **twice** in one app: once as ESM by one dependency and once as CommonJS by another. Then there are two copies of every class and every piece of module state: `error instanceof PandaError` is `false` for an error from the other copy, and a "single" cache exists twice. If your package has classes or state, that's one more reason to ship ESM only.
+
+</Callout>
+
+## Dependencies: who installs what
+
+Where a package goes in `package.json` decides whether your **users** get it:
+
+- **`dependencies`**: everything your published code needs at runtime, **and** every `@types` package that your published `.d.ts` files import from. If `dist/index.d.ts` says `import type { Request } from "express"`, your users need `@types/express` too.
+- **`peerDependencies`**: frameworks the user already has and that must be **the same copy**, like React or Express. `"peerDependencies": { "react": "^18.0.0 || ^19.0.0" }` says "bring your own React, either of these versions".
+- **`devDependencies`**: TypeScript, build tools, test tools and types you only use internally. Users never install them.
+
+<Callout type="danger" title="It works on my machine">
+
+The most common types bug in published packages: an `@types` package that the declaration files need is in `devDependencies`. In your repository it's installed, so everything compiles. Your users install the package, and their build fails inside your `.d.ts` file, with an error that points at code they didn't write.
+
+</Callout>
+
+## Versions are promises too
+
+Publishing turns the semver rules from [API Design & Migrations](/learn/typescript/api-design-and-migrations) into something real. Users install with ranges like `^1.4.0`, which accept any `1.x` from 1.4.0 on, so a breaking change shipped as a minor release breaks their builds on their next install, without them changing a line. For types, the rule of thumb is: what users **pass in** may only get wider, and what they **get back** may only get narrower. Two breaking changes that are specific to packages are easy to miss: changing `exports` so an import path stops resolving, and emitting `.d.ts` files that need a newer TypeScript version than your users have.
+
+The `_Params` and `_Returns` type tests from earlier turn an accidental breaking change into a failing build in **your** CI, which is exactly where you want it.
+
+<Quiz
+  question="Version 2.3.0 of a package has: export function find(id: string): User. Which change is fine in 2.4.0?"
+  options={[
+    "find(id: string): User | undefined",
+    "find(id: string, options?: { cache: boolean }): User",
+    "find(id: string, options: { cache: boolean }): User",
+    "Renaming the export to findUser",
+  ]}
+  answer={1}
+  explanation="A new optional parameter doesn't break any existing call. Returning User | undefined widens the return type, so callers' code that uses the result directly stops compiling; a required parameter breaks every existing call; renaming breaks every import. All three need a major version."
+/>
+
+## Check before you publish
+
+Since your own project can't show these bugs, use tools that look at the package the way your users will:
+
+```bash
+npm pack --dry-run                    # exactly which files are published
+npx publint                           # package.json and exports mistakes
+npx @arethetypeswrong/cli --pack .    # do the types resolve for every user?
+```
+
+**publint** checks `package.json` against the rules you've just learned: files that `exports` points to but that don't exist, formats that don't match, `"types"` in the wrong place. **Are the types wrong?** (`attw`) packs your package and resolves it like TypeScript would, under the settings users might have (for example `node16` from ESM and from CommonJS, and `bundler`), and prints a table of problems such as "No types", "Masquerading as ESM" and "Resolution failed". The last check is a real one: install the tarball in a fresh project and import it.
+
+```bash
+npm pack                               # creates panda-slug-1.0.0.tgz
+cd ../try-panda-slug
+npm install ../panda-slug/panda-slug-1.0.0.tgz
+```
+
+## Publishing to npm
+
+The first time, log in and publish; scoped names like `@panda/slug` need `--access public` to be public:
+
+```bash
+npm login
+npm publish                 # prepublishOnly builds first
+```
+
+For every later release, bump the version (this also creates a Git commit and tag) and publish again:
+
+```bash
+npm version minor           # 1.0.0 → 1.1.0
+git push --follow-tags
+npm publish
+```
+
+In real projects, releases usually happen from CI rather than a laptop: the workflow runs the type check, tests, `publint` and `attw`, then publishes with `npm publish --provenance`, which attaches a signed record of which repository and workflow built the package. Tools such as **Changesets** collect a note with each pull request ("minor: add maxLength option") and turn them into version bumps and a `CHANGELOG.md` on release. And one rule never changes: a published version can't be changed or reused. If you published a mistake, fix it and publish a new version.
+
+<Exercise
+  title="A pre-publish check for exports"
+  language="typescript"
+  starter={`// "exports" holds a path, or an object of conditions
+// ("types", "import", "default"…) or subpaths (".", "./utils"),
+// nested as deep as you like
+type Target = string | TargetMap;
+interface TargetMap {
+  [key: string]: Target;
+}
+
+interface PackageJson {
+  name: string;
+  version: string;
+  type?: "module" | "commonjs";
+  exports?: Target;
+}
+
+type Format = "import" | "require";
+type Problem =
+  | "types-not-first"
+  | \`missing-types:\${Format}\`
+  | \`types-mismatch:\${Format}\`;
+
+// Which declaration file belongs to which JavaScript file
+const DECLARATION_FOR: Record<string, string> = {
+  ".js": ".d.ts",
+  ".mjs": ".d.mts",
+  ".cjs": ".d.cts",
+};
+
+// "./dist/index.d.cts" → ".d.cts", "./dist/index.js" → ".js"
+function extensionOf(path: string): string {
+  const match = /(\\.d)?\\.[cm]?[jt]s$/.exec(path);
+  return match ? match[0] : "";
+}
+
+// 1. The file a tool gets for this subpath and these
+//    conditions, or null if nothing matches
+function resolveExport(
+  exports: Target,
+  subpath: string,
+  conditions: readonly string[],
+): string | null {
+  return null;
+}
+
+// 2. Everything wrong with the package's "exports"
+function checkPackage(pkg: PackageJson): Problem[] {
+  return [];
+}
+
+const pkg: PackageJson = {
+  name: "panda-slug",
+  version: "2.0.0",
+  type: "module",
+  exports: {
+    ".": {
+      import: {
+        types: "./dist/index.d.ts",
+        default: "./dist/index.js",
+      },
+      require: {
+        default: "./dist/index.cjs",
+        types: "./dist/index.d.cts",
+      },
+    },
+    "./package.json": "./package.json",
+  },
+};
+
+console.log(resolveExport(pkg.exports!, ".", ["types", "import"]));
+console.log(resolveExport(pkg.exports!, ".", ["require"]));
+console.log(resolveExport(pkg.exports!, "./utils", ["import"]));
+console.log(checkPackage(pkg));
+`}
+  tests={[
+    { name: "A string is the \".\" entry: it matches \".\" and nothing else", check: 'resolveExport("./index.js", ".", ["import"]) === "./index.js" && resolveExport("./index.js", "./utils", ["import"]) === null' },
+    { name: "Only active conditions and \"default\" match", check: 'resolveExport({ import: "./a.mjs", require: "./a.cjs" }, ".", ["require"]) === "./a.cjs" && resolveExport({ import: "./a.mjs" }, ".", ["require"]) === null' },
+    { name: "Object order decides, not the order of the conditions", check: 'resolveExport({ default: "./d.js", import: "./i.js" }, ".", ["import"]) === "./d.js" && resolveExport({ import: "./i.js", types: "./i.d.ts" }, ".", ["types", "import"]) === "./i.js"' },
+    { name: "Subpath maps: \".\", \"./utils\" and missing subpaths", check: '(e => resolveExport(e, "./utils", ["types", "import"]) === "./u.d.ts" && resolveExport(e, ".", ["import"]) === "./i.js" && resolveExport(e, "./missing", ["import"]) === null)({ ".": { import: "./i.js" }, "./utils": { types: "./u.d.ts", default: "./u.js" } })' },
+    { name: "A nested object with no match falls through to the next key", check: 'resolveExport({ ".": { node: { import: "./n.mjs" }, default: "./d.js" } }, ".", ["require", "node"]) === "./d.js"' },
+    { name: "Correct ESM-only and dual packages have no problems", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: { ".": { types: "./index.d.ts", default: "./index.js" } } })) === "[]" && JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: { ".": { import: { types: "./i.d.ts", default: "./i.js" }, require: { types: "./i.d.cts", default: "./i.cjs" } } } })) === "[]"' },
+    { name: "Finds types-not-first and the missing types it causes", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: { ".": { import: { default: "./i.js", types: "./i.d.ts" } } } })) === JSON.stringify(["types-not-first", "missing-types:import"])' },
+    { name: "Finds ESM types on a CommonJS file", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: { ".": { import: { types: "./i.d.ts", default: "./i.js" }, require: { types: "./i.d.ts", default: "./i.cjs" } } } })) === JSON.stringify(["types-mismatch:require"])' },
+    { name: "A plain string export has no types for either format", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0", exports: "./index.js" })) === JSON.stringify(["missing-types:import", "missing-types:require"])' },
+    { name: "No exports: nothing to check; the sample package has two problems", check: 'JSON.stringify(checkPackage({ name: "a", version: "1.0.0" })) === "[]" && JSON.stringify(checkPackage(pkg)) === JSON.stringify(["types-not-first", "missing-types:require"])' },
+  ]}
+>
+
+Build a tiny version of what publint and attw do: a function that resolves `exports` like Node and TypeScript, and a checker that uses it to find the classic mistakes. It's all plain logic on the `package.json` data; the types at the top describe that data, including the recursive `Target` type.
+
+**1. `resolveExport(exports, subpath, conditions)`** returns the path a tool gets, or `null`:
+
+- If `exports` is an object with keys that start with `"."`, it's a map of **subpaths**: look up `subpath` exactly (`"./utils"`; no `*` patterns). Otherwise, the whole `exports` value is the entry for `"."`. A missing subpath gives `null`.
+- Resolving an entry: a string is the answer. For an object, go through its keys **in order**; a key matches if it's `"default"` or in `conditions`. Resolve the matching value (it can be another object). If that finds a path, return it; if not, carry on with the next key. Nothing found gives `null`.
+
+**2. `checkPackage(pkg)`** returns the problems in this order (and `[]` if there's no `exports`):
+
+- `"types-not-first"`: some conditions object, at any depth, has a `"types"` key that isn't its first key.
+- Then for each format, `"import"` first, then `"require"`: if resolving `"."` with `[format]` gives `null`, the package doesn't offer that format, so skip it. Otherwise resolve it again with `["types", format]`. If that doesn't give a declaration file (a path containing `.d.`), add `"missing-types:<format>"`. If it does, but its extension isn't the one `DECLARATION_FOR` lists for the JavaScript file's extension, add `"types-mismatch:<format>"`.
+
+The sample package should print `./dist/index.d.ts`, `./dist/index.cjs`, `null` and `[ 'types-not-first', 'missing-types:require' ]`. Our checker can't see the files on disk, so unlike TypeScript it can't look for a declaration file next to the JavaScript. It only trusts explicit `"types"` conditions, which is exactly the habit you want anyway.
+
+<Hint>
+
+Write a recursive helper for one entry:
+
+```ts
+function resolveTarget(
+  target: Target,
+  conditions: readonly string[],
+): string | null {
+  if (typeof target === "string") return target;
+  for (const [key, value] of Object.entries(target)) {
+    // matches? resolve value; return it unless it's null
+  }
+  return null;
+}
+```
+
+In `resolveExport`, check `typeof exports === "object" && Object.keys(exports).some((key) => key.startsWith("."))`; if it isn't a subpath map, use `{ ".": exports }`. For `"types-not-first"`, another recursive helper works: a string is fine; for an object, look at `Object.keys(target)`, then check every value with `Object.values(target).every(...)`. The format loop can use a `Format[]` array, and `` `missing-types:${format}` `` has exactly the `Problem` type.
+
+</Hint>
+
+<Solution>
+
+```ts
+// "exports" holds a path, or an object of conditions
+// ("types", "import", "default"…) or subpaths (".", "./utils"),
+// nested as deep as you like
+type Target = string | TargetMap;
+interface TargetMap {
+  [key: string]: Target;
+}
+
+interface PackageJson {
+  name: string;
+  version: string;
+  type?: "module" | "commonjs";
+  exports?: Target;
+}
+
+type Format = "import" | "require";
+type Problem =
+  | "types-not-first"
+  | `missing-types:${Format}`
+  | `types-mismatch:${Format}`;
+
+// Which declaration file belongs to which JavaScript file
+const DECLARATION_FOR: Record<string, string> = {
+  ".js": ".d.ts",
+  ".mjs": ".d.mts",
+  ".cjs": ".d.cts",
+};
+
+// "./dist/index.d.cts" → ".d.cts", "./dist/index.js" → ".js"
+function extensionOf(path: string): string {
+  const match = /(\.d)?\.[cm]?[jt]s$/.exec(path);
+  return match ? match[0] : "";
+}
+
+function resolveTarget(
+  target: Target,
+  conditions: readonly string[],
+): string | null {
+  if (typeof target === "string") return target;
+  // Object order decides, not the order of `conditions`
+  for (const [key, value] of Object.entries(target)) {
+    if (key === "default" || conditions.includes(key)) {
+      const found = resolveTarget(value, conditions);
+      if (found !== null) return found; // else keep looking
+    }
+  }
+  return null;
+}
+
+// 1. The file a tool gets for this subpath and these
+//    conditions, or null if nothing matches
+function resolveExport(
+  exports: Target,
+  subpath: string,
+  conditions: readonly string[],
+): string | null {
+  const isSubpathMap =
+    typeof exports === "object" &&
+    Object.keys(exports).some((key) => key.startsWith("."));
+  const entries: TargetMap = isSubpathMap
+    ? exports
+    : { ".": exports };
+  const target = entries[subpath];
+  return target === undefined
+    ? null
+    : resolveTarget(target, conditions);
+}
+
+function typesComeFirst(target: Target): boolean {
+  if (typeof target === "string") return true;
+  const keys = Object.keys(target);
+  if (keys.includes("types") && keys[0] !== "types") {
+    return false;
+  }
+  return Object.values(target).every(typesComeFirst);
+}
+
+// 2. Everything wrong with the package's "exports"
+function checkPackage(pkg: PackageJson): Problem[] {
+  const problems: Problem[] = [];
+  const exports = pkg.exports;
+  if (exports === undefined) return problems;
+  if (!typesComeFirst(exports)) {
+    problems.push("types-not-first");
+  }
+  const formats: Format[] = ["import", "require"];
+  for (const format of formats) {
+    const js = resolveExport(exports, ".", [format]);
+    if (js === null) continue; // this format isn't offered
+    const types = resolveExport(exports, ".", ["types", format]);
+    if (types === null || !types.includes(".d.")) {
+      problems.push(`missing-types:${format}`);
+    } else if (
+      DECLARATION_FOR[extensionOf(js)] !== extensionOf(types)
+    ) {
+      problems.push(`types-mismatch:${format}`);
+    }
+  }
+  return problems;
+}
+
+const pkg: PackageJson = {
+  name: "panda-slug",
+  version: "2.0.0",
+  type: "module",
+  exports: {
+    ".": {
+      import: {
+        types: "./dist/index.d.ts",
+        default: "./dist/index.js",
+      },
+      require: {
+        default: "./dist/index.cjs",
+        types: "./dist/index.d.cts",
+      },
+    },
+    "./package.json": "./package.json",
+  },
+};
+
+console.log(resolveExport(pkg.exports!, ".", ["types", "import"]));
+console.log(resolveExport(pkg.exports!, ".", ["require"]));
+console.log(resolveExport(pkg.exports!, "./utils", ["import"]));
+console.log(checkPackage(pkg));
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A package ships **JavaScript**, **declaration files** and their maps, and a `package.json` that tells every tool which file is which. `npm pack --dry-run` shows exactly what goes out.
+- The `.d.ts` file is your public promise: explicit signatures, every public type exported by name, JSDoc that shows up in users' editors, and type tests to stop accidental changes.
+- **`tsc`** alone is ideal for ESM-only packages (`module: nodenext`, explicit `rootDir`, `declaration`, `declarationMap`); **tsup/tsdown** or **Vite library mode** help with dual formats, CSS and assets, but don't check types.
+- **`exports`** lists the entry points and hides everything else. Conditions are tried **in object order** and the first match wins, so put **`"types"` first**.
+- ESM only is a good default now that Node can `require()` ES modules. Dual packages need a declaration file of the **same format** as each JavaScript file (`.d.cts` for `.cjs`), and risk the dual package hazard.
+- `@types` packages your declarations import belong in `dependencies`; frameworks go in `peerDependencies`. Type changes follow semver: inputs may only widen, outputs may only narrow.
+- Check with **publint** and **attw**, try the tarball in a fresh project, then `npm version` and `npm publish` (from CI with `--provenance`).

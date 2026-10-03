@@ -1,0 +1,771 @@
+---
+title: Reviewing TypeScript Code
+description: "Review TypeScript for honest, precise types: spot any, as and !, wide types and flags, non-exhaustive switches and over-clever types, write kind comments, and let typescript-eslint do the rest."
+duration: 25
+xp: 30
+---
+
+A pull request is green: it compiles, the tests pass, the linter is quiet. Is it safe to approve? In a TypeScript codebase that question has a twist. The compiler proves that the types are **consistent** with each other. It can't prove that they're **true** (does this JSON really contain a `User`?) or **precise** (is `status` really any string at all?). Those two questions are your job as a reviewer, and they're where the expensive bugs hide. This lesson is a reviewer's kit for TypeScript: what to look for, how to say it, and which parts to hand over to typescript-eslint. 🔍
+
+The general craft of code review (what it's for, Conventional Comments, small pull requests, design docs) is in the JavaScript lesson [Code Review and Technical Leadership](/learn/javascript/code-review-and-leadership). Here we focus on the types.
+
+## What to look for in a TypeScript diff
+
+Read a TypeScript change with two questions in mind:
+
+1. **Are the types honest?** Does every type describe what's really there at runtime, or does somebody just *say* so?
+2. **Are the types precise?** Do they allow only the values the domain allows, or much more?
+
+Most problems fall into a handful of patterns. With a little practice you'll spot them while scrolling:
+
+| In the diff | Why it hurts | What to suggest |
+| --- | --- | --- |
+| `any`, explicit or from `JSON.parse`, `res.json()`, `catch (e: any)` | switches checking off for everything it touches, far beyond this line | `unknown` plus a guard or a schema |
+| `as Order` on outside data, `{} as User` | a promise nobody checks | validate, or build the object in one go with an annotation |
+| `x!` | moves the crash somewhere else, with a worse message | handle the missing case, or `assert` with a clear message |
+| `// @ts-ignore` | hides this error, and any future error on that line | fix it, or `@ts-expect-error` with a reason and a ticket |
+| `status: string // "placed" or "shipped"` | typos compile; the comment is a type nobody checks | a union of string literals |
+| `isLoading`, `hasError`, `data?` side by side | impossible combinations compile | a discriminated union |
+| `switch` with a catch-all `default` | a new variant silently falls into it | an exhaustive check with `never` |
+| `?` on every property, `Partial<T>` everywhere | every reader must handle `undefined`; often means "I didn't decide yet" | required fields, plus a separate draft type if needed |
+| a 30-line conditional type in app code | nobody else can change it, and its errors are puzzling | a simpler type, or type tests and an owner |
+| a new generic helper without type tests | its types can break without any test failing | `@ts-expect-error` and `Equal` type tests |
+
+None of this replaces normal review (correctness, design, tests, security). It's an extra layer, and it pays off because type mistakes **spread**: one `any` in a shared function quietly switches off checking in every file that calls it, as you saw in [Designing Types for Large Codebases](/learn/typescript/designing-types-for-large-codebases).
+
+## Escape hatches hide in plain sight
+
+You already know `any`, `as` and `!` from [Type Guards & unknown](/learn/typescript/type-guards-and-unknown). In a review they're easy to miss, because each one is a few characters in a line that looks perfectly reasonable. Here's one that slips through a lot of reviews:
+
+<CodeExample output={`Cannot read properties of undefined (reading 'toLowerCase')
+Hi Mei <mei@x.io>`}>
+
+```ts
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+
+// In the diff: "I'll fill it in below"
+const user = {} as User;
+user.id = "u1";
+user.name = "Mei";
+// ...and nobody notices email is never set
+
+function greeting(user: User): string {
+  return `Hi ${user.name} <${user.email.toLowerCase()}>`;
+}
+
+try {
+  console.log(greeting(user));
+} catch (error) {
+  if (error instanceof Error) console.log(error.message);
+}
+
+// The same object, built in one go and annotated
+const checked: User = { id: "u1", name: "Mei", email: "MEI@x.io" };
+console.log(greeting(checked));
+```
+
+</CodeExample>
+
+`{} as User` tells the compiler "this empty object is a complete user", and the compiler believes it. Build the object in one go with an annotation instead, and the forgotten field is caught where it happens:
+
+```ts
+const user: User = { id: "u1", name: "Mei" };
+// ❌ Error: Property 'email' is missing in type '{ id: string; name: string; }' but required in type 'User'.
+```
+
+Things to look for, line by line:
+
+- **`await res.json()`** and **`JSON.parse(text)`** both give you `any`. If the result goes straight into a typed variable or gets an `as`, nothing checked it. Ask where the validation is (a guard, or a schema like the one from [Runtime Validation](/learn/typescript/runtime-validation)).
+- **Exported functions without a return type.** If the body returns something built from `any`, the function returns `any` too, and every caller inherits it.
+- **`as` anywhere outside a validator.** Ask "what makes this true?". Sometimes there's a good answer (the value was checked two lines up, but TypeScript can't follow it). Often the honest answer is "it made the error go away".
+- **`!`**: ask what happens when the value *is* missing. "It can't be" deserves a comment or an `assert` with a message.
+- **`@ts-ignore`**: it silences *any* error on the next line, including ones nobody has written yet. `@ts-expect-error` with a reason is better: when the problem is fixed, TypeScript reports "Unused '@ts-expect-error' directive." and the suppression can't go stale.
+
+<Callout type="tip" title="Is this escape hatch fine?">
+
+Not every `as` is a bug. A cast is defensible when it sits **inside** a small, tested function whose whole job is to check something (a validator, a smart constructor like `parseEmail`), and the rest of the code receives a properly typed value. A cast in the middle of business logic is a different thing. The question to ask is "if this cast is wrong, who finds out, and when?"
+
+</Callout>
+
+## Types that are wider than the domain
+
+A wide type compiles everything the domain allows, plus a lot of things it doesn't. Two patterns show up in almost every codebase.
+
+**A string with a comment listing its values.** The comment is a type that the compiler can't read. Turn it into a union, and typos stop compiling:
+
+```ts
+type Status = "placed" | "shipped" | "delivered" | "cancelled";
+
+const s: Status = "canceled";
+// ❌ Error: Type '"canceled"' is not assignable to type 'Status'. Did you mean '"cancelled"'?
+```
+
+With `status: string`, that typo would compile, and every `if (status === "cancelled")` would quietly be false for it.
+
+**Boolean flags next to optional data.** Every flag doubles the number of possible states, and most combinations make no sense:
+
+<CodeExample output={`Loading…
+0 results
+2 results
+Error: Timed out`}>
+
+```ts
+// Before: two flags and two optionals = 16 combinations
+interface SearchStateFlags {
+  isLoading: boolean;
+  hasError: boolean;
+  error?: string;
+  results?: string[];
+}
+
+// All of these compile. Which one is "true"?
+const confused: SearchStateFlags = {
+  isLoading: true,
+  hasError: false,
+  error: "Timed out",
+  results: ["Dune"],
+};
+
+function viewFlags(state: SearchStateFlags): string {
+  if (state.isLoading) return "Loading…";
+  if (state.error) return `Error: ${state.error}`;
+  return `${state.results?.length ?? 0} results`;
+}
+console.log(viewFlags(confused));
+console.log(viewFlags({ isLoading: false, hasError: true }));
+
+// After: one field says which state we're in
+type SearchState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "error"; error: string }
+  | { status: "done"; results: string[] };
+
+function view(state: SearchState): string {
+  switch (state.status) {
+    case "idle":
+      return "Type to search";
+    case "loading":
+      return "Loading…";
+    case "error":
+      return `Error: ${state.error}`;
+    case "done":
+      return `${state.results.length} results`;
+  }
+}
+console.log(view({ status: "done", results: ["Dune", "Heat"] }));
+console.log(view({ status: "error", error: "Timed out" }));
+```
+
+</CodeExample>
+
+The flag version shows "Loading…" for a search that has both an error and results, and "0 results" for one that failed. The union version can't even express those states. That's the idea from [Discriminated Unions](/learn/typescript/discriminated-unions): make impossible states impossible.
+
+Is it always worth asking for? **It depends on reach.** A shared type that's stored, sent over the network or read in twenty components deserves the precise version: a blocking comment. A flag in a private helper that two lines read is a suggestion at most.
+
+## Switches that won't notice a new case
+
+A `default` branch feels defensive. With a union, it does the opposite: it **catches the variants you haven't written yet**, silently. This switch was written before `"delivered"` existed. When someone adds it to `Status`, everything still compiles, and delivered orders show "Updated":
+
+```ts
+function label(status: Status): string {
+  switch (status) {
+    case "placed":
+      return "Order received";
+    case "shipped":
+      return "On its way";
+    case "cancelled":
+      return "Cancelled";
+    default:
+      return "Updated"; // "delivered" ends up here, silently
+  }
+}
+```
+
+Ask for an exhaustive check instead. In the `default` branch, the value should have type `never`; `satisfies never` (or the `assertNever` helper you know) turns a forgotten case into a compile error that points at the right line:
+
+```ts
+    default:
+      status satisfies never;
+      // ❌ Error: Type '"delivered"' does not satisfy the expected type 'never'.
+      throw new Error(`Unknown status: ${status}`);
+```
+
+The `throw` still protects you at runtime from values that slipped past the types (old data, a newer server). A catch-all `default` is fine when the input really is open-ended, like a `string` from a URL, but on a union it hides exactly the change you'd want to hear about.
+
+## Over-clever types
+
+TypeScript's type system can compute almost anything, and some developers can't resist. On one team, a developer wrote a helper so that `get(config, "db.pool.max")` checked the path string and returned the right type. It was genuinely clever, and for a while it worked well:
+
+```ts
+type Paths<T> = T extends object
+  ? {
+      [K in keyof T & string]: K | `${K}.${Paths<T[K]>}`;
+    }[keyof T & string]
+  : never;
+
+// ...plus PathValue<T, P>, another eight lines
+function get<T, P extends Paths<T>>(obj: T, path: P): PathValue<T, P>;
+
+get(config, "db.pool.mx");
+// ❌ Error: Argument of type '"db.pool.mx"' is not assignable to parameter of type '"db.pool.max" | "db" | "cache" | "db.host" | "db.pool" | "db.pool.min" | "cache.ttl"'.
+```
+
+Months later, someone added a `rootCategory: Category` setting to the shop config, where a `Category` has an optional `parent: Category`. Suddenly every `get(...)` call in the app, including the unrelated `get(config, "db.pool.max")`, failed with:
+
+```ts
+const max = get(config, "db.pool.max");
+// ❌ Error: Type of property 'parent' circularly references itself in mapped type '{ [K in "name" | "parent"]: K | `${K}.${Paths<Category[K]>}`; }'.
+```
+
+Nobody but the author could read that, and the author had moved to another team. The fix was to delete the helper and write `config.db.pool.max`, which TypeScript had been checking all along. 🙃
+
+That's the pattern to watch for: a clever type saves a little typing at each call site and charges interest every time someone has to change it. When a review contains one, weigh it honestly:
+
+| Worth the complexity when… | Probably not when… |
+| --- | --- |
+| many call sites benefit (a library, a helper used a hundred times) | it serves two call sites in one feature |
+| it catches mistakes people really make | it encodes rules nobody gets wrong |
+| errors at the call site are readable | errors point into the type's internals |
+| it has type tests and someone who owns it | only the author understands it |
+| the editor stays fast | hovering shows a forty-line type |
+
+If it stays, ask for **type tests** (`@ts-expect-error` lines and `Expect<Equal<…>>`, from [Testing Types](/learn/typescript/testing-types)), so the next person can change it without fear. And if you're the author: the simplest type that catches the real mistakes wins.
+
+## Writing review comments about types
+
+Type comments are easy to get wrong in tone. "Don't use `any`" sounds like a rule from a style guide; it doesn't say what the `any` costs here. Here's a pull request:
+
+```ts
+// PR #388: "Load user preferences"
+export async function loadPrefs(userId: any) {
+  const res = await fetch(`/api/users/${userId}/prefs`);
+  return (await res.json()) as Prefs;
+}
+
+export interface Prefs {
+  theme: string; // "light" | "dark" | "system"
+  emailDigest: boolean;
+  digestDay?: string; // only when emailDigest is true
+}
+```
+
+And review comments that help, labelled the Conventional Comments way:
+
+- **issue (blocking):** `as Prefs` claims the response was checked, but nothing checks it, and `res.ok` isn't checked either. A 404 body `{ "error": "Not found" }` would reach the settings page typed as `Prefs`. Could we parse it as `unknown` with our `prefsSchema` and return a `Result`?
+- **issue (blocking):** `userId: any` lets the wrong thing through: `SettingsPage` calls `loadPrefs(user)`, which requests `/api/users/[object Object]/prefs`. With `userId: UserId` that call wouldn't compile.
+- **suggestion:** The comment on `theme` already lists the values. As `theme: "light" | "dark" | "system"`, the compiler checks them for us.
+- **question:** Can `digestDay` be set while `emailDigest` is false? If not, `digest: { enabled: false } | { enabled: true; day: Weekday }` makes that state impossible. Happy to leave it if only this page reads it.
+- **nit (non-blocking):** An explicit return type on the exported function would document the contract: `Promise<Result<Prefs, PrefsError>>`.
+- **praise:** Nice to see `Prefs` exported from one place instead of being re-declared in the component. 👍
+
+What makes these work for types in particular:
+
+| Instead of… | Try… | Why |
+| --- | --- | --- |
+| "Don't use any." | "`userId: any` lets `loadPrefs(user)` compile, and it requests `/users/[object Object]`." | Shows the **concrete** cost in this code |
+| "This type is too complicated." | "I struggled to follow `DeepKeys<T>`. Could a type test show what it produces, or would `keyof Settings` cover our two call sites?" | Talks about your experience and offers a way forward |
+| "Use a union." | Paste the error the union would give: "Did you mean '"cancelled"'?" | The compiler makes the argument for you |
+| "Add types." | "Could the guard come with a test for the 404 body?" | Asks for the **proof**, not for more annotations |
+
+GitHub and GitLab let you attach a **suggestion** to a comment: a few replacement lines the author can apply with one click. For small type fixes (a union, a return type) that's often kinder than a paragraph of explanation.
+
+<Callout type="note" title="It's a conversation">
+
+The author may know something you don't. Maybe the API really can return any theme string, because users can install custom themes. "Can `theme` be anything else?" is a better start than "this should be a union". Strong opinions about types, loosely held.
+
+</Callout>
+
+## Let typescript-eslint do the boring part
+
+If you've written the same review comment three times, it should be a **lint rule**. **typescript-eslint** runs ESLint rules that can see types, so it finds the patterns from this lesson in every file, on every push, and nobody has to be the bad guy. A good starting point:
+
+```js title="eslint.config.mjs"
+import { defineConfig } from "eslint/config";
+import js from "@eslint/js";
+import tseslint from "typescript-eslint";
+
+export default defineConfig(
+  js.configs.recommended,
+  // the type-aware rules, including the strict ones
+  tseslint.configs.strictTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: { projectService: true },
+    },
+    rules: {
+      // not in any preset: switch it on yourself
+      "@typescript-eslint/switch-exhaustiveness-check": "error",
+      // ban `{} as User`; casts on other values stay possible
+      "@typescript-eslint/consistent-type-assertions": [
+        "error",
+        { assertionStyle: "as", objectLiteralTypeAssertions: "never" },
+      ],
+    },
+  },
+);
+```
+
+Here's what it says about a small module that `tsc` accepts without a single error (output trimmed and wrapped to fit):
+
+```bash
+npx eslint src/orders.ts
+
+src/orders.ts
+  10:9   error  Unsafe assignment of an `any` value         @typescript-eslint/no-unsafe-assignment
+  11:21  error  Unsafe member access .id on an `any` value  @typescript-eslint/no-unsafe-member-access
+  15:11  error  Switch is not exhaustive. Cases not matched: "delivered"
+                                                            @typescript-eslint/switch-exhaustiveness-check
+  31:3   error  Promises must be awaited, end with a call to .catch, end with a call to .then
+                with a rejection handler or be explicitly marked as ignored with the `void` operator
+                                                            @typescript-eslint/no-floating-promises
+  35:10  error  Forbidden non-null assertion                @typescript-eslint/no-non-null-assertion
+```
+
+Rules that earn their place in a team's config, and the review comment each one replaces:
+
+| Rule | Catches | Preset |
+| --- | --- | --- |
+| `no-explicit-any`, `no-unsafe-assignment`, `no-unsafe-member-access`, `no-unsafe-call`, `no-unsafe-return`, `no-unsafe-argument` | `any` written down, and `any` **flowing** from `JSON.parse` or an untyped library | recommended (the `no-unsafe-*` rules: type-checked) |
+| `no-floating-promises`, `no-misused-promises` | a forgotten `await`; an `async` callback where a plain one is expected (`forEach`, `onClick`) | recommended (type-checked) |
+| `restrict-template-expressions` | `${user}` printing `[object Object]` | recommended (type-checked) |
+| `ban-ts-comment` | `@ts-ignore`; `@ts-expect-error` without a reason | recommended |
+| `no-non-null-assertion` | `!` | strict |
+| `no-unnecessary-condition` | a check that can never be false, often a sign the type is wrong | strict (type-checked) |
+| `no-deprecated` | calls to APIs marked `@deprecated` | strict (type-checked) |
+| `switch-exhaustiveness-check` | a `switch` over a union that misses a case | none: enable it |
+| `consistent-type-assertions` with `objectLiteralTypeAssertions: "never"` | `{} as User` | none: configure it |
+
+"Type-checked" rules need type information, which is what `projectService: true` provides. They're slower than plain lint rules (seconds to minutes on a big codebase), so run them in CI and in the editor rather than in a pre-commit hook. For a brand-new project start with `strictTypeChecked`; for an existing one, start with `recommendedTypeChecked` and tighten step by step. The next lesson, [Leading TypeScript Adoption](/learn/typescript/leading-typescript-adoption), is about how to roll out stricter settings without stopping the team.
+
+<Callout type="warning" title="Lint can't review meaning">
+
+Lint finds `as` and `any`. It can't tell you that `status: string` should be a union, that two flags describe one state, or that a clever type isn't worth it. Those are judgement calls, and they're what reviewers are for. Let the tools take the mechanical part, so your attention goes to the part only a human can do.
+
+</Callout>
+
+<Quiz
+  question="A pull request adds the field status: string with the comment // active, paused or closed, and every check compares it with a string literal. Which review comment helps most?"
+  options={[
+    "nit: please don't use comments for documentation",
+    "suggestion: make it the union \"active\" | \"paused\" | \"closed\", so a typo like \"pased\" stops compiling instead of silently never matching",
+    "issue (blocking): never use strings in types",
+    "No comment: it compiles and the tests pass",
+  ]}
+  answer={1}
+  explanation="The comment already lists the values; a union turns it into something the compiler checks. The good review comment is specific (which type), says why (typos compile and comparisons silently fail) and is labelled at the right weight."
+/>
+
+<Quiz
+  question="Why do many teams ban // @ts-ignore but allow // @ts-expect-error with a reason?"
+  options={[
+    "@ts-expect-error doesn't hide the error, it only turns it into a warning",
+    "@ts-ignore only works in JavaScript files",
+    "@ts-expect-error reports Unused '@ts-expect-error' directive once the line no longer has an error, so suppressions can't go stale, and the reason documents why it's there",
+    "@ts-expect-error also fixes the error at runtime",
+  ]}
+  answer={2}
+  explanation="Both directives suppress the error on the next line. The difference is that @ts-expect-error fails when there's nothing to suppress any more, so a fixed problem forces you to remove it. typescript-eslint's ban-ts-comment rule enforces this, and requires a description by default."
+/>
+
+<Exercise
+  title="Review and fix: order notifications"
+  language="typescript"
+  starter={`import { describe, it, expect } from "vitest";
+
+// PR #431: "Tell customers when their order changes"
+// The warehouse sends us order updates as JSON text.
+
+type Order = {
+  id: string;
+  status: string; // placed, shipped, delivered or cancelled
+  total: number; // in pence: 1250 is £12.50
+  trackingCode?: string; // shipped orders
+  reason?: string; // cancelled orders
+};
+
+type ParseResult =
+  | { ok: true; order: Order }
+  | { ok: false; error: string };
+
+// From the team's utils (this one is fine)
+function isObject(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+function pounds(pence: number): string {
+  return \`£\${(pence / 100).toFixed(2)}\`;
+}
+
+function parseOrder(json: string): ParseResult {
+  const order = JSON.parse(json) as Order;
+  return { ok: true, order };
+}
+
+function notification(order: Order): string {
+  const { id } = order;
+  switch (order.status) {
+    case "placed":
+      return \`Order \${id} received: \${pounds(order.total)}\`;
+    case "shipped":
+      return \`Order \${id} shipped, tracking \${order.trackingCode!}\`;
+    case "canceled":
+      return \`Order \${id} cancelled: \${order.reason}\`;
+    default:
+      return \`Order \${id} updated\`;
+  }
+}
+
+function totalsByStatus(orders: any[]): any {
+  const totals: any = {};
+  for (const order of orders) {
+    totals[order.status] = (totals[order.status] || 0) + order.total;
+  }
+  return totals;
+}
+
+// ---- Tests (don't change them) ----
+const json = (fields: object) =>
+  JSON.stringify({ id: "o1", total: 1250, ...fields });
+
+describe("parseOrder", () => {
+  it("accepts every kind of order", () => {
+    // The warehouse also sends internal fields like "shelf"
+    const placed = json({ status: "placed", shelf: "B4" });
+    expect(parseOrder(placed)).toEqual({
+      ok: true,
+      order: { id: "o1", status: "placed", total: 1250 },
+    });
+    const shipped = json({ status: "shipped", trackingCode: "RM1" });
+    const cancelled = json({ status: "cancelled", reason: "no stock" });
+    expect(parseOrder(shipped).ok).toBe(true);
+    expect(parseOrder(json({ status: "delivered" })).ok).toBe(true);
+    expect(parseOrder(cancelled).ok).toBe(true);
+  });
+
+  it("says what is wrong with a bad order", () => {
+    const cases = [
+      [json({ status: "lost" }), "status"],
+      [json({ status: "placed", total: "1250" }), "total"],
+      [json({ status: "placed", id: 42 }), "id"],
+      [json({ status: "shipped" }), "trackingCode"],
+      [json({ status: "cancelled" }), "reason"],
+      ["[1, 2]", "object"],
+      ["{ oops", "JSON"],
+    ];
+    for (const [text, problem] of cases) {
+      expect(parseOrder(text)).toEqual({
+        ok: false,
+        error: expect.stringContaining(problem),
+      });
+    }
+  });
+});
+
+describe("notification", () => {
+  it("has a message for every status", () => {
+    const messages = [
+      "placed|Order o1 received: £12.50",
+      "shipped|Order o1 shipped, tracking RM1",
+      "delivered|Order o1 delivered",
+      "cancelled|Order o1 cancelled: no stock",
+    ];
+    for (const line of messages) {
+      const [status, message] = line.split("|");
+      const result = parseOrder(json({
+        status, trackingCode: "RM1", reason: "no stock",
+      }));
+      if (!result.ok) throw new Error(result.error);
+      expect(notification(result.order)).toBe(message);
+    }
+  });
+});
+
+describe("totalsByStatus", () => {
+  it("adds up the totals for each status", () => {
+    const orders: Order[] = [
+      { id: "a", status: "placed", total: 500 },
+      { id: "b", status: "placed", total: 250 },
+      { id: "c", status: "delivered", total: 1000 },
+    ];
+    expect(totalsByStatus(orders)).toEqual({
+      placed: 750, shipped: 0, delivered: 1000, cancelled: 0,
+    });
+  });
+});
+
+// ---- Type tests (don't change them) ----
+// A line under @ts-expect-error must BE a type error.
+function typeTests(order: Order) {
+  // @ts-expect-error: "lost" is not an order status
+  const lost: Order = { id: "o1", status: "lost", total: 100 };
+  // @ts-expect-error: a shipped order needs its tracking code
+  const noCode: Order = { id: "o2", status: "shipped", total: 100 };
+  // @ts-expect-error: only cancelled orders have a reason
+  const why = order.reason;
+  // @ts-expect-error: one total per status, and only those
+  const lostTotal = totalsByStatus([]).lost;
+
+  // ...and these must compile
+  const shipped: Order = {
+    id: "o3", status: "shipped", total: 100, trackingCode: "RM2",
+  };
+  const delivered: number = totalsByStatus([shipped]).delivered;
+}
+`}
+  tests={[
+    { name: "All 4 tests in the file pass", check: "__vitest.failed === 0 && __vitest.passed === 4" },
+    { name: "The type tests are still there, all four of them", check: `typeof typeTests === "function" && typeTests.toString().split("@ts-expect-error").length === 5` },
+    { name: "parseOrder returns only the order's own fields, for other orders too", check: `(() => { const r = parseOrder(JSON.stringify({ id: "x9", status: "shipped", total: 99, trackingCode: "ZX", dock: 4 })); return r.ok && r.order.status === "shipped" && r.order.id === "x9" && r.order.total === 99 && r.order.trackingCode === "ZX" && !("dock" in r.order); })()` },
+    { name: "parseOrder rejects other bad input without throwing", check: `["null", "42", '"placed"', JSON.stringify({ status: "placed", id: "a" }), JSON.stringify({ status: "Placed", id: "a", total: 1 })].every((text) => { const r = parseOrder(text); return r.ok === false && typeof r.error === "string"; })` },
+    { name: "notification works for other orders", check: `notification({ id: "B7", status: "placed", total: 5 }) === "Order B7 received: £0.05" && notification({ id: "B8", status: "cancelled", total: 5, reason: "address unknown" }) === "Order B8 cancelled: address unknown" && notification({ id: "B9", status: "delivered", total: 5 }) === "Order B9 delivered" && notification({ id: "C1", status: "shipped", total: 5, trackingCode: "QQ7" }) === "Order C1 shipped, tracking QQ7"` },
+    { name: "totalsByStatus works for other orders", check: `JSON.stringify(totalsByStatus([{ id: "q", status: "cancelled", total: 30, reason: "x" }, { id: "r", status: "shipped", total: 20, trackingCode: "T" }, { id: "s", status: "shipped", total: 5, trackingCode: "U" }])) === JSON.stringify({ placed: 0, shipped: 25, delivered: 0, cancelled: 30 })` },
+  ]}
+>
+
+A teammate's pull request turns warehouse updates into messages for customers. You've reviewed it, and the two of you agreed on what it must do: that agreement is the **tests and type tests** at the bottom of the file. Now fix the module so they all pass. Don't change the tests.
+
+What the module must do:
+
+- **`Order`**: a shipped order **must** have a `trackingCode`, a cancelled one **must** have a `reason`, and the other statuses have neither. `status` is one of `"placed"`, `"shipped"`, `"delivered"`, `"cancelled"` and nothing else. `total` is in pence.
+- **`parseOrder(json)`** never throws. For a valid order it returns `{ ok: true, order }`, where `order` contains only the order's own fields (the warehouse also sends internal fields such as `shelf`). Otherwise it returns `{ ok: false, error }`, where `error` names the problem: the bad field (`id`, `total`, `status`, `trackingCode` or `reason`), the word `object` if the JSON isn't an object, or `JSON` if the text isn't valid JSON.
+- **`notification(order)`** has a message for every status: `Order o1 received: £12.50`, `Order o1 shipped, tracking RM1`, `Order o1 delivered`, `Order o1 cancelled: no stock`. Adding a fifth status later should be a compile error here until it's handled.
+- **`totalsByStatus(orders)`** returns the sum of `total` for **every** status, with `0` for statuses that have no orders.
+
+The starter doesn't compile yet: the `@ts-expect-error` lines are **type tests**, and they only pass when the line below them **is** a type error. "Unused '@ts-expect-error' directive." means the type is still too loose. Fix the types first, then the tests run and show you the remaining bugs.
+
+<Hint>
+
+Review comments you might have left:
+
+1. `status: string` plus optional fields: make `Order` a discriminated union with one member per status, where `trackingCode` and `reason` are required on their own member. A `STATUSES` array `as const` gives you the `Status` type too.
+2. `JSON.parse(json) as Order`: the cast checks nothing and `JSON.parse` throws on bad text. Parse into `let data: unknown` inside `try`/`catch`, use `isObject`, check `id` and `total` with `typeof`, then `switch (status)`: each case builds a **new** object with just that status's fields (`{ status, id, total, trackingCode }`), and `default` returns an error.
+3. `case "canceled"` is a typo that compiles only because `status` is a `string`, `"delivered"` is missing, and the `default` hides both. With the union, handle all four and put `order satisfies never;` in `default`.
+4. `totalsByStatus(orders: any[]): any`: take `readonly Order[]`, return `Record<Status, number>`, and start from an object with all four statuses at `0`.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect } from "vitest";
+
+// PR #431: "Tell customers when their order changes"
+// The warehouse sends us order updates as JSON text.
+
+const STATUSES = [
+  "placed",
+  "shipped",
+  "delivered",
+  "cancelled",
+] as const;
+type Status = (typeof STATUSES)[number];
+
+// Each status carries exactly the fields it needs
+type Order =
+  | { status: "placed"; id: string; total: number }
+  | {
+      status: "shipped";
+      id: string;
+      total: number; // in pence: 1250 is £12.50
+      trackingCode: string;
+    }
+  | { status: "delivered"; id: string; total: number }
+  | { status: "cancelled"; id: string; total: number; reason: string };
+
+type ParseResult =
+  | { ok: true; order: Order }
+  | { ok: false; error: string };
+
+// From the team's utils (this one is fine)
+function isObject(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+function pounds(pence: number): string {
+  return `£${(pence / 100).toFixed(2)}`;
+}
+
+function fail(error: string): ParseResult {
+  return { ok: false, error };
+}
+
+function parseOrder(json: string): ParseResult {
+  let data: unknown;
+  try {
+    data = JSON.parse(json);
+  } catch {
+    return fail("not valid JSON");
+  }
+  if (!isObject(data)) return fail("expected an object");
+
+  const { id, status, total } = data;
+  if (typeof id !== "string") return fail("invalid id");
+  if (typeof total !== "number") return fail("invalid total");
+
+  // Build a fresh object: unknown extra fields stay outside
+  switch (status) {
+    case "placed":
+    case "delivered":
+      return { ok: true, order: { status, id, total } };
+    case "shipped": {
+      const { trackingCode } = data;
+      if (typeof trackingCode !== "string") {
+        return fail("shipped order without a trackingCode");
+      }
+      return { ok: true, order: { status, id, total, trackingCode } };
+    }
+    case "cancelled": {
+      const { reason } = data;
+      if (typeof reason !== "string") {
+        return fail("cancelled order without a reason");
+      }
+      return { ok: true, order: { status, id, total, reason } };
+    }
+    default:
+      return fail(`unknown status ${JSON.stringify(status)}`);
+  }
+}
+
+function notification(order: Order): string {
+  const { id } = order;
+  switch (order.status) {
+    case "placed":
+      return `Order ${id} received: ${pounds(order.total)}`;
+    case "shipped":
+      return `Order ${id} shipped, tracking ${order.trackingCode}`;
+    case "delivered":
+      return `Order ${id} delivered`;
+    case "cancelled":
+      return `Order ${id} cancelled: ${order.reason}`;
+    default:
+      order satisfies never; // a new status won't compile until handled
+      throw new Error("Unknown order status");
+  }
+}
+
+function totalsByStatus(
+  orders: readonly Order[],
+): Record<Status, number> {
+  const totals: Record<Status, number> = {
+    placed: 0,
+    shipped: 0,
+    delivered: 0,
+    cancelled: 0,
+  };
+  for (const order of orders) {
+    totals[order.status] += order.total;
+  }
+  return totals;
+}
+
+// ---- Tests (don't change them) ----
+const json = (fields: object) =>
+  JSON.stringify({ id: "o1", total: 1250, ...fields });
+
+describe("parseOrder", () => {
+  it("accepts every kind of order", () => {
+    // The warehouse also sends internal fields like "shelf"
+    const placed = json({ status: "placed", shelf: "B4" });
+    expect(parseOrder(placed)).toEqual({
+      ok: true,
+      order: { id: "o1", status: "placed", total: 1250 },
+    });
+    const shipped = json({ status: "shipped", trackingCode: "RM1" });
+    const cancelled = json({ status: "cancelled", reason: "no stock" });
+    expect(parseOrder(shipped).ok).toBe(true);
+    expect(parseOrder(json({ status: "delivered" })).ok).toBe(true);
+    expect(parseOrder(cancelled).ok).toBe(true);
+  });
+
+  it("says what is wrong with a bad order", () => {
+    const cases = [
+      [json({ status: "lost" }), "status"],
+      [json({ status: "placed", total: "1250" }), "total"],
+      [json({ status: "placed", id: 42 }), "id"],
+      [json({ status: "shipped" }), "trackingCode"],
+      [json({ status: "cancelled" }), "reason"],
+      ["[1, 2]", "object"],
+      ["{ oops", "JSON"],
+    ];
+    for (const [text, problem] of cases) {
+      expect(parseOrder(text)).toEqual({
+        ok: false,
+        error: expect.stringContaining(problem),
+      });
+    }
+  });
+});
+
+describe("notification", () => {
+  it("has a message for every status", () => {
+    const messages = [
+      "placed|Order o1 received: £12.50",
+      "shipped|Order o1 shipped, tracking RM1",
+      "delivered|Order o1 delivered",
+      "cancelled|Order o1 cancelled: no stock",
+    ];
+    for (const line of messages) {
+      const [status, message] = line.split("|");
+      const result = parseOrder(json({
+        status, trackingCode: "RM1", reason: "no stock",
+      }));
+      if (!result.ok) throw new Error(result.error);
+      expect(notification(result.order)).toBe(message);
+    }
+  });
+});
+
+describe("totalsByStatus", () => {
+  it("adds up the totals for each status", () => {
+    const orders: Order[] = [
+      { id: "a", status: "placed", total: 500 },
+      { id: "b", status: "placed", total: 250 },
+      { id: "c", status: "delivered", total: 1000 },
+    ];
+    expect(totalsByStatus(orders)).toEqual({
+      placed: 750, shipped: 0, delivered: 1000, cancelled: 0,
+    });
+  });
+});
+
+// ---- Type tests (don't change them) ----
+// A line under @ts-expect-error must BE a type error.
+function typeTests(order: Order) {
+  // @ts-expect-error: "lost" is not an order status
+  const lost: Order = { id: "o1", status: "lost", total: 100 };
+  // @ts-expect-error: a shipped order needs its tracking code
+  const noCode: Order = { id: "o2", status: "shipped", total: 100 };
+  // @ts-expect-error: only cancelled orders have a reason
+  const why = order.reason;
+  // @ts-expect-error: one total per status, and only those
+  const lostTotal = totalsByStatus([]).lost;
+
+  // ...and these must compile
+  const shipped: Order = {
+    id: "o3", status: "shipped", total: 100, trackingCode: "RM2",
+  };
+  const delivered: number = totalsByStatus([shipped]).delivered;
+}
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- The compiler proves types are **consistent**; a TypeScript reviewer asks whether they're **honest** (true at runtime) and **precise** (no wider than the domain).
+- Look for escape hatches in the diff: `any` from `JSON.parse`/`res.json()`, `as` outside validators, `{} as T`, `!`, `@ts-ignore`. Ask "if this is wrong, who finds out, and when?"
+- Suggest unions instead of strings-with-a-comment, discriminated unions instead of flags, and exhaustive `switch`es (`satisfies never`) instead of catch-all `default`s on unions. How hard to push depends on how far the type reaches.
+- Clever types must pay for themselves: many call sites, real mistakes caught, readable errors, type tests and an owner. Otherwise, simpler wins.
+- Make type comments specific: show the concrete bug, paste the compiler error, ask questions, label the weight, and praise good types.
+- If you've written a comment three times, make it a **typescript-eslint** rule: the `no-unsafe-*` family, `no-floating-promises`, `ban-ts-comment`, `no-non-null-assertion`, `switch-exhaustiveness-check`. Keep human review for meaning.

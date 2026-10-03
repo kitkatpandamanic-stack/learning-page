@@ -1,0 +1,629 @@
+---
+title: "Branded Types & Type-Safe APIs"
+description: "Stop mixing up ids and units with branded types and smart constructors, pick overloads, generics or unions, track state in type parameters and make illegal states unrepresentable."
+duration: 25
+xp: 30
+---
+
+A payments team once shipped a refund function that took an order id and a user id, both plain strings. A refactor swapped the arguments at one call site. Every test still passed, because the test data happened to use the same value for both, and for two days refunds were looked up under the wrong records. Another team stored prices in pounds in one service and in pence in the other: a £49.99 charge went out as £4,999.
+
+TypeScript didn't catch either bug, and it couldn't: to a structural type system, a string is a string and a number is a number. In this lesson you'll teach it the difference with **branded types**, then use the same idea to design APIs where wrong calls simply don't compile: smart constructors, phantom types, type-safe builders, and the right choice between overloads, generics and unions. 🏷️
+
+## When structural typing is too forgiving
+
+A type alias is only a **nickname**. `UserId` and `OrderId` below are both just `string`, so TypeScript happily accepts them in either order:
+
+<CodeExample output="Refunding order u_42 to user o_1001">
+
+```ts
+type UserId = string;
+type OrderId = string;
+
+function refund(orderId: OrderId, userId: UserId): string {
+  return `Refunding order ${orderId} to user ${userId}`;
+}
+
+const userId: UserId = "u_42";
+const orderId: OrderId = "o_1001";
+console.log(refund(userId, orderId)); // swapped: no error!
+```
+
+</CodeExample>
+
+The names help humans, but the compiler sees `refund(string, string)`. To make TypeScript tell them apart, the two types must differ in **structure**.
+
+## Branded types
+
+A **branded type** adds a property that exists only in the type system: a "brand" that no ordinary string has.
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type UserId = Brand<string, "UserId">;
+type OrderId = Brand<string, "OrderId">;
+```
+
+Line by line:
+
+- `declare const brand: unique symbol` describes a symbol **without creating it**: it exists only in the types, so nothing at runtime can ever have this key, and it doesn't clutter autocomplete like a string key would.
+- `T & { readonly [brand]: Name }` is "a `T` that also carries this brand". A `UserId` is still a string: you can call `.toUpperCase()` on it, print it, pass it where a `string` is expected.
+- Different names make different brands, so `UserId` and `OrderId` are no longer interchangeable.
+
+At runtime nothing changes: the brand is erased with the other types, so branded values cost exactly nothing. But now both bugs from the start are compile errors:
+
+```ts
+refund(userId, orderId);
+// ❌ Error: Argument of type 'UserId' is not assignable to parameter of type 'OrderId'.
+refund("o_1001", userId);
+// ❌ Error: Argument of type 'string' is not assignable to parameter of type 'OrderId'.
+```
+
+You'll often see the simpler `string & { readonly __brand: "UserId" }` in codebases. It works the same way; the `unique symbol` version just can't clash with a real property called `__brand`, and libraries like zod (`.brand<"UserId">()`) and Effect ship their own helpers.
+
+## Smart constructors: the only way in
+
+If a plain string isn't a `UserId`, how do you get one? Through a **smart constructor**: a function that checks the value and, only if it passes, brands it. The brand then means more than "this is an email-ish string". It means **"this string has been validated"**:
+
+<CodeExample output={`Welcome mail queued for mei@panda.dev
+Error: "not-an-email" is not an email`}>
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type Email = Brand<string, "Email">;
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// The ONLY place that may create an Email
+function parseEmail(input: string): Result<Email, string> {
+  const email = input.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { ok: false, error: `"${input}" is not an email` };
+  }
+  return { ok: true, value: email as Email };
+}
+
+// Code inside can trust the type: no re-checking
+function sendWelcome(to: Email): string {
+  return `Welcome mail queued for ${to}`;
+}
+
+for (const input of ["  Mei@Panda.dev ", "not-an-email"]) {
+  const parsed = parseEmail(input);
+  if (parsed.ok) {
+    console.log(sendWelcome(parsed.value));
+  } else {
+    console.log(`Error: ${parsed.error}`);
+  }
+}
+```
+
+</CodeExample>
+
+This is the idea often summed up as **"parse, don't validate"**. A function that validates and returns `boolean` forgets what it learned; every caller has to check again or trust that someone did. A function that **parses** returns a more precise type, and the proof travels with the value. `sendWelcome` can't be called with an unchecked string anymore:
+
+```ts
+sendWelcome("mei@panda.dev");
+// ❌ Error: Argument of type 'string' is not assignable to parameter of type 'Email'.
+```
+
+<Callout type="warning" title="A brand is only as honest as its constructors">
+
+`"anything" as Email` compiles anywhere, and every such cast is a forged certificate. Keep the `as` inside the smart constructor, right after the check that justifies it, and nowhere else. In code review, treat `as Email` outside that function as a bug. Data loaded from a database or JSON must go through the constructor too (or through a mapper that you trust as much). If brands get forged casually, they're worse than no brands: they make unchecked data **look** checked.
+
+</Callout>
+
+## Units: cents are not pounds
+
+Brands work on numbers too, and money is the classic case. Storing prices as floating-point pounds invites rounding errors (`0.1 + 0.2` is `0.30000000000000004`), so payment systems use whole **cents** (or pence). A `Cents` brand makes sure nobody passes pounds by accident:
+
+<CodeExample output={`1999 400
+£23.99
+Bad amount: "19.9"`}>
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type Cents = Brand<number, "Cents">;
+
+function cents(amount: number): Cents {
+  if (!Number.isSafeInteger(amount)) {
+    throw new RangeError(`${amount} is not a whole number of cents`);
+  }
+  return amount as Cents;
+}
+
+// "19.99" → 1999, parsed as text: no floating-point maths
+function fromPounds(text: string): Cents {
+  const match = /^(\d+)(?:\.(\d{2}))?$/.exec(text);
+  if (!match) throw new RangeError(`Bad amount: "${text}"`);
+  return cents(Number(match[1]) * 100 + Number(match[2] ?? 0));
+}
+
+function add(a: Cents, b: Cents): Cents {
+  return (a + b) as Cents;
+}
+
+function format(amount: Cents): string {
+  return `£${(amount / 100).toFixed(2)}`;
+}
+
+const price = fromPounds("19.99");
+const shipping = fromPounds("4");
+console.log(price, shipping);
+console.log(format(add(price, shipping)));
+try {
+  fromPounds("19.9");
+} catch (error) {
+  console.log((error as Error).message);
+}
+```
+
+</CodeExample>
+
+Notice what arithmetic does to a brand: `price + price` is a plain `number`. That's a feature. The compiler can't know whether `price * price` (meaningless) or `price * 2` (fine) makes sense, so it drops the brand and makes you say so through a helper like `add`:
+
+```ts
+format(19.99);
+// ❌ Error: Argument of type 'number' is not assignable to parameter of type 'Cents'.
+format(price * 2);
+// ❌ Error: Argument of type 'number' is not assignable to parameter of type 'Cents'.
+```
+
+How far to take this? Brand the values that cross **boundaries** and cause expensive mix-ups: ids of different entities, money, validated emails and URLs, units (milliseconds vs seconds is a classic). Don't brand every string in your app: each brand needs constructors and helpers, and a brand nobody needed is just friction.
+
+<Quiz
+  question="type Cents = number & { readonly [brand]: 'Cents' }. Given a: Cents and b: Cents, what is the type of a + b?"
+  options={[
+    "Cents, because both operands are Cents",
+    "number, because arithmetic doesn't keep brands",
+    "never, because the brand can't be added",
+    "It's a type error to add branded numbers",
+  ]}
+  answer={1}
+  explanation="The + operator on two number-like values always gives number; the brand only exists on the operands. That's deliberate: TypeScript can't know whether the result is still a valid amount, so you re-brand it through a helper like add(a, b)."
+/>
+
+## Phantom types
+
+A **phantom type parameter** describes a value without ever being stored in it: `Distance<"km">` vs `Distance<"mi">`, `Form<"draft">` vs `Form<"validated">`. Here's the trap that catches almost everyone the first time:
+
+```ts
+interface User { name: string }
+interface Order { total: number }
+
+type Id<Entity> = string; // Entity is never used...
+const userId: Id<User> = "u1";
+const orderId: Id<Order> = userId; // ...so this compiles!
+```
+
+TypeScript compares **structures**, and a type parameter that doesn't appear in the structure makes no difference to it: `Id<User>` and `Id<Order>` are both just `string`. A phantom parameter only works if it shows up **somewhere** in the type, and a brand is the perfect place:
+
+<CodeExample output="21.1">
+
+```ts
+type Unit = "km" | "mi";
+
+// The unit lives only in the type: nothing extra at runtime
+type Distance<U extends Unit> = number & { readonly unit: U };
+
+function km(value: number): Distance<"km"> {
+  return value as Distance<"km">;
+}
+function mi(value: number): Distance<"mi"> {
+  return value as Distance<"mi">;
+}
+
+function toKm(d: Distance<"mi">): Distance<"km"> {
+  return km(d * 1.609344);
+}
+
+function add<U extends Unit>(
+  a: Distance<U>,
+  b: NoInfer<Distance<U>>,
+): Distance<U> {
+  return (a + b) as Distance<U>;
+}
+
+const run = km(5);
+const ride = mi(10);
+console.log(add(run, toKm(ride)).toFixed(1));
+```
+
+</CodeExample>
+
+The `NoInfer` is not decoration. Without it, both arguments are inference sites, and `add(km(5), mi(10))` happily infers `U` as `"km" | "mi"`: exactly the bug the type was meant to stop. With it, `U` comes from the first argument only (you saw why in [Variance & Inference](/learn/typescript/variance-and-inference)):
+
+```ts
+add(run, ride);
+// ❌ Error: Argument of type 'Distance<"mi">' is not assignable to parameter of type 'Distance<"km">'.
+```
+
+That's the general lesson about clever types: **test the failure cases**, not just the happy path. A `// @ts-expect-error` line on `add(run, ride)` would have caught the missing `NoInfer` immediately.
+
+## Type-safe builders
+
+Phantom parameters can also track **progress**. A request builder shouldn't let you call `build()` before the URL and method are set. Each step returns a builder whose type parameters record what's been done, and `build` declares (with a `this` parameter) that it only works on a finished builder:
+
+<CodeExample output={`{
+  headers: { Accept: 'application/json' },
+  url: 'https://api.pandadev.test/todos',
+  method: 'GET'
+}`}>
+
+```ts
+type Method = "GET" | "POST" | "DELETE";
+
+interface HttpRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+}
+
+class RequestBuilder<HasUrl = false, HasMethod = false> {
+  // Type-only: makes the two flags part of the structure
+  declare private readonly steps: [HasUrl, HasMethod];
+
+  private constructor(private readonly draft: Partial<HttpRequest>) {}
+
+  static create(): RequestBuilder {
+    return new RequestBuilder({ headers: {} });
+  }
+
+  url(url: string): RequestBuilder<true, HasMethod> {
+    return new RequestBuilder({ ...this.draft, url });
+  }
+
+  method(method: Method): RequestBuilder<HasUrl, true> {
+    return new RequestBuilder({ ...this.draft, method });
+  }
+
+  header(
+    name: string,
+    value: string,
+  ): RequestBuilder<HasUrl, HasMethod> {
+    const headers = { ...this.draft.headers, [name]: value };
+    return new RequestBuilder({ ...this.draft, headers });
+  }
+
+  // Only callable once both url and method are set
+  build(this: RequestBuilder<true, true>): HttpRequest {
+    return this.draft as HttpRequest;
+  }
+}
+
+const request = RequestBuilder.create()
+  .url("https://api.pandadev.test/todos")
+  .header("Accept", "application/json")
+  .method("GET")
+  .build();
+console.log(request);
+```
+
+</CodeExample>
+
+Forget a step, and the mistake is caught where you make it:
+
+```ts
+RequestBuilder.create().url("/todos").build();
+// ❌ Error: The 'this' context of type 'RequestBuilder<true, false>' is not assignable to method's 'this' of type 'RequestBuilder<true, true>'.
+```
+
+The `declare private readonly steps` line is the phantom-type lesson again. `declare` tells TypeScript the field exists without creating it (so it costs nothing at runtime). Delete that line and the code still compiles, but `build()` quietly works on **every** builder, because `HasUrl` and `HasMethod` would no longer appear in the structure.
+
+Is a builder worth it? Look at the error message above: accurate, but it takes a moment to decode. A plain function with a **required options object**, `createRequest({ method: "GET", url })`, gives the same guarantee with no cleverness at all, and TypeScript's message ("Property 'method' is missing") is instantly clear. Builders earn their keep when there are many optional steps, the order matters, or they're the public face of a library (query builders such as Kysely, schema builders such as zod). In application code, start with the options object.
+
+## Overloads vs generics vs unions
+
+API design in TypeScript constantly asks: how should the **return type** relate to the **arguments**? There are three tools, and a simple order of preference:
+
+1. **A union parameter** when the result doesn't depend on which kind came in: `function len(x: string | readonly unknown[]): number`. One signature, easy to call with a value that's either.
+2. **A generic** when the output type follows the input type directly: `first<T>(items: readonly T[]): T | undefined`.
+3. **Overloads** when the result depends on the input in a few distinct cases that you can list:
+
+<CodeExample output="450 [ 120, 99 ]">
+
+```ts
+function toCents(text: string): number;
+function toCents(texts: readonly string[]): number[];
+function toCents(input: string | readonly string[]): number | number[] {
+  if (typeof input === "string") {
+    return Math.round(Number(input) * 100);
+  }
+  return input.map((text) => toCents(text));
+}
+
+const one = toCents("4.50"); // number
+const many = toCents(["1.20", "0.99"]); // number[]
+console.log(one, many);
+```
+
+</CodeExample>
+
+Callers get precise types, but overloads have a famous weakness: each call must match **one** overload, so a value that could be either doesn't fit any:
+
+```ts
+declare const fromForm: string | string[];
+toCents(fromForm);
+// ❌ Error: No overload matches this call.
+```
+
+You'd need a third overload for the union. The alternative, a generic with a conditional return type (`T extends string ? number : number[]`), reads nicely at the call site but can't be implemented without casts, because TypeScript can't check a conditional return type inside the function body:
+
+```ts
+function toCents<T extends string | readonly string[]>(
+  input: T,
+): T extends string ? number : number[] {
+  if (typeof input === "string") {
+    return Math.round(Number(input) * 100);
+    // ❌ Error: Type 'number' is not assignable to type 'T extends string ? number : number[]'.
+  }
+  return input.map((text) => Math.round(Number(text) * 100));
+  // ❌ Error: Type 'number[]' is not assignable to type 'T extends string ? number : number[]'.
+}
+```
+
+So the rule of thumb: prefer a **union** if the return type is the same; prefer a **generic** if the output simply mirrors the input; use **overloads** for a small, fixed set of distinct cases, and add the union overload last if callers might have either. Keep conditional return types for library internals where you'll test them heavily.
+
+## Make illegal states unrepresentable at the boundary
+
+Everything in this module points to one design habit: put the strictness at the **edges** of your API, so that the inside can be simple. A checklist for a function or module that other people call:
+
+- **Parse at the boundary.** Data arrives as `unknown` or plain strings; smart constructors turn it into `Email`, `UserId`, `Cents`. Inside, nobody checks again (see [Runtime Validation](/learn/typescript/runtime-validation) for whole objects).
+- **States as discriminated unions**, not flags: `{ status: "paid"; paidAt: string }` instead of `paid: boolean; paidAt?: string` ([Discriminated Unions](/learn/typescript/discriminated-unions)).
+- **Either-or options** as a union with `never` on the other side, so passing both is an error (example below).
+- **"At least one of"** with `RequireAtLeastOne` from [the first lesson](/learn/typescript/building-utility-types).
+- **Named fields for same-typed values.** A brand can't stop you swapping two `AccountId`s. `transfer({ from, to, amount })` can, because every value is labelled at the call site.
+
+Here's the either-or pattern. A `never` property can only be left out (or `undefined`), so each variant forbids the other's key:
+
+```ts
+type Lookup =
+  | { id: string; email?: never }
+  | { email: string; id?: never };
+declare function findUser(by: Lookup): void;
+
+findUser({ id: "u1" }); // ✅
+findUser({ id: "u1", email: "mei@panda.dev" });
+// ❌ Error: Argument of type '{ id: string; email: string; }' is not assignable to parameter of type 'Lookup'.
+```
+
+Without the `never` parts, `{ id: string } | { email: string }` would accept an object with both, because it fits the first variant and the extra `email` is allowed by the second.
+
+And know when to stop. Inside one small module, with one author and good tests, `string` is fine. Branded types, builders and phantom parameters pay off where many people call an API, where mistakes are expensive (money, permissions, other people's data), or where the same mix-up has already happened once. If a type makes the API harder to use than the bug it prevents, it's the wrong type.
+
+<Quiz
+  question="type Id<Entity> = string. Why does const orderId: Id<Order> = userId (a Id<User>) compile?"
+  options={[
+    "Because Id is a type alias, and aliases are always interchangeable",
+    "Because Entity doesn't appear in the structure, so Id<User> and Id<Order> are both just string",
+    "Because User and Order are both object types",
+    "It doesn't compile: different type arguments make different types",
+  ]}
+  answer={1}
+  explanation="TypeScript compares structures. An unused (phantom) type parameter changes nothing about the structure, so both types are string. Put the parameter into a brand, e.g. string & { readonly entity: Entity }, and they become different."
+/>
+
+<Exercise
+  title="Branded money transfers"
+  language="typescript"
+  starter={`declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type Result<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string };
+
+// TYPES: make these brands, so unchecked values can't sneak in
+type AccountId = string;
+type Cents = number;
+
+// "acc_" followed by 4 to 12 lower-case letters or digits
+function parseAccountId(input: string): Result<AccountId> {
+  return { ok: false, error: "TODO" };
+}
+
+// A whole number of cents from text like "12.50" or "7"
+// (digits, optionally a dot and exactly two more digits)
+function parseCents(input: string): Result<Cents> {
+  return { ok: false, error: "TODO" };
+}
+
+function addCents(a: Cents, b: Cents): Cents {
+  return 0;
+}
+
+// 1250 → "£12.50"
+function formatCents(amount: Cents): string {
+  return "";
+}
+
+interface Transfer {
+  from: AccountId;
+  to: AccountId;
+  amount: Cents;
+}
+
+// Refuse transfers to the same account and amounts of 0
+function createTransfer(transfer: Transfer): Result<Transfer> {
+  return { ok: false, error: "TODO" };
+}
+
+// ===== Type tests: don't change these =====
+function _typeTests(id: AccountId, amount: Cents) {
+  createTransfer({ from: id, to: id, amount });
+  // @ts-expect-error: a raw string isn't a checked account id
+  createTransfer({ from: "acc_mei01", to: id, amount });
+  // @ts-expect-error: a raw number isn't a checked amount
+  createTransfer({ from: id, to: id, amount: 500 });
+  // @ts-expect-error: + gives a plain number; use addCents
+  const _total: Cents = amount + amount;
+}
+
+// ===== Try it =====
+const from = parseAccountId("acc_mei01");
+const to = parseAccountId("acc_sam42");
+const price = parseCents("12.50");
+const tip = parseCents("2");
+if (from.ok && to.ok && price.ok && tip.ok) {
+  const total = addCents(price.value, tip.value);
+  console.log(formatCents(total));
+  console.log(
+    createTransfer({ from: from.value, to: to.value, amount: total }),
+  );
+  console.log(
+    createTransfer({ from: from.value, to: from.value, amount: total }),
+  );
+}
+console.log(parseCents("12.5"));
+console.log(parseAccountId("ACC_MEI"));
+`}
+  tests={[
+    { name: "parseAccountId accepts valid ids", check: "(() => { const a = parseAccountId('acc_mei01'); const b = parseAccountId('acc_x9y8z7w6v5u4'); return a.ok && a.value === 'acc_mei01' && b.ok && b.value === 'acc_x9y8z7w6v5u4'; })()" },
+    { name: "parseAccountId rejects everything else with a message", check: "['acc_', 'acc_abc', 'ACC_MEI01', 'acc_Mei01', 'usr_mei01', 'acc_mei-01', 'acc_x9y8z7w6v5u4t', ' acc_mei01', ''].every((s) => { const r = parseAccountId(s); return r.ok === false && typeof r.error === 'string' && r.error.length > 0; })" },
+    { name: "parseCents turns text into whole cents", check: "(() => { const ok = (s, n) => { const r = parseCents(s); return r.ok && r.value === n; }; return ok('12.50', 1250) && ok('7', 700) && ok('0.05', 5) && ok('0.29', 29) && ok('1000000.01', 100000001) && ok('0', 0); })()" },
+    { name: "parseCents rejects badly formatted amounts", check: "['12.5', '1.234', '-3', '3.', '.50', 'abc', '', '1,50', ' 2'].every((s) => { const r = parseCents(s); return r.ok === false && typeof r.error === 'string' && r.error.length > 0; })" },
+    { name: "addCents and formatCents work", check: "addCents(1250, 75) === 1325 && formatCents(1250) === '£12.50' && formatCents(5) === '£0.05' && formatCents(0) === '£0.00' && formatCents(123456) === '£1234.56'" },
+    { name: "createTransfer accepts a valid transfer", check: "(() => { const t = createTransfer({ from: 'acc_aaaa', to: 'acc_bbbb', amount: 100 }); return t.ok === true && t.value.from === 'acc_aaaa' && t.value.to === 'acc_bbbb' && t.value.amount === 100; })()" },
+    { name: "createTransfer refuses the same account and zero amounts", check: "(() => { const same = createTransfer({ from: 'acc_aaaa', to: 'acc_aaaa', amount: 100 }); const zero = createTransfer({ from: 'acc_aaaa', to: 'acc_bbbb', amount: 0 }); return same.ok === false && zero.ok === false && same.error.length > 0 && zero.error.length > 0; })()" },
+  ]}
+>
+
+Build the core of a small payments module, where an unchecked id or amount can't even reach a transfer. The type tests at the bottom fail until `AccountId` and `Cents` are real brands (each `// @ts-expect-error` passes only when the line below it **is** an error).
+
+1. **Types:** make `AccountId` and `Cents` brands with the `Brand` helper.
+2. **`parseAccountId(input)`**: valid ids are `"acc_"` followed by 4 to 12 lower-case letters or digits, nothing else (no trimming, no capitals). Return `{ ok: true, value }` with the branded id, or `{ ok: false, error }` with a helpful message.
+3. **`parseCents(input)`**: digits, optionally followed by a dot and **exactly two** digits (`"12.50"` → `1250`, `"7"` → `700`). Anything else is an error. Build the number from the two parts as whole numbers; don't multiply a decimal by 100.
+4. **`addCents(a, b)`** adds two amounts; **`formatCents(amount)`** gives `"£12.50"` for `1250` and `"£0.05"` for `5`.
+5. **`createTransfer(transfer)`** returns an error for a transfer to the same account or an amount of `0`, and `{ ok: true, value: transfer }` otherwise. (It takes an object on purpose: brands can't stop you swapping `from` and `to`, but named fields can.)
+
+<Hint>
+
+Types: `type AccountId = Brand<string, "AccountId">;` and `type Cents = Brand<number, "Cents">;`. The only `as` casts belong in the parse functions and `addCents`, right after the checks.
+
+`parseAccountId`: `/^acc_[a-z0-9]{4,12}$/.test(input)`.
+
+`parseCents`: `const match = /^(\d+)(?:\.(\d{2}))?$/.exec(input);`, then `Number(match[1]) * 100 + Number(match[2] ?? "0")`.
+
+`formatCents`: `Math.floor(amount / 100)` for the pounds and `String(amount % 100).padStart(2, "0")` for the pence.
+
+</Hint>
+
+<Solution>
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type Result<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string };
+
+type AccountId = Brand<string, "AccountId">;
+type Cents = Brand<number, "Cents">;
+
+function parseAccountId(input: string): Result<AccountId> {
+  if (!/^acc_[a-z0-9]{4,12}$/.test(input)) {
+    return { ok: false, error: `Invalid account id: "${input}"` };
+  }
+  return { ok: true, value: input as AccountId };
+}
+
+function parseCents(input: string): Result<Cents> {
+  const match = /^(\d+)(?:\.(\d{2}))?$/.exec(input);
+  if (!match) {
+    return { ok: false, error: `Invalid amount: "${input}"` };
+  }
+  // whole numbers only: no floating-point surprises
+  const cents = Number(match[1]) * 100 + Number(match[2] ?? "0");
+  if (!Number.isSafeInteger(cents)) {
+    return { ok: false, error: `Amount too large: "${input}"` };
+  }
+  return { ok: true, value: cents as Cents };
+}
+
+function addCents(a: Cents, b: Cents): Cents {
+  return (a + b) as Cents;
+}
+
+function formatCents(amount: Cents): string {
+  const pounds = Math.floor(amount / 100);
+  const pence = String(amount % 100).padStart(2, "0");
+  return `£${pounds}.${pence}`;
+}
+
+interface Transfer {
+  from: AccountId;
+  to: AccountId;
+  amount: Cents;
+}
+
+function createTransfer(transfer: Transfer): Result<Transfer> {
+  if (transfer.from === transfer.to) {
+    return { ok: false, error: "Can't transfer to the same account" };
+  }
+  if (transfer.amount === 0) {
+    return { ok: false, error: "Amount must be more than 0" };
+  }
+  return { ok: true, value: transfer };
+}
+
+// ===== Type tests: don't change these =====
+function _typeTests(id: AccountId, amount: Cents) {
+  createTransfer({ from: id, to: id, amount });
+  // @ts-expect-error: a raw string isn't a checked account id
+  createTransfer({ from: "acc_mei01", to: id, amount });
+  // @ts-expect-error: a raw number isn't a checked amount
+  createTransfer({ from: id, to: id, amount: 500 });
+  // @ts-expect-error: + gives a plain number; use addCents
+  const _total: Cents = amount + amount;
+}
+
+// ===== Try it =====
+const from = parseAccountId("acc_mei01");
+const to = parseAccountId("acc_sam42");
+const price = parseCents("12.50");
+const tip = parseCents("2");
+if (from.ok && to.ok && price.ok && tip.ok) {
+  const total = addCents(price.value, tip.value);
+  console.log(formatCents(total));
+  console.log(
+    createTransfer({ from: from.value, to: to.value, amount: total }),
+  );
+  console.log(
+    createTransfer({ from: from.value, to: from.value, amount: total }),
+  );
+}
+console.log(parseCents("12.5"));
+console.log(parseAccountId("ACC_MEI"));
+// £14.50
+// {
+//   ok: true,
+//   value: { from: 'acc_mei01', to: 'acc_sam42', amount: 1450 }
+// }
+// { ok: false, error: "Can't transfer to the same account" }
+// { ok: false, error: 'Invalid amount: "12.5"' }
+// { ok: false, error: 'Invalid account id: "ACC_MEI"' }
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A type alias is only a nickname; structural typing can't tell `UserId` from `OrderId` until their **structures** differ.
+- A **branded type** (`T & { readonly [brand]: Name }`) adds a type-only marker: zero runtime cost, and mix-ups become compile errors.
+- **Smart constructors** are the only way in: check, then brand ("parse, don't validate"). Keep every `as` inside them; a forged brand is worse than none.
+- Brand **units** like `Cents`: arithmetic drops the brand on purpose, so you re-brand through helpers.
+- A **phantom type parameter** must appear in the structure (usually in a brand) or TypeScript ignores it; use `NoInfer` so unions don't sneak in, and type-test the failure cases.
+- **Type-safe builders** track progress in type parameters and restrict `build` with a `this` parameter; an options object with required fields is often the simpler choice.
+- Prefer **unions** when the return type is the same, **generics** when output mirrors input, and **overloads** for a few distinct cases (they reject union arguments unless you add an overload for them).
+- Make illegal states unrepresentable **at the boundary**: parse into branded types, model states as unions, use `never` for either-or options and named fields for same-typed values, and stop when a type costs more than the bug it prevents.
+
+🎉 That's the Type-Level Programming module done. You can now build and test your own utility types, reason precisely about assignability and inference, and design APIs where the wrong call doesn't compile.

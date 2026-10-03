@@ -22,3 +22,21 @@ for (const file of vendorSources) hash.update(readFileSync(file));
 
 /** e.g. react-19.2.8-1a2b3c4d.js */
 export const reactVendorName = `react-${reactVersion}-${hash.digest("hex").slice(0, 8)}.js`;
+
+/**
+ * React's type packages for TypeScript lessons, by folder in the types
+ * vendor folder (see REACT_TYPE_FILES in src/lib/runner/typecheck.ts).
+ */
+export const reactTypePackages = {
+  react: join(root, "node_modules", "@types", "react"),
+  "react-dom": join(root, "node_modules", "@types", "react-dom"),
+  csstype: join(root, "node_modules", "csstype"),
+};
+
+const typesHash = createHash("sha256");
+for (const dir of Object.values(reactTypePackages)) {
+  typesHash.update(readFileSync(join(dir, "package.json")));
+}
+
+/** e.g. react-types-19.3.0-1a2b3c4d: a new folder whenever a package changes */
+export const reactTypesVendorName = `react-types-${require("@types/react/package.json").version}-${typesHash.digest("hex").slice(0, 8)}`;

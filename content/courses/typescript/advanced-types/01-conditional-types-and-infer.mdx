@@ -1,0 +1,567 @@
+---
+title: "Conditional Types & infer"
+description: "Write types that make decisions with T extends U ? X : Y, pull types apart with infer, see how they distribute over unions, recurse safely, and know when a type is too clever."
+duration: 22
+xp: 25
+---
+
+You've been using conditional types for a while without seeing them. [`Exclude`, `Extract`, `NonNullable`, `ReturnType`, `Parameters` and `Awaited`](/learn/typescript/utility-types) are all **conditional types**: a few lines each in TypeScript's library files. In this lesson you'll write them yourself. That matters for two reasons. You'll be able to **read** the types of the libraries you use every day (React, Express and Zod are full of them), and you'll be able to judge when one of these types earns its place in **your** code and when it's a puzzle your colleagues will have to solve every time they touch it. 🧠
+
+## Types that make decisions
+
+A conditional type looks like the ternary operator, but for types:
+
+```ts
+type IsString<T> = T extends string ? true : false;
+
+type A = IsString<"hi">; // true
+type B = IsString<42>; // false
+```
+
+Read `T extends string ? X : Y` as "**if `T` is assignable to `string`**, then `X`, otherwise `Y`". `extends` means the same as in a [generic constraint](/learn/typescript/generic-functions): "fits into". And since a conditional type is a type, you can chain them like `else if`.
+
+Where does this help in real code? Whenever the **output type depends on an input type**. Here's a helper that reads query-string values, where the kind you ask for decides what you get back:
+
+<CodeExample output="4 true PRICE">
+
+```ts
+type ParamKind = "string" | "number" | "boolean";
+
+type ParamValue<K extends ParamKind> = K extends "number"
+  ? number
+  : K extends "boolean"
+    ? boolean
+    : string;
+
+function readParam<K extends ParamKind>(
+  raw: string,
+  kind: K,
+): ParamValue<K> {
+  if (kind === "number") return Number(raw) as ParamValue<K>;
+  if (kind === "boolean") return (raw === "true") as ParamValue<K>;
+  return raw as ParamValue<K>;
+}
+
+const page = readParam("3", "number"); // number
+const debug = readParam("true", "boolean"); // boolean
+const sort = readParam("price", "string"); // string
+
+console.log(page + 1, debug, sort.toUpperCase());
+```
+
+</CodeExample>
+
+Each call gets an exact type, so `page + 1` is maths, not string concatenation, and `sort.toUpperCase()` is allowed. Notice the `as ParamValue<K>` casts inside the function. They're not laziness: TypeScript can't check a function body against a conditional return type, and we'll come back to what that costs at the end of the lesson.
+
+## Testing types with `Equal` and `Expect`
+
+Types never show up in the output, so how do you know `ParamValue<"boolean">` really is `boolean`? Hovering over it in your editor works for a quick look. For anything you want to **keep** working, write **type tests**: lines that compile only when a type is exactly what you expect. You met this pair of helpers in [Testing Types](/learn/typescript/testing-types); here's a reminder:
+
+```ts
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamValue<"number">, number>>,
+  Expect<Equal<ParamValue<"boolean">, boolean>>,
+  Expect<Equal<ParamValue<"string">, string>>,
+];
+```
+
+`Expect` only accepts `true`, and `Equal` is `true` only when the two types are **exactly** the same. The odd-looking definition (comparing two generic functions) is a well-known trick that makes the comparison strict: `any` doesn't match `string`, and `readonly` properties don't match writable ones. Treat it as a tool; nobody writes it from memory. When a test fails, you get a type error on that line, so the code doesn't run:
+
+```ts
+type _broken = Expect<Equal<ParamValue<"number">, string>>;
+// ❌ Error: Type 'false' does not satisfy the constraint 'true'.
+```
+
+From now on, examples and exercises in this module use type tests to prove what a type does. They are also the main way to protect a tricky type from the next person who "simplifies" it.
+
+## Distribution: conditional types over unions
+
+What happens when you pass a **union** into a conditional type? Something surprising and useful: the condition runs **once per member**, and the results are joined back into a union. This is called a **distributive conditional type**.
+
+That's how `Exclude` works. Here it is, rebuilt:
+
+```ts
+type MyExclude<T, U> = T extends U ? never : T;
+
+type Left = MyExclude<"a" | "b" | "c", "a">;
+// = MyExclude<"a", "a"> | MyExclude<"b", "a"> | MyExclude<"c", "a">
+// = never | "b" | "c"
+// = "b" | "c"
+```
+
+The trick is `never`, the empty union: it disappears when joined with other members. So "return `never` for the ones you don't want" is how you **filter** a union. `Extract` is the same type with the branches swapped.
+
+Distribution is often exactly what you want. A `toArray` helper should turn a value into an array, and leave arrays alone:
+
+<CodeExample output={`[ 'urgent' ]
+[ 'bug', 'ui' ]
+[ 42 ] [ 1, 2 ]`}>
+
+```ts
+type ToArray<T> = T extends readonly unknown[] ? T : T[];
+
+function toArray<T>(value: T): ToArray<T> {
+  return (Array.isArray(value) ? value : [value]) as ToArray<T>;
+}
+
+function normaliseTags(tags: string | string[]): string[] {
+  return toArray(tags); // ToArray<string> | ToArray<string[]>
+}
+
+console.log(normaliseTags("urgent"));
+console.log(normaliseTags(["bug", "ui"]));
+console.log(toArray(42), toArray([1, 2]));
+```
+
+</CodeExample>
+
+For `string | string[]`, the type is worked out per member: `ToArray<string>` is `string[]`, `ToArray<string[]>` is `string[]`, so the result is `string[]`. Correct, and `normaliseTags` type-checks without a cast.
+
+Sometimes, though, you want to treat the union **as a whole**. Distribution only happens when the checked type is a **naked type parameter** (`T extends ...`), so wrap both sides in a one-element tuple to switch it off:
+
+```ts
+type ListOf<T> = T extends unknown ? T[] : never;
+type ListOfWhole<T> = [T] extends [unknown] ? T[] : never;
+
+type A = ListOf<string | number>; // string[] | number[]
+type B = ListOfWhole<string | number>; // (string | number)[]
+
+const mixed: ListOf<string | number> = ["a", 1];
+// ❌ Error: Type '(string | number)[]' is not assignable to type 'string[] | number[]'.
+```
+
+`A` means "a list of strings, or a list of numbers", which is rarely what you meant by "a list of strings and numbers".
+
+The same brackets fix the most famous distribution surprise. `never` is an empty union, so a distributive conditional type over `never` runs zero times and gives back `never`, not `true` or `false`:
+
+```ts
+type IsNever<T> = T extends never ? true : false;
+type Oops = IsNever<never>; // never (!)
+
+type IsNeverFixed<T> = [T] extends [never] ? true : false;
+type Good = IsNeverFixed<never>; // true
+type AlsoGood = IsNeverFixed<string>; // false
+```
+
+<Callout type="tip" title="Ask: per member, or as a whole?">
+
+Every time you write `T extends ...` where `T` might be a union, decide which one you mean. Filtering or mapping each member (`Exclude`, `ToArray`, picking variants of a [discriminated union](/learn/typescript/discriminated-unions)): leave it naked. A yes/no question about the whole type (`IsNever`, "is this exactly `any`?", "are these two types equal?"): wrap it in `[T]`. Getting this wrong is the most common bug in hand-written conditional types, and a type test with a union input catches it.
+
+</Callout>
+
+<Quiz
+  question="Given type Wrap<T> = T extends unknown ? { value: T } : never, what is Wrap<'a' | 'b'>?"
+  options={[
+    "{ value: 'a' | 'b' }",
+    "{ value: 'a' } | { value: 'b' }",
+    "never",
+    "{ value: unknown }",
+  ]}
+  answer={1}
+  explanation="T is a naked type parameter, so the condition is applied to 'a' and to 'b' separately and the results are joined: { value: 'a' } | { value: 'b' }. To get { value: 'a' | 'b' }, write [T] extends [unknown] instead."
+/>
+
+## Pulling types apart with `infer`
+
+So far the conditions only answered yes or no. With **`infer`** a condition can also **capture** part of a type. Inside the `extends` clause, `infer U` declares a new type variable, and TypeScript fills it in by pattern matching:
+
+```ts
+type ElementType<T> = T extends readonly (infer U)[] ? U : never;
+
+type A = ElementType<string[]>; // string
+type B = ElementType<readonly ["a", 1]>; // "a" | 1
+type C = ElementType<number>; // never: not an array
+```
+
+"If `T` is an array of *something*, call that something `U` and give it back." You can only use `infer` in the `extends` part of a conditional type, and the captured variable only exists in the "true" branch. The pattern can be any type shape. Here's how `ReturnType` and `Parameters` are built:
+
+```ts
+type MyReturnType<F> =
+  F extends (...args: never[]) => infer R ? R : never;
+type MyParameters<F> =
+  F extends (...args: infer P) => unknown ? P : never;
+
+function add(a: number, b: number) {
+  return a + b;
+}
+
+type R = MyReturnType<typeof add>; // number
+type P = MyParameters<typeof add>; // [a: number, b: number]
+```
+
+Why `never[]` for the parameters in `MyReturnType`, and not `unknown[]`? Because a function that takes a `string` **can't** be used where a function that accepts `unknown` arguments is expected, so `((x: string) => void) extends ((...args: unknown[]) => unknown)` is false. Every function, though, fits `(...args: never[]) => unknown`. (You'll see `any[]` in TypeScript's own library for the same reason; the type-level programming module explains the rules behind it.)
+
+Tuples are patterns too, with spreads for "the rest":
+
+```ts
+type Tail<T extends readonly unknown[]> =
+  T extends readonly [unknown, ...infer Rest] ? Rest : [];
+type Swap<T> = T extends [infer A, infer B] ? [B, A] : never;
+
+type T1 = Tail<[1, 2, 3]>; // [2, 3]
+type T2 = Swap<[string, number]>; // [number, string]
+```
+
+The everyday use of `infer` is getting at types that nobody exported. A library hands you a client object, but only exports the function that makes it. Instead of copying its shapes by hand (and watching them drift), dig them out:
+
+<CodeExample output={`Mei (pro)
+42`}>
+
+```ts
+// Imagine this comes from a library that exports no types
+function createClient() {
+  return {
+    async getUser(id: string) {
+      return { id, name: "Mei", plan: "pro" as "free" | "pro" };
+    },
+    async listOrders(userId: string) {
+      return [{ id: "o1", userId, total: 42 }];
+    },
+  };
+}
+
+type ReturnOf<F> = F extends (...args: never[]) => infer R ? R : never;
+type Unpromise<T> = T extends Promise<infer V> ? V : T;
+type ItemOf<T> = T extends readonly (infer U)[] ? U : never;
+
+type Client = ReturnOf<typeof createClient>;
+type User = Unpromise<ReturnOf<Client["getUser"]>>;
+type Order = ItemOf<Unpromise<ReturnOf<Client["listOrders"]>>>;
+
+function describeUser(user: User): string {
+  return `${user.name} (${user.plan})`;
+}
+
+function sumOrders(orders: Order[]): number {
+  return orders.reduce((sum, order) => sum + order.total, 0);
+}
+
+const client = createClient();
+const user = await client.getUser("u1");
+const orders = await client.listOrders(user.id);
+console.log(describeUser(user));
+console.log(sumOrders(orders));
+```
+
+</CodeExample>
+
+When the library adds a field to users, `User` gets it automatically. In real code you'd use the built-in `ReturnType` and [`Awaited`](/learn/typescript/typing-promises-and-async); the point is that they're nothing more than this.
+
+<Callout type="note" title="You often don't need infer at all">
+
+If **you** write the generic function, capture the pieces as type parameters directly instead of taking a whole function type and digging into it later. `function logged<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R` needs no `Parameters` or `ReturnType`, gives better error messages, and needs no casts. `infer` shines when the type comes from somewhere else.
+
+</Callout>
+
+<Quiz
+  question="Given type ElementType<T> = T extends readonly (infer U)[] ? U : never, what is ElementType<string[][]>?"
+  options={["string", "string[]", "string[][]", "never"]}
+  answer={1}
+  explanation="string[][] is an array whose elements are string[], so U is string[]. The pattern matches one level only. To get all the way down to string, the type has to call itself: that's recursion, coming next."
+/>
+
+## Recursive conditional types
+
+A conditional type may refer to **itself** in one of its branches. That's how you deal with structures of any depth. Promises are the classic case. At runtime, a promise that resolves to another promise is flattened: `await` always gives you the final value. A type that unwraps one level gets that wrong; a recursive one gets it right:
+
+<CodeExample output="5 number">
+
+```ts
+type OneLevel<T> = T extends Promise<infer V> ? V : T;
+type Unwrap<T> = T extends Promise<infer V> ? Unwrap<V> : T;
+
+function later<T>(value: T): Promise<T> {
+  return new Promise((resolve) => {
+    setTimeout(() => resolve(value), 10);
+  });
+}
+
+const nested = later(later(5)); // Promise<Promise<number>>
+
+type Shallow = OneLevel<typeof nested>; // Promise<number>: wrong
+type Deep = Unwrap<typeof nested>; // number: right
+
+const value: Deep = await nested;
+console.log(value, typeof value);
+```
+
+</CodeExample>
+
+With `OneLevel`, TypeScript would insist that `value` is a `Promise<number>` and complain when you used it as a number, while the program happily printed `5`. The built-in `Awaited<T>` is `Unwrap` plus some care for `null`, `undefined` and "thenable" objects that aren't real promises.
+
+Recursion needs an **exit**: a branch that doesn't call the type again (here, `: T`). Without one, or with an input too deep, TypeScript gives up rather than freezing your editor:
+
+```ts
+type Forever<T> = T extends unknown ? Forever<[T]> : never;
+// ❌ Error: Type instantiation is excessively deep and possibly infinite.
+```
+
+The limits are generous but real. When the recursive call is the **whole** result of a branch (like `Unwrap<V>` above, called **tail recursion**), TypeScript can go about 1,000 levels deep. When the result is built around the recursive call (like `[0, ...Repeat<N>]`), the limit is about 50. Data types rarely get that deep, but type-level "loops" that count (building a tuple of length 100, parsing a long string character by character) hit these limits quickly, and every level costs compile time in every file that uses the type.
+
+## When conditional types get unreadable
+
+Now the senior part: **should** you write these types? Here's a version of `readParam` with **overloads** instead of a conditional type:
+
+<CodeExample output="4 true">
+
+```ts
+type ParamKind = "string" | "number" | "boolean";
+
+function readParam(raw: string, kind: "number"): number;
+function readParam(raw: string, kind: "boolean"): boolean;
+function readParam(raw: string, kind: "string"): string;
+function readParam(
+  raw: string,
+  kind: ParamKind,
+): string | number | boolean {
+  if (kind === "number") return Number(raw);
+  if (kind === "boolean") return raw === "true";
+  return raw;
+}
+
+const page = readParam("3", "number"); // number
+const debug = readParam("true", "boolean"); // boolean
+console.log(page + 1, debug);
+```
+
+</CodeExample>
+
+No casts, and anyone can read it. The trade-off shows up when the argument is itself a union. The conditional version distributes (`readParam(raw, kind)` with `kind: "number" | "boolean"` returns `number | boolean`); overloads are tried one at a time and none of them fits:
+
+```ts
+function fromForm(raw: string, kind: "number" | "boolean") {
+  return readParam(raw, kind);
+  // ❌ Error: No overload matches this call.
+}
+```
+
+And the casts in the conditional version are a real cost. TypeScript **can't check** a function body against a conditional return type, so without `as` you get:
+
+```ts
+function readParam<K extends ParamKind>(
+  raw: string,
+  kind: K,
+): ParamValue<K> {
+  if (kind === "number") return Number(raw);
+  // ❌ Error: Type 'number' is not assignable to type 'ParamValue<K>'.
+  ...
+}
+```
+
+With the casts, nothing stops you from returning a number in the `"boolean"` branch. The types promise more than the code proves, so only tests protect that function.
+
+A team I worked with had a 60-line conditional type that computed API response shapes from request options. It was clever and mostly right. But error messages ran to 30 lines, editor hovers showed the unexpanded formula instead of a shape, and only its author dared to change it. When she left, the team replaced it with four named response types and a few overloads in an afternoon, and nobody missed it.
+
+My rules of thumb:
+
+- **Library or app?** A type that powers hundreds of call sites (a router, a form library, an SDK) can be complex, because its users never read it. A type used in two places should be boring.
+- **A few fixed cases?** Prefer overloads or plain named types. Reach for a conditional type when the cases follow a **rule** (any union, any array, any function) or when union arguments matter.
+- **Can you capture it instead?** Separate type parameters (`<A, R>`) beat `infer`ring from a whole function type.
+- **Name the steps.** `User = Unpromise<ReturnOf<Client["getUser"]>>` reads like a sentence. One 15-line nested ternary doesn't.
+- **Every clever type gets type tests**, including unions, `never` and empty tuples. They are its documentation and its safety net.
+- **Check the error messages.** Call it wrongly on purpose and read what TypeScript says. If a junior colleague can't act on that message, simplify.
+
+<Callout type="warning" title="Types that lie are worse than loose types">
+
+A cast inside a conditional-typed function is a promise the compiler can't verify. Keep such functions tiny, keep the cast in one place (`return result as ParamValue<K>`), and cover them with runtime tests **and** type tests. A wide return type that's honest (`string | number | boolean`) is better than a precise one that's sometimes wrong.
+
+</Callout>
+
+<Exercise
+  title="Typed list helpers"
+  language="typescript"
+  starter={`type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+// The first element of a list: for a tuple with at least one
+// element, that element's type; otherwise the element type
+// | undefined (and just undefined for an empty tuple)
+type First<T extends readonly unknown[]> = unknown;
+
+// The same for the last element
+type Last<T extends readonly unknown[]> = unknown;
+
+// What's left after flattening nested arrays all the way down:
+// number[][][] -> number, (string | number[])[] -> string | number
+type DeepItem<T> = unknown;
+
+function first<T extends readonly unknown[]>(items: T): First<T> {
+  throw new Error("Not written yet");
+}
+
+function last<T extends readonly unknown[]>(items: T): Last<T> {
+  throw new Error("Not written yet");
+}
+
+// A new array with every nested item, in order, at any depth.
+// Don't change the input.
+function flattenDeep<T>(items: readonly T[]): DeepItem<T>[] {
+  throw new Error("Not written yet");
+}
+
+// ===== Type tests: don't change these =====
+type _tests = [
+  Expect<Equal<First<[1, 2, 3]>, 1>>,
+  Expect<Equal<First<readonly ["a", "b"]>, "a">>,
+  Expect<Equal<First<string[]>, string | undefined>>,
+  Expect<Equal<First<[]>, undefined>>,
+  Expect<Equal<Last<[1, 2, 3]>, 3>>,
+  Expect<Equal<Last<readonly [boolean, string]>, string>>,
+  Expect<Equal<Last<number[]>, number | undefined>>,
+  Expect<Equal<DeepItem<number[][][]>, number>>,
+  Expect<Equal<DeepItem<(string | number[])[]>, string | number>>,
+  Expect<Equal<DeepItem<boolean>, boolean>>,
+];
+
+function typeTests(scores: number[]) {
+  const best: number = first([9, 7] as const);
+  // @ts-expect-error: an array might be empty
+  const top: number = first(scores);
+  const all: number[] = flattenDeep([1, [2, [3]]]);
+  // @ts-expect-error: the items are numbers, not strings
+  const words: string[] = flattenDeep([[1], [2]]);
+}
+
+// ===== Try it =====
+const podium = ["Mei", "Sam", "Ana"] as const;
+const winner = first(podium); // "Mei"
+console.log(\`Gold: \${winner}, bronze: \${last(podium)}\`);
+
+const scores: number[] = [];
+console.log(first(scores) ?? "no scores yet");
+
+const grid = [[1, 2], [3, [4, [5]]]];
+const cells = flattenDeep(grid); // number[]
+console.log(cells, cells.reduce((a, b) => a + b, 0));
+`}
+  tests={[
+    { name: "first returns the first item", check: "first([5, 6]) === 5 && first(['x']) === 'x'" },
+    { name: "last returns the last item", check: "last([1, 2, 3]) === 3 && last(['a']) === 'a'" },
+    { name: "first and last of an empty list are undefined", check: "first([]) === undefined && last([]) === undefined" },
+    { name: "flattenDeep flattens any depth, in order", check: "flattenDeep([1, [2, [3, [4, [5]]]]]).join() === '1,2,3,4,5' && flattenDeep(['a', ['b'], []]).join() === 'a,b'" },
+    { name: "flattenDeep doesn't change its input", check: "(() => { const input = [[1], [2, [3]]]; const out = flattenDeep(input); return out.join() === '1,2,3' && input[1].length === 2 && Array.isArray(input[1][1]) && flattenDeep([]).length === 0; })()" },
+  ]}
+>
+
+Write three small list helpers whose types are as precise as the values allow: `first`, `last` and `flattenDeep`. The behaviour is the easy part; the types are the real task.
+
+**Types.** Replace each `unknown` with a conditional type:
+
+- `First<T>`: for a tuple with at least one element, the type of that element (`First<[1, 2, 3]>` is `1`). For anything else, the element type `| undefined`, because an array might be empty (`First<string[]>` is `string | undefined`, `First<[]>` is `undefined`).
+- `Last<T>`: the same for the last element.
+- `DeepItem<T>`: unwrap arrays recursively until you reach something that isn't an array. It must distribute over unions: `DeepItem<(string | number[])[]>` is `string | number`.
+
+The `Expect<Equal<...>>` lines and the `// @ts-expect-error` lines are type tests: the first kind compiles only when your type is exactly right, the second only when the line below **is** an error. The starter fails them all, so it won't run until your types are right.
+
+**Behaviour.** Then make the functions work: `first` and `last` return the first and last item (or `undefined` for an empty list), and `flattenDeep` returns a **new** array with every nested item in order, at any depth.
+
+<Hint>
+
+**Types:** match a tuple pattern first, then fall back to "any array". For `First`: `T extends readonly [infer F, ...unknown[]] ? F : T extends readonly (infer U)[] ? U | undefined : never`. `Last` is the same with the spread at the front: `readonly [...unknown[], infer L]`. Don't forget `readonly`, or `as const` tuples won't match. `DeepItem` calls itself: `T extends readonly (infer U)[] ? DeepItem<U> : T`.
+
+**Behaviour:** `items[0]` and `items[items.length - 1]` are `undefined` for an empty array. TypeScript can't check them against a conditional return type, so cast once: `return items[0] as First<T>;`. For `flattenDeep`, collect into a `const result: unknown[] = []`, loop over the items, and when `Array.isArray(item)`, push the items of `flattenDeep(item)` (spread them); otherwise push the item. Finish with `return result as DeepItem<T>[];`.
+
+</Hint>
+
+<Solution>
+
+```ts
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type First<T extends readonly unknown[]> =
+  T extends readonly [infer F, ...unknown[]]
+    ? F
+    : T extends readonly (infer U)[]
+      ? U | undefined
+      : never;
+
+type Last<T extends readonly unknown[]> =
+  T extends readonly [...unknown[], infer L]
+    ? L
+    : T extends readonly (infer U)[]
+      ? U | undefined
+      : never;
+
+type DeepItem<T> = T extends readonly (infer U)[] ? DeepItem<U> : T;
+
+function first<T extends readonly unknown[]>(items: T): First<T> {
+  return items[0] as First<T>;
+}
+
+function last<T extends readonly unknown[]>(items: T): Last<T> {
+  return items[items.length - 1] as Last<T>;
+}
+
+function flattenDeep<T>(items: readonly T[]): DeepItem<T>[] {
+  const result: unknown[] = [];
+  for (const item of items) {
+    if (Array.isArray(item)) {
+      result.push(...flattenDeep(item));
+    } else {
+      result.push(item);
+    }
+  }
+  return result as DeepItem<T>[];
+}
+
+// ===== Type tests: don't change these =====
+type _tests = [
+  Expect<Equal<First<[1, 2, 3]>, 1>>,
+  Expect<Equal<First<readonly ["a", "b"]>, "a">>,
+  Expect<Equal<First<string[]>, string | undefined>>,
+  Expect<Equal<First<[]>, undefined>>,
+  Expect<Equal<Last<[1, 2, 3]>, 3>>,
+  Expect<Equal<Last<readonly [boolean, string]>, string>>,
+  Expect<Equal<Last<number[]>, number | undefined>>,
+  Expect<Equal<DeepItem<number[][][]>, number>>,
+  Expect<Equal<DeepItem<(string | number[])[]>, string | number>>,
+  Expect<Equal<DeepItem<boolean>, boolean>>,
+];
+
+function typeTests(scores: number[]) {
+  const best: number = first([9, 7] as const);
+  // @ts-expect-error: an array might be empty
+  const top: number = first(scores);
+  const all: number[] = flattenDeep([1, [2, [3]]]);
+  // @ts-expect-error: the items are numbers, not strings
+  const words: string[] = flattenDeep([[1], [2]]);
+}
+
+// ===== Try it =====
+const podium = ["Mei", "Sam", "Ana"] as const;
+const winner = first(podium); // "Mei"
+console.log(`Gold: ${winner}, bronze: ${last(podium)}`);
+
+const scores: number[] = [];
+console.log(first(scores) ?? "no scores yet");
+
+const grid = [[1, 2], [3, [4, [5]]]];
+const cells = flattenDeep(grid); // number[]
+console.log(cells, cells.reduce((a, b) => a + b, 0));
+// Gold: Mei, bronze: Ana
+// no scores yet
+// [ 1, 2, 3, 4, 5 ] 15
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **conditional type** `T extends U ? X : Y` picks a type based on whether `T` fits `U`. Use it when an output type depends on an input type.
+- **Type tests** (`Expect<Equal<A, B>>`, `// @ts-expect-error`) prove what a type does and keep it working.
+- With a **naked type parameter**, conditional types **distribute** over unions: one result per member, and `never` members vanish. That's how `Exclude` and `Extract` filter. Wrap in `[T]` to treat a union (or `never`) as a whole.
+- **`infer`** captures part of a type by pattern matching: array elements, return types, parameters, tuple heads and tails, promise values. It's how you get at types nobody exported.
+- Conditional types can be **recursive** (`Unwrap`, `DeepItem`), with an exit branch and depth limits (about 1,000 levels for tail recursion, about 50 otherwise).
+- TypeScript can't check function bodies against conditional return types, so they need casts. Prefer **overloads** or plain named types for a few fixed cases, keep clever types for rules that many call sites benefit from, and give every clever type tests and readable error messages.

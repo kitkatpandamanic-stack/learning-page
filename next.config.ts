@@ -2,7 +2,10 @@ import type { NextConfig } from "next";
 import { withSentryConfig } from "@sentry/nextjs/config";
 import createNextIntlPlugin from "next-intl/plugin";
 
-import { reactVendorName } from "./scripts/vendor-name.mjs";
+import {
+  reactTypesVendorName,
+  reactVendorName,
+} from "./scripts/vendor-name.mjs";
 
 // Translations: messages are loaded by src/i18n/request.ts.
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
@@ -48,7 +51,11 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
-  env: { NEXT_PUBLIC_REACT_VENDOR: reactVendor },
+  env: {
+    NEXT_PUBLIC_REACT_VENDOR: reactVendor,
+    // React's types, for type-checking TSX lessons (see build-vendor.mjs)
+    NEXT_PUBLIC_REACT_TYPES: `/vendor/${reactTypesVendorName}`,
+  },
   async headers() {
     return [
       { source: "/:path*", headers: securityHeaders },
