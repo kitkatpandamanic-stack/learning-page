@@ -1,8 +1,16 @@
-import { transform } from "sucrase";
+import { transform, type Transform } from "sucrase";
 
+import { createExpressModule, createSupertestModule } from "./express-shim";
+import { createFakeApi, createFetch, type RequestLogEntry } from "./fake-api";
 import { formatArgs } from "./format";
+import {
+  createVitest,
+  type TimerFunctions,
+  type VitestSummary,
+} from "./vitest-shim";
 
-export type RunLanguage = "javascript" | "typescript" | "python";
+/** "react" is JavaScript with JSX, run in the live preview with React loaded. */
+export type RunLanguage = "javascript" | "typescript" | "python" | "react";
 export type LogLevel = "log" | "info" | "warn" | "error";
 export type OutputLine = {
   level: LogLevel;
@@ -21,6 +29,17 @@ export type ExecuteResult = {
   output: OutputLine[];
   error?: RunError;
   tests?: TestResult[];
+  /** When the code defined Vitest tests: how they went */
+  vitest?: VitestSummary;
+};
+
+/** Code with import/export statements needs turning into require() calls. */
+const MODULE_SYNTAX = /^\s*(import\s*[\w{*'"]|export\s)/m;
+
+/** What `import … from "name"` can load in the editor. */
+const MODULES: Record<string, () => unknown> = {
+  express: createExpressModule,
+  supertest: createSupertestModule,
 };
 
 export const MAX_OUTPUT_LINES = 500;
@@ -108,13 +127,12 @@ export async function execute(
 
   let code: string;
   try {
-    code =
-      language === "typescript"
-        ? transform(source, {
-            transforms: ["typescript"],
-            disableESTransforms: true,
-          }).code
-        : source;
+    const transforms: Transform[] = [];
+    if (language === "typescript") transforms.push("typescript");
+    if (MODULE_SYNTAX.test(source)) transforms.push("imports");
+    code = transforms.length
+      ? transform(source, { transforms, disableESTransforms: true }).code
+      : source;
   } catch (error) {
     return {
       output,
@@ -147,7 +165,7 @@ export async function execute(
     }
   };
 
-  const timers = {
+  const tracked = {
     setTimeout: (
       fn: (...args: unknown[]) => unknown,
       ms?: number,
@@ -185,6 +203,91 @@ export async function execute(
       }
     },
   };
+  // vi.useFakeTimers() swaps the learner's timer functions for fake ones.
+  let fakeTimers: TimerFunctions | null = null;
+  const timers = {
+    setTimeout: (
+      fn: (...args: unknown[]) => unknown,
+      ms?: number,
+      ...args: unknown[]
+    ) =>
+      fakeTimers
+        ? fakeTimers.setTimeout(fn, ms, ...args)
+        : tracked.setTimeout(fn, ms, ...args),
+    clearTimeout: (id: ReturnType<typeof setTimeout>) =>
+      fakeTimers ? fakeTimers.clearTimeout(id) : tracked.clearTimeout(id),
+    setInterval: (
+      fn: (...args: unknown[]) => unknown,
+      ms?: number,
+      ...args: unknown[]
+    ) =>
+      fakeTimers
+        ? fakeTimers.setInterval(fn, ms, ...args)
+        : tracked.setInterval(fn, ms, ...args),
+    clearInterval: (id: ReturnType<typeof setInterval>) =>
+      fakeTimers ? fakeTimers.clearInterval(id) : tracked.clearInterval(id),
+  };
+
+  // fetch() answers https://api.pandadev.test itself; its delays always use
+  // real (tracked) timers so the run waits for them.
+  const requests: RequestLogEntry[] = [];
+  const fetch = createFetch(
+    createFakeApi(),
+    (ms, signal) =>
+      new Promise<void>((resolve, reject) => {
+        const id = tracked.setTimeout(() => resolve(), ms);
+        signal?.addEventListener("abort", () => {
+          tracked.clearTimeout(id);
+          reject(signal.reason);
+        });
+      }),
+    requests,
+  );
+
+  const vitest = createVitest({
+    print: (level, text) => push(level, [text]),
+    setTimers: (fake) => {
+      fakeTimers = fake;
+    },
+  });
+  const vitestSummary: VitestSummary = {
+    total: 0,
+    passed: 0,
+    failed: 0,
+    skipped: 0,
+    tests: [],
+  };
+  const require = (name: string) => {
+    if (name === "vitest") return vitest.module;
+    const make = MODULES[name];
+    if (!make) {
+      throw new Error(
+        `Cannot find module '${name}'. The editor can import: vitest, ${Object.keys(MODULES).join(", ")}.`,
+      );
+    }
+    return make();
+  };
+  /** For checks: runs the code again with some text replaced (e.g. a bug the learner's tests should catch) and returns the test results. */
+  const retest = async (replacements: [string, string][]) => {
+    let changed = source;
+    for (const [from, to] of replacements) {
+      if (!changed.includes(from)) {
+        throw new Error(`Couldn't find ${JSON.stringify(from)} in the code`);
+      }
+      changed = changed.replace(from, to);
+    }
+    const again = await execute(changed, { language });
+    return (
+      again.vitest ?? {
+        ...vitestSummary,
+        total: 0,
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        tests: [],
+      }
+    );
+  };
 
   const params = [
     "console",
@@ -192,9 +295,15 @@ export async function execute(
     "clearTimeout",
     "setInterval",
     "clearInterval",
+    "fetch",
+    "require",
+    "exports",
     "__output",
+    "__vitest",
+    "__retest",
+    "__requests",
   ];
-  const testThunks = tests.map((t) => `() => (${t.check})`).join(",\n");
+  const testThunks = tests.map((t) => `async () => (${t.check})`).join(",\n");
   const body = `"use strict";${code}\n;return [${testThunks}];`;
 
   let thunks: (() => unknown)[] = [];
@@ -207,7 +316,13 @@ export async function execute(
       timers.clearTimeout,
       timers.setInterval,
       timers.clearInterval,
+      fetch,
+      require,
+      {},
       texts,
+      vitestSummary,
+      retest,
+      requests,
     );
     // A top-level `return` in the learner's code skips our list of tests.
     thunks = Array.isArray(returned) ? (returned as (() => unknown)[]) : [];
@@ -217,15 +332,27 @@ export async function execute(
   }
 
   // Let promise callbacks and timers finish.
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  if (pending > 0) {
-    await new Promise<void>((resolve) => {
-      notifyIdle = resolve;
-    });
-  }
+  const idle = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (pending > 0) {
+      await new Promise<void>((resolve) => {
+        notifyIdle = resolve;
+      });
+    }
+  };
+  await idle();
+  vitest.cleanup();
   error ??= asyncError;
 
-  if (tests.length === 0) return { output, error };
+  // Like `vitest run`: tests defined with it()/test() run once the code has.
+  let summary: VitestSummary | undefined;
+  if (!error && vitest.hasTests()) {
+    summary = await vitest.run();
+    Object.assign(vitestSummary, summary);
+    await idle();
+  }
+
+  if (tests.length === 0) return { output, error, vitest: summary };
 
   const results: TestResult[] = [];
   for (const [i, test] of tests.entries()) {
@@ -250,7 +377,7 @@ export async function execute(
       });
     }
   }
-  return { output, error, tests: results };
+  return { output, error, tests: results, vitest: summary };
 }
 
 /** Compares printed output with what the exercise expects (ignoring trailing spaces and blank lines). */

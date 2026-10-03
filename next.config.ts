@@ -1,3 +1,5 @@
+import { createRequire } from "node:module";
+
 import type { NextConfig } from "next";
 import { PHASE_DEVELOPMENT_SERVER } from "next/constants";
 import { withSentryConfig } from "@sentry/nextjs/config";
@@ -6,7 +8,13 @@ import createNextIntlPlugin from "next-intl/plugin";
 // Translations: messages are loaded by src/i18n/request.ts.
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
-const nextConfig: NextConfig = {};
+// React for the code editor's preview pages (built by scripts/build-vendor.mjs
+// from node_modules/react, which isn't the React copy Next.js runs on).
+const reactVendor = `/vendor/react-${createRequire(import.meta.url)("react/package.json").version}.js`;
+
+const nextConfig: NextConfig = {
+  env: { NEXT_PUBLIC_REACT_VENDOR: reactVendor },
+};
 
 async function config(phase: string): Promise<NextConfig> {
   // In dev, run Velite in watch mode alongside Next so content edits show up live.

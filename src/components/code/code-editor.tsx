@@ -102,7 +102,10 @@ export function CodeEditor({
       language === "python"
         ? // Python style (PEP 8) and all our lessons use 4-space indents.
           [python(), indentUnit.of("    ")]
-        : javascript({ typescript: language === "typescript" }),
+        : javascript({
+            typescript: language === "typescript",
+            jsx: language === "react",
+          }),
       glassTheme,
       EditorView.contentAttributes.of({ "aria-label": label }),
     ],

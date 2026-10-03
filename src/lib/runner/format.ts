@@ -86,7 +86,51 @@ function inspect(value: unknown, depth: number, seen: Set<unknown>): string {
   }
 }
 
-/** Formats console.log arguments: strings print raw, everything else is inspected. */
+/**
+ * Formats console.log arguments: strings print raw, everything else is
+ * inspected. Like Node, a first string argument can hold placeholders
+ * (`%s`, `%d`, `%i`, `%f`, `%j`, `%o`, `%O`, `%c`, `%%`), which React's
+ * warnings use.
+ */
 export function formatArgs(args: unknown[]): string {
-  return args.map((arg) => inspect(arg, 0, new Set())).join(" ");
+  let rest = args;
+  let head = "";
+  if (typeof args[0] === "string" && args[0].includes("%")) {
+    let next = 1;
+    head = args[0].replace(/%([sdifjoOc%])/g, (match, type: string) => {
+      if (type === "%") return "%";
+      if (next >= args.length) return match;
+      const value = args[next++];
+      switch (type) {
+        case "s":
+          return typeof value === "string"
+            ? value
+            : typeof value === "object" && value !== null
+              ? inspect(value, 1, new Set())
+              : inspect(value, 0, new Set());
+        case "d":
+        case "i": {
+          if (typeof value === "object" && value !== null) return "NaN";
+          const n = Number(value);
+          return inspect(type === "i" ? Math.trunc(n) : n, 0, new Set());
+        }
+        case "f":
+          return inspect(Number.parseFloat(String(value)), 0, new Set());
+        case "j":
+          try {
+            return JSON.stringify(value) ?? "undefined";
+          } catch {
+            return "[Circular]";
+          }
+        case "c":
+          return "";
+        default:
+          return inspect(value, 1, new Set());
+      }
+    });
+    rest = args.slice(next);
+    if (rest.length === 0) return head;
+  }
+  const tail = rest.map((arg) => inspect(arg, 0, new Set())).join(" ");
+  return args === rest ? tail : `${head} ${tail}`;
 }

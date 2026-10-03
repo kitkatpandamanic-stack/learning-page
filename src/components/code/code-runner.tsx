@@ -26,6 +26,7 @@ import {
   type RunLanguage,
   type TestSpec,
 } from "@/lib/runner/execute";
+import { REACT_HTML } from "@/lib/runner/dom-harness";
 import { runCode, type RunResult, type RunStatus } from "@/lib/runner/run-code";
 import { runDom, type DomRun } from "@/lib/runner/run-dom";
 import { isPythonReady, preloadPython } from "@/lib/runner/run-python";
@@ -38,6 +39,7 @@ const languageLabel: Record<RunLanguage, string> = {
   javascript: "JavaScript",
   typescript: "TypeScript",
   python: "Python",
+  react: "React",
 };
 
 const lineStyle: Record<OutputLine["level"], string> = {
@@ -80,7 +82,7 @@ export function CodeRunner({
   storageId,
   minHeight,
   activityId,
-  html,
+  html: page,
   autoRun = false,
 }: {
   starter: string;
@@ -98,6 +100,9 @@ export function CodeRunner({
   /** Preview only: run the code as soon as the editor appears (demos) */
   autoRun?: boolean;
 }) {
+  // React code always runs in the preview, on an empty page by default.
+  const react = language === "react";
+  const html = page ?? (react ? REACT_HTML : undefined);
   const pathname = usePathname();
   const locale = useLocale();
   const t = useTranslations("runner");
@@ -165,6 +170,7 @@ export function CodeRunner({
         : undefined,
       storage: readPageStorage(),
       onStorage: savePageStorage,
+      react,
     });
     previewRun.current = preview;
     return () => preview.dispose();
@@ -259,10 +265,13 @@ export function CodeRunner({
       onLine: (line) => setLines((prev) => [...prev, line]),
       storage: readPageStorage(),
       onStorage: savePageStorage,
+      react,
     });
     previewRun.current = visible;
     const hidden =
-      withChecks && canCheck ? runDom(code, { html: page, tests }) : null;
+      withChecks && canCheck
+        ? runDom(code, { html: page, tests, react })
+        : null;
     cancelRef.current = () => {
       visible.cancel();
       hidden?.cancel();

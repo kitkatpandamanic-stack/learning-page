@@ -14,6 +14,7 @@ import {
   type RunLanguage,
   type TestSpec,
 } from "@/lib/runner/execute";
+import { REACT_HTML } from "@/lib/runner/dom-harness";
 import { executePython } from "@/lib/runner/execute-python";
 import { typeErrorResult } from "@/lib/runner/typecheck";
 
@@ -119,7 +120,9 @@ function exercisesIn(file: string): Exercise[] {
     if (typeof attrs.starter !== "string") return [];
     const body = block.slice(0, block.indexOf("</Exercise>"));
     const solution =
-      /<Solution>\s*```(?:js|ts|python)[^\n]*\n([\s\S]*?)```/.exec(body)?.[1];
+      /<Solution>\s*```(?:js|jsx|ts|python)[^\n]*\n([\s\S]*?)```/.exec(
+        body,
+      )?.[1];
     return [
       {
         file: file.slice(ROOT.length + 1),
@@ -137,9 +140,13 @@ function exercisesIn(file: string): Exercise[] {
 
 async function solves(code: string, ex: Exercise) {
   const result =
-    ex.html !== undefined
-      ? await runDomInNode(code, ex.html, ex.tests)
-      : await run(code, ex.language, ex.tests);
+    ex.language === "react"
+      ? await runDomInNode(code, ex.html ?? REACT_HTML, ex.tests, undefined, {
+          react: true,
+        })
+      : ex.html !== undefined
+        ? await runDomInNode(code, ex.html, ex.tests)
+        : await run(code, ex.language, ex.tests);
   const output =
     ex.expectedOutput !== undefined
       ? compareOutput(result.output, ex.expectedOutput)
@@ -251,9 +258,13 @@ describe("TryIt live previews", () => {
     async (_name, b) => {
       expect(typeof b.code, "TryIt needs code").toBe("string");
       const result =
-        b.html !== undefined
-          ? await runDomInNode(b.code, b.html)
-          : await run(b.code, b.language);
+        b.language === "react"
+          ? await runDomInNode(b.code, b.html ?? REACT_HTML, [], undefined, {
+              react: true,
+            })
+          : b.html !== undefined
+            ? await runDomInNode(b.code, b.html)
+            : await run(b.code, b.language);
       expect(result.error, JSON.stringify(result.output)).toBeUndefined();
     },
     PACKAGE_TIMEOUT_MS,

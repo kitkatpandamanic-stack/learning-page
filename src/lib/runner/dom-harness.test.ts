@@ -62,6 +62,32 @@ describe("preview harness", () => {
     }
   });
 
+  it("fills %s-style placeholders like the worker runner", () => {
+    const argLists = [
+      '"%s is %d years", "Mei", 3',
+      '"%s and %s", "one"',
+      '"%i%% done", 42.9',
+      '"%o", { a: [1, "x"] }',
+      '"%s", { a: 1 }',
+      '"%c styled", "color: red"',
+      '"%j", { a: 1 }',
+      '"%d", {}',
+      '"no placeholders", 1, "two"',
+      '"%s!", "hi", "extra", 3',
+    ];
+    const window = openPreview("").window as unknown as {
+      eval(code: string): unknown;
+    };
+    for (const args of argLists) {
+      const inPage = window.eval(`__pandaFormat([${args}])`);
+      const inWorker = formatArgs((0, eval)(`[${args}]`));
+      expect(inPage, args).toBe(inWorker);
+    }
+    expect(formatArgs(["%s is %d years", "Mei", 3])).toBe("Mei is 3 years");
+    expect(formatArgs(["%s!", "hi", "extra", 3])).toBe("hi! extra 3");
+    expect(formatArgs(["%s and %s", "one"])).toBe("one and %s");
+  });
+
   it("formats elements and node lists", async () => {
     const r = await runDomInNode(
       'console.log(document.querySelector("#add"), document.querySelectorAll("p"));',
@@ -138,5 +164,111 @@ describe("preview harness", () => {
 
     await runDomInNode("localStorage.clear();", html, [], storage);
     expect(storage).toEqual({});
+  });
+});
+
+describe("React and fetch in the preview", () => {
+  const root = '<div id="root"></div>';
+
+  it("renders JSX with state, and checks can click and wait", async () => {
+    const code = [
+      'import { useState } from "react";',
+      'import { createRoot } from "react-dom/client";',
+      "function Counter() {",
+      "  const [count, setCount] = useState(0);",
+      "  return <button onClick={() => setCount(count + 1)}>Clicked {count} times</button>;",
+      "}",
+      'createRoot(document.getElementById("root")).render(<Counter />);',
+    ].join("\n");
+    const r = await runDomInNode(
+      code,
+      root,
+      [
+        {
+          name: "renders",
+          check:
+            "document.querySelector('button').textContent === 'Clicked 0 times'",
+        },
+        {
+          name: "clicks",
+          check:
+            "(await __click('button'), await __click('button'), document.querySelector('button').textContent === 'Clicked 2 times')",
+        },
+      ],
+      undefined,
+      { react: true },
+    );
+    expect(r.error).toBeUndefined();
+    expect(r.tests?.map((t) => t.passed)).toEqual([true, true]);
+  });
+
+  it("lets checks type into controlled inputs", async () => {
+    const code = [
+      "function Greeter() {",
+      '  const [name, setName] = React.useState("");',
+      "  return (",
+      "    <>",
+      "      <input value={name} onChange={(e) => setName(e.target.value)} />",
+      "      <p>Hello, {name || 'stranger'}!</p>",
+      "    </>",
+      "  );",
+      "}",
+      'ReactDOM.createRoot(document.getElementById("root")).render(<Greeter />);',
+    ].join("\n");
+    const r = await runDomInNode(
+      code,
+      root,
+      [
+        {
+          name: "types",
+          check:
+            "(await __type('input', 'Mei'), document.querySelector('p').textContent === 'Hello, Mei!')",
+        },
+      ],
+      undefined,
+      { react: true },
+    );
+    expect(r.tests?.[0].passed).toBe(true);
+  });
+
+  it("shows React's warnings, like a missing key", async () => {
+    const code = [
+      "const items = ['a', 'b'];",
+      "function List() { return <ul>{items.map((i) => <li>{i}</li>)}</ul>; }",
+      'ReactDOM.createRoot(document.getElementById("root")).render(<List />);',
+    ].join("\n");
+    const r = await runDomInNode(code, root, [], undefined, { react: true });
+    expect(r.output.map((l) => l.text).join("\n")).toMatch(/unique "key" prop/);
+  });
+
+  it("reports JSX syntax errors on the right line", async () => {
+    const r = await runDomInNode(
+      "const a = 1;\nconst el = <div>;\n",
+      root,
+      [],
+      undefined,
+      { react: true },
+    );
+    expect(r.error).toMatchObject({ name: "SyntaxError", line: 2 });
+  });
+
+  it("answers fetch from the practice API and waits for it before checks", async () => {
+    const code = [
+      "fetch('https://api.pandadev.test/movies?search=bamboo')",
+      "  .then((res) => res.json())",
+      "  .then((data) => {",
+      "    document.querySelector('#out').textContent = data.results.map((m) => m.title).join(', ');",
+      "  });",
+    ].join("\n");
+    const r = await runDomInNode(code, '<p id="out"></p>', [
+      {
+        name: "shows movies",
+        check:
+          "document.querySelector('#out').textContent === 'The Bamboo Heist, The Great Bamboo Race'",
+      },
+      { name: "logged", check: "__requests.length === 1" },
+    ]);
+    expect(r.error).toBeUndefined();
+    expect(r.tests?.map((t) => t.passed)).toEqual([true, true]);
   });
 });

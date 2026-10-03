@@ -15,6 +15,8 @@ const eslintConfig = defineConfig([
     "build/**",
     "next-env.d.ts",
     ".velite/**",
+    // Generated: React for the editor's preview (scripts/build-vendor.mjs).
+    "public/vendor/**",
   ]),
 ]);
 

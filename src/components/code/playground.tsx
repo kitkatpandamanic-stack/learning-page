@@ -72,6 +72,37 @@ function levelUp(learner: Learner): Learner {
 
 console.log(levelUp(panda));
 `,
+    react: ru
+      ? `// Песочница React: компонент сразу появляется в окне предпросмотра ниже.
+import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+function Counter() {
+  const [count, setCount] = useState(0);
+  return (
+    <button onClick={() => setCount(count + 1)}>
+      🐼 Нажато {count} раз
+    </button>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<Counter />);
+`
+      : `// React playground: your component appears in the preview below.
+import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+function Counter() {
+  const [count, setCount] = useState(0);
+  return (
+    <button onClick={() => setCount(count + 1)}>
+      🐼 Clicked {count} times
+    </button>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<Counter />);
+`,
   };
 }
 
@@ -87,27 +118,30 @@ export function Playground() {
         aria-label={t("language")}
         className="inline-flex self-start rounded-full p-1 glass"
       >
-        {(["javascript", "python", "typescript"] as const).map((lang) => (
-          <button
-            key={lang}
-            type="button"
-            aria-pressed={language === lang}
-            onClick={() => setLanguage(lang)}
-            className={cn(
-              "rounded-full px-4 py-1.5 text-sm font-medium text-white/70 transition hover:text-white",
-              language === lang &&
-                "bg-gradient-brand text-white shadow-glow-violet",
-            )}
-          >
-            {
+        {(["javascript", "python", "typescript", "react"] as const).map(
+          (lang) => (
+            <button
+              key={lang}
+              type="button"
+              aria-pressed={language === lang}
+              onClick={() => setLanguage(lang)}
+              className={cn(
+                "rounded-full px-4 py-1.5 text-sm font-medium text-white/70 transition hover:text-white",
+                language === lang &&
+                  "bg-gradient-brand text-white shadow-glow-violet",
+              )}
+            >
               {
-                javascript: "JavaScript",
-                python: "Python",
-                typescript: "TypeScript",
-              }[lang]
-            }
-          </button>
-        ))}
+                {
+                  javascript: "JavaScript",
+                  python: "Python",
+                  typescript: "TypeScript",
+                  react: "React",
+                }[lang]
+              }
+            </button>
+          ),
+        )}
       </div>
       {/* Remount per language so each keeps its own saved code */}
       <LazyCodeRunner

@@ -37,6 +37,7 @@ const rules: [RegExp, (t: T, m: RegExpExecArray) => string][] = [
     (t, m) => t("pythonFailed", { error: m[1] }),
   ],
   [/^Couldn't load the TypeScript checker/, (t) => t("tsUnavailable")],
+  [/^React couldn't load\./, (t) => t("reactFailed")],
   [
     /^RangeError: Stopped a loop that ran for over 2 seconds\./,
     (t) => `RangeError: ${t("loopStopped")}`,

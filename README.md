@@ -72,6 +72,7 @@ Lessons can use these components without importing them:
 | `<Exercise title="…" starter={`…`} tests={[…]} expectedOutput={`…`}>` with `<Hint>` and `<Solution>` | Practice task with an in-browser editor, Run and Check |
 | `<TryIt html={`…`} code={`…`} />`                                                                    | Live HTML + JavaScript demo the learner can edit       |
 | `<TryIt language="python" code={`…`} />`                                                             | Editable code to run, e.g. Python that draws a chart   |
+| `<TryIt language="react" code={`…`} />`                                                              | Live React component (renders into `<div id="root">`)  |
 
 Code blocks support titles and highlighted lines: ` ```js title="app.js" {2} `.
 
@@ -90,6 +91,23 @@ a simple event loop and runs FastAPI's `TestClient` on it; `plt.show()` prints t
 as an image. The code is saved as `lesson.py`, so `pytest.main([__file__])` runs its
 tests, and checks can call `_panda_pytest()` (counts of passed/failed tests) or
 `_panda_pytest(patch={"add": buggy})` to make sure the learner's tests catch a bug.
+
+JavaScript can `fetch` the built-in practice API at `https://api.pandadev.test`
+(`/movies`, `/weather?city=`, `/recipes`, `/users`, `/posts`, `/todos` with full CRUD,
+`/status/404`, `/delay/1500`, `/flaky`; see `src/lib/runner/fake-api.ts`). It answers
+after a fixed 100 ms with the same data every run, and never touches the network; checks
+can read `__requests` (method, URL and body of each request). Code can also
+`import { describe, it, expect, vi } from "vitest"` (tests run after the code, like
+`vitest run`, and print a report; checks read `__vitest` or call
+`await __retest([["a + b", "a - b"]])` to make sure the learner's tests catch a bug), and
+`import express from "express"` / `import request from "supertest"` for an
+Express-compatible server that tests call without a network.
+
+React exercises use `language="react"`: JSX runs in the live preview with React 19
+(bundled from `node_modules` by `scripts/build-vendor.mjs`, development build so learners
+see React's warnings), on `<div id="root"></div>` unless `html` says otherwise. Checks
+can `await __click("button")`, `await __type("input", "Mei")` and `await __settle()` to
+wait for renders and requests.
 
 TypeScript exercises add `language="typescript"`. Code is type-checked first (strict,
 ES2023 library, no DOM) with the real TypeScript compiler, loaded from jsDelivr in the
