@@ -3,7 +3,7 @@ import type * as TS from "typescript";
 import type { ExecuteResult, OutputLine, TestSpec } from "./execute";
 
 /** Must match the installed `typescript` package (a test keeps them in sync). */
-export const TYPESCRIPT_VERSION = "5.9.3";
+export const TYPESCRIPT_VERSION = "6.0.3";
 
 /** Standard library for lesson code: modern JavaScript, no DOM. */
 export const TS_LIB = "lib.es2023.d.ts";
