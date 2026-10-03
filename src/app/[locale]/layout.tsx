@@ -6,6 +6,7 @@ import { Analytics } from "@vercel/analytics/next";
 import { SpeedInsights } from "@vercel/speed-insights/next";
 import { JetBrains_Mono, Onest, Plus_Jakarta_Sans } from "next/font/google";
 
+import { ServiceWorker } from "@/components/layout/service-worker";
 import { SpaceBackground } from "@/components/layout/space-background";
 import { MotionProvider } from "@/components/motion/motion-provider";
 import { Providers } from "@/components/progress/providers";
@@ -80,6 +81,7 @@ export default async function LocaleLayout({
             <Providers>{children}</Providers>
           </MotionProvider>
         </NextIntlClientProvider>
+        <ServiceWorker />
         <Analytics />
         <SpeedInsights />
       </body>

@@ -118,8 +118,8 @@ hold the practice API's answers: `(__hold(), __type("input", "p"),
 await __release(await __waitFor(() => /* loading is shown */)))`.
 
 TypeScript exercises add `language="typescript"`. Code is type-checked first (strict,
-ES2023 library, no DOM) with the real TypeScript compiler, loaded from jsDelivr in the
-browser and from `node_modules` in tests; code with type errors doesn't run, so a starter
+ES2023 library, no DOM) with the real TypeScript compiler, which `scripts/build-vendor.mjs`
+copies from `node_modules` into `public/vendor` (so the site serves it, not a CDN); code with type errors doesn't run, so a starter
 with deliberate type errors makes a good "fix the types" task. `npm test` fails if any
 TypeScript example or solution has a type error. To show an error in a lesson, use a plain
 code block with a `// ❌ Error: …` comment.
@@ -187,6 +187,11 @@ Production environment variables (Vercel → Project → Settings → Environmen
 Without the database or auth variables the site still works, just without sign-in and
 saved progress.
 
+In production a service worker (`public/sw.js`) keeps Python, the TypeScript compiler,
+React and the site's scripts after their first download, so the editor starts instantly
+on later visits, and keeps visited lessons for offline use. Printed values match Node's
+`console.log`, including line breaking and promises (`Promise { <pending> }`).
+
 ## Scripts
 
 | Command                | What it does                                                        |
@@ -198,6 +203,7 @@ saved progress.
 | `npm run typecheck`    | TypeScript type check                                               |
 | `npm run format`       | Format all files with Prettier                                      |
 | `npm run format:check` | Check formatting                                                    |
+| `npm run test:e2e`     | Solve every exercise in Chrome against a running site (`npm start`) |
 | `npm run content`      | Build and validate course content                                   |
 | `npm run db:generate`  | Create a migration from schema changes                              |
 | `npm run db:migrate`   | Apply migrations to the database                                    |

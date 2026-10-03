@@ -3,7 +3,8 @@
 // presses Check. Also fails on page errors and Content-Security-Policy
 // violations. Needs a running site (`npm run build && npm start`):
 //
-//   node tests/e2e/exercises.mjs [base URL] [--only=python] [--concurrency=4]
+//   node tests/e2e/exercises.mjs [base URL] [--only=python] [--shard=1/2]
+//     [--concurrency=4]
 //
 // Chrome comes from CHROME_PATH, or the usual place on macOS and Linux.
 import { existsSync, readFileSync } from "node:fs";
@@ -16,6 +17,8 @@ const option = (name) =>
 const base = args.find((a) => !a.startsWith("--")) ?? "http://localhost:3000";
 const only = option("only")?.split(",");
 const concurrency = Number(option("concurrency") ?? 4);
+// --shard=1/2: every second lesson, so CI machines can share the work
+const [shard, shards] = (option("shard") ?? "1/1").split("/").map(Number);
 
 const chrome =
   process.env.CHROME_PATH ??
@@ -29,6 +32,7 @@ if (!chrome) throw new Error("Chrome not found: set CHROME_PATH");
 const lessons = JSON.parse(readFileSync(".velite/lessons.json", "utf8"))
   .filter((l) => l.exerciseCount > 0)
   .filter((l) => !only || only.includes(l.language))
+  .filter((_, index) => index % shards === shard - 1)
   .map((l) => ({
     url: `${l.locale === "en" ? "" : `/${l.locale}`}${l.permalink}`,
     exercises: l.exerciseCount,

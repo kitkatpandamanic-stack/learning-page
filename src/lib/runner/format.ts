@@ -12,6 +12,14 @@
 export type Formatter = {
   /** Formats console.log arguments, including %s-style placeholders */
   formatArgs(args: ArrayLike<unknown>): string;
+  /**
+   * A console that shows promises like Node (`Promise { 1 }`,
+   * `Promise { <pending> }`). A promise's state can only be seen one
+   * microtask later, so lines are passed to `emit` a moment later, in order.
+   */
+  createConsoleWriter(
+    emit: (level: string, text: string) => void,
+  ): (level: string, args: ArrayLike<unknown>) => void;
   /** Wraps the Proxy constructor so printed proxies show their target, like Node */
   trackProxies(proxy: ProxyConstructor): ProxyConstructor;
 };
@@ -29,6 +37,8 @@ export function createFormatter(
   const MAX_ARRAY_LENGTH = 100;
   const KEY = /^[a-zA-Z_][a-zA-Z_0-9]*$/;
   const proxyTargets = new WeakMap<object, object>();
+  /** Promises met while formatting a console line (see createConsoleWriter) */
+  let promisesInLine: Promise<unknown>[] | null = null;
 
   type Ctx = {
     depth: number;
@@ -245,6 +255,11 @@ export function createFormatter(
   function formatRaw(value: object, recurseTimes: number, ctx: Ctx): string {
     const custom = special?.(value, quote, recurseTimes);
     if (custom !== undefined) return custom;
+    // A placeholder, filled in once the promise's state is known.
+    if (promisesInLine && value instanceof Promise) {
+      promisesInLine.push(value);
+      return `\u0000P${promisesInLine.length - 1}\u0000`;
+    }
 
     const ctor = constructorName(value);
     const tag = toStringTag(value, ctor);
@@ -582,7 +597,53 @@ export function createFormatter(
     });
   }
 
-  return { formatArgs, trackProxies };
+  function createConsoleWriter(emit: (level: string, text: string) => void) {
+    type Line = { level: string; text: string; ready: boolean };
+    const queue: Line[] = [];
+    const flush = () => {
+      while (queue.length && queue[0].ready) {
+        const line = queue.shift()!;
+        emit(line.level, line.text);
+      }
+    };
+    return (level: string, args: ArrayLike<unknown>) => {
+      const found: Promise<unknown>[] = [];
+      promisesInLine = found;
+      let text: string;
+      try {
+        text = formatArgs(args);
+      } finally {
+        promisesInLine = null;
+      }
+      const line: Line = { level, text, ready: found.length === 0 };
+      queue.push(line);
+      if (line.ready) return flush();
+      type State = { status: string; value?: unknown };
+      const states: State[] = found.map(() => ({ status: "pending" }));
+      found.forEach((promise, i) => {
+        // Reactions to an already settled promise run at the next
+        // microtask, before the one queued below; pending ones run later.
+        promise.then(
+          (value) => (states[i] = { status: "fulfilled", value }),
+          (value) => (states[i] = { status: "rejected", value }),
+        );
+      });
+      queueMicrotask(() => {
+        line.text = line.text.replace(/\u0000P(\d+)\u0000/g, (_, i) => {
+          const state = states[Number(i)];
+          if (state.status === "pending") return "Promise { <pending> }";
+          const shown = inspect(state.value);
+          return state.status === "rejected"
+            ? `Promise { <rejected> ${shown} }`
+            : `Promise { ${shown} }`;
+        });
+        line.ready = true;
+        flush();
+      });
+    };
+  }
+
+  return { formatArgs, trackProxies, createConsoleWriter };
 }
 
 const formatter = createFormatter();

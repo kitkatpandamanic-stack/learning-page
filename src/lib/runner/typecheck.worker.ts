@@ -14,7 +14,8 @@ export type TypeCheckMessage =
   | { type: "load-error"; message: string }
   | { type: "result"; id: number; diagnostics: TypeDiagnostic[] };
 
-const CDN = `https://cdn.jsdelivr.net/npm/typescript@${TYPESCRIPT_VERSION}/lib/`;
+// Served by this site (scripts/build-vendor.mjs copies it from node_modules).
+const BASE = `/vendor/typescript-${TYPESCRIPT_VERSION}/`;
 
 // The project's TypeScript lib is "dom", so describe the worker scope we use.
 const scope = self as unknown as {
@@ -23,7 +24,7 @@ const scope = self as unknown as {
 };
 
 async function download(file: string) {
-  const response = await fetch(CDN + file);
+  const response = await fetch(BASE + file);
   if (!response.ok) throw new Error(`${file}: HTTP ${response.status}`);
   return response.text();
 }

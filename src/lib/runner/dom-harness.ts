@@ -65,10 +65,12 @@ const HARNESS = String.raw`
   // Printed proxies show their target, like Node (no traps run).
   window.Proxy = formatter.trackProxies(window.Proxy);
   window.__pandaFormat = formatArgs;
+  // Promises print like Node (Promise { 1 }); such lines wait a microtask.
+  var write = formatter.createConsoleWriter(emit);
 
   ["log", "info", "warn", "error", "debug", "table"].forEach(function (method) {
     var level = method === "debug" || method === "table" ? "log" : method;
-    console[method] = function () { emit(level, formatArgs(arguments)); };
+    console[method] = function () { write(level, arguments); };
   });
 
   // Loops get a __pandaLoop() call (see loop-guard.ts). The clock starts at

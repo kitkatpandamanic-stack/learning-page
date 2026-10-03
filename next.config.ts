@@ -32,7 +32,8 @@ const contentSecurityPolicy = [
   "object-src 'none'",
   "base-uri 'self'",
   "form-action 'self'",
-  ...(isDev ? [] : ["upgrade-insecure-requests"]),
+  // (No upgrade-insecure-requests: HSTS already keeps the site on https, and
+  // it broke the production build served over http on localhost.)
 ].join("; ");
 
 const securityHeaders = [
@@ -49,7 +50,25 @@ const securityHeaders = [
 const nextConfig: NextConfig = {
   env: { NEXT_PUBLIC_REACT_VENDOR: reactVendor },
   async headers() {
-    return [{ source: "/:path*", headers: securityHeaders }];
+    return [
+      { source: "/:path*", headers: securityHeaders },
+      // The service worker must always be fresh, so updates reach everyone.
+      {
+        source: "/sw.js",
+        headers: [{ key: "Cache-Control", value: "no-cache" }],
+      },
+      // Vendor files have a version or content hash in their name, so they
+      // never change: browsers may keep them for a year.
+      {
+        source: "/vendor/:path*",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=31536000, immutable",
+          },
+        ],
+      },
+    ];
   },
   // Lesson bodies are read from disk (src/lib/lesson-body.ts).
   outputFileTracingIncludes: {

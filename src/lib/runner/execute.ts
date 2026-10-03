@@ -6,7 +6,7 @@ import {
   createSupertestModule,
 } from "./express-shim";
 import { createFakeApi, createFetch, type RequestLogEntry } from "./fake-api";
-import { formatArgs, trackProxies } from "./format";
+import { createFormatter, formatArgs } from "./format";
 import {
   createVitest,
   type TimerFunctions,
@@ -98,7 +98,10 @@ export async function execute(
   const texts: string[] = [];
   let truncated = false;
 
-  const push = (level: LogLevel, args: unknown[]) => {
+  // Each run gets its own formatter: it tracks the run's proxies, and holds
+  // back lines with promises for a microtask to show their state like Node.
+  const formatter = createFormatter();
+  const emit = (level: LogLevel, text: string) => {
     if (output.length >= MAX_OUTPUT_LINES) {
       if (!truncated) {
         truncated = true;
@@ -111,11 +114,15 @@ export async function execute(
       }
       return;
     }
-    const line: OutputLine = { level, text: formatArgs(args) };
+    const line: OutputLine = { level, text };
     output.push(line);
     if (level !== "error" && level !== "warn") texts.push(line.text);
     onLine?.(line);
   };
+  const write = formatter.createConsoleWriter((level, text) =>
+    emit(level as LogLevel, text),
+  );
+  const push = (level: LogLevel, args: unknown[]) => write(level, args);
 
   const fakeConsole = {
     log: (...a: unknown[]) => push("log", a),
@@ -336,7 +343,7 @@ export async function execute(
   };
 
   // Printed proxies show their target, like Node (no traps run).
-  const trackedProxy = trackProxies(Proxy);
+  const trackedProxy = formatter.trackProxies(Proxy);
 
   const params = [
     "console",

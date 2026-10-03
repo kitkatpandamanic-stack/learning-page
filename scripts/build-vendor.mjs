@@ -4,11 +4,19 @@
 // The bundle also brings the in-memory WebSocket network (src/lib/runner/
 // ws-shim.ts), so a page can run a `ws` server and its clients together.
 // Runs before `next dev` / `next build`; tests call buildReactVendor().
-import { existsSync, mkdirSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { buildSync } from "esbuild";
+import { buildSync, transformSync } from "esbuild";
 
 import { reactVendorName, reactVersion } from "./vendor-name.mjs";
 
@@ -72,6 +80,38 @@ export function buildReactVendor({ force = false } = {}) {
   return reactVendorFile;
 }
 
+// The TypeScript compiler and its lib files for the editor's type checker
+// (src/lib/runner/typecheck.worker.ts), served by this site rather than a
+// CDN. The compiler is minified on the way (9 MB → about 3.5 MB).
+const require = createRequire(import.meta.url);
+const typescriptLib = dirname(require.resolve("typescript/lib/typescript.js"));
+export const typescriptVersion = require("typescript/package.json").version;
+export const typescriptVendorDir = join(
+  root,
+  "public",
+  "vendor",
+  `typescript-${typescriptVersion}`,
+);
+
+export function buildTypeScriptVendor({ force = false } = {}) {
+  const compiler = join(typescriptVendorDir, "typescript.js");
+  if (!force && existsSync(compiler)) return typescriptVendorDir;
+  mkdirSync(typescriptVendorDir, { recursive: true });
+  const { code } = transformSync(
+    readFileSync(join(typescriptLib, "typescript.js"), "utf8"),
+    // A classic script declaring a global `ts`: keep top-level names.
+    { minify: true, legalComments: "none", target: "es2020" },
+  );
+  writeFileSync(compiler, code);
+  for (const file of readdirSync(typescriptLib)) {
+    if (/^lib\..*\.d\.ts$/.test(file)) {
+      copyFileSync(join(typescriptLib, file), join(typescriptVendorDir, file));
+    }
+  }
+  return typescriptVendorDir;
+}
+
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   console.log(`Built ${buildReactVendor({ force: true })}`);
+  console.log(`Built ${buildTypeScriptVendor({ force: true })}`);
 }

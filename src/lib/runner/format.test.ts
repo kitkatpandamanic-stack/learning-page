@@ -117,3 +117,30 @@ describe("formatArgs", () => {
     expect(() => (TrackedProxy as unknown as () => void)()).toThrow(TypeError);
   });
 });
+
+describe("promises in console output", () => {
+  it("prints them like Node, in order", async () => {
+    const { execute } = await import("./execute");
+    const r = await execute(`
+      const late = new Promise((resolve) => setTimeout(() => resolve(2), 10));
+      async function done() { return "done"; }
+      async function waits() { await null; return 1; }
+      console.log(Promise.resolve(1));
+      console.log(late, "then");
+      console.log(done(), waits());
+      console.log([Promise.resolve({ a: 1 }), late]);
+      const failed = Promise.reject(new Error("nope"));
+      failed.catch(() => {});
+      console.log(failed);
+      console.log("last");
+    `);
+    expect(r.output.map((l) => l.text)).toEqual([
+      "Promise { 1 }",
+      "Promise { <pending> } then",
+      "Promise { 'done' } Promise { <pending> }",
+      "[ Promise { { a: 1 } }, Promise { <pending> } ]",
+      "Promise { <rejected> Error: nope }",
+      "last",
+    ]);
+  });
+});

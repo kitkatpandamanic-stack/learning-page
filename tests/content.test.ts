@@ -228,6 +228,8 @@ describe("Code + Output examples", () => {
     }));
   });
 
+  // CI tests one language at a time; some have none of these.
+  if (examples.length === 0) it.skip("none in these lessons", () => {});
   it.each(examples.map((ex) => [ex.name, ex] as const))(
     "%s",
     async (_name, ex) => {
@@ -263,6 +265,8 @@ describe("TryIt live previews", () => {
       });
   });
 
+  // CI tests one language at a time; some have none of these.
+  if (blocks.length === 0) it.skip("none in these lessons", () => {});
   it.each(blocks.map((b) => [b.name, b] as const))(
     "%s runs without errors",
     async (_name, b) => {
@@ -294,6 +298,8 @@ describe("links between lessons", () => {
     ),
   );
 
+  // CI tests one language at a time; some have none of these.
+  if (links.length === 0) it.skip("none in these lessons", () => {});
   it.each(links)("%s links to %s", (_file, href) => {
     expect(slugs.has(href), `${href} is not a lesson`).toBe(true);
   });

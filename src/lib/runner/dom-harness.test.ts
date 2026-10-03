@@ -318,3 +318,21 @@ describe("React and fetch in the preview", () => {
     expect(r.tests?.[0]).toMatchObject({ passed: true });
   });
 });
+
+describe("promises in the preview console", () => {
+  it("prints them like the worker runner", async () => {
+    const r = await runDomInNode(
+      [
+        "console.log(Promise.resolve(1), 'a');",
+        "console.log(new Promise(() => {}));",
+        "console.log('last');",
+      ].join("\n"),
+      "<p></p>",
+    );
+    expect(r.output.map((l) => l.text)).toEqual([
+      "Promise { 1 } a",
+      "Promise { <pending> }",
+      "last",
+    ]);
+  });
+});
