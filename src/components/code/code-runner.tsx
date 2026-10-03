@@ -2,24 +2,21 @@
 
 import * as React from "react";
 import { usePathname } from "@/i18n/navigation";
-import {
-  AppWindow,
-  CheckCircle2,
-  CircleCheckBig,
-  Loader2,
-  Play,
-  RotateCcw,
-  Square,
-  Terminal,
-  XCircle,
-} from "lucide-react";
+import { CheckCircle2, Loader2, XCircle } from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { cn } from "cn";
 
 import { CodeEditor } from "@/components/code/code-editor";
+import {
+  EmptyOutput,
+  languageLabel,
+  OutputPanel,
+  RunnerPreview,
+  RunnerToolbar,
+  runnerFrameClass,
+} from "@/components/code/runner-frame";
 import { localizeRunnerText } from "@/components/code/runner-messages";
 import { languageFromPath, useAward } from "@/components/progress/use-progress";
-import { Button } from "@/components/ui/button";
 import {
   compareOutput,
   type OutputLine,
@@ -35,13 +32,6 @@ import {
   isTypeScriptReady,
   preloadTypeScript,
 } from "@/lib/runner/run-typecheck";
-
-const languageLabel: Record<RunLanguage, string> = {
-  javascript: "JavaScript",
-  typescript: "TypeScript",
-  python: "Python",
-  react: "React",
-};
 
 const lineStyle: Record<OutputLine["level"], string> = {
   log: "text-white/85",
@@ -294,62 +284,16 @@ export function CodeRunner({
   }
 
   return (
-    <div className="not-prose overflow-hidden rounded-2xl border border-white/10 bg-space-950/70 shadow-[inset_0_1px_0_0_rgb(255_255_255/0.06)]">
-      {/* Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-white/3 px-3 py-2">
-        <div className="flex items-center gap-2">
-          <span className="flex gap-1.5" aria-hidden>
-            <span className="size-2.5 rounded-full bg-neon-pink" />
-            <span className="size-2.5 rounded-full bg-neon-amber" />
-            <span className="size-2.5 rounded-full bg-neon-lime" />
-          </span>
-          <span className="ml-1 font-mono text-xs text-white/50">
-            {languageLabel[language]}
-          </span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={reset}
-            className="text-white/60"
-            title={t("resetTitle")}
-          >
-            <RotateCcw /> {t("reset")}
-          </Button>
-          {running ? (
-            <Button
-              variant="glass"
-              size="sm"
-              className="px-3"
-              onClick={() => cancelRef.current?.()}
-            >
-              <Square /> {t("stop")}
-            </Button>
-          ) : (
-            <Button
-              variant="glass"
-              size="sm"
-              className="px-3"
-              onClick={() => run(false)}
-              title={t("runTitle")}
-            >
-              <Play /> {t("run")}
-            </Button>
-          )}
-          {canCheck && (
-            <Button
-              variant="gradient"
-              size="sm"
-              className="px-3"
-              disabled={running}
-              onClick={() => run(true)}
-            >
-              <CircleCheckBig /> {t("check")}
-            </Button>
-          )}
-        </div>
-      </div>
+    <div className={runnerFrameClass}>
+      <RunnerToolbar
+        language={language}
+        canCheck={canCheck}
+        running={running}
+        onReset={reset}
+        onRun={() => run(false)}
+        onStop={() => cancelRef.current?.()}
+        onCheck={() => run(true)}
+      />
 
       <CodeEditor
         value={code}
@@ -361,25 +305,13 @@ export function CodeRunner({
         label={t("editorLabel")}
       />
 
-      {hasPreview && (
-        <div className="border-t border-white/10">
-          <p className="flex items-center gap-1.5 bg-white/3 px-4 py-1.5 font-mono text-[11px] tracking-wider text-white/65 uppercase">
-            <AppWindow className="size-3.5" /> {t("preview")}
-          </p>
-          <div
-            ref={previewRef}
-            className="h-56 resize-y overflow-hidden bg-[#0b0d1f]"
-          />
-        </div>
-      )}
+      {hasPreview && <RunnerPreview ref={previewRef} />}
 
       {/* Output */}
-      <div className="border-t border-white/10 bg-black/35 px-4 py-3">
-        <div className="mb-1.5 flex items-center justify-between font-mono text-[11px] tracking-wider text-white/65 uppercase">
-          <span className="flex items-center gap-1.5">
-            <Terminal className="size-3.5" /> {t("output")}
-          </span>
-          {running ? (
+      <OutputPanel
+        tall={lines.some((line) => line.image)}
+        status={
+          running ? (
             <span className="flex items-center gap-1.5 normal-case">
               <Loader2 className="size-3 animate-spin" />{" "}
               {status === "loading"
@@ -394,53 +326,43 @@ export function CodeRunner({
                 {Math.round(result.durationMs)} ms
               </span>
             )
-          )}
-        </div>
-        <div
-          role="log"
-          aria-live="polite"
-          className={cn(
-            "overflow-y-auto font-mono text-sm leading-relaxed",
-            lines.some((line) => line.image) ? "max-h-[32rem]" : "max-h-64",
-          )}
-        >
-          {lines.length > 0 ? (
-            lines.map((line, i) =>
-              line.image ? (
-                // A data: URL chart from matplotlib; next/image can't help here.
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  key={i}
-                  src={line.image}
-                  alt={t("chartAlt")}
-                  className="my-2 max-w-full rounded-lg bg-white"
-                />
-              ) : (
-                <pre
-                  key={i}
-                  className={cn("whitespace-pre-wrap", lineStyle[line.level])}
-                >
-                  {localizeRunnerText(line.text, t)}
-                </pre>
-              ),
-            )
-          ) : (
-            <p className="text-white/55">
-              {result ? t("noOutput") : t("pressRun")}
-            </p>
-          )}
-          {result?.error?.line && (
-            <p className="mt-1 text-xs text-rose-300/80">
-              {t("onLine", { line: result.error.line })}
-            </p>
-          )}
-          {result?.notice && (
-            <p className="mt-1 text-xs text-amber-200/80">
-              {localizeRunnerText(result.notice, t)}
-            </p>
-          )}
-        </div>
-      </div>
+          )
+        }
+      >
+        {lines.length > 0 ? (
+          lines.map((line, i) =>
+            line.image ? (
+              // A data: URL chart from matplotlib; next/image can't help here.
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                key={i}
+                src={line.image}
+                alt={t("chartAlt")}
+                className="my-2 max-w-full rounded-lg bg-white"
+              />
+            ) : (
+              <pre
+                key={i}
+                className={cn("whitespace-pre-wrap", lineStyle[line.level])}
+              >
+                {localizeRunnerText(line.text, t)}
+              </pre>
+            ),
+          )
+        ) : (
+          <EmptyOutput>{result ? t("noOutput") : t("pressRun")}</EmptyOutput>
+        )}
+        {result?.error?.line && (
+          <p className="mt-1 text-xs text-rose-300/80">
+            {t("onLine", { line: result.error.line })}
+          </p>
+        )}
+        {result?.notice && (
+          <p className="mt-1 text-xs text-amber-200/80">
+            {localizeRunnerText(result.notice, t)}
+          </p>
+        )}
+      </OutputPanel>
 
       {/* Check results */}
       {check && (

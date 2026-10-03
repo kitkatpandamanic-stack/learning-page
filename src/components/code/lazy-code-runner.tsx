@@ -1,47 +1,59 @@
 "use client";
 
 import * as React from "react";
-import dynamic from "next/dynamic";
 import { useTranslations } from "next-intl";
 
 import type { CodeRunner as CodeRunnerType } from "./code-runner";
+import {
+  editorHeight,
+  EmptyOutput,
+  OutputPanel,
+  RunnerPreview,
+  RunnerToolbar,
+  runnerFrameClass,
+} from "./runner-frame";
 
 type RunnerProps = React.ComponentProps<typeof CodeRunnerType>;
 
-function EditorPlaceholder({ height }: { height?: number }) {
+/**
+ * Stands in for the runner while it loads: the same toolbar and output
+ * panel, and a box as tall as the editor will be, so nothing below moves
+ * when the editor replaces it.
+ */
+function EditorPlaceholder(props: RunnerProps) {
+  const { starter, language = "javascript", minHeight, html } = props;
   const t = useTranslations("runner");
   return (
-    <div
-      className="not-prose flex h-64 animate-pulse items-center justify-center rounded-2xl border border-white/10 bg-space-950/60 text-sm text-white/40"
-      style={height ? { height } : undefined}
-    >
-      {t("loadingEditor")}
+    <div className={runnerFrameClass}>
+      <RunnerToolbar
+        language={language}
+        canCheck={Boolean(
+          props.tests?.length || props.expectedOutput !== undefined,
+        )}
+      />
+      <div
+        className="flex animate-pulse items-center justify-center bg-white/2 text-sm text-white/40"
+        style={{ height: editorHeight(starter, minHeight) }}
+      >
+        {t("loadingEditor")}
+      </div>
+      {(html !== undefined || language === "react") && <RunnerPreview />}
+      <OutputPanel>
+        <EmptyOutput>{t("pressRun")}</EmptyOutput>
+      </OutputPanel>
     </div>
   );
 }
 
 const loadRunner = () => import("./code-runner");
-const CodeRunner = dynamic(() => loadRunner().then((m) => m.CodeRunner), {
-  ssr: false,
-  loading: () => <EditorPlaceholder />,
-});
+const CodeRunner = React.lazy(() =>
+  loadRunner().then((m) => ({ default: m.CodeRunner })),
+);
 
 /** How close (in pixels) an editor gets to the screen before it loads. */
 const LOAD_MARGIN = 800;
 /** Editors wait until scrolling pauses for this long (ms). */
 const SCROLL_PAUSE = 150;
-
-/**
- * About how tall the finished runner is (measured): ~24px per line of code,
- * the toolbar and output panel, and the live preview if there is one. A
- * placeholder of the same height means little moves when it loads.
- */
-function estimatedHeight({ starter, html, language, minHeight }: RunnerProps) {
-  const lines = starter.split("\n").length;
-  const editor = Math.max(lines * 23.8 + 24, parseInt(minHeight ?? "160", 10));
-  const preview = html !== undefined || language === "react" ? 234 : 0;
-  return Math.round(editor + 165 + preview);
-}
 
 let lastScroll = 0;
 if (typeof window !== "undefined") {
@@ -79,7 +91,7 @@ export function LazyCodeRunner(props: RunnerProps) {
         // Keep the sized placeholder until the editor's code has arrived.
         void loadRunner().then(
           () => setNear(true),
-          () => setNear(true), // let next/dynamic show its own error/retry
+          () => setNear(true), // React.lazy then reports the error
         );
       } else {
         timer = setTimeout(loadWhenStill, SCROLL_PAUSE - quietFor);
@@ -99,10 +111,16 @@ export function LazyCodeRunner(props: RunnerProps) {
     };
   }, []);
 
-  if (near) return <CodeRunner {...props} />;
+  if (near) {
+    return (
+      <React.Suspense fallback={<EditorPlaceholder {...props} />}>
+        <CodeRunner {...props} />
+      </React.Suspense>
+    );
+  }
   return (
     <div ref={placeholder}>
-      <EditorPlaceholder height={estimatedHeight(props)} />
+      <EditorPlaceholder {...props} />
     </div>
   );
 }
