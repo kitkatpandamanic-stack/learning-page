@@ -325,6 +325,22 @@ function eachTitle(title: string, row: unknown, index: number) {
   return out;
 }
 
+/** Like Vitest's default testTimeout: a test that never finishes fails. */
+const TEST_TIMEOUT_MS = 5000;
+function withTimeout(result: unknown) {
+  let id: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    // The real timer (not the learner's, which may be fake).
+    id = globalThis.setTimeout(
+      () => reject(new Error(`Test timed out in ${TEST_TIMEOUT_MS}ms.`)),
+      TEST_TIMEOUT_MS,
+    );
+  });
+  return Promise.race([Promise.resolve(result), timeout]).finally(() =>
+    globalThis.clearTimeout(id),
+  );
+}
+
 export function createVitest(options: {
   print: (level: "log" | "error", text: string) => void;
   /** Switches the learner's timer functions to fake ones, or back with null */
@@ -991,7 +1007,7 @@ export function createVitest(options: {
           try {
             for (const s of suites)
               for (const hook of s.beforeEach) await hook();
-            await child.fn();
+            await withTimeout(child.fn());
           } catch (error) {
             failure = error;
           }

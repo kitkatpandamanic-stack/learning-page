@@ -33,7 +33,9 @@ describe("formatArgs", () => {
   it("handles circular references", () => {
     const a: Record<string, unknown> = { name: "loop" };
     a.self = a;
-    expect(formatArgs([a])).toBe("{ name: 'loop', self: [Circular] }");
+    expect(formatArgs([a])).toBe(
+      "<ref *1> { name: 'loop', self: [Circular *1] }",
+    );
   });
 });
 

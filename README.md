@@ -101,11 +101,17 @@ can read `__requests` (method, URL, headers and body of each request). Code can 
 `vitest run`, and print a report; checks read `__vitest` or call
 `await __retest([["a + b", "a - b"]])` to make sure the learner's tests catch a bug), and
 `import express from "express"` / `import request from "supertest"` for an
-Express-compatible server that tests call without a network.
+Express-compatible server that tests call without a network (with `res.cookie()`,
+`cookie-parser`, and `request.agent(app)`, which keeps cookies like a browser).
+`import { WebSocketServer } from "ws"` starts a WebSocket server on an in-memory network
+for that run, and the global `WebSocket` (or the `ws` client) connects to it, e.g.
+`new WebSocket("ws://localhost:8080")`; messages arrive asynchronously, one task each,
+like a real connection (`src/lib/runner/ws-shim.ts`).
 
 React exercises use `language="react"`: JSX runs in the live preview with React 19
 (bundled from `node_modules` by `scripts/build-vendor.mjs`, development build so learners
-see React's warnings), on `<div id="root"></div>` unless `html` says otherwise. Checks
+see React's warnings), on `<div id="root"></div>` unless `html` says otherwise. The same bundle brings the
+WebSocket network, so one page can run a `ws` server and a React client together. Checks
 can `await __click("button")`, `await __type("input", "Mei")` and `await __settle()` to
 wait for renders and requests. To check a loading state without racing the response,
 hold the practice API's answers: `(__hold(), __type("input", "p"),

@@ -1,13 +1,18 @@
 import { transform, type Transform } from "sucrase";
 
-import { createExpressModule, createSupertestModule } from "./express-shim";
+import {
+  createCookieParserModule,
+  createExpressModule,
+  createSupertestModule,
+} from "./express-shim";
 import { createFakeApi, createFetch, type RequestLogEntry } from "./fake-api";
-import { formatArgs } from "./format";
+import { formatArgs, trackProxies } from "./format";
 import {
   createVitest,
   type TimerFunctions,
   type VitestSummary,
 } from "./vitest-shim";
+import { createWsNetwork } from "./ws-shim";
 
 /** "react" is JavaScript with JSX, run in the live preview with React loaded. */
 export type RunLanguage = "javascript" | "typescript" | "python" | "react";
@@ -36,11 +41,14 @@ export type ExecuteResult = {
 /** Code with import/export statements needs turning into require() calls. */
 const MODULE_SYNTAX = /^\s*(import\s*[\w{*'"]|export\s)/m;
 
-/** What `import … from "name"` can load in the editor. */
-const MODULES: Record<string, () => unknown> = {
-  express: createExpressModule,
-  supertest: createSupertestModule,
-};
+/** What `import … from "name"` can load in the editor (besides vitest). */
+const MODULE_NAMES = [
+  "express",
+  "supertest",
+  "cookie-parser",
+  "ws",
+  "http",
+] as const;
 
 export const MAX_OUTPUT_LINES = 500;
 
@@ -244,6 +252,39 @@ export async function execute(
     requests,
   );
 
+  // WebSocket servers and clients in this run talk over an in-memory network.
+  // Each delivery is its own task, like on a real connection. A
+  // MessageChannel gives tasks without the 4 ms minimum browsers put on
+  // nested setTimeout(0) calls; pending deliveries keep the run going.
+  const channel =
+    typeof MessageChannel === "function" ? new MessageChannel() : null;
+  const deliveries: (() => void)[] = [];
+  if (channel) {
+    channel.port1.onmessage = () => {
+      const deliver = deliveries.shift();
+      if (!deliver) return;
+      guard(deliver)();
+      settle();
+    };
+  }
+  const network = createWsNetwork((fn) => {
+    if (!channel) {
+      tracked.setTimeout(fn, 0);
+      return;
+    }
+    pending++;
+    deliveries.push(fn);
+    channel.port2.postMessage(null);
+  });
+  const modules: Record<(typeof MODULE_NAMES)[number], () => unknown> = {
+    express: () =>
+      createExpressModule({ createServer: () => network.createServer() }),
+    supertest: createSupertestModule,
+    "cookie-parser": createCookieParserModule,
+    ws: () => network.ws,
+    http: () => network.http,
+  };
+
   const vitest = createVitest({
     print: (level, text) => push(level, [text]),
     setTimers: (fake) => {
@@ -259,10 +300,11 @@ export async function execute(
   };
   const require = (name: string) => {
     if (name === "vitest") return vitest.module;
-    const make = MODULES[name];
+    const bare = name.replace(/^node:/, "");
+    const make = modules[bare as keyof typeof modules];
     if (!make) {
       throw new Error(
-        `Cannot find module '${name}'. The editor can import: vitest, ${Object.keys(MODULES).join(", ")}.`,
+        `Cannot find module '${name}'. The editor can import: vitest, ${MODULE_NAMES.join(", ")}.`,
       );
     }
     return make();
@@ -293,6 +335,9 @@ export async function execute(
     );
   };
 
+  // Printed proxies show their target, like Node (no traps run).
+  const trackedProxy = trackProxies(Proxy);
+
   const params = [
     "console",
     "setTimeout",
@@ -300,6 +345,8 @@ export async function execute(
     "setInterval",
     "clearInterval",
     "fetch",
+    "WebSocket",
+    "Proxy",
     "require",
     "exports",
     "__output",
@@ -321,6 +368,8 @@ export async function execute(
       timers.setInterval,
       timers.clearInterval,
       fetch,
+      network.WebSocket,
+      trackedProxy,
       require,
       {},
       texts,
@@ -347,6 +396,10 @@ export async function execute(
   await idle();
   vitest.cleanup();
   error ??= asyncError;
+  const closeChannel = () => {
+    channel?.port1.close();
+    channel?.port2.close();
+  };
 
   // Like `vitest run`: tests defined with it()/test() run once the code has.
   let summary: VitestSummary | undefined;
@@ -356,7 +409,10 @@ export async function execute(
     await idle();
   }
 
-  if (tests.length === 0) return { output, error, vitest: summary };
+  if (tests.length === 0) {
+    closeChannel();
+    return { output, error, vitest: summary };
+  }
 
   const results: TestResult[] = [];
   for (const [i, test] of tests.entries()) {
@@ -381,6 +437,7 @@ export async function execute(
       });
     }
   }
+  closeChannel();
   return { output, error, tests: results, vitest: summary };
 }
 

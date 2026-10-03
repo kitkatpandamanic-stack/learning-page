@@ -1,16 +1,16 @@
-import { createRequire } from "node:module";
-
 import type { NextConfig } from "next";
 import { PHASE_DEVELOPMENT_SERVER } from "next/constants";
 import { withSentryConfig } from "@sentry/nextjs/config";
 import createNextIntlPlugin from "next-intl/plugin";
+
+import { reactVendorName } from "./scripts/vendor-name.mjs";
 
 // Translations: messages are loaded by src/i18n/request.ts.
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
 // React for the code editor's preview pages (built by scripts/build-vendor.mjs
 // from node_modules/react, which isn't the React copy Next.js runs on).
-const reactVendor = `/vendor/react-${createRequire(import.meta.url)("react/package.json").version}.js`;
+const reactVendor = `/vendor/${reactVendorName}`;
 
 const nextConfig: NextConfig = {
   env: { NEXT_PUBLIC_REACT_VENDOR: reactVendor },

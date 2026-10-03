@@ -1,11 +1,12 @@
 import { transform, type Transform } from "sucrase";
 
 import { MAX_OUTPUT_LINES } from "./execute";
+import { createFormatter } from "./format";
 import { addLoopGuards } from "./loop-guard";
 
 /**
  * Runs inside the preview page, before the learner's HTML. It captures the
- * console (formatted like format.ts, which a test keeps in sync), reports
+ * console (formatted by format.ts's createFormatter, copied in), reports
  * errors, stops runaway loops, and defines `__pandaRun(code, checks, emit)`,
  * which runs the learner's script and then the checks in the page's global
  * scope. In a sandboxed iframe it talks to the parent with postMessage; in
@@ -18,7 +19,6 @@ const HARNESS = String.raw`
   "use strict";
   var MAX_LINES = __MAX_LINES__;
   var LOOP_LIMIT_MS = 2000;
-  var MAX_DEPTH = 2;
   var emitTo = function () {};
   var count = 0;
   var stopped = false;
@@ -36,15 +36,8 @@ const HARNESS = String.raw`
     emitTo(level, text);
   }
 
-  function quote(s) {
-    return "'" + s.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n") + "'";
-  }
-
-  function isPlainKey(key) {
-    return /^[A-Za-z_$][\w$]*$/.test(key);
-  }
-
-  function describeNode(node) {
+  // The worker runner's formatter (format.ts), plus DOM nodes and lists.
+  function describeNode(node, quote) {
     if (node.nodeType === 1) {
       var tag = "<" + node.tagName.toLowerCase();
       if (node.id) tag += ' id="' + node.id + '"';
@@ -56,103 +49,21 @@ const HARNESS = String.raw`
     if (node.nodeType === 9) return "#document";
     return node.nodeName;
   }
-
-  function inspect(value, depth, seen) {
-    if (value === null) return "null";
-    switch (typeof value) {
-      case "string": return depth === 0 ? value : quote(value);
-      case "number": return Object.is(value, -0) ? "-0" : String(value);
-      case "bigint": return value + "n";
-      case "undefined": return "undefined";
-      case "boolean": return String(value);
-      case "symbol": return value.toString();
-      case "function":
-        return value.name ? "[Function: " + value.name + "]" : "[Function (anonymous)]";
-    }
-    if (seen.has(value)) return "[Circular]";
-    if (value instanceof Error) {
-      return (value.stack && value.stack.indexOf(value.name) === 0)
-        ? value.stack.split("\n")[0]
-        : value.name + ": " + value.message;
-    }
-    if (value instanceof Date) return isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
-    if (value instanceof RegExp) return value.toString();
-    if (Object.prototype.toString.call(value) === "[object Generator]") return "Object [Generator] {}";
-    if (typeof Node !== "undefined" && value instanceof Node) return describeNode(value);
-
-    var nested = depth + 1;
-    seen.add(value);
-    try {
-      var isList = typeof NodeList !== "undefined" &&
-        (value instanceof NodeList || value instanceof HTMLCollection);
-      if (Array.isArray(value) || isList) {
-        var items = Array.prototype.slice.call(value);
-        var label = isList ? value.constructor.name + "(" + items.length + ") " : "";
-        if (items.length === 0) return label + "[]";
-        if (depth > MAX_DEPTH) return isList ? "[" + value.constructor.name + "]" : "[Array]";
-        return label + "[ " + items.map(function (v) { return inspect(v, nested, seen); }).join(", ") + " ]";
-      }
-      if (value instanceof Map) {
-        if (depth > MAX_DEPTH) return "[Map]";
-        var entries = [];
-        value.forEach(function (v, k) { entries.push(inspect(k, nested, seen) + " => " + inspect(v, nested, seen)); });
-        return "Map(" + value.size + ") {" + (entries.length ? " " + entries.join(", ") + " " : "") + "}";
-      }
-      if (value instanceof Set) {
-        if (depth > MAX_DEPTH) return "[Set]";
-        var members = [];
-        value.forEach(function (v) { members.push(inspect(v, nested, seen)); });
-        return "Set(" + value.size + ") {" + (members.length ? " " + members.join(", ") + " " : "") + "}";
-      }
-      var proto = Object.getPrototypeOf(value);
-      var ctor = proto && proto.constructor;
-      var named = ctor && ctor !== Object && typeof ctor.name === "string" && ctor.name;
-      var prefix = named ? ctor.name + " " : "";
-      var keys = Object.keys(value);
-      if (keys.length === 0) return prefix + "{}";
-      if (depth > MAX_DEPTH) return named ? "[" + ctor.name + "]" : "[Object]";
-      return prefix + "{ " + keys.map(function (key) {
-        return (isPlainKey(key) ? key : quote(key)) + ": " + inspect(value[key], nested, seen);
-      }).join(", ") + " }";
-    } finally {
-      seen.delete(value);
-    }
-  }
-
-  // Mirrors formatArgs in format.ts, including %s-style placeholders.
-  function formatArgs(args) {
-    var list = Array.prototype.slice.call(args);
-    var head = null;
-    if (typeof list[0] === "string" && list[0].indexOf("%") !== -1) {
-      var next = 1;
-      head = list[0].replace(/%([sdifjoOc%])/g, function (match, type) {
-        if (type === "%") return "%";
-        if (next >= list.length) return match;
-        var value = list[next++];
-        if (type === "s") {
-          return typeof value === "string" ? value
-            : typeof value === "object" && value !== null ? inspect(value, 1, new Set())
-            : inspect(value, 0, new Set());
-        }
-        if (type === "d" || type === "i") {
-          if (typeof value === "object" && value !== null) return "NaN";
-          var n = Number(value);
-          return inspect(type === "i" ? Math.trunc(n) : n, 0, new Set());
-        }
-        if (type === "f") return inspect(parseFloat(String(value)), 0, new Set());
-        if (type === "j") {
-          try { var json = JSON.stringify(value); return json === undefined ? "undefined" : json; }
-          catch (e) { return "[Circular]"; }
-        }
-        if (type === "c") return "";
-        return inspect(value, 1, new Set());
-      });
-      list = list.slice(next);
-      if (list.length === 0) return head;
-    }
-    var tail = list.map(function (a) { return inspect(a, 0, new Set()); }).join(" ");
-    return head === null ? tail : head + " " + tail;
-  }
+  // Some compilers (esbuild's keepNames, used by tsx) wrap functions in
+  // __name(fn, "name") calls inside the copied source.
+  var __name = function (fn) { return fn; };
+  var formatter = (__FORMATTER__)(function (value, quote) {
+    if (typeof Node !== "undefined" && value instanceof Node) return describeNode(value, quote);
+    var isList = typeof NodeList !== "undefined" &&
+      (value instanceof NodeList || value instanceof HTMLCollection);
+    if (!isList) return undefined;
+    var items = Array.prototype.map.call(value, function (n) { return describeNode(n, quote); });
+    var label = value.constructor.name + "(" + items.length + ") ";
+    return items.length ? label + "[ " + items.join(", ") + " ]" : label + "[]";
+  });
+  function formatArgs(args) { return formatter.formatArgs(args); }
+  // Printed proxies show their target, like Node (no traps run).
+  window.Proxy = formatter.trackProxies(window.Proxy);
   window.__pandaFormat = formatArgs;
 
   ["log", "info", "warn", "error", "debug", "table"].forEach(function (method) {
@@ -329,9 +240,11 @@ const HARNESS = String.raw`
     var calmSince = 0;
     while (Date.now() < until) {
       await macrotask(0);
-      if (inflight > 0 || requestsStarted !== seen) {
+      // WebSocket messages on their way count too (see build-vendor.mjs).
+      var busy = inflight + (window.__pandaWsPending ? window.__pandaWsPending() : 0);
+      if (busy > 0 || requestsStarted !== seen) {
         seen = requestsStarted;
-        calmSince = inflight > 0 ? 0 : Date.now();
+        calmSince = busy > 0 ? 0 : Date.now();
         await macrotask(10);
         continue;
       }
@@ -449,7 +362,9 @@ const HARNESS = String.raw`
     });
   }
 })();
-`.replace("__MAX_LINES__", String(MAX_OUTPUT_LINES));
+`
+  .replace("__MAX_LINES__", String(MAX_OUTPUT_LINES))
+  .replace("__FORMATTER__", () => createFormatter.toString());
 
 /** Default look for the preview, matching the site's dark theme. */
 const PREVIEW_STYLES = `

@@ -311,3 +311,174 @@ describe("Express in the editor", () => {
     expect(r.error?.message).toMatch(/Cannot find module 'lodash'/);
   });
 });
+
+describe("cookies in Express", () => {
+  it("sets, reads and clears cookies; agents remember them", async () => {
+    const r = await execute(`
+      import express from "express";
+      import cookieParser from "cookie-parser";
+      import request from "supertest";
+      const app = express();
+      app.use(cookieParser());
+      app.post("/login", (req, res) => {
+        res.cookie("sid", "abc 123", { httpOnly: true, sameSite: "lax", secure: true });
+        res.json({ ok: true });
+      });
+      app.get("/me", (req, res) => res.json({ sid: req.cookies.sid ?? null }));
+      app.post("/logout", (req, res) => res.clearCookie("sid").sendStatus(204));
+      const login = await request(app).post("/login");
+      console.log(login.headers["set-cookie"]);
+      const agent = request.agent(app);
+      await agent.post("/login");
+      console.log((await agent.get("/me")).body);
+      await agent.post("/logout");
+      console.log((await agent.get("/me")).body);
+      console.log((await request(app).get("/me").set("Cookie", "sid=x%3D1; a=2")).body);
+    `);
+    expect(r.error).toBeUndefined();
+    expect(texts(r)).toEqual([
+      "[ 'sid=abc%20123; Path=/; HttpOnly; Secure; SameSite=Lax' ]",
+      "{ sid: 'abc 123' }",
+      "{ sid: null }",
+      "{ sid: 'x=1' }",
+    ]);
+  });
+});
+
+describe("WebSockets in the editor", () => {
+  it("connects browser-style clients to a ws server and broadcasts", async () => {
+    const r = await execute(`
+      import { WebSocketServer, WebSocket as WS } from "ws";
+      const wss = new WebSocketServer({ port: 8080 });
+      wss.on("connection", (socket, req) => {
+        const name = new URL(req.url, "http://x").searchParams.get("name");
+        socket.send(JSON.stringify({ type: "welcome", name }));
+        socket.on("message", (data) => {
+          for (const client of wss.clients) {
+            if (client.readyState === WS.OPEN) {
+              client.send(name + ": " + data);
+            }
+          }
+        });
+        socket.on("close", (code) => console.log("left", name, code));
+      });
+      const mei = new WebSocket("ws://localhost:8080/?name=Mei");
+      const bo = new WebSocket("ws://localhost:8080/?name=Bo");
+      console.log(mei.readyState);
+      bo.onmessage = (event) => console.log("Bo got", event.data);
+      mei.addEventListener("open", () => mei.send("hi all"));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      console.log(wss.clients.size);
+      bo.close(1000, "bye");
+      await new Promise((resolve) => (bo.onclose = (e) => resolve(e)));
+      console.log(bo.readyState, wss.clients.size);
+    `);
+    expect(r.error).toBeUndefined();
+    expect(texts(r)).toEqual([
+      "0",
+      `Bo got {"type":"welcome","name":"Bo"}`,
+      "Bo got Mei: hi all",
+      "2",
+      "left Bo 1000",
+      "3 1",
+    ]);
+  });
+
+  it("refuses connections nobody listens for and works with app.listen()", async () => {
+    const r = await execute(`
+      import express from "express";
+      import { WebSocketServer } from "ws";
+      const lost = new WebSocket("ws://localhost:9999");
+      lost.onerror = () => console.log("error");
+      lost.onclose = (e) => console.log("closed", e.code, e.wasClean);
+      const app = express();
+      const server = app.listen(3000, () => console.log("listening"));
+      const wss = new WebSocketServer({ server, path: "/chat" });
+      wss.on("connection", (socket) => socket.send("hello"));
+      const client = new WebSocket("ws://localhost:3000/chat");
+      const message = await new Promise((r) => (client.onmessage = (e) => r(e.data)));
+      console.log(message);
+      try {
+        new WebSocket("http2://x").send("x");
+      } catch (error) {
+        console.log(error.name);
+      }
+      try {
+        new WebSocket("ws://localhost:3000/chat").send("too early");
+      } catch (error) {
+        console.log(error.name);
+      }
+      wss.close();
+    `);
+    expect(r.error).toBeUndefined();
+    expect(texts(r)).toEqual([
+      "listening",
+      "error",
+      "closed 1006 false",
+      "hello",
+      "SyntaxError",
+      "InvalidStateError",
+    ]);
+  });
+
+  it("lets Vitest tests talk to a server", async () => {
+    const r = await execute(`
+      import { test, expect } from "vitest";
+      import { WebSocketServer } from "ws";
+      const wss = new WebSocketServer({ port: 4000 });
+      wss.on("connection", (s) => s.on("message", (d) => s.send(String(d).toUpperCase())));
+      const nextMessage = (ws) => new Promise((r) => ws.addEventListener("message", (e) => r(e.data), { once: true }));
+      test("echoes in capitals", async () => {
+        const ws = new WebSocket("ws://localhost:4000");
+        await new Promise((r) => (ws.onopen = r));
+        ws.send("panda");
+        expect(await nextMessage(ws)).toBe("PANDA");
+        ws.close();
+      });
+    `);
+    expect(r.error).toBeUndefined();
+    expect(texts(r).at(-1)).toBe("Tests  1 passed (1)");
+  });
+});
+
+describe("Express details", () => {
+  it("adds ETags like Express and answers 304 when the copy is fresh", async () => {
+    const r = await execute(`
+      import express from "express";
+      import request from "supertest";
+      const app = express();
+      app.get("/hello", (req, res) => res.send("hello"));
+      app.get("/fresh", (req, res) => res.json({ fresh: req.fresh }));
+      app.options("/hello", (req, res) => res.sendStatus(204));
+      const first = await request(app).get("/hello");
+      console.log(first.headers.etag, first.headers["content-length"]);
+      const again = await request(app).get("/hello").set("If-None-Match", first.headers.etag);
+      console.log(again.status, JSON.stringify(again.text), again.headers["content-type"]);
+      const options = await request(app).options("/hello");
+      console.log(options.status, options.headers["content-type"]);
+      console.log((await request(app).get("/fresh")).body);
+    `);
+    expect(r.error).toBeUndefined();
+    expect(texts(r)).toEqual([
+      'W/"5-qvTGHdzF6KLavt4PO0gs2a6pQ00" 5',
+      '304 "" undefined',
+      "204 undefined",
+      "{ fresh: false }",
+    ]);
+  });
+});
+
+describe("Vitest timeouts", () => {
+  it("fails a test that never finishes, like Vitest's 5 s testTimeout", async () => {
+    const r = await execute(`
+      import { test } from "vitest";
+      test("waits forever", () => new Promise(() => {}));
+    `);
+    expect(texts(r)).toEqual([
+      "× waits forever",
+      "  → Error: Test timed out in 5000ms.",
+      "",
+      "Tests  1 failed (1)",
+    ]);
+  }, 10_000);
+});

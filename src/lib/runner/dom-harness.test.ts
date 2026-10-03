@@ -272,4 +272,49 @@ describe("React and fetch in the preview", () => {
     expect(r.error).toBeUndefined();
     expect(r.tests?.map((t) => t.passed)).toEqual([true, true]);
   });
+  it("runs a ws server and a React chat client on one page", async () => {
+    const code = [
+      'import { useEffect, useState } from "react";',
+      'import { createRoot } from "react-dom/client";',
+      'import { WebSocketServer } from "ws";',
+      "const wss = new WebSocketServer({ port: 8080 });",
+      "wss.on('connection', (socket) => {",
+      "  socket.on('message', (data) => {",
+      "    for (const c of wss.clients) c.send('echo: ' + data);",
+      "  });",
+      "});",
+      "function Chat() {",
+      "  const [lines, setLines] = useState([]);",
+      "  const [ws, setWs] = useState(null);",
+      "  useEffect(() => {",
+      "    const socket = new WebSocket('ws://localhost:8080');",
+      "    socket.onmessage = (e) => setLines((l) => [...l, e.data]);",
+      "    setWs(socket);",
+      "    return () => socket.close();",
+      "  }, []);",
+      "  return (",
+      "    <>",
+      "      <button onClick={() => ws.send('hi')}>Send</button>",
+      "      <ul>{lines.map((l, i) => <li key={i}>{l}</li>)}</ul>",
+      "    </>",
+      "  );",
+      "}",
+      'createRoot(document.getElementById("root")).render(<Chat />);',
+    ].join("\n");
+    const r = await runDomInNode(
+      code,
+      root,
+      [
+        {
+          name: "sends and receives",
+          check:
+            "(await __click('button'), document.querySelector('li')?.textContent === 'echo: hi')",
+        },
+      ],
+      undefined,
+      { react: true },
+    );
+    expect(r.error).toBeUndefined();
+    expect(r.tests?.[0]).toMatchObject({ passed: true });
+  });
 });
