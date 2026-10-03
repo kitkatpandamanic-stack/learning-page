@@ -1,0 +1,603 @@
+---
+title: XSS and Injection Attacks
+description: Think like an attacker, then close the classic holes in JavaScript apps - XSS in the browser and React, SQL and NoSQL injection, prototype pollution, eval and ReDoS.
+duration: 24
+xp: 25
+---
+
+Most security bugs in JavaScript apps come from one root mistake: **treating data as code**. A comment gets parsed as HTML, a search term becomes part of a SQL query, a JSON key quietly rewrites `Object.prototype`. In each case, someone outside your team gets to decide what your program does. In this lesson you'll learn to spot the places where that can happen, watch a few attacks work in a safe sandbox, and then close each hole with the fix professionals use. 🛡️
+
+Everything here is **defensive**: you'll see just enough of each attack to understand it and to write a test that proves your fix works.
+
+## Think like an attacker
+
+Security work starts with a simple question for every feature: **what could go wrong, and who would make it go wrong?** This is **threat modelling**, and you don't need a formal method to start:
+
+- **What are we protecting?** Accounts, personal data, money, the ability to change things, your servers' CPU time.
+- **Where does untrusted data come in?** Request bodies, query strings, headers, cookies, uploaded files, `location.hash`, `postMessage`, third-party APIs, and even data from **your own database** that a user once typed. Every one of these is a **trust boundary**.
+- **What happens if this is abused?** "Someone reads every user's messages" deserves far more care than "someone sees a typo".
+
+The **OWASP Top 10** (from the Open Worldwide Application Security Project) lists the most common serious risks in web apps. Here's how the big ones look in JavaScript:
+
+| Risk | Typical JavaScript mistake | Where you'll fix it |
+| --- | --- | --- |
+| Broken access control | checking login but not ownership | [authentication](/learn/javascript/authentication-and-sessions) |
+| Injection (incl. XSS) | `innerHTML`, string-built SQL, `{ "$ne": "" }` | this lesson |
+| Cryptographic failures | MD5/SHA-256 passwords, tokens in `localStorage` | [authentication](/learn/javascript/authentication-and-sessions) |
+| Security misconfiguration | permissive CORS, no security headers | [CSRF, CORS and secrets](/learn/javascript/csrf-cors-and-secrets) |
+| Vulnerable / malicious packages | old lockfiles, typosquatted npm names | [CSRF, CORS and secrets](/learn/javascript/csrf-cors-and-secrets) |
+| Authentication failures | no rate limit on login, sessions that never expire | [authentication](/learn/javascript/authentication-and-sessions) |
+
+The mindset that ties it together is **defence in depth**: never rely on one check. Validate input **and** escape output **and** send a Content-Security-Policy, so one mistake doesn't become a breach.
+
+## Cross-site scripting (XSS)
+
+**XSS** happens when an attacker gets **their** JavaScript to run on **your** page, in your users' browsers. That script runs with the same powers as your own code: it can read anything on the page (including tokens in `localStorage`), send requests as the logged-in user, or swap your login form for a fake one. There are three flavours:
+
+- **Stored XSS**: the payload is saved (a comment, a profile name, a product review) and served to **every** visitor. The most dangerous kind.
+- **Reflected XSS**: the payload is in a link, e.g. `/search?q=<payload>`, and the server echoes it straight into the page. The attacker tricks someone into clicking.
+- **DOM-based XSS**: the server never sees it. Your own front-end code reads something like `location.hash` and writes it into the page with `innerHTML`.
+
+All three end the same way: a string from outside gets **parsed as HTML**. A classic payload doesn't even need a `<script>` tag (browsers don't run scripts inserted with `innerHTML`), because an event handler attribute works just as well.
+
+### innerHTML vs textContent
+
+Press **Run**, then try both buttons. The "comment" is an image with a broken `src` and an `onerror` handler: harmless here, it only writes a message on the page, but a real attacker's handler would send your cookies or tokens somewhere.
+
+<TryIt
+  html={`<p>A visitor posted this comment:</p>
+<textarea id="comment" rows="3" cols="56"><img src="x" onerror="document.querySelector('#alarm').textContent = '😱 Injected code just ran!'"></textarea>
+<p>
+  <button id="unsafe">Show with innerHTML</button>
+  <button id="safe">Show with textContent</button>
+</p>
+<div id="output"></div>
+<p id="alarm"></p>`}
+  code={`const comment = document.querySelector("#comment");
+const output = document.querySelector("#output");
+const alarm = document.querySelector("#alarm");
+
+document.querySelector("#unsafe").addEventListener("click", () => {
+  alarm.textContent = "";
+  output.innerHTML = comment.value; // ❌ parsed as HTML
+});
+
+document.querySelector("#safe").addEventListener("click", () => {
+  alarm.textContent = "";
+  output.textContent = comment.value; // ✅ shown as text
+});`}
+/>
+
+With **`innerHTML`** the browser builds a real `<img>` element, the image fails to load, and the attacker's `onerror` code runs. With **`textContent`** the very same string is shown as harmless characters. That's the first rule of XSS defence:
+
+- To show **text**, use `textContent`, `createElement` + `append`, or `setAttribute` with a safe value. These never parse HTML.
+- Treat `innerHTML`, `outerHTML`, `insertAdjacentHTML` and `document.write` as **danger zones**. Only feed them HTML you built yourself, or HTML that has been sanitised (more on that below).
+
+## Escaping HTML: context matters
+
+Sometimes you really are building an HTML string: a server-side template, an email, a string you later put into `innerHTML`. Then every piece of untrusted data must be **escaped**: special characters are replaced by **HTML entities** that display the character instead of acting as markup.
+
+| Character | Entity | Why it's dangerous |
+| --- | --- | --- |
+| `&` | `&amp;` | starts an entity (escape it **first**) |
+| `<` and `>` | `&lt;` and `&gt;` | start and end tags |
+| `"` | `&quot;` | ends a `"…"` attribute value |
+| `'` | `&#39;` | ends a `'…'` attribute value |
+
+A common half-fix escapes only `<` and `>`. Watch what happens when the value lands inside an **attribute**:
+
+<CodeExample output={`<a href="/pandas" title="Cute pandas">
+<a href="/pandas" title="" onmouseover="steal()">`}>
+
+```js
+// Escaping only < and > is not enough
+function escapeAngles(text) {
+  return text.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function renderLink(url, title) {
+  const href = escapeAngles(url);
+  return `<a href="${href}" title="${escapeAngles(title)}">`;
+}
+
+console.log(renderLink("/pandas", "Cute pandas"));
+console.log(renderLink("/pandas", '" onmouseover="steal()'));
+```
+
+</CodeExample>
+
+No angle brackets needed: the quote closes the `title` attribute early and the attacker adds a brand-new event handler. You'll write a complete `escapeHtml` in the exercise.
+
+Escaping depends on **where** the data goes. HTML entities protect HTML text and quoted attributes, but not a URL inside `href`: `javascript:alert(1)` contains nothing to escape and still runs when clicked. For links that come from users, **parse** the URL and allow only the schemes you expect:
+
+<CodeExample output={`true https://example.com/pandas
+true /profile/mei
+false javascript:alert(document.cookie)
+false  JaVaScRiPt:alert(1)
+false data:text/html,<script>alert(1)</script>`}>
+
+```js
+function isSafeUrl(text) {
+  try {
+    const url = new URL(text, "https://pandadev.example");
+    return ["http:", "https:", "mailto:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+const links = [
+  "https://example.com/pandas",
+  "/profile/mei",
+  "javascript:alert(document.cookie)",
+  " JaVaScRiPt:alert(1)",
+  "data:text/html,<script>alert(1)</script>",
+];
+for (const link of links) {
+  console.log(isSafeUrl(link), link);
+}
+```
+
+</CodeExample>
+
+The URL parser handles the tricks (mixed case, leading spaces) that a hand-written `startsWith("javascript:")` check would miss. That's a pattern worth remembering: **parse, then check an allowlist**, instead of trying to spot every bad input with a blocklist.
+
+## React escapes for you (mostly)
+
+Good news: React escapes everything you put in `{curly braces}`. Bad news: it gives you an escape hatch with a deliberately scary name. Edit the comment and compare the two outputs:
+
+<TryIt
+  language="react"
+  code={`import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+const evil =
+  '<img src="x" onerror="this.parentNode.append(\\'😱 code ran!\\')">';
+
+function Comment({ text }) {
+  // ✅ React escapes {text}: the tags appear as plain text
+  return <p className="safe">{text}</p>;
+}
+
+function RawComment({ html }) {
+  // ❌ dangerouslySetInnerHTML puts the string in as real HTML
+  return (
+    <p className="raw" dangerouslySetInnerHTML={{ __html: html }} />
+  );
+}
+
+function App() {
+  const [text, setText] = useState(evil);
+  return (
+    <div>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        cols={50}
+      />
+      <h3>{"{text}"}</h3>
+      <Comment text={text} />
+      <h3>dangerouslySetInnerHTML</h3>
+      <RawComment html={text} />
+    </div>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);`}
+/>
+
+So in React, XSS usually sneaks in through a few known doors:
+
+- **`dangerouslySetInnerHTML`**: only with HTML you trust or have sanitised. Search for it in code review.
+- **URLs in `href` / `src`** built from user data: validate them like `isSafeUrl` above. Recent React versions block `javascript:` URLs, but don't make that your only defence.
+- **Refs and effects** that touch the DOM directly (`ref.current.innerHTML = ...`): React can't protect code that bypasses it.
+- **Server-rendered state** embedded in a `<script>` tag with `JSON.stringify` (a `</script>` inside the data ends the tag early). Frameworks like Next.js escape this for you; hand-rolled SSR often doesn't.
+
+### When you must render user HTML: sanitise it
+
+Rich-text editors, Markdown previews and HTML emails need real HTML. Don't write your own filter (attackers know hundreds of tricks); use a well-tested **sanitiser** such as **DOMPurify**, which keeps safe tags and strips scripts and event handlers:
+
+```bash
+npm install dompurify
+```
+
+```jsx
+import DOMPurify from "dompurify";
+
+function RichComment({ html }) {
+  const clean = DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: ["b", "i", "em", "strong", "a", "p", "ul", "li"],
+    ALLOWED_ATTR: ["href"],
+  });
+  return <div dangerouslySetInnerHTML={{ __html: clean }} />;
+}
+
+// '<img src=x onerror=steal()><b>hi</b>' becomes '<b>hi</b>'
+```
+
+Sanitise as **late** as possible, right before rendering, so that every path to the page goes through it. On a Node server, DOMPurify needs a DOM implementation (`isomorphic-dompurify` wraps it with jsdom).
+
+## Content-Security-Policy: a safety net
+
+Even careful teams ship an XSS bug eventually. A **Content-Security-Policy** (CSP) header tells the browser which scripts are allowed to run at all, so an injected one is blocked even if it reaches the page:
+
+```text
+Content-Security-Policy: default-src 'self';
+  script-src 'self' 'nonce-r4nd0mPerRequest';
+  object-src 'none'; base-uri 'self'; frame-ancestors 'none'
+```
+
+(It's one header line; it's split here to fit.) With this policy, scripts load only from your own origin or from `<script nonce="r4nd0mPerRequest">` tags whose **nonce** matches the one the server generated for this response, and **inline event handlers** like `onerror="..."` are blocked entirely. That one header would have stopped every attack in this lesson's demos.
+
+- Roll it out with **`Content-Security-Policy-Report-Only`** first: the browser reports violations without blocking anything, so you find the inline scripts you forgot about.
+- Avoid `'unsafe-inline'` and `'unsafe-eval'` in `script-src`: they switch most of the protection off.
+- CSP is the **second** line of defence. Escaping and safe DOM APIs are still the first.
+
+You'll send CSP and the other security headers from Express in the [CSRF, CORS and secrets](/learn/javascript/csrf-cors-and-secrets) lesson.
+
+<Callout type="warning" title="Tokens in localStorage turn XSS into account takeover">
+
+Any script on your page can read `localStorage`. If your login token lives there, one XSS bug lets the attacker copy it and use the account from their own machine, long after the victim closes the tab. An `HttpOnly` cookie can't be read by JavaScript at all. You'll weigh this trade-off properly in the [next lesson](/learn/javascript/authentication-and-sessions).
+
+</Callout>
+
+## Injection on the server
+
+XSS is injection into **HTML**. The same mistake on the server injects into **queries** and **commands**.
+
+### SQL injection
+
+Building SQL by gluing strings together lets the input change the **meaning** of the query:
+
+<CodeExample output={`SELECT * FROM users WHERE email = 'mei@example.com'
+SELECT * FROM users WHERE email = 'x' OR '1'='1'
+SELECT * FROM users WHERE email = 'x'; DROP TABLE users; --'`}>
+
+```js
+function findUserSql(email) {
+  return `SELECT * FROM users WHERE email = '${email}'`;
+}
+
+console.log(findUserSql("mei@example.com"));
+console.log(findUserSql("x' OR '1'='1"));
+console.log(findUserSql("x'; DROP TABLE users; --"));
+```
+
+</CodeExample>
+
+The second query matches **every** user; the third deletes a table. The fix is never "escape the quotes yourself". It's **parameterised queries**: the SQL and the values travel to the database separately, so a value can never become SQL. On your machine, with PostgreSQL or SQLite:
+
+```js
+// node-postgres (npm i pg): $1, $2 are placeholders
+const { rows } = await pool.query(
+  "SELECT id, email FROM users WHERE email = $1",
+  [email],
+);
+
+// better-sqlite3 (npm i better-sqlite3): ? placeholders
+const user = db
+  .prepare("SELECT id, email FROM users WHERE email = ?")
+  .get(email);
+```
+
+Query builders and ORMs (Prisma, Drizzle, Knex, Sequelize) parameterise for you, **except** in their raw-SQL escape hatches. `prisma.$queryRaw` with a tagged template is safe, while `` prisma.$queryRawUnsafe(`... ${email}`) `` is exactly the bug above with a nicer name. The same rule covers shell commands: `execFile("convert", [file, "out.png"])` passes arguments safely, while `` exec(`convert ${file} out.png`) `` lets a filename like `x; rm -rf ~` run a second command.
+
+### NoSQL operator injection
+
+MongoDB queries are objects, not strings, so people assume they're safe. But `express.json()` happily turns a request body into **objects**, and MongoDB treats keys starting with `$` as **operators**. Below, a tiny stand-in for MongoDB's `findOne` understands `$ne` ("not equal"), just like the real thing:
+
+<CodeExample output={`/login-unsafe 200 { loggedIn: true }
+/login 400 { error: 'Invalid input' }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+// A tiny stand-in for MongoDB's findOne: it understands
+// plain values and the $ne ("not equal") operator.
+// (Plain-text passwords only to keep it short: see next lesson!)
+const users = [{ username: "admin", password: "s3cret!" }];
+function findOne(query) {
+  return users.find((user) =>
+    Object.entries(query).every(([field, wanted]) =>
+      wanted?.$ne !== undefined
+        ? user[field] !== wanted.$ne
+        : user[field] === wanted
+    )
+  );
+}
+
+const app = express();
+app.use(express.json());
+
+app.post("/login-unsafe", (req, res) => {
+  const { username, password } = req.body;
+  const user = findOne({ username, password });
+  res.json({ loggedIn: Boolean(user) });
+});
+
+app.post("/login", (req, res) => {
+  const { username, password } = req.body ?? {};
+  if (typeof username !== "string" ||
+      typeof password !== "string") {
+    return res.status(400).json({ error: "Invalid input" });
+  }
+  const user = findOne({ username, password });
+  res.json({ loggedIn: Boolean(user) });
+});
+
+const attack = { username: "admin", password: { $ne: "" } };
+for (const url of ["/login-unsafe", "/login"]) {
+  const res = await request(app).post(url).send(attack);
+  console.log(url, res.status, res.body);
+}
+```
+
+</CodeExample>
+
+"Log me in as admin, where the password is **not equal to** an empty string" matches the admin, whatever their password is. The fix is boring and effective: **check the type** of every field before it reaches a query. A schema library like Zod (`z.string()`) does this for whole objects, and Mongoose has a `sanitizeFilter` option that neutralises `$` keys in filters as an extra layer.
+
+## Prototype pollution
+
+This one is special to JavaScript. Every plain object inherits from `Object.prototype`, and the key `"__proto__"` is a **getter/setter for an object's prototype**. `JSON.parse` creates `"__proto__"` as an ordinary key, but a careless **deep merge** later writes into it, and then it's writing into `Object.prototype`, which **every** object shares:
+
+<CodeExample output={`{ font: 18 } light
+true true
+false`}>
+
+```js
+// A hand-written deep merge, like thousands on npm
+function merge(target, source) {
+  for (const key in source) {
+    const value = source[key];
+    if (value && typeof value === "object") {
+      target[key] ??= {};
+      merge(target[key], value);
+    } else {
+      target[key] = value;
+    }
+  }
+  return target;
+}
+
+const defaults = { theme: "light", sizes: { font: 14 } };
+const body = JSON.parse(
+  '{"sizes": {"font": 18}, "__proto__": {"isAdmin": true}}'
+);
+const settings = merge(structuredClone(defaults), body);
+console.log(settings.sizes, settings.theme);
+
+const visitor = { name: "Po" }; // a brand-new, unrelated object
+console.log("isAdmin" in visitor, visitor.isAdmin);
+console.log(Object.hasOwn(visitor, "isAdmin"));
+
+delete Object.prototype.isAdmin; // clean up after the demo
+```
+
+</CodeExample>
+
+The merge looked correct, the settings came out right, and yet a completely unrelated object now says `isAdmin: true`. Any code like `if (user.isAdmin)` for a user without that field is now fooled, for **every request** until the server restarts. Depending on what the app reads, pollution has led to privilege escalation, crashes and even remote code execution through template engines. In 2019, lodash's `defaultsDeep` had exactly this bug, and countless projects had to update.
+
+Ways to stay safe:
+
+<CodeExample output={`null [ '__proto__' ]
+true undefined
+true undefined
+true false`}>
+
+```js
+const body = JSON.parse('{"__proto__": {"isAdmin": true}}');
+
+// 1. A dictionary with no prototype at all
+const dict = Object.create(null);
+dict["__proto__"] = { isAdmin: true };
+console.log(Object.getPrototypeOf(dict), Object.keys(dict));
+
+// 2. A Map: keys are just keys
+const map = new Map(Object.entries(body));
+console.log(map.has("__proto__"), {}.isAdmin);
+
+// 3. Copying? Use structuredClone, not a hand-written deep copy
+const copy = structuredClone(body);
+console.log(Object.hasOwn(copy, "__proto__"), {}.isAdmin);
+
+// 4. Lookups on plain objects: check the key is really its own
+const roles = { mei: "admin" };
+const who = "constructor";
+console.log(roles[who] !== undefined, Object.hasOwn(roles, who));
+```
+
+</CodeExample>
+
+- Use **`Map`** or **`Object.create(null)`** for dictionaries whose keys come from users.
+- Use **`structuredClone`** for deep copies; it creates plain own properties and never walks into prototypes.
+- If you must merge, **reject** `__proto__`, `constructor` and `prototype` keys, and only copy **own** keys (`Object.keys`, not `for...in`). You'll do this in the exercise.
+- Check lookups with **`Object.hasOwn`**: the last line shows that `roles["constructor"]` finds the inherited `Object` function, which is truthy.
+- As hardening, Node can remove the `__proto__` accessor entirely: `node --disable-proto=delete server.js`.
+
+## eval, new Function and ReDoS
+
+Two more ways to hand control to an attacker:
+
+```js
+// ❌ Each of these runs a string as code
+eval(req.query.expr);
+new Function("return " + userFormula)();
+setTimeout(userString, 100); // a string here is eval'd too
+
+// ✅ Data stays data
+const data = JSON.parse(req.body.raw);
+const ops = { add: (a, b) => a + b, mul: (a, b) => a * b };
+const result = ops[op]?.(a, b); // a fixed allowlist of actions
+```
+
+There's almost never a good reason to `eval` input. If users need formulas, use a small expression parser with a fixed set of operations. A strict CSP without `'unsafe-eval'` blocks `eval` in the browser as a backstop.
+
+**ReDoS** (Regular expression Denial of Service) is subtler. Some regexes with **nested quantifiers**, like `/^(a+)+$/`, take exponential time on input that *almost* matches, such as thirty `a`s followed by `!`. JavaScript has one main thread, so one such request freezes the **whole server** for every user.
+
+```js
+// ❌ Don't run this with long input: nested + makes it explode
+const bad = /^(a+)+$/;
+bad.test("a".repeat(30) + "!"); // seconds... or minutes
+
+// ✅ Same meaning, no nesting, and cap the length first
+const good = /^a+$/;
+if (input.length <= 100 && good.test(input)) { /* ... */ }
+```
+
+Defences: limit input length **before** matching, avoid nested quantifiers like `(a+)+` and `(.*)*`, use the linter rules in `eslint-plugin-regexp` to flag dangerous patterns, and for user-supplied patterns use the `re2` package, whose engine runs in linear time.
+
+<Callout type="tip" title="Validate on the way in, encode on the way out">
+
+Two habits cover most of this lesson. **On the way in**, validate every input at the boundary: type, length, format, allowed keys. **On the way out**, encode for the place the data goes: HTML escaping for HTML, parameters for SQL, an argument array for shell commands, `JSON.stringify` for JSON. Validation alone isn't enough, because a perfectly valid name like `O'Brien` still breaks a string-built query.
+
+</Callout>
+
+<Quiz
+  question="A search page runs results.innerHTML = 'You searched for ' + new URLSearchParams(location.search).get('q'). The server never stores or echoes the query. What kind of XSS is this, and what is the simplest fix?"
+  options={["Stored XSS; fix it by validating the search term on the server", "DOM-based XSS; fix it by setting results.textContent instead of innerHTML", "Reflected XSS; fix it with a CSRF token", "It is safe, because the data comes from the browser's own address bar"]}
+  answer={1}
+  explanation="The payload goes from the URL into the page entirely in front-end code, which is DOM-based XSS. Writing it with textContent shows it as text. Anyone can send a victim a link with a malicious q, so the address bar is untrusted input."
+/>
+
+<Quiz
+  question="A server deep-merges JSON from request bodies into a settings object with a for...in loop. Which body could make every object in the process inherit isAdmin: true?"
+  options={["{ \"isAdmin\": true }", "{ \"settings\": { \"isAdmin\": true } }", "{ \"__proto__\": { \"isAdmin\": true } }", "[ \"isAdmin\", true ]"]}
+  answer={2}
+  explanation="JSON.parse keeps __proto__ as a normal key, but when the merge does target['__proto__'] it gets Object.prototype and copies isAdmin into it, so all plain objects inherit it. Rejecting __proto__, constructor and prototype keys (or using Map / Object.create(null)) prevents it."
+/>
+
+<Exercise
+  title="Escape the output, guard the merge"
+  starter={`function escapeHtml(value) {
+  // TODO 1: turn value into a string and replace
+  //         & < > " ' with their HTML entities
+  return value;
+}
+
+function renderComment({ author, text }) {
+  return \`<li title="\${escapeHtml(author)}">\` +
+    \`<b>\${escapeHtml(author)}</b>: \${escapeHtml(text)}</li>\`;
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" &&
+    !Array.isArray(value);
+}
+
+function safeMerge(target, source) {
+  for (const key in source) {
+    // TODO 2: throw new Error(\`Unsafe key: \${key}\`) for the keys
+    //         __proto__, constructor and prototype
+    // TODO 3: only merge the source's OWN keys
+    const value = source[key];
+    if (isPlainObject(value)) {
+      if (!isPlainObject(target[key])) target[key] = {};
+      safeMerge(target[key], value);
+    } else {
+      target[key] = value;
+    }
+  }
+  return target;
+}
+
+console.log(renderComment({
+  author: 'Po "Dragon Warrior"',
+  text: "I <3 dumplings & tea",
+}));
+
+const settings = { theme: "light", sizes: { font: 14 } };
+safeMerge(settings, JSON.parse('{"sizes": {"font": 18}}'));
+console.log(settings);
+`}
+  tests={[
+    { name: "escapeHtml escapes < > \" and '", check: `escapeHtml('<script>alert("hi")</script>') === '&lt;script&gt;alert(&quot;hi&quot;)&lt;/script&gt;' && escapeHtml("It's") === 'It&#39;s'` },
+    { name: "escapeHtml escapes & first (no double escaping of its own entities)", check: `escapeHtml('&lt;') === '&amp;lt;' && escapeHtml('Tom & Jerry') === 'Tom &amp; Jerry'` },
+    { name: "escapeHtml turns any value into a string", check: `escapeHtml(42) === '42' && escapeHtml(null) === 'null' && escapeHtml(true) === 'true'` },
+    { name: "renderComment can't be broken out of, in text or in the title attribute", check: `(() => { const html = renderComment({ author: 'x" onclick="steal()', text: '<img src=x onerror=steal()>' }); return !html.includes('<img') && !html.includes('" onclick') && html.includes('&lt;img src=x onerror=steal()&gt;'); })()` },
+    { name: "safeMerge still deep-merges objects and replaces other values", check: `JSON.stringify(safeMerge({ a: 1, b: { c: 2, d: [1] } }, { b: { d: [3], e: 4 }, f: null })) === JSON.stringify({ a: 1, b: { c: 2, d: [3], e: 4 }, f: null })` },
+    { name: "safeMerge throws on a nested __proto__ key and Object.prototype stays clean", check: `(() => { let threw = false; try { safeMerge({}, JSON.parse('{"a": {"__proto__": {"pwned": true}}}')); } catch (e) { threw = e.message === 'Unsafe key: __proto__'; } const clean = ({}).pwned === undefined; delete Object.prototype.pwned; return threw && clean; })()` },
+    { name: "safeMerge throws on constructor and prototype keys too", check: `['constructor', 'prototype'].every((key) => { try { safeMerge({}, JSON.parse('{"x": {"' + key + '": {"pwned": true}}}')); return false; } catch (e) { return e.message === 'Unsafe key: ' + key; } finally { delete Object.prototype.pwned; } })` },
+    { name: "safeMerge copies only the source's own keys", check: `(() => { const source = Object.create({ inherited: 1 }); source.own = 2; return Object.keys(safeMerge({}, source)).join() === 'own'; })()` },
+  ]}
+>
+
+A comments widget builds HTML strings and merges user settings from JSON. Press **Run**: the comment's quotes and `<` come out raw, so both the attribute and the text can be broken out of. Fix the two helpers:
+
+1. **`escapeHtml(value)`** turns `value` into a string (`String(value)`) and replaces `&` with `&amp;`, `<` with `&lt;`, `>` with `&gt;`, `"` with `&quot;` and `'` with `&#39;`. Escape `&` **first**, or you'll turn your own `&lt;` into `&amp;lt;`.
+2. **`safeMerge(target, source)`** must throw `new Error("Unsafe key: <key>")` (e.g. `Unsafe key: __proto__`) when it meets a `__proto__`, `constructor` or `prototype` key at any depth.
+3. It must merge only the source's **own** keys: an inherited property is not part of the data.
+
+Keep the rest as it is: plain objects merge deeply, everything else (numbers, arrays, `null`) replaces the old value.
+
+<Hint>
+
+Chain `.replaceAll(...)` calls on `String(value)`, starting with `"&"`. For the merge, loop over `Object.keys(source)` instead of `for...in` (that fixes TODO 3), and check the key against a `Set` of the three dangerous names before doing anything else with it. The recursive call checks the nested levels for free.
+
+</Hint>
+
+<Solution>
+
+```js
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;") // first, or we'd escape our own &s
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function renderComment({ author, text }) {
+  return `<li title="${escapeHtml(author)}">` +
+    `<b>${escapeHtml(author)}</b>: ${escapeHtml(text)}</li>`;
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" &&
+    !Array.isArray(value);
+}
+
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function safeMerge(target, source) {
+  for (const key of Object.keys(source)) {
+    if (UNSAFE_KEYS.has(key)) {
+      throw new Error(`Unsafe key: ${key}`);
+    }
+    const value = source[key];
+    if (isPlainObject(value)) {
+      if (!isPlainObject(target[key])) target[key] = {};
+      safeMerge(target[key], value);
+    } else {
+      target[key] = value;
+    }
+  }
+  return target;
+}
+
+console.log(renderComment({
+  author: 'Po "Dragon Warrior"',
+  text: "I <3 dumplings & tea",
+}));
+
+const settings = { theme: "light", sizes: { font: 14 } };
+safeMerge(settings, JSON.parse('{"sizes": {"font": 18}}'));
+console.log(settings);
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Threat modelling**: ask what you protect, where untrusted data enters (every trust boundary) and what abuse would cost. Layer your defences (**defence in depth**).
+- **XSS** (stored, reflected, DOM-based) is a string parsed as HTML in your page. Show text with `textContent`; keep `innerHTML` and `dangerouslySetInnerHTML` for trusted or **sanitised** HTML (DOMPurify).
+- **Escape for the context**: `& < > " '` for HTML (`&` first); parse URLs and allow only `http:`/`https:` schemes for links. React escapes `{values}` for you.
+- A **Content-Security-Policy** with nonces blocks injected and inline scripts as a safety net; roll it out with Report-Only first.
+- **SQL injection**: always use parameterised queries (`$1`, `?`), including in ORMs' raw-SQL helpers; use argument arrays for shell commands.
+- **NoSQL operator injection**: check the **type** of every field (`typeof password === "string"`) before it reaches a query.
+- **Prototype pollution**: reject `__proto__`/`constructor`/`prototype`, copy own keys only, prefer `Map`, `Object.create(null)` and `structuredClone`, check with `Object.hasOwn`.
+- Never `eval` input, and avoid regexes with nested quantifiers (**ReDoS**): cap input length, lint your patterns, use `re2` for user patterns.

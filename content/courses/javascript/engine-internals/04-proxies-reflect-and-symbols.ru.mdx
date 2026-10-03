@@ -1,0 +1,663 @@
+---
+title: Proxy, Reflect и символы
+description: Управляйте поведением свойств с помощью дескрипторов, freeze и геттеров, подключайтесь к языку через well-known символы и перехватывайте объекты с Proxy и Reflect — трюк, на котором стоят Vue и MobX.
+duration: 25
+xp: 30
+---
+
+Некоторые JavaScript-библиотеки кажутся волшебством. Во Vue вы пишете `state.count++`, и страница обновляется. В MobX компонент перерисовывается тогда и только тогда, когда меняются данные, которые он прочитал. ORM позволяет написать `user.posts` и тихо выполняет запрос к базе данных. Никакой магии тут нет: это **метапрограммирование (metaprogramming)** — код, который меняет поведение самих объектов. В этом уроке разберём инструменты от маленьких (дескрипторы свойств, заморозка, символы) до мощных (`Proxy` и `Reflect`), чтобы вы могли читать код фреймворков, отлаживать его и сами пользоваться этими инструментами, когда они действительно уместны. 🪄
+
+## Дескрипторы свойств
+
+Свойство — это не только имя и значение. У каждого свойства есть **дескриптор (descriptor)** с тремя флагами, которые им управляют:
+
+| Флаг | Если `false`... |
+| --- | --- |
+| **`writable`** | значение нельзя изменить (в строгом режиме присваивание бросает `TypeError`) |
+| **`enumerable`** | свойство скрыто от `Object.keys`, `for...in`, spread и `JSON.stringify` |
+| **`configurable`** | свойство нельзя удалить, а его флаги больше нельзя изменить |
+
+У свойств, созданных обычным способом, все три флага равны `true`. **`Object.defineProperty`** создаёт свойство ровно с теми флагами, которые вы выбрали, а все пропущенные флаги по умолчанию равны **`false`**:
+
+<CodeExample output={`{ value: 'Mei', writable: true, enumerable: true, configurable: true }
+{ value: 7, writable: false, enumerable: false, configurable: false }
+[ 'name' ] {"name":"Mei"}
+7
+TypeError`}>
+
+```js
+const user = { name: "Mei" };
+console.log(Object.getOwnPropertyDescriptor(user, "name"));
+
+Object.defineProperty(user, "id", { value: 7 }); // флаги: false
+console.log(Object.getOwnPropertyDescriptor(user, "id"));
+
+console.log(Object.keys(user), JSON.stringify(user)); // id скрыт
+console.log(user.id); // но он есть
+
+try {
+  user.id = 8; // только для чтения
+} catch (error) {
+  console.log(error.name);
+}
+```
+
+</CodeExample>
+
+Так устроены встроенные объекты: `Math.PI` нельзя перезаписать, а методы массивов вроде `map` неперечисляемые — поэтому `for...in` по массиву их не выводит. В вашем коде неперечисляемые свойства удобны для метаданных, которые не должны попасть в JSON.
+
+<Callout type="warning" title="Тихий провал в нестрогом режиме">
+
+В строгом режиме (модули, классы, этот раннер) запись в свойство только для чтения бросает ошибку. В старых скриптах без модулей она **молча не срабатывает**: присваивание игнорируется, и код продолжает работать со старым значением. Если в легаси-коде вы столкнулись с «моё присваивание ничего не сделало», проверьте, нет ли там замороженных объектов и свойств только для чтения.
+
+</Callout>
+
+## Геттеры и сеттеры
+
+Вместо `value` у свойства может быть **геттер (getter)** (`get`) и/или **сеттер (setter)** (`set`) — функции, которые выполняются при чтении или записи свойства. Вы использовали их в классах; под капотом это **дескрипторы доступа (accessor descriptors)**. Изящный трюк уровня Senior — **ленивое свойство (lazy property)**: геттер, который при первом обращении делает дорогую работу, а затем заменяет себя обычным значением, чтобы больше никогда не выполняться:
+
+<CodeExample output={`(собираем отчёт...)
+42 панды
+42 панды`}>
+
+```js
+const stats = {
+  get report() {
+    console.log("(собираем отчёт...)"); // дорогая работа
+    const value = "42 панды";
+    // Заменяем геттер обычным свойством с данными
+    Object.defineProperty(this, "report", {
+      value,
+      enumerable: true,
+    });
+    return value;
+  },
+};
+
+console.log(stats.report); // выполняет геттер
+console.log(stats.report); // просто читает сохранённое значение
+```
+
+</CodeExample>
+
+Геттеры отлично подходят для производных значений (`get total()`), но пусть они будут дешёвыми и без побочных эффектов. Геттер, который отправляет сетевой запрос или меняет состояние, удивляет всех, включая отладчик, который вызывает геттеры, когда показывает объект.
+
+## Заморозка и запечатывание
+
+Три встроенные функции блокируют объект целиком:
+
+| Функция | Добавлять свойства | Удалять свойства | Менять значения |
+| --- | --- | --- | --- |
+| `Object.preventExtensions(obj)` | ❌ | ✅ | ✅ |
+| `Object.seal(obj)` | ❌ | ❌ | ✅ |
+| `Object.freeze(obj)` | ❌ | ❌ | ❌ |
+
+Все три **поверхностные (shallow)**: они блокируют сам объект, но не объекты внутри него. У замороженного конфига с вложенным объектом `limits` лимиты всё ещё можно поменять. Для настоящей неизменяемости замораживайте рекурсивно:
+
+<CodeExample output={`всё ещё можно изменить: 999
+TypeError
+10 true`}>
+
+```js
+const shallow = Object.freeze({ limits: { upload: 10 } });
+shallow.limits.upload = 999; // внутренний объект не заморожен!
+console.log("всё ещё можно изменить:", shallow.limits.upload);
+
+function deepFreeze(obj) {
+  for (const value of Object.values(obj)) {
+    if (typeof value === "object" && value !== null) {
+      deepFreeze(value);
+    }
+  }
+  return Object.freeze(obj);
+}
+
+const settings = deepFreeze({ theme: "dark", limits: { upload: 10 } });
+try {
+  settings.limits.upload = 999;
+} catch (error) {
+  console.log(error.name);
+}
+console.log(settings.limits.upload, Object.isFrozen(settings.limits));
+```
+
+</CodeExample>
+
+Заморозка полезна для констант, конфигурации и **объектов-значений (value objects)** (вы встретитесь с ними в модуле о паттернах проектирования), а также чтобы ловить случайные мутации во время разработки. Например, Immer (библиотека внутри Redux Toolkit) замораживает созданное им состояние, так что случайная мутация бросает ошибку, а не приводит к тонкому багу. Не замораживайте большие структуры данных на горячих участках просто потому, что можете: настоящая защита от случайных мутаций — привычка создавать новые объекты (`{ ...state, done: true }`).
+
+## Символы
+
+**Символ (symbol)** — примитивное значение, которое гарантированно **уникально**. Его главная задача — быть ключом свойства, который никогда не столкнётся с чужими ключами:
+
+<CodeExample output={`false
+true
+Symbol(id) id
+7
+[ 'name' ] {"name":"Mei"}
+[ Symbol(id) ]`}>
+
+```js
+console.log(Symbol("id") === Symbol("id")); // всегда уникален
+console.log(Symbol.for("id") === Symbol.for("id")); // реестр
+
+const id = Symbol("id"); // "id" — только описание
+console.log(id.toString(), id.description);
+
+// Библиотека может пометить ваши объекты, не конфликтуя с вашими ключами
+const user = { name: "Mei" };
+user[id] = 7;
+console.log(user[id]);
+console.log(Object.keys(user), JSON.stringify(user)); // пропущен
+console.log(Object.getOwnPropertySymbols(user)); // но не секретен
+```
+
+</CodeExample>
+
+- Каждый вызов `Symbol("id")` создаёт новый, отличный от других символ. А `Symbol.for("id")` ищет символ в глобальном реестре, поэтому одно и то же имя всегда даёт один и тот же символ (даже между iframe).
+- Ключи-символы пропускаются `Object.keys`, `for...in` и `JSON.stringify`, поэтому они хороши для метаданных. Но они **не приватные**: `Object.getOwnPropertySymbols` и `Reflect.ownKeys` их находят. Для настоящей приватности используйте поля `#private`.
+
+### Well-known символы: точки подключения к языку
+
+Самые важные символы встроены в язык. Сам язык ищет их у ваших объектов, и это позволяет вашим классам подключаться к синтаксису:
+
+| Символ | Кто использует |
+| --- | --- |
+| `Symbol.iterator` | `for...of`, spread `[...x]`, деструктуризация, `Array.from` |
+| `Symbol.asyncIterator` | `for await...of` |
+| `Symbol.toPrimitive` | преобразование в число или строку: `+x`, `` `${x}` ``, `x > 3`, `x + 1` |
+| `Symbol.toStringTag` | `Object.prototype.toString` (`[object Something]`) |
+
+С `Symbol.iterator` вы познакомились вместе с генераторами. Он работает и без них: достаточно вернуть объект с методом `next()`. `Symbol.asyncIterator` — его асинхронный двойник, на котором, как вы видели в [прошлом уроке](/learn/javascript/the-event-loop-in-depth), работает `for await`. А `Symbol.toPrimitive` решает, во что превратится ваш объект в арифметике и строках:
+
+<CodeExample output={`[ 1, 2, 3, 4, 5 ]
+тик 1
+тик 2
+£12.50 12.5 25 true`}>
+
+```js
+class Range {
+  constructor(from, to) {
+    this.from = from;
+    this.to = to;
+  }
+  [Symbol.iterator]() {
+    let current = this.from;
+    const last = this.to;
+    return {
+      next: () =>
+        current <= last
+          ? { value: current++, done: false }
+          : { value: undefined, done: true },
+    };
+  }
+}
+console.log([...new Range(1, 5)]);
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const ticker = {
+  async *[Symbol.asyncIterator]() {
+    for (let i = 1; i <= 2; i++) {
+      await wait(10);
+      yield `тик ${i}`;
+    }
+  },
+};
+for await (const tick of ticker) console.log(tick);
+
+const price = {
+  pence: 1250,
+  [Symbol.toPrimitive](hint) {
+    // hint: "number", "string" или "default"
+    if (hint === "number") return this.pence / 100;
+    return `£${(this.pence / 100).toFixed(2)}`;
+  },
+};
+console.log(`${price}`, +price, price * 2, price > 10);
+```
+
+</CodeExample>
+
+Пользуйтесь `Symbol.toPrimitive` осторожно: объект `Money`, который молча превращается в дробное число, может скрывать ошибки округления. Явный `price.format()` часто понятнее.
+
+## Proxy: перехват операций с объектом
+
+**Proxy** оборачивает **целевой объект (target)** и позволяет перехватывать базовые операции с ним: чтение свойства, запись, проверку `in`, удаление, получение списка ключей, вызов функции. Вы передаёте **обработчик (handler)**, методы которого называются **ловушками (traps)**:
+
+| Ловушка | Что перехватывает |
+| --- | --- |
+| `get(target, key, receiver)` | `proxy.key`, `proxy[key]` |
+| `set(target, key, value, receiver)` | `proxy.key = value` (при успехе должна вернуть `true`) |
+| `has(target, key)` | `key in proxy` |
+| `deleteProperty(target, key)` | `delete proxy.key` |
+| `ownKeys(target)` | `Object.keys`, `for...in`, spread, `JSON.stringify` |
+| `apply`, `construct` | вызов прокси, `new proxy()` (для функций в роли target) |
+
+Любая неопределённая ловушка пропускает операцию к целевому объекту, как будто прокси нет. А для каждой ловушки есть одноимённая функция в **`Reflect`**, которая выполняет поведение **по умолчанию**, так что ловушка может сделать свою дополнительную работу и затем передать управление обычной операции. Самый простой полезный прокси логирует каждое обращение:
+
+<CodeExample output={`чтение name
+запись likes = 1
+чтение likes
+1`}>
+
+```js
+const panda = { name: "Mei", likes: 0 };
+
+const watched = new Proxy(panda, {
+  get(target, key, receiver) {
+    console.log(`чтение ${String(key)}`);
+    return Reflect.get(target, key, receiver);
+  },
+  set(target, key, value, receiver) {
+    console.log(`запись ${String(key)} = ${value}`);
+    return Reflect.set(target, key, value, receiver);
+  },
+});
+
+watched.name;
+watched.likes = 1;
+console.log(watched.likes);
+```
+
+</CodeExample>
+
+(`String(key)` нужен потому, что ключи бывают и символами, а символы не преобразуются в строки в шаблонных литералах.)
+
+### Значения по умолчанию
+
+Ловушка `get` может отвечать за несуществующие свойства. Здесь у любого отсутствующего товара остаток `0`, так что `+=` просто работает:
+
+<CodeExample output={`12 0
+5 { bamboo: 12, dumplings: 5 }`}>
+
+```js
+function withDefault(target, fallback) {
+  return new Proxy(target, {
+    get(obj, key, receiver) {
+      return key in obj ? Reflect.get(obj, key, receiver) : fallback;
+    },
+  });
+}
+
+const stock = withDefault({ bamboo: 12 }, 0);
+console.log(stock.bamboo, stock.dumplings);
+stock.dumplings += 5;
+console.log(stock.dumplings, { ...stock });
+```
+
+</CodeExample>
+
+### Валидация
+
+Ловушка `set` может проверять каждую запись. Для плохих значений бросайте ошибку, при успехе возвращайте `true`. (Если ловушка `set` вернёт `false`, код в строгом режиме получит невнятный `TypeError` о том, что ловушка «вернула falsish», так что бросить собственную ошибку с понятным сообщением — вежливее.)
+
+<CodeExample output={`TypeError: age должен быть целым числом от 0 до 150
+{ name: 'Mei', age: 4 }`}>
+
+```js
+const isValidAge = (v) => Number.isInteger(v) && v >= 0 && v <= 150;
+
+const person = new Proxy({ name: "Mei", age: 3 }, {
+  set(target, key, value, receiver) {
+    if (key === "age" && !isValidAge(value)) {
+      throw new TypeError("age должен быть целым числом от 0 до 150");
+    }
+    return Reflect.set(target, key, value, receiver);
+  },
+});
+
+person.age = 4;
+try {
+  person.age = -1;
+} catch (error) {
+  console.log(`${error.name}: ${error.message}`);
+}
+console.log({ ...person });
+```
+
+</CodeExample>
+
+### Скрываем и защищаем свойства
+
+`has`, `ownKeys` и `deleteProperty` позволяют скрывать внутренние поля и защищать обязательные:
+
+<CodeExample output={`true false
+[ 'name' ] {"name":"Mei"}
+TypeError: поле name обязательно`}>
+
+```js
+const isInternal = (key) => String(key).startsWith("_");
+
+const user = new Proxy({ name: "Mei", _passwordHash: "x1f" }, {
+  has: (obj, key) => !isInternal(key) && key in obj,
+  ownKeys: (obj) => Reflect.ownKeys(obj).filter((k) => !isInternal(k)),
+  deleteProperty(obj, key) {
+    if (key === "name") throw new TypeError("поле name обязательно");
+    return Reflect.deleteProperty(obj, key);
+  },
+});
+
+console.log("name" in user, "_passwordHash" in user);
+console.log(Object.keys(user), JSON.stringify(user));
+try {
+  delete user.name;
+} catch (error) {
+  console.log(`${error.name}: ${error.message}`);
+}
+```
+
+</CodeExample>
+
+Это удобство, а не безопасность: `user._passwordHash` всё ещё можно прочитать напрямую (мы не перехватывали `get`), а исходный объект не тронут. Не отправляйте хеши паролей туда, где важно их скрыть.
+
+### Зачем Reflect, а не просто target[key]?
+
+`Reflect.get(target, key, receiver)` выглядит как длинный способ написать `target[key]`, но третий аргумент важен. **Получатель (receiver)** — это объект, из которого свойство изначально читали, и геттерам он нужен в роли `this`. Разница появляется, как только в деле наследование:
+
+<CodeExample output={`Привет, Mei
+Привет, Bao`}>
+
+```js
+const base = {
+  first: "Mei",
+  get greeting() {
+    return `Привет, ${this.first}`;
+  },
+};
+
+const sloppy = new Proxy(base, { get: (t, key) => t[key] });
+const correct = new Proxy(base, {
+  get: (t, key, receiver) => Reflect.get(t, key, receiver),
+});
+
+const bao1 = Object.create(sloppy); // наследует от прокси
+bao1.first = "Bao";
+const bao2 = Object.create(correct);
+bao2.first = "Bao";
+
+console.log(bao1.greeting); // геттер выполнился с this = base: неверно
+console.log(bao2.greeting); // this = bao2: верно
+```
+
+</CodeExample>
+
+Методы `Reflect` ещё и **возвращают** `true`/`false` там, где старые версии `Object.*` бросают ошибку (`Reflect.defineProperty`, `Reflect.set`), а `Reflect.ownKeys` перечисляет и строковые, **и** символьные ключи. Простое правило: внутри ловушки передавайте управление методу `Reflect` с тем же именем и теми же аргументами.
+
+## Реактивность: как Vue и MobX узнают, что изменилось
+
+Теперь о «магии». `reactive()` во Vue 3 и observable в MobX построены ровно на этой идее:
+
+1. Пока выполняется **эффект (effect)** (рендер компонента, вычисляемое значение), ловушка `get` **отслеживает (track)**, какие свойства он читает.
+2. Когда свойство записывают, ловушка `set` **запускает (trigger)** эффекты, которые его читали, — и только их.
+
+Вот вся идея меньше чем в 40 строках. Обратите внимание на `WeakMap` из [урока о памяти](/learn/javascript/memory-and-garbage-collection): когда реактивный объект больше не используется, его служебные данные исчезают вместе с ним:
+
+<CodeExample output={`Итого: £10
+Итого: £15
+Итого: £12`}>
+
+```js
+const effectsFor = new WeakMap(); // target -> Map(key -> Set)
+let activeEffect = null;
+
+function track(target, key) {
+  if (!activeEffect) return;
+  if (!effectsFor.has(target)) effectsFor.set(target, new Map());
+  const byKey = effectsFor.get(target);
+  if (!byKey.has(key)) byKey.set(key, new Set());
+  byKey.get(key).add(activeEffect);
+}
+
+function trigger(target, key) {
+  effectsFor.get(target)?.get(key)?.forEach((fn) => fn());
+}
+
+function reactive(target) {
+  return new Proxy(target, {
+    get(obj, key, receiver) {
+      track(obj, key); // кто-то читает: запоминаем, кто
+      return Reflect.get(obj, key, receiver);
+    },
+    set(obj, key, value, receiver) {
+      const old = obj[key];
+      const ok = Reflect.set(obj, key, value, receiver);
+      if (!Object.is(old, value)) trigger(obj, key); // перезапуск
+      return ok;
+    },
+  });
+}
+
+function effect(fn) {
+  activeEffect = fn;
+  fn(); // первый запуск записывает, что читает fn
+  activeEffect = null;
+}
+
+const cart = reactive({ items: 2, price: 5, coupon: "" });
+effect(() => {
+  console.log(`Итого: £${cart.items * cart.price}`);
+});
+
+cart.items = 3; // эффект читал items: он перезапускается
+cart.price = 5; // то же значение: делать нечего
+cart.coupon = "PANDA"; // coupon никто не читал: ничего не происходит
+cart.price = 4;
+```
+
+</CodeExample>
+
+Настоящие библиотеки добавляют поверх многое: повторное отслеживание при каждом запуске (`if` может изменить то, что читает эффект), объединение нескольких записей в одно обновление, ленивое оборачивание вложенных объектов, массивы и Map, планирование эффектов как микрозадач. Но суть такая: **ловушки Proxy превращают обычный доступ к свойствам в граф зависимостей.** Vue 2, когда Proxy ещё не было, использовал вместо этого геттеры и сеттеры `Object.defineProperty`, поэтому не замечал добавления новых свойств (`Vue.set` существовал как раз для этого). Прокси это исправили.
+
+## Цена и подводные камни
+
+Прокси — мощный инструмент, и именно поэтому Senior-разработчики обращаются с ними осторожно.
+
+- **Скорость.** Каждая операция с прокси вызывает функцию-ловушку, и JIT не может применить свои трюки с формами и инлайн-кэшами из [первого урока](/learn/javascript/how-engines-run-code). Доступ к свойству через прокси часто во много раз медленнее, чем к обычному объекту. Это нормально для состояния приложения, которое читается несколько сотен раз за обновление, но не для массива из 100 000 элементов в горячем цикле (во Vue для этого есть `markRaw` и `shallowRef`).
+- **Идентичность.** `proxy !== target`. Код, который кладёт исходный объект в `Set`, а потом ищет там прокси (или наоборот), его не найдёт.
+- **Обход.** Изменения, сделанные напрямую в **целевом объекте**, минуют все ловушки. Держите исходный объект приватным (создавайте его внутри функции, которая делает прокси), чтобы никто не смог обойти вашу валидацию.
+- **Внутренние слоты и приватные поля.** Встроенные объекты вроде `Map`, `Set` и `Date`, а также классы с полями `#private` хранят данные там, куда может добраться только настоящий объект. Если вызвать их методы через прокси, `this` будет прокси, и они бросят ошибку:
+
+<CodeExample output={`TypeError
+TypeError
+1 1`}>
+
+```js
+const plain = new Proxy(new Map([["a", 1]]), {});
+try {
+  plain.size; // геттер Map выполняется с this = прокси
+} catch (error) {
+  console.log(error.name);
+}
+
+class Account {
+  #balance = 10;
+  get balance() {
+    return this.#balance;
+  }
+}
+try {
+  new Proxy(new Account(), {}).balance;
+} catch (error) {
+  console.log(error.name);
+}
+
+// Решение для встроенных объектов: выполнять методы на настоящем объекте
+const fixed = new Proxy(new Map([["a", 1]]), {
+  get(target, key) {
+    const value = Reflect.get(target, key, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  },
+});
+console.log(fixed.size, fixed.get("a"));
+```
+
+</CodeExample>
+
+- **Неожиданность.** `state.count++`, который тайно перерисовывает страницу, или `user.posts`, который тайно делает запрос к базе данных, — это прекрасно, пока кто-нибудь не засунет это в цикл. Если строите что-то на прокси, делайте магию очевидной в названиях и документации. В коде приложения обычный класс с явными методами (`store.setCount(…)`) часто оказывается лучшим выбором; берите Proxy, когда строите слой **в духе библиотеки**, которым будут пользоваться многие разработчики.
+
+<Quiz
+  question="Для const config = { theme: 'dark', limits: { upload: 10 } } вызвали Object.freeze(config). Что произойдёт в строгом режиме при config.limits.upload = 50?"
+  options={[
+    "Будет брошен TypeError, потому что config заморожен",
+    "Всё сработает: freeze поверхностный, поэтому вложенный объект limits всё ещё можно менять",
+    "Присваивание молча проигнорируется",
+    "Будет заменён весь объект limits",
+  ]}
+  answer={1}
+  explanation="Object.freeze блокирует только переданный ему объект. config.limits нельзя заменить, но объект, на который он указывает, не заморожен, поэтому его свойства всё ещё можно менять. Чтобы заблокировать и вложенные объекты, используйте рекурсивный deepFreeze."
+/>
+
+<Quiz
+  question="Почему внутри ловушки get у Proxy return Reflect.get(target, key, receiver) лучше, чем return target[key]?"
+  options={[
+    "Reflect.get быстрее",
+    "target[key] не работает с ключами-символами",
+    "Reflect.get передаёт receiver, поэтому геттеры выполняются с правильным this, например когда другой объект наследует от прокси",
+    "target[key] снова вызывает ловушку get и зацикливается навсегда",
+  ]}
+  answer={2}
+  explanation="target[key] выполняет геттеры с this, равным target. Reflect.get с receiver выполняет их с this, равным объекту, из которого свойство действительно читали, — это важно для наследования и для других прокси в цепочке. К тому же так поведение ловушки остаётся идентичным поведению по умолчанию."
+/>
+
+<Exercise
+  title="Хранилище с валидацией и подпиской"
+  starter={`function createStore(initial, schema) {
+  const listeners = new Set();
+
+  // TODO: оберните КОПИЮ initial в Proxy с ловушками set и
+  // deleteProperty, которые проверяют, защищают и уведомляют.
+  const state = initial;
+
+  return {
+    state,
+    subscribe(fn) {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    },
+  };
+}
+
+const store = createStore(
+  { title: "Без названия", likes: 0, published: false },
+  { title: "string", likes: "number", published: "boolean" },
+);
+const unsubscribe = store.subscribe((key, value, old) => {
+  console.log(\`\${key}: \${old} → \${value}\`);
+});
+
+store.state.likes += 1;
+store.state.title = "Бамбук";
+store.state.title = "Бамбук"; // то же значение: сообщения нет
+for (const attempt of [
+  () => (store.state.likes = "много"),
+  () => (store.state.author = "Mei"),
+  () => delete store.state.title,
+]) {
+  try {
+    attempt();
+  } catch (error) {
+    console.log(\`\${error.name}: \${error.message}\`);
+  }
+}
+unsubscribe();
+store.state.published = true; // больше никто не слушает
+console.log(JSON.stringify(store.state));
+`}
+  tests={[
+    { name: "Демо печатает ожидаемые строки", check: `__output.join("|") === "likes: 0 → 1|title: Без названия → Бамбук|TypeError: likes должно иметь тип number|TypeError: Неизвестное поле \\"author\\"|TypeError: Нельзя удалить \\"title\\"|{\\"title\\":\\"Бамбук\\",\\"likes\\":1,\\"published\\":true}"` },
+    { name: "Отклоняет значения неверного типа с TypeError", check: `(() => { const s = createStore({ n: 1 }, { n: "number", tag: "string" }); try { s.state.n = "x"; return false; } catch (e) { return e instanceof TypeError && e.message === "n должно иметь тип number" && s.state.n === 1; } })()` },
+    { name: "Отклоняет поля, которых нет в схеме", check: `(() => { const s = createStore({}, { tag: "string" }); s.state.tag = "new"; try { s.state.zzz = 1; return false; } catch (e) { return e instanceof TypeError && e.message === "Неизвестное поле \\"zzz\\"" && !("zzz" in s.state) && s.state.tag === "new"; } })()` },
+    { name: "Не даёт удалять поля", check: `(() => { const s = createStore({ a: "x" }, { a: "string" }); try { delete s.state.a; return false; } catch (e) { return e instanceof TypeError && e.message === "Нельзя удалить \\"a\\"" && s.state.a === "x"; } })()` },
+    { name: "Уведомляет всех слушателей после изменения, пропускает неизменённые значения, и unsubscribe работает", check: `(() => { const s = createStore({ n: 1 }, { n: "number" }); const a = []; const b = []; let seen; s.subscribe((k, v, o) => { a.push([k, v, o].join()); seen = s.state.n; }); const off = s.subscribe((k, v) => b.push(v)); s.state.n++; off(); s.state.n = 10; s.state.n = 10; return a.join("|") === "n,2,1|n,10,2" && b.join() === "2" && seen === 10; })()` },
+    { name: "Работает с копией, поэтому исходный объект не может её обойти", check: `(() => { const init = { a: 1 }; const s = createStore(init, { a: "number" }); s.state.a = 2; return init.a === 1 && s.state.a === 2; })()` },
+  ]}
+>
+
+Соберите крошечное хранилище состояния — из тех, что дают фреймворки. `createStore(initial, schema)` возвращает `{ state, subscribe }`, где `state` — это **Proxy** вокруг **копии** `initial`, а `schema` сопоставляет каждому разрешённому полю его тип по `typeof` (`"string"`, `"number"`, `"boolean"`).
+
+Ловушка `set` должна:
+
+1. Бросать `TypeError` с сообщением `Неизвестное поле "author"` (с именем поля) для ключей, которых нет в схеме.
+2. Бросать `TypeError` с сообщением `likes должно иметь тип number` (поле и тип — из схемы), когда `typeof value` не совпадает.
+3. Ничего не делать (и никого не уведомлять), когда новое значение совпадает со старым (используйте `Object.is`).
+4. В остальных случаях **сначала** сохранить значение, затем вызвать каждого слушателя с `(key, value, oldValue)` и вернуть `true`.
+
+Ловушка `deleteProperty` должна бросать `TypeError` с сообщением `Нельзя удалить "title"` (с именем поля). Для чтения ловушка не нужна. `subscribe` уже готов.
+
+<Hint>
+
+Начните с `const state = new Proxy({ ...initial }, { set(target, key, value, receiver) { ... }, deleteProperty(target, key) { ... } });`. В `set` сначала проверьте `!(key in schema)` и бросьте `new TypeError(...)`, собранный шаблонной строкой (используйте `String(key)`, ведь ключи бывают символами), затем сравните `typeof value !== schema[key]`. Сохраните `const old = target[key];`, сразу сделайте `return true`, если `Object.is(old, value)`, затем вызовите `Reflect.set(target, key, value, receiver)` и `listeners.forEach((fn) => fn(key, value, old));`, прежде чем вернуть `true`.
+
+</Hint>
+
+<Solution>
+
+```js
+function createStore(initial, schema) {
+  const listeners = new Set();
+
+  const state = new Proxy({ ...initial }, {
+    set(target, key, value, receiver) {
+      if (!(key in schema)) {
+        throw new TypeError(`Неизвестное поле "${String(key)}"`);
+      }
+      if (typeof value !== schema[key]) {
+        throw new TypeError(`${String(key)} должно иметь тип ${schema[key]}`);
+      }
+      const old = target[key];
+      if (Object.is(old, value)) return true; // ничего не изменилось
+      Reflect.set(target, key, value, receiver);
+      listeners.forEach((fn) => fn(key, value, old));
+      return true;
+    },
+    deleteProperty(target, key) {
+      throw new TypeError(`Нельзя удалить "${String(key)}"`);
+    },
+  });
+
+  return {
+    state,
+    subscribe(fn) {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    },
+  };
+}
+
+const store = createStore(
+  { title: "Без названия", likes: 0, published: false },
+  { title: "string", likes: "number", published: "boolean" },
+);
+const unsubscribe = store.subscribe((key, value, old) => {
+  console.log(`${key}: ${old} → ${value}`);
+});
+
+store.state.likes += 1;
+store.state.title = "Бамбук";
+store.state.title = "Бамбук"; // то же значение: сообщения нет
+for (const attempt of [
+  () => (store.state.likes = "много"),
+  () => (store.state.author = "Mei"),
+  () => delete store.state.title,
+]) {
+  try {
+    attempt();
+  } catch (error) {
+    console.log(`${error.name}: ${error.message}`);
+  }
+}
+unsubscribe();
+store.state.published = true; // больше никто не слушает
+console.log(JSON.stringify(store.state));
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- У каждого свойства есть **дескриптор**: `writable`, `enumerable`, `configurable` (с `Object.defineProperty` все по умолчанию `false`) или пара `get`/`set`. Ленивые геттеры могут заменять себя значением.
+- `preventExtensions` < `seal` < `freeze`, и все три **поверхностные**; для настоящей неизменяемости замораживайте рекурсивно. Строгий режим бросает ошибку при запрещённой записи, нестрогий молча её игнорирует.
+- **Символы** — уникальные ключи, которые пропускаются `Object.keys` и JSON, но не являются приватными. **Well-known символы** (`Symbol.iterator`, `Symbol.asyncIterator`, `Symbol.toPrimitive`, `Symbol.toStringTag`) подключают ваши объекты к возможностям языка.
+- **Proxy** перехватывает операции с помощью **ловушек** (`get`, `set`, `has`, `deleteProperty`, `ownKeys`...); **Reflect** выполняет поведение по умолчанию с правильным **receiver**. Применения: значения по умолчанию, валидация, логирование, скрытие полей и **реактивность** (отслеживать чтения в `get`, запускать эффекты в `set`), как во Vue и MobX.
+- Подводные камни: прокси **медленнее**, `proxy !== target`, запись прямо в целевой объект **обходит** ловушки, встроенные объекты и поля `#private` ломаются, если методы не выполняются на настоящем объекте, а скрытая магия удивляет коллег. Используйте прокси для слоёв в духе библиотек, а не везде.

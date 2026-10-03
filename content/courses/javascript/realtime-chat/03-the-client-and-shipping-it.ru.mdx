@@ -1,0 +1,1638 @@
+---
+title: "Часть 3: клиент и выпуск"
+description: "React-клиент чата, который переподключается с задержкой и разбросом и показывает участников и «печатает…», а затем план выпуска: Redis pub/sub, плавная остановка, Docker, CI и мониторинг."
+duration: 25
+xp: 30
+---
+
+Сервер PandaChat работает: он аутентифицирует, проверяет, рассылает по комнатам и убирает мёртвые сокеты, а тесты это доказывают. В этой последней части мы дадим ему лицо — **React-клиент**, которым людям действительно приятно пользоваться, — а затем спланируем настоящий запуск: на нескольких серверах, за балансировщиком нагрузки, с деплоями, которые никого не выкидывают, и под присмотром мониторинга. 🚀
+
+Именно в клиенте становятся заметны дурные манеры сети. Wi-Fi пропадает, ноутбуки засыпают, серверы перезапускаются во время деплоев. Хороший клиент реального времени этого **ожидает**: он честно показывает состояние соединения, сам переподключается, не забрасывая сервер запросами, и догоняет пропущенное. Вам пригодятся эффекты и функции очистки (cleanup) из урока [Эффекты и данные](/learn/javascript/effects-and-data), троттлинг (throttling) из урока [Быстрый код в браузере](/learn/javascript/fast-code-in-the-browser), экспоненциальная задержка с разбросом из урока [Функции реального времени и отказоустойчивость](/learn/javascript/real-time-and-resilience) и конечные автоматы (state machines) из урока [Внедрение зависимостей и моделирование предметной области](/learn/javascript/dependency-injection-and-domain-modelling).
+
+## Одна страница: и сервер, и клиент
+
+Превью PandaDev умеют запускать сервер `ws` **и** React-приложение вместе, в одной встроенной сети, поэтому упражнение этой части — одна страница: сверху сервер из частей 1 и 2 (без изменений; его тесты остались в своих тестовых файлах, потому что превью запускает React, а не Vitest), ниже — клиент. Два небольших отличия от части 2: страница импортирует из `ws` только `WebSocketServer`, потому что в браузере уже есть `WebSocket`, и здесь никто не вызывает `chat.sweep()` по таймеру.
+
+На вашей машине это два проекта: сервер работает в Node, а клиент — это приложение на Vite + React в браузере. Код тот же:
+
+```bash
+# сервер
+cd pandachat-server && npm install ws && node server.js
+# клиент, в другом терминале
+npm create vite@latest pandachat-web -- --template react
+cd pandachat-web && npm install && npm run dev
+```
+
+## Соединение — это конечный автомат
+
+Соединение клиента всегда находится ровно в одном из четырёх состояний, и интерфейс показывает, в каком:
+
+| Состояние | Значит | Переходит в |
+| --- | --- | --- |
+| `connecting` | первая попытка в процессе | `online` (вошли в комнату), `reconnecting` (закрыто), `unauthorized` (4001) |
+| `online` | вошли в комнату; отправлять можно | `reconnecting` (закрыто) |
+| `reconnecting` | соединение потеряно; повтор запланирован | `online`, снова `reconnecting`, `unauthorized` |
+| `unauthorized` | сервер ответил 4001: повторы не помогут | никуда: пользователь должен войти заново |
+
+Из таблицы вытекают три правила, и каждое исправляет баг, с которым настоящие чаты выходили в продакшен:
+
+- **«В сети» значит «вошёл в комнату», а не «сокет открыт».** Сокет открывается до того, как сервер нас аутентифицировал, и до ответа на `join`. Статус становится `online` по ответу `joined`, и в этот же момент счётчик попыток сбрасывается в ноль. (Если сбрасывать его по `open`, сервер, который принимает соединение и тут же его закрывает, будет получать повторы на полной скорости вечно.)
+- **Никогда не повторяйте после 4001.** Истёкший билет не станет лучше от новой попытки; цикл переподключений с плохим билетом — это маленькая DoS-атака на собственный сервер.
+- **Кнопка отправки следует за состоянием.** Она отключена, пока состояние не `online`, чтобы никто не писал сообщения в пустоту.
+
+## Переподключение без давки
+
+Когда деплой перезапускает сервер, все его 20 000 клиентов теряют соединение **в один и тот же момент**. Если все они сразу переподключатся, то накатят на следующий сервер волной, а если тот упадёт, все снова повторят попытку — вместе. Это **проблема громоподобного стада (thundering herd)**, и лекарство состоит из двух частей: **экспоненциальная задержка (exponential backoff)** (ждать 100 мс, потом 200, 400, 800… до потолка) и **разброс (jitter)** (случайное время ожидания, чтобы стадо рассеялось):
+
+<CodeExample output={`[ 100, 200, 400, 800, 1000, 1000 ]
+[ 50, 100, 200, 400, 500, 500 ]
+клиент: в сети
+сервер: упал
+клиент: закрыт (1001), повтор через 100 мс
+клиент: закрыт (1006), повтор через 200 мс
+клиент: закрыт (1006), повтор через 400 мс
+сервер: снова работает
+клиент: в сети`}>
+
+```js
+import { WebSocketServer } from "ws";
+
+const RETRY = { base: 100, max: 1000 };
+
+function backoffDelay(attempt, random = Math.random) {
+  const ceiling = Math.min(RETRY.max, RETRY.base * 2 ** attempt);
+  return Math.round(ceiling / 2 + (random() * ceiling) / 2);
+}
+
+console.log([0, 1, 2, 3, 4, 5].map((n) => backoffDelay(n, () => 1)));
+console.log([0, 1, 2, 3, 4, 5].map((n) => backoffDelay(n, () => 0)));
+
+// Сервер, который на время падает
+let wss = new WebSocketServer({ port: 4000 });
+setTimeout(() => {
+  console.log("сервер: упал");
+  for (const socket of wss.clients) socket.close(1001, "Restarting");
+  wss.close();
+}, 50);
+setTimeout(() => {
+  console.log("сервер: снова работает");
+  wss = new WebSocketServer({ port: 4000 });
+}, 600);
+
+// Клиент, который не сдаётся и с каждым разом ждёт дольше
+let attempt = 0;
+function connect() {
+  const ws = new WebSocket("ws://localhost:4000");
+  ws.onopen = () => {
+    console.log("клиент: в сети");
+    attempt = 0;
+  };
+  ws.onclose = (event) => {
+    const delay = backoffDelay(attempt, () => 1); // здесь без разброса
+    attempt += 1;
+    if (attempt > 6) return; // это демо, а не вечный цикл
+    console.log(`клиент: закрыт (${event.code}), повтор через ${delay} мс`);
+    setTimeout(connect, delay);
+  };
+}
+connect();
+setTimeout(() => wss.close(), 1500); // прибираемся
+```
+
+</CodeExample>
+
+В уроке [Функции реального времени и отказоустойчивость](/learn/javascript/real-time-and-resilience) мы использовали **полный разброс (full jitter)**: ждать случайное время от 0 до значения задержки. Здесь мы используем **равный разброс (equal jitter)**: от **половины** задержки до полной. Полный разброс чуть лучше рассеивает стадо, но может повторить попытку через 0 мс; равный гарантирует, что каждый повтор ждёт хотя бы половину расписания. Это бережнее к серверу, который и так с трудом справляется, и поведение клиента проще предсказать. В превью числа крошечные (100 мс, потолок 1 с), чтобы вам не ждать; в продакшене начинали бы примерно с 1 секунды и упирались бы в потолок на 30.
+
+А вот как делать **не** надо. Эта маленькая страница запускает сервер и клиент, который всегда повторяет попытку через 500 мс. Оборвите соединение, затем остановите сервер и посмотрите, как клиент стучится в закрытую дверь дважды в секунду — вечно. А теперь представьте 20 000 таких клиентов:
+
+<TryIt
+  language="react"
+  code={`import { useState, useEffect } from "react";
+import { createRoot } from "react-dom/client";
+import { WebSocketServer } from "ws";
+
+// ---- крошечный сервер (в жизни это Node) ----
+let wss;
+function startServer() {
+  wss = new WebSocketServer({ port: 4000 });
+  wss.on("connection", (socket) => {
+    socket.send(JSON.stringify({ type: "welcome" }));
+  });
+}
+function stopServer() {
+  for (const socket of wss.clients) socket.close(1001, "Restart");
+  wss.close();
+}
+const dropAll = () => {
+  for (const socket of wss.clients) socket.terminate();
+};
+startServer();
+
+// ---- браузер: наивный хук с переподключением ----
+function useConnection(url) {
+  const [status, setStatus] = useState("connecting");
+  const [log, setLog] = useState([]);
+  const note = (text) => setLog((list) => [...list.slice(-5), text]);
+
+  useEffect(() => {
+    let socket;
+    let timer;
+    let stopped = false;
+    function connect() {
+      socket = new WebSocket(url);
+      socket.onopen = () => setStatus("online");
+      socket.onclose = (event) => {
+        if (stopped) return;
+        setStatus("reconnecting");
+        note(\`закрыто с кодом \${event.code}, повтор через 500 мс\`);
+        timer = setTimeout(connect, 500); // всегда 500 мс: наивно!
+      };
+    }
+    connect();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+      socket.close();
+    };
+  }, [url]);
+
+  return { status, log };
+}
+
+function App() {
+  const { status, log } = useConnection("ws://localhost:4000");
+  const [serverUp, setServerUp] = useState(true);
+  function toggleServer() {
+    if (serverUp) stopServer();
+    else startServer();
+    setServerUp(!serverUp);
+  }
+  return (
+    <main>
+      <p className={\`status \${status}\`}>Статус: {status}</p>
+      <button onClick={dropAll}>Оборвать соединение</button>{" "}
+      <button onClick={toggleServer}>
+        {serverUp ? "Остановить сервер" : "Запустить сервер"}
+      </button>
+      <ul>
+        {log.map((line, i) => (
+          <li key={i}>{line}</li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);`}
+/>
+
+## Хук useChat
+
+Вся работа с сетью живёт в одном пользовательском хуке `useChat({ token, room })`. Он возвращает компонентам обычное состояние (`status`, `me`, `messages`, `members`, `typing`, `error`) и две функции (`sendMessage`, `sendTyping`). Компоненты никогда не трогают сокет. Его каркас:
+
+```jsx
+useEffect(() => {
+  let socket;
+  let attempt = 0;
+  let retryTimer;
+  let stopped = false; // выставляется в функции очистки ниже
+
+  function connect() {
+    socket = new WebSocket(`${SERVER_URL}/?${params}`);
+    socketRef.current = socket; // для sendMessage()
+    socket.onopen = () => socket.send(join);
+    socket.onmessage = (event) => handle(JSON.parse(event.data));
+    socket.onclose = (event) => {
+      // stopped? 4001? иначе: повтор через backoffDelay(attempt)
+    };
+  }
+
+  connect();
+  return () => {
+    stopped = true;            // после размонтирования не переподключаемся
+    clearTimeout(retryTimer);
+    socket.close();
+  };
+}, [token, room]);
+```
+
+Почему он устроен именно так:
+
+- **Эффект владеет всей жизнью сокета.** Он подключается, переподключается и в функции очистки закрывает соединение. Когда компонент размонтируется (или меняется `room`), очистка выставляет `stopped`, и вызванный ею `close` не запускает переподключение. Если об этом забыть, получится классический баг «сокета-зомби»: чат, из которого вы ушли, продолжает переподключаться в фоне.
+- **Изменяемые детали соединения живут в замыкании эффекта**, а не в состоянии React: `attempt`, `retryTimer` и `socket` меняются без перерисовки. Текущий сокет ещё и хранится в **ref**, чтобы до него могла дотянуться `sendMessage`, которая работает вне эффекта.
+- **Обновления используют функциональную форму**: `setMessages((list) => [...list, msg.message])`. Обработчик `onmessage` создан один раз, когда сработал эффект; с `setMessages([...messages, ...])` он навсегда видел бы `messages` из того первого рендера (**устаревшее замыкание**, stale closure) и терял бы сообщения.
+- **Повторный вход догоняет пропущенное.** После переподключения клиент снова отправляет `join`, и сервер отвечает списком `members` и недавней `history`. Клиент **заменяет** свой список этой историей, а не дописывает её в конец, поэтому получает сообщения, пропущенные в офлайне, без дублей. Так окупается решение «история при (повторном) входе» из дизайн-документа части 1.
+
+## Индикатор «печатает…» — дёшево
+
+«Bo печатает…» выглядит пустяком, но это симпатичная маленькая задача на производительность. Каждое нажатие клавиши могло бы отправлять событие `typing` 25 людям: быстро печатающий человек создавал бы сотни сообщений в минуту, которые никому не нужны. Поэтому осторожны обе стороны:
+
+- **Отправитель ограничивает частоту (throttle).** `sendTyping()` отправляет не больше одного события `typing` в секунду (`TYPING_EVERY`), как бы быстро вы ни печатали: это throttle из урока [Быстрый код в браузере](/learn/javascript/fast-code-in-the-browser), сделанный через метку времени в ref.
+- **Получатель забывает по таймеру.** Сообщения «перестал печатать» нет (оно всё равно потерялось бы, когда кто-то закрывает вкладку). Каждое событие `typing` (пере)запускает таймер для этого пользователя; когда через `TYPING_MS` он истекает или приходит сообщение этого пользователя, тот убирается из списка. Таймеры хранятся в `Map` по id пользователя и очищаются в функции очистки эффекта, поэтому после размонтирования ни один из них не сработает.
+
+## Выпускаем
+
+Код готов. Запустить его для тысяч людей — другая работа, и она в основном про то, что находится **между** кодом: серверы, балансировщики нагрузки, деплои и мониторинг. Вот план — так, как вы записали бы его во второй половине дизайн-документа.
+
+### Много серверов: pub/sub через Redis
+
+Один процесс Node держит десятки тысяч сокетов, но нам нужно хотя бы два — ради резервирования и деплоев без простоя. Тогда Mei может оказаться подключённой к серверу A, а Bo — к серверу B, и сервис на A никогда не слышал о Bo. Наш дизайн делает исправление на удивление маленьким, потому что **каждая** доставка уже идёт через события сервиса. Мы публикуем эти события в **Redis pub/sub**, и каждый сервер пересылает полученное своим сокетам:
+
+```js
+import { createClient } from "redis"; // npm install redis
+
+const pub = createClient({ url: process.env.REDIS_URL });
+const sub = pub.duplicate();
+await Promise.all([pub.connect(), sub.connect()]);
+
+// 1. Локальные события уходят на все серверы (включая этот)...
+service.subscribe((event) => {
+  pub.publish("chat-events", JSON.stringify(event));
+});
+
+// 2. ...и каждый сервер доставляет их своим сокетам.
+await sub.subscribe("chat-events", (raw) => {
+  deliverToLocalSockets(JSON.parse(raw)); // цикл рассылки
+});
+```
+
+`createChatServer` меняется в одном месте: его цикл рассылки слушает подписку Redis, а не сервис напрямую. Но переехать должно и состояние в памяти, и дизайн-документ должен сказать куда:
+
+| Состояние | Сейчас (один процесс) | С многими серверами |
+| --- | --- | --- |
+| Сообщения | массив на комнату, хранится 200 | PostgreSQL, через репозиторий с теми же методами |
+| Участники комнат | `Map` на комнату | множество Redis на комнату (`SADD room:general u1`), со счётчиком на пользователя для нескольких вкладок |
+| Лимиты | корзина токенов на пользователя | в Redis, атомарно обновляется маленьким Lua-скриптом |
+| Сокеты | `wss.clients` | остаются локальными: сокет может жить только в одном процессе |
+
+В очень больших системах один канал `chat-events` становится узким местом (каждый сервер получает каждое событие); это лечат каналы на комнату или журнал вроде Kafka или NATS JetStream. При 8 000 доставок в секунду они вам не нужны.
+
+### Балансировщики нагрузки и липкие сессии
+
+Балансировщик должен пропускать **upgrade** до WebSocket и не обрывать простаивающие соединения через свои обычные 60 секунд:
+
+```nginx
+location /chat {
+  proxy_pass http://pandachat_servers;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_read_timeout 1h;    # наш heartbeat всё равно держит его занятым
+}
+```
+
+**Липкие сессии (sticky sessions)** — когда клиента каждый раз отправляют на один и тот же сервер — для обычного WebSocket не нужны: соединение всю жизнь остаётся на своём сервере. А поскольку при переподключении мы заново входим в комнату и перезагружаем историю, клиент, который после переподключения попал на **другой** сервер, просто продолжает работу. Такой дизайн может в любой момент потерять любой сервер — а именно это и делают деплои и автомасштабирование. (Библиотекам, которые откатываются на long polling, вроде Socket.IO, липкие сессии *нужны*, потому что каждый опрос — отдельный HTTP-запрос.)
+
+### Плавная остановка и проверки здоровья
+
+Платформы вроде Kubernetes, Fly.io или Render останавливают контейнер так: отправляют **SIGTERM**, ждут какое-то время, а потом убивают его. Если использовать эту паузу с умом, деплои становятся незаметными:
+
+```js
+// server.js (Node)
+let ready = true;
+app.get("/health/live", (req, res) => res.sendStatus(200));
+app.get("/health/ready", async (req, res) => {
+  const ok = ready && (await pub.ping()) === "PONG";
+  res.sendStatus(ok ? 200 : 503);
+});
+
+process.on("SIGTERM", () => {
+  ready = false;              // 1. балансировщик перестаёт слать новых
+  clearInterval(heartbeat);
+  setTimeout(() => {
+    chat.close();             // 2. всем 1001: они переподключаются
+    httpServer.close(() => process.exit(0)); //  в другое место, с разбросом
+  }, 5_000);
+  setTimeout(() => process.exit(1), 25_000).unref(); // 3. никогда не виснем
+});
+```
+
+**Liveness** (живость) говорит «процесс работает» (если нет — перезапустите его); **readiness** (готовность) говорит «присылайте мне трафик» (она становится false во время остановки или когда Redis недоступен). Короткая пауза перед закрытием даёт балансировщику время это заметить. Благодаря задержке с разбросом код 1001 не вызывает давку на оставшихся серверах. Выкатывайте серверы по одному, и одновременно переподключаться будет только 1/N пользователей.
+
+### Docker и CI
+
+Сервер выпускается как маленький образ без root, а CI запускает тесты из частей 1 и 2 на каждый pull request:
+
+```dockerfile
+FROM node:24-alpine
+ENV NODE_ENV=production
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY src/ ./src/
+USER node
+EXPOSE 8080
+HEALTHCHECK CMD wget -qO- http://localhost:8080/health/live || exit 1
+CMD ["node", "src/server.js"]
+```
+
+```yaml
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npx vitest run          # тесты ядра и сервера
+      - run: npm audit --audit-level=high
+      - run: docker build -t pandachat:${{ github.sha }} .
+```
+
+Клиент — это статическая сборка Vite (`npm run build`), которая раздаётся с CDN с хешированными именами файлов и `immutable`, как в уроке [Сборка и кэширование](/learn/javascript/bundling-and-caching). Его URL для WebSocket берётся из конфигурации сборки (`VITE_CHAT_URL`), и это нормально, потому что это не секрет; соединение защищает эндпоинт **билетов**, который стоит за cookie сессии.
+
+### Наблюдаемость
+
+Перед запуском решите, что значит «работает» в цифрах, и убедитесь, что вы эти цифры видите:
+
+| Сигнал | Метрика | Зачем |
+| --- | --- | --- |
+| Нагрузка | открытые соединения на сервер (gauge) | планирование мощностей, неравномерная балансировка |
+| Трафик | входящие сообщения/с и исходящие доставки/с | рассылка из дизайн-документа |
+| Задержка | время от получения сообщения до его пересылки (p50, p99) | требование 200 мс |
+| Ошибки | ответы с ошибкой по `code`, ошибки `internal` | всплески `rate_limited` = злоупотребление или клиент с багом |
+| Текучка | подключения и обрывы по heartbeat в минуту | шторм переподключений или проблема с сетью |
+| Сторона клиента | время переподключения, о котором сообщает браузер | то, что на самом деле чувствуют пользователи |
+
+С `prom-client` в Node gauge и гистограмма — это несколько строк (`new Gauge({ name: "chat_connections", ... })`, `connections.inc()` при подключении, `.dec()` при закрытии). Дальше — расчёт мощностей на числах из части 1:
+
+<CodeExample output={`без задержки: 200 000 подключений/с
+с разбросом: 40 000 подключений/с
+по 10 с: 2 000 подключений/с
+серверов на 1,5× пика плюс запасной: 4`}>
+
+```js
+const clients = 20_000;          // подключены к одному серверу
+const fmt = (n) =>
+  Math.round(n).toLocaleString("en-US").replaceAll(",", " ");
+
+// Деплой перезапускает сервер: переподключаются все.
+// Повторяя сразу, все они приходят в пределах ~100 мс:
+console.log(`без задержки: ${fmt(clients / 0.1)} подключений/с`);
+
+// С разбросом первый повтор размазан по 0,5–1 с
+// (в продакшене base 1000 мс), так что пик примерно:
+console.log(`с разбросом: ${fmt(clients / 0.5)} подключений/с`);
+
+// Более длинная первая задержка (или сервер, который говорит
+// клиентам, когда вернуться) размажет их по 10 с:
+console.log(`по 10 с: ${fmt(clients / 10)} подключений/с`);
+
+// Сколько серверов? Держим каждый намного ниже его предела
+// и добавляем запасной, чтобы пережить деплой или падение:
+const perServer = 10_000;        // безопасно по нагрузочному тесту
+const servers = Math.ceil(clients * 1.5 / perServer) + 1;
+console.log(`серверов на 1,5× пика плюс запасной: ${servers}`);
+```
+
+</CodeExample>
+
+Даже с разбросом перезапуск сервера на мгновение означает десятки тысяч новых подключений в секунду, и каждое из них проходит аутентификацию и загружает историю. Поэтому нагрузочный тест должен включать **шторм переподключений** (убить сервер под нагрузкой и смотреть на остальные), а не только ровный трафик.
+
+### Чек-лист запуска
+
+| Область | Проверка |
+| --- | --- |
+| Протокол | каждое сообщение проверяется; `maxPayload` задан; на неизвестные типы и плохой JSON приходит ответ, а не исключение |
+| Безопасность | только `wss://`; одноразовые билеты; `Origin` проверяется; id пользователей от клиентов не принимаются на веру; лимиты на сообщения **и** на подключения с одного IP |
+| Надёжность | heartbeat включён; плавная остановка проверена; минимум два сервера; у Redis и базы данных есть бэкапы и алерты |
+| Клиенты | задержка с разбросом; никаких повторов после 4001; повторный вход перезагружает историю; сокеты-зомби невозможны (очистка) |
+| Наблюдаемость | соединения, рассылка, задержка, коды ошибок и текучка на дашборде; алерты на задержку p99 и долю ошибок |
+| Поставка | CI запускает тесты и аудит; образы помечены коммитом; деплои выкатываются по одному серверу |
+
+<Callout type="tip" title="Отрепетируйте плохой день">
+
+Перед запуском ломайте всё нарочно на staging: убейте сервер под нагрузкой, перезапустите Redis, задеплойте во время нагрузочного теста, отключите Wi-Fi на ноутбуке на минуту. Каждая репетиция либо доказывает, что дизайн работает, либо находит баг, пока он дешёвый. После этого запишите, что вы узнали (без поиска виноватых, как в уроке [Код-ревью и лидерство](/learn/javascript/code-review-and-leadership)), и добавьте это в чек-лист.
+
+</Callout>
+
+<Quiz
+  question="PandaChat работает на двух серверах за балансировщиком нагрузки, без Redis. Mei (на сервере A) и Bo (на сервере B) оба входят в #general. Что произойдёт, когда Mei отправит сообщение?"
+  options={[
+    "Увидят оба, потому что балансировщик копирует сообщения между серверами",
+    "Его увидят только те, кто подключён к серверу A: сервис чата на B о нём не узнает, поэтому Bo его не получит",
+    "Сообщение потеряется для всех",
+    "Сервер B отклонит сообщение Mei, потому что она не его участник",
+  ]}
+  answer={1}
+  explanation="Каждый процесс знает только свои сокеты и свои комнаты в памяти. Сообщение, опубликованное на A, уходит только слушателям на A. Публикация событий в общий канал (Redis pub/sub) позволяет каждому серверу доставить их своим сокетам, поэтому дизайн и пропускает каждую доставку через события."
+/>
+
+<Exercise
+  title="Соберите: готовый чат"
+  language="react"
+  html={`<style>
+  main { max-width: 560px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  .status { margin: 0; font-size: 14px; color: #a1a1c2; }
+  .status::before { content: "● "; }
+  .status.online::before { color: #4ade80; }
+  .status.connecting::before, .status.reconnecting::before { color: #facc15; }
+  .status.unauthorized::before { color: #f87171; }
+  .layout { display: grid; grid-template-columns: 1fr 110px; gap: 10px; }
+  .messages { height: 220px; overflow-y: auto; margin: 0; padding: 8px; list-style: none; border-radius: 10px; background: #ffffff0d; }
+  .messages li { padding: 3px 0; }
+  .messages li.mine strong { color: #c4b5fd; }
+  .members { margin: 0; padding: 8px; list-style: none; font-size: 14px; border-radius: 10px; background: #ffffff08; }
+  .members li::before { content: "🟢 "; font-size: 10px; }
+  .typing { min-height: 1.5em; margin: 4px 0; font-size: 14px; color: #a1a1c2; font-style: italic; }
+  .error { margin: 4px 0; color: #fca5a5; font-size: 14px; }
+  .send { display: flex; gap: 8px; }
+  .send input { flex: 1; }
+  .send button:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+<div id="root"></div>`}
+  starter={`import { useState, useEffect, useRef } from "react";
+import { createRoot } from "react-dom/client";
+import { WebSocketServer } from "ws";
+
+// ============ сервер: части 1 и 2 ============
+// (без изменений; их тесты остались в тестовых файлах)
+
+// ---------- ошибки ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- время ----------
+
+/** Часы для тестов: время идёт, только когда это скажет тест. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- сервис чата ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // символов в сообщении
+  keep: 200, // сколько сообщений хранит комната
+  burst: 5, // сообщений одной серией...
+  perSecond: 1, // ...а дальше по одному в секунду
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // имя -> { members, messages }
+  const buckets = new Map(); // id пользователя -> корзина токенов
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "В названии комнаты только a-z, 0-9 и -, до 30 символов",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", \`Сначала войдите в комнату \${name}\`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) return false;
+    room.members.delete(userId);
+    emit({
+      type: "presence",
+      room: name,
+      action: "leave",
+      user,
+      members: members(name),
+    });
+    return true;
+  }
+
+  function leaveAll(userId) {
+    const left = [];
+    for (const name of rooms.keys()) {
+      if (leave(name, userId)) left.push(name);
+    }
+    return left;
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", \`Сначала войдите в комнату \${name}\`);
+    }
+    const clean = typeof text === "string" ? text.trim() : "";
+    if (clean.length < 1 || clean.length > config.maxLength) {
+      throw new ChatError(
+        "invalid_text",
+        \`В сообщении должно быть от 1 до \${config.maxLength} символов\`,
+      );
+    }
+    if (!bucketFor(userId).take()) {
+      throw new ChatError("rate_limited", "Помедленнее, пожалуйста");
+    }
+    const message = {
+      id: newId(),
+      room: name,
+      user,
+      text: clean,
+      at: clock(),
+    };
+    room.messages.push(message);
+    if (room.messages.length > config.keep) room.messages.shift();
+    emit({ type: "message", room: name, message });
+    return message;
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    const messages = rooms.get(name)?.messages ?? [];
+    const size = Number.isInteger(limit)
+      ? Math.min(Math.max(limit, 1), 100)
+      : 50;
+    let end = messages.length;
+    if (before !== undefined) {
+      end = messages.findIndex((m) => m.id === before);
+      if (end === -1) return []; // неизвестное или уже удалённое
+    }
+    return messages.slice(Math.max(0, end - size), end);
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- сервер реального времени ----------
+
+function send(socket, message) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function createChatServer({ port, service, authenticate }) {
+  // maxPayload: отклонять фреймы больше 16 КБ (в сообщении чата
+  // не больше 500 символов, так что всё крупнее — злоупотребление)
+  const wss = new WebSocketServer({ port, maxPayload: 16 * 1024 });
+
+  // Каждое событие сервиса уходит сокетам из его комнаты.
+  const unsubscribe = service.subscribe((event) => {
+    for (const socket of wss.clients) {
+      if (!socket.rooms?.has(event.room)) continue;
+      const own = socket.user.id === event.user?.id;
+      if (event.type === "typing" && own) continue;
+      send(socket, event);
+    }
+  });
+
+  wss.on("connection", (socket, req) => {
+    const url = new URL(req.url, "http://localhost");
+    const user = authenticate(url.searchParams.get("token"));
+    if (!user) {
+      socket.close(4001, "Unauthorized");
+      return;
+    }
+    socket.user = user;
+    socket.rooms = new Set();
+    socket.isAlive = true;
+    socket.on("pong", () => {
+      socket.isAlive = true;
+    });
+    socket.on("message", (data) => handle(socket, data));
+    socket.on("close", () => {
+      socket.rooms.clear();
+      service.leaveAll(user.id);
+    });
+    send(socket, { type: "welcome", user });
+  });
+
+  function handle(socket, data) {
+    let msg;
+    try {
+      msg = JSON.parse(String(data));
+    } catch {
+      send(socket, {
+        type: "error",
+        code: "bad_json",
+        message: "Сообщения должны быть в формате JSON",
+      });
+      return;
+    }
+    try {
+      route(socket, msg);
+    } catch (error) {
+      const known = error instanceof ChatError;
+      if (!known) console.error("Непредвиденная ошибка:", error.message);
+      send(socket, {
+        type: "error",
+        code: known ? error.code : "internal",
+        message: known ? error.message : "Что-то пошло не так",
+      });
+    }
+  }
+
+  function route(socket, msg) {
+    const { user, rooms } = socket;
+    switch (msg?.type) {
+      case "join": {
+        const joined = service.join(msg.room, user);
+        rooms.add(msg.room);
+        send(socket, { type: "joined", ...joined });
+        break;
+      }
+      case "leave":
+        rooms.delete(msg.room);
+        service.leave(msg.room, user.id);
+        send(socket, { type: "left", room: msg.room });
+        break;
+      case "message":
+        service.postMessage(msg.room, user.id, msg.text);
+        break;
+      case "typing":
+        service.typing(msg.room, user.id);
+        break;
+      case "history": {
+        if (!rooms.has(msg.room)) {
+          throw new ChatError("not_member", \`Сначала войдите в комнату \${msg.room}\`);
+        }
+        const messages = service.history(msg.room, {
+          before: msg.before,
+          limit: msg.limit,
+        });
+        send(socket, { type: "history", room: msg.room, messages });
+        break;
+      }
+      default:
+        throw new ChatError(
+          "unknown_type",
+          \`Неизвестный тип сообщения: \${msg?.type}\`,
+        );
+    }
+  }
+
+  // Настоящий интервал вызывает это каждые 30 с (см. урок).
+  function sweep() {
+    for (const socket of wss.clients) {
+      if (!socket.isAlive) {
+        socket.terminate();
+        continue;
+      }
+      socket.isAlive = false;
+      socket.ping();
+    }
+  }
+
+  function close() {
+    unsubscribe();
+    for (const socket of wss.clients) {
+      socket.close(1001, "Server shutting down");
+    }
+    wss.close();
+  }
+
+  return { wss, sweep, close };
+}
+
+const TOKENS = new Map([
+  ["mei-token", { id: "u1", name: "Mei" }],
+  ["bo-token", { id: "u2", name: "Bo" }],
+  ["kai-token", { id: "u3", name: "Kai" }],
+]);
+const service = createChatService();
+const chat = createChatServer({
+  port: 4000,
+  service,
+  authenticate: (token) => TOKENS.get(token) ?? null,
+});
+
+// ================= клиент =================
+
+const SERVER_URL = "ws://localhost:4000";
+const RETRY = { base: 100, max: 1000 }; // мс; в продакшене: 1000 / 30000
+const TYPING_MS = 1000; // сколько держится "печатает…"
+const TYPING_EVERY = 1000; // как часто можно слать "typing"
+
+/** Экспоненциальная задержка с "равным разбросом". */
+function backoffDelay(attempt, random = Math.random) {
+  // TODO 1: удваивайте RETRY.base с каждой попыткой, но не больше
+  // RETRY.max; затем ждите от половины этого значения до целого
+  return 0;
+}
+
+function useChat({ token, room }) {
+  const [status, setStatus] = useState("connecting");
+  const [me, setMe] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [typing, setTyping] = useState([]);
+  const [error, setError] = useState("");
+  const socketRef = useRef(null);
+  const lastTypingRef = useRef(0);
+
+  useEffect(() => {
+    let socket;
+    let attempt = 0;
+    let retryTimer;
+    let stopped = false;
+    const typingTimers = new Map();
+
+    function stopTyping(user) {
+      clearTimeout(typingTimers.get(user.id));
+      typingTimers.delete(user.id);
+      setTyping((list) => list.filter((u) => u.id !== user.id));
+    }
+
+    function handle(msg) {
+      switch (msg.type) {
+        case "welcome":
+          setMe(msg.user);
+          break;
+        case "joined":
+          attempt = 0;
+          setStatus("online");
+          setMembers(msg.members);
+          setMessages(msg.history);
+          break;
+        case "message":
+          setMessages((list) => [...list, msg.message]);
+          stopTyping(msg.message.user);
+          break;
+        // TODO 3: "presence" (новый список участников) и "typing"
+        // (добавить пользователя один раз; убрать через TYPING_MS,
+        // перезапуская таймер, если он печатает снова)
+        case "error":
+          setError(msg.message);
+          break;
+      }
+    }
+
+    function connect() {
+      const params = new URLSearchParams({ token });
+      socket = new WebSocket(\`\${SERVER_URL}/?\${params}\`);
+      socketRef.current = socket;
+      socket.onopen = () => {
+        socket.send(JSON.stringify({ type: "join", room }));
+      };
+      socket.onmessage = (event) => handle(JSON.parse(event.data));
+      socket.onclose = (event) => {
+        socketRef.current = null;
+        // TODO 2: ничего не делать, если компонента уже нет (stopped).
+        // Код 4001: показать "unauthorized" и сдаться. Иначе
+        // показать "reconnecting" и снова вызвать connect() через
+        // backoffDelay(attempt) мс, засчитав попытку.
+      };
+    }
+
+    connect();
+    return () => {
+      stopped = true;
+      clearTimeout(retryTimer);
+      for (const timer of typingTimers.values()) clearTimeout(timer);
+      socket.close();
+    };
+  }, [token, room]);
+
+  function send(type, data = {}) {
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ type, room, ...data }));
+    return true;
+  }
+
+  function sendMessage(text) {
+    setError("");
+    return send("message", { text });
+  }
+  function sendTyping() {
+    // TODO 4: отправляйте "typing" не чаще раза в TYPING_EVERY мс
+    // (время последней отправки храните в lastTypingRef)
+  }
+
+  return {
+    status, me, messages, members, typing, error,
+    sendMessage, sendTyping,
+  };
+}
+
+// ---------- компоненты ----------
+
+const STATUS_TEXT = {
+  connecting: "Подключение…",
+  online: "В сети",
+  reconnecting: "Переподключение…",
+  unauthorized: "Войдите заново",
+};
+
+function StatusBar({ status, me }) {
+  const who = status === "online" && me ? \` как \${me.name}\` : "";
+  return (
+    <p className={\`status \${status}\`}>
+      {STATUS_TEXT[status]}
+      {who}
+    </p>
+  );
+}
+
+function MemberList({ members }) {
+  return (
+    <ul className="members">
+      {members.map((user) => (
+        <li key={user.id}>{user.name}</li>
+      ))}
+    </ul>
+  );
+}
+
+function MessageList({ messages, me }) {
+  const listRef = useRef(null);
+  useEffect(() => {
+    const list = listRef.current; // новое сообщение всегда на виду
+    list.scrollTop = list.scrollHeight;
+  }, [messages]);
+  return (
+    <ul className="messages" ref={listRef}>
+      {messages.map((m) => (
+        <li key={m.id} className={m.user.id === me?.id ? "mine" : ""}>
+          <strong>{m.user.name}:</strong> {m.text}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function TypingIndicator({ users }) {
+  // TODO 5: "Bo печатает…" или "Bo и Kai печатают…"
+  return <p className="typing" />;
+}
+
+function SendForm({ disabled, onSend, onTyping }) {
+  const [text, setText] = useState("");
+  function handleSubmit(event) {
+    event.preventDefault();
+    if (!text.trim()) return;
+    if (onSend(text.trim())) setText("");
+  }
+  return (
+    <form className="send" onSubmit={handleSubmit}>
+      <input
+        name="text"
+        value={text}
+        placeholder="Напишите что-нибудь приятное"
+        autoComplete="off"
+        onChange={(event) => {
+          setText(event.target.value);
+          onTyping();
+        }}
+      />
+      <button disabled={disabled}>Отправить</button>
+    </form>
+  );
+}
+
+function App({ token = "mei-token", room = "general" }) {
+  const chat = useChat({ token, room });
+  return (
+    <main>
+      <header>
+        <h1># {room}</h1>
+        <StatusBar status={chat.status} me={chat.me} />
+      </header>
+      <div className="layout">
+        <MessageList messages={chat.messages} me={chat.me} />
+        <MemberList members={chat.members} />
+      </div>
+      <TypingIndicator users={chat.typing} />
+      {chat.error && <p className="error">{chat.error}</p>}
+      <SendForm
+        disabled={chat.status !== "online"}
+        onSend={chat.sendMessage}
+        onTyping={chat.sendTyping}
+      />
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);`}
+  tests={[
+    { name: "1 в сети", check: `(await __waitFor(() => document.querySelector('.status')?.classList.contains('online'), 600), document.querySelector('.status').textContent === 'В сети как Mei' && [...document.querySelectorAll('.members li')].map((li) => li.textContent).join() === 'Mei' && service.members('general').map((u) => u.name).join() === 'Mei')` },
+    { name: "2 отправка", check: `(await __type('input[name=text]', '  Hello, pandas!  '), await __click('form.send button'), await __waitFor(() => document.querySelectorAll('.messages li').length === 1, 600), document.querySelector('.messages li').textContent === 'Mei: Hello, pandas!' && document.querySelector('.messages li').className === 'mine' && document.querySelector('input[name=text]').value === '' && service.history('general').length === 1)` },
+    { name: "3 входит Bo", check: `(window.bo = new WebSocket('ws://localhost:4000/?token=bo-token'), window.boInbox = [], bo.onmessage = (e) => boInbox.push(JSON.parse(e.data)), await __waitFor(() => bo.readyState === 1, 600), bo.send(JSON.stringify({ type: 'join', room: 'general' })), await __waitFor(() => document.querySelectorAll('.members li').length === 2, 600), [...document.querySelectorAll('.members li')].map((li) => li.textContent).join() === 'Mei,Bo')` },
+    { name: "4 печатает, потом сообщение", check: `(bo.send(JSON.stringify({ type: 'typing', room: 'general' })), await __waitFor(() => document.querySelector('.typing')?.textContent === 'Bo печатает…', 600)) && (bo.send(JSON.stringify({ type: 'message', room: 'general', text: 'Hi Mei!' })), await __waitFor(() => [...document.querySelectorAll('.messages li')].some((li) => li.textContent === 'Bo: Hi Mei!' && li.className === ''), 600)) && !document.querySelector('.typing')?.textContent` },
+    { name: "5 «печатает» исчезает со временем", check: `(bo.send(JSON.stringify({ type: 'typing', room: 'general' })), await __waitFor(() => document.querySelector('.typing')?.textContent === 'Bo печатает…', 600)) && await __waitFor(() => !document.querySelector('.typing')?.textContent, 2000)` },
+    { name: "6 typing не чаще раза в секунду", check: `(boInbox.length = 0, await __type('input[name=text]', 'W'), await __type('input[name=text]', 'Wh'), await __type('input[name=text]', 'Wha'), await __type('input[name=text]', 'What'), await __type('input[name=text]', ''), await __waitFor(() => boInbox.some((m) => m.type === 'typing'), 600), [1, 2].includes(boInbox.filter((m) => m.type === 'typing' && m.user.name === 'Mei').length))` },
+    { name: "7 переподключение и догоняющая история", check: `(boInbox.length = 0, [...chat.wss.clients].filter((s) => s.user?.id === 'u1').forEach((s) => s.terminate()), await __waitFor(() => boInbox.some((m) => m.type === 'presence' && m.action === 'leave'), 600), bo.send(JSON.stringify({ type: 'message', room: 'general', text: 'Did you miss me?' })), await __waitFor(() => document.querySelector('.status')?.classList.contains('online') && [...document.querySelectorAll('.messages li')].some((li) => li.textContent === 'Bo: Did you miss me?'), 600)) && [...document.querySelectorAll('.messages li')].map((li) => li.textContent).join('|') === 'Mei: Hello, pandas!|Bo: Hi Mei!|Bo: Did you miss me?' && boInbox.some((m) => m.type === 'presence' && m.action === 'join' && m.user.name === 'Mei')` },
+    { name: "8 задержка, пока сервер лежит", check: `await (async () => { const Real = window.WebSocket; let attempts = 0; window.WebSocket = class extends Real { constructor(...args) { super(...args); attempts++; } }; try { chat.close(); const down = await __waitFor(() => document.querySelector('.status')?.classList.contains('reconnecting'), 600); if (!down) return false; const text = document.querySelector('.status').textContent; const disabled = document.querySelector('form.send button').disabled; await new Promise((r) => setTimeout(r, 800)); const tries = attempts; const stillDown = document.querySelector('.status').classList.contains('reconnecting'); window.chat2 = createChatServer({ port: 4000, service, authenticate: (t) => TOKENS.get(t) ?? null }); const back = await __waitFor(() => document.querySelector('.status')?.classList.contains('online'), 2000); return down && text === 'Переподключение…' && disabled && stillDown && tries >= 2 && tries <= 6 && back && !document.querySelector('form.send button').disabled; } finally { window.WebSocket = Real; } })()` },
+    { name: "9 неверный токен", check: `await (async () => { const Real = window.WebSocket; let attempts = 0; window.WebSocket = class extends Real { constructor(...args) { super(...args); attempts++; } }; const el = document.createElement('div'); document.body.append(el); const root = require('react-dom/client').createRoot(el); try { root.render(require('react').createElement(App, { token: 'nope' })); const shown = await __waitFor(() => el.querySelector('.status')?.textContent === 'Войдите заново', 600); await new Promise((r) => setTimeout(r, 300)); return shown && attempts === 1 && el.querySelector('form.send button').disabled; } finally { window.WebSocket = Real; root.unmount(); el.remove(); } })()` },
+    { name: "10 размонтирование", check: `await (async () => { const el = document.createElement('div'); document.body.append(el); const root = require('react-dom/client').createRoot(el); root.render(require('react').createElement(App, { token: 'kai-token' })); const online = await __waitFor(() => el.querySelector('.status.online'), 600); const inRoom = service.members('general').some((u) => u.name === 'Kai'); root.unmount(); el.remove(); const gone = await __waitFor(() => !service.members('general').some((u) => u.name === 'Kai'), 600); await new Promise((r) => setTimeout(r, 400)); return online && inRoom && gone && !service.members('general').some((u) => u.name === 'Kai'); })()` },
+    { name: "11 ошибка лимита", check: `await (async () => { for (let i = 0; i < 8; i++) { await __type('input[name=text]', 'spam ' + i); await __click('form.send button'); } const shown = await __waitFor(() => document.querySelector('.error')?.textContent === 'Помедленнее, пожалуйста', 600); return shown; })()` },
+    { name: "12 backoffDelay", check: `backoffDelay(0, () => 1) === 100 && backoffDelay(0, () => 0) === 50 && backoffDelay(1, () => 1) === 200 && backoffDelay(2, () => 0.5) === 300 && backoffDelay(3, () => 1) === 800 && backoffDelay(4, () => 1) === 1000 && backoffDelay(20, () => 0) === 500 && backoffDelay(1) >= 100 && backoffDelay(1) <= 200` },
+  ]}
+>
+
+В редакторе весь PandaChat: сверху сервер из частей 1 и 2, запущенный на порту 4000 с тремя пользователями (`mei-token`, `bo-token` и `kai-token`), а ниже — React-клиент. Компоненты и большая часть `useChat` готовы, и приложение уже подключается и отправляет сообщения. Доделайте клиент:
+
+1. **`backoffDelay(attempt, random = Math.random)`**: потолок равен `RETRY.base * 2 ** attempt`, но не больше `RETRY.max`; верните `Math.round(ceiling / 2 + random() * ceiling / 2)` (равный разброс).
+2. **Переподключение** в `socket.onclose`: ничего не делайте, если `stopped` (компонента больше нет). Для кода `4001` выставьте статус `"unauthorized"` и остановитесь. Иначе выставьте `"reconnecting"` и снова вызовите `connect` через `backoffDelay(attempt)` мс (таймер храните в `retryTimer`), затем увеличьте `attempt` на единицу. (`"joined"` уже сбрасывает его в 0.)
+3. **`handle`**: сообщение `"presence"` заменяет участников на `msg.members`. Сообщение `"typing"` добавляет `msg.user` в `typing` (один раз, даже если он продолжает печатать) и запускает таймер на `TYPING_MS`, который вызывает `stopTyping(user)`; новое `typing` от того же пользователя перезапускает его таймер (таймеры храните в `typingTimers` по id пользователя).
+4. **`sendTyping()`**: отправляйте `"typing"` через `send("typing")`, но не чаще раза в `TYPING_EVERY` мс: сравнивайте `Date.now()` со временем в `lastTypingRef.current`.
+5. **`TypingIndicator`**: `<p className="typing">` с текстом `"Bo печатает…"` для одного пользователя или `"Bo и Kai печатают…"` для нескольких (имена соединяются через `" и "`); пустой `<p className="typing" />`, когда никто не печатает.
+
+Нажмите «Запустить» и поздоровайтесь. Потом проверки подключатся как Bo, чтобы поговорить с вами (в том числе «попечатать»), оборвут ваше соединение, остановят и снова запустят сервер и отрисуют приложение с другими токенами.
+
+<Hint>
+
+`backoffDelay` — это две строки: `const ceiling = Math.min(RETRY.max, RETRY.base * 2 ** attempt);`, а затем `return`. В `onclose` порядок такой: `if (stopped) return;`, проверка 4001 (с `return`), `setStatus("reconnecting")`, `retryTimer = setTimeout(connect, backoffDelay(attempt))`, `attempt += 1`. Для «печатает…»: `clearTimeout(typingTimers.get(user.id))`, затем `typingTimers.set(user.id, setTimeout(() => stopTyping(user), TYPING_MS))` и `setTyping((list) => list.some((u) => u.id === user.id) ? list : [...list, user])`. В `sendTyping` при каждой отправке сохраняйте `Date.now()` в `lastTypingRef.current`.
+
+</Hint>
+
+<Solution>
+
+```jsx
+import { useState, useEffect, useRef } from "react";
+import { createRoot } from "react-dom/client";
+import { WebSocketServer } from "ws";
+
+// ============ сервер: части 1 и 2 ============
+// (без изменений; их тесты остались в тестовых файлах)
+
+// ---------- ошибки ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- время ----------
+
+/** Часы для тестов: время идёт, только когда это скажет тест. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- сервис чата ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // символов в сообщении
+  keep: 200, // сколько сообщений хранит комната
+  burst: 5, // сообщений одной серией...
+  perSecond: 1, // ...а дальше по одному в секунду
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // имя -> { members, messages }
+  const buckets = new Map(); // id пользователя -> корзина токенов
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "В названии комнаты только a-z, 0-9 и -, до 30 символов",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Сначала войдите в комнату ${name}`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) return false;
+    room.members.delete(userId);
+    emit({
+      type: "presence",
+      room: name,
+      action: "leave",
+      user,
+      members: members(name),
+    });
+    return true;
+  }
+
+  function leaveAll(userId) {
+    const left = [];
+    for (const name of rooms.keys()) {
+      if (leave(name, userId)) left.push(name);
+    }
+    return left;
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Сначала войдите в комнату ${name}`);
+    }
+    const clean = typeof text === "string" ? text.trim() : "";
+    if (clean.length < 1 || clean.length > config.maxLength) {
+      throw new ChatError(
+        "invalid_text",
+        `В сообщении должно быть от 1 до ${config.maxLength} символов`,
+      );
+    }
+    if (!bucketFor(userId).take()) {
+      throw new ChatError("rate_limited", "Помедленнее, пожалуйста");
+    }
+    const message = {
+      id: newId(),
+      room: name,
+      user,
+      text: clean,
+      at: clock(),
+    };
+    room.messages.push(message);
+    if (room.messages.length > config.keep) room.messages.shift();
+    emit({ type: "message", room: name, message });
+    return message;
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    const messages = rooms.get(name)?.messages ?? [];
+    const size = Number.isInteger(limit)
+      ? Math.min(Math.max(limit, 1), 100)
+      : 50;
+    let end = messages.length;
+    if (before !== undefined) {
+      end = messages.findIndex((m) => m.id === before);
+      if (end === -1) return []; // неизвестное или уже удалённое
+    }
+    return messages.slice(Math.max(0, end - size), end);
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- сервер реального времени ----------
+
+function send(socket, message) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function createChatServer({ port, service, authenticate }) {
+  // maxPayload: отклонять фреймы больше 16 КБ (в сообщении чата
+  // не больше 500 символов, так что всё крупнее — злоупотребление)
+  const wss = new WebSocketServer({ port, maxPayload: 16 * 1024 });
+
+  // Каждое событие сервиса уходит сокетам из его комнаты.
+  const unsubscribe = service.subscribe((event) => {
+    for (const socket of wss.clients) {
+      if (!socket.rooms?.has(event.room)) continue;
+      const own = socket.user.id === event.user?.id;
+      if (event.type === "typing" && own) continue;
+      send(socket, event);
+    }
+  });
+
+  wss.on("connection", (socket, req) => {
+    const url = new URL(req.url, "http://localhost");
+    const user = authenticate(url.searchParams.get("token"));
+    if (!user) {
+      socket.close(4001, "Unauthorized");
+      return;
+    }
+    socket.user = user;
+    socket.rooms = new Set();
+    socket.isAlive = true;
+    socket.on("pong", () => {
+      socket.isAlive = true;
+    });
+    socket.on("message", (data) => handle(socket, data));
+    socket.on("close", () => {
+      socket.rooms.clear();
+      service.leaveAll(user.id);
+    });
+    send(socket, { type: "welcome", user });
+  });
+
+  function handle(socket, data) {
+    let msg;
+    try {
+      msg = JSON.parse(String(data));
+    } catch {
+      send(socket, {
+        type: "error",
+        code: "bad_json",
+        message: "Сообщения должны быть в формате JSON",
+      });
+      return;
+    }
+    try {
+      route(socket, msg);
+    } catch (error) {
+      const known = error instanceof ChatError;
+      if (!known) console.error("Непредвиденная ошибка:", error.message);
+      send(socket, {
+        type: "error",
+        code: known ? error.code : "internal",
+        message: known ? error.message : "Что-то пошло не так",
+      });
+    }
+  }
+
+  function route(socket, msg) {
+    const { user, rooms } = socket;
+    switch (msg?.type) {
+      case "join": {
+        const joined = service.join(msg.room, user);
+        rooms.add(msg.room);
+        send(socket, { type: "joined", ...joined });
+        break;
+      }
+      case "leave":
+        rooms.delete(msg.room);
+        service.leave(msg.room, user.id);
+        send(socket, { type: "left", room: msg.room });
+        break;
+      case "message":
+        service.postMessage(msg.room, user.id, msg.text);
+        break;
+      case "typing":
+        service.typing(msg.room, user.id);
+        break;
+      case "history": {
+        if (!rooms.has(msg.room)) {
+          throw new ChatError("not_member", `Сначала войдите в комнату ${msg.room}`);
+        }
+        const messages = service.history(msg.room, {
+          before: msg.before,
+          limit: msg.limit,
+        });
+        send(socket, { type: "history", room: msg.room, messages });
+        break;
+      }
+      default:
+        throw new ChatError(
+          "unknown_type",
+          `Неизвестный тип сообщения: ${msg?.type}`,
+        );
+    }
+  }
+
+  // Настоящий интервал вызывает это каждые 30 с (см. урок).
+  function sweep() {
+    for (const socket of wss.clients) {
+      if (!socket.isAlive) {
+        socket.terminate();
+        continue;
+      }
+      socket.isAlive = false;
+      socket.ping();
+    }
+  }
+
+  function close() {
+    unsubscribe();
+    for (const socket of wss.clients) {
+      socket.close(1001, "Server shutting down");
+    }
+    wss.close();
+  }
+
+  return { wss, sweep, close };
+}
+
+const TOKENS = new Map([
+  ["mei-token", { id: "u1", name: "Mei" }],
+  ["bo-token", { id: "u2", name: "Bo" }],
+  ["kai-token", { id: "u3", name: "Kai" }],
+]);
+const service = createChatService();
+const chat = createChatServer({
+  port: 4000,
+  service,
+  authenticate: (token) => TOKENS.get(token) ?? null,
+});
+
+// ================= клиент =================
+
+const SERVER_URL = "ws://localhost:4000";
+const RETRY = { base: 100, max: 1000 }; // мс; в продакшене: 1000 / 30000
+const TYPING_MS = 1000; // сколько держится "печатает…"
+const TYPING_EVERY = 1000; // как часто можно слать "typing"
+
+/** Экспоненциальная задержка с "равным разбросом". */
+function backoffDelay(attempt, random = Math.random) {
+  const ceiling = Math.min(RETRY.max, RETRY.base * 2 ** attempt);
+  return Math.round(ceiling / 2 + (random() * ceiling) / 2);
+}
+
+function useChat({ token, room }) {
+  const [status, setStatus] = useState("connecting");
+  const [me, setMe] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [typing, setTyping] = useState([]);
+  const [error, setError] = useState("");
+  const socketRef = useRef(null);
+  const lastTypingRef = useRef(0);
+
+  useEffect(() => {
+    let socket;
+    let attempt = 0;
+    let retryTimer;
+    let stopped = false;
+    const typingTimers = new Map();
+
+    function stopTyping(user) {
+      clearTimeout(typingTimers.get(user.id));
+      typingTimers.delete(user.id);
+      setTyping((list) => list.filter((u) => u.id !== user.id));
+    }
+
+    function handle(msg) {
+      switch (msg.type) {
+        case "welcome":
+          setMe(msg.user);
+          break;
+        case "joined":
+          attempt = 0;
+          setStatus("online");
+          setMembers(msg.members);
+          setMessages(msg.history);
+          break;
+        case "message":
+          setMessages((list) => [...list, msg.message]);
+          stopTyping(msg.message.user);
+          break;
+        case "presence":
+          setMembers(msg.members);
+          break;
+        case "typing": {
+          const { user } = msg;
+          clearTimeout(typingTimers.get(user.id));
+          const timer = setTimeout(() => stopTyping(user), TYPING_MS);
+          typingTimers.set(user.id, timer);
+          setTyping((list) =>
+            list.some((u) => u.id === user.id) ? list : [...list, user],
+          );
+          break;
+        }
+        case "error":
+          setError(msg.message);
+          break;
+      }
+    }
+
+    function connect() {
+      const params = new URLSearchParams({ token });
+      socket = new WebSocket(`${SERVER_URL}/?${params}`);
+      socketRef.current = socket;
+      socket.onopen = () => {
+        socket.send(JSON.stringify({ type: "join", room }));
+      };
+      socket.onmessage = (event) => handle(JSON.parse(event.data));
+      socket.onclose = (event) => {
+        socketRef.current = null;
+        if (stopped) return;
+        if (event.code === 4001) {
+          setStatus("unauthorized");
+          return;
+        }
+        setStatus("reconnecting");
+        retryTimer = setTimeout(connect, backoffDelay(attempt));
+        attempt += 1;
+      };
+    }
+
+    connect();
+    return () => {
+      stopped = true;
+      clearTimeout(retryTimer);
+      for (const timer of typingTimers.values()) clearTimeout(timer);
+      socket.close();
+    };
+  }, [token, room]);
+
+  function send(type, data = {}) {
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ type, room, ...data }));
+    return true;
+  }
+
+  function sendMessage(text) {
+    setError("");
+    return send("message", { text });
+  }
+  function sendTyping() {
+    const now = Date.now();
+    if (now - lastTypingRef.current < TYPING_EVERY) return;
+    lastTypingRef.current = now;
+    send("typing");
+  }
+
+  return {
+    status, me, messages, members, typing, error,
+    sendMessage, sendTyping,
+  };
+}
+
+// ---------- компоненты ----------
+
+const STATUS_TEXT = {
+  connecting: "Подключение…",
+  online: "В сети",
+  reconnecting: "Переподключение…",
+  unauthorized: "Войдите заново",
+};
+
+function StatusBar({ status, me }) {
+  const who = status === "online" && me ? ` как ${me.name}` : "";
+  return (
+    <p className={`status ${status}`}>
+      {STATUS_TEXT[status]}
+      {who}
+    </p>
+  );
+}
+
+function MemberList({ members }) {
+  return (
+    <ul className="members">
+      {members.map((user) => (
+        <li key={user.id}>{user.name}</li>
+      ))}
+    </ul>
+  );
+}
+
+function MessageList({ messages, me }) {
+  const listRef = useRef(null);
+  useEffect(() => {
+    const list = listRef.current; // новое сообщение всегда на виду
+    list.scrollTop = list.scrollHeight;
+  }, [messages]);
+  return (
+    <ul className="messages" ref={listRef}>
+      {messages.map((m) => (
+        <li key={m.id} className={m.user.id === me?.id ? "mine" : ""}>
+          <strong>{m.user.name}:</strong> {m.text}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function TypingIndicator({ users }) {
+  if (users.length === 0) return <p className="typing" />;
+  const names = users.map((user) => user.name);
+  const who = names.join(" и ");
+  const verb = names.length === 1 ? "печатает" : "печатают";
+  return <p className="typing">{`${who} ${verb}…`}</p>;
+}
+
+function SendForm({ disabled, onSend, onTyping }) {
+  const [text, setText] = useState("");
+  function handleSubmit(event) {
+    event.preventDefault();
+    if (!text.trim()) return;
+    if (onSend(text.trim())) setText("");
+  }
+  return (
+    <form className="send" onSubmit={handleSubmit}>
+      <input
+        name="text"
+        value={text}
+        placeholder="Напишите что-нибудь приятное"
+        autoComplete="off"
+        onChange={(event) => {
+          setText(event.target.value);
+          onTyping();
+        }}
+      />
+      <button disabled={disabled}>Отправить</button>
+    </form>
+  );
+}
+
+function App({ token = "mei-token", room = "general" }) {
+  const chat = useChat({ token, room });
+  return (
+    <main>
+      <header>
+        <h1># {room}</h1>
+        <StatusBar status={chat.status} me={chat.me} />
+      </header>
+      <div className="layout">
+        <MessageList messages={chat.messages} me={chat.me} />
+        <MemberList members={chat.members} />
+      </div>
+      <TypingIndicator users={chat.typing} />
+      {chat.error && <p className="error">{chat.error}</p>}
+      <SendForm
+        disabled={chat.status !== "online"}
+        onSend={chat.sendMessage}
+        onTyping={chat.sendTyping}
+      />
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- **React-клиент чата**, вся сетевая часть которого живёт в одном хуке `useChat`: **конечный автомат** соединения (`connecting`, `online`, `reconnecting`, `unauthorized`), переподключение с **экспоненциальной задержкой и равным разбросом**, никаких повторов после 4001, никаких сокетов-зомби после размонтирования и повторный вход, который **догоняет** пропущенное по истории без дублей.
+- **Индикатор «печатает…»**, частота которого ограничивается при отправке и который гаснет по таймеру при получении, и форму отправки, которая следует за состоянием соединения.
+- **План выпуска**: Redis pub/sub для многих серверов и что куда переезжает из состояния, настройки балансировщика для upgrade, плавную остановку по SIGTERM с проверками liveness и readiness, Docker-образ без root, CI, важные метрики, расчёт мощностей и шторма переподключений и чек-лист запуска.
+- И готовую платформу: протестированное ядро, укреплённый WebSocket-сервер и устойчивый клиент — от одностраничного документа до плана запуска.
+
+## Что дальше
+
+PandaChat — настоящий фундамент. Каждая из этих задач научит чему-то новому:
+
+1. **Перейдите на несколько серверов**: подключите адаптер Redis pub/sub, перенесите участников и лимиты в Redis и протестируйте это двумя экземплярами `createChatServer` в одном тесте (с общим фейковым объектом-шиной), прежде чем трогать настоящий Redis.
+2. **Сохраняйте историю**: `MessageRepository` с версией в памяти и версией для PostgreSQL, которые проходят одни и те же контрактные тесты, сортируемые по времени id (UUIDv7) и кнопка «Загрузить старые» в клиенте на основе сообщения `history` с `before`.
+3. **Несколько вкладок на пользователя**: считайте соединения пользователя в сервисе, чтобы закрытие одной вкладки не объявляло, что Mei вышла, пока открыта другая её вкладка.
+4. **Доставка, которой можно доверять**: пусть клиенты отправляют с каждым сообщением `clientId`, показывают его как «отправляется…», пока не придёт эхо, переотправляют после переподключения, а сервер игнорирует дубли (ключи идемпотентности из урока [Функции реального времени и отказоустойчивость](/learn/javascript/real-time-and-resilience)).
+5. **Закрытые комнаты и модерация**: входить могут только приглашённые, модераторы могут удалять сообщения и заглушать пользователей, и каждое решение проверяется на сервере.
+
+## Поздравляем! 🎉🐼
+
+Вы прошли **весь курс JavaScript на PandaDev** — все четыре уровня. Вспомните, с чего вы начинали: `console.log("Hello, World!")`, переменные и первый `if`. С тех пор вы сделали список дел и игру «Угадай число», поработали с DOM, написали классы и модули, получали данные из API, тестировали с Vitest, строили приложения на React и API на Express, заглянули внутрь движка и цикла событий, ловили утечки памяти, измеряли и оптимизировали, защищали API, проектировали архитектуры и системы, а теперь с чистого листа спроектировали, построили и спланировали запуск платформы реального времени.
+
+Это уже не набор новичка, а инструментарий senior-разработчика на JavaScript. Самые важные навыки дальше — те, которые не закончит за вас ни один курс: читать чужой код, часто выпускать небольшие вещи, учиться на каждом инциденте и помогать расти людям вокруг. Сделайте что-нибудь, что вам по-настоящему важно, покажите это настоящим пользователям — и продолжайте. Мы гордимся вами. 💚

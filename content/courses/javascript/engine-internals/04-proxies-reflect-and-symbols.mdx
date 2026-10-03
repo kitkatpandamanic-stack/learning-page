@@ -1,0 +1,663 @@
+---
+title: Proxies, Reflect and Symbols
+description: Control how properties behave with descriptors, freeze and getters, hook into the language with well-known symbols, and intercept objects with Proxy and Reflect, the trick behind Vue and MobX.
+duration: 25
+xp: 30
+---
+
+Some JavaScript libraries feel like magic. In Vue you write `state.count++` and the page updates. In MobX a component re-renders when, and only when, the data it read changes. An ORM lets you write `user.posts` and quietly runs a database query. None of that is magic: it's **metaprogramming**, code that changes how objects themselves behave. This lesson covers the tools, from the small (property descriptors, freezing, symbols) to the powerful (`Proxy` and `Reflect`), so you can read framework code, debug it, and use these tools yourself when they're the right call. 🪄
+
+## Property descriptors
+
+A property is more than a name and a value. Every property has a **descriptor** with three flags that control it:
+
+| Flag | When `false`... |
+| --- | --- |
+| **`writable`** | the value can't be changed (in strict mode, assigning throws a `TypeError`) |
+| **`enumerable`** | the property is hidden from `Object.keys`, `for...in`, spread and `JSON.stringify` |
+| **`configurable`** | the property can't be deleted and its flags can't be changed any more |
+
+Properties you create normally have all three set to `true`. **`Object.defineProperty`** creates a property with exactly the flags you choose, and any flag you leave out defaults to **`false`**:
+
+<CodeExample output={`{ value: 'Mei', writable: true, enumerable: true, configurable: true }
+{ value: 7, writable: false, enumerable: false, configurable: false }
+[ 'name' ] {"name":"Mei"}
+7
+TypeError`}>
+
+```js
+const user = { name: "Mei" };
+console.log(Object.getOwnPropertyDescriptor(user, "name"));
+
+Object.defineProperty(user, "id", { value: 7 }); // flags: false
+console.log(Object.getOwnPropertyDescriptor(user, "id"));
+
+console.log(Object.keys(user), JSON.stringify(user)); // id hidden
+console.log(user.id); // but it's there
+
+try {
+  user.id = 8; // read-only
+} catch (error) {
+  console.log(error.name);
+}
+```
+
+</CodeExample>
+
+That's how built-in objects work: `Math.PI` is non-writable, and array methods like `map` are non-enumerable, which is why `for...in` over an array doesn't list them. In your own code, non-enumerable properties are handy for metadata that shouldn't end up in JSON.
+
+<Callout type="warning" title="Silent failure in sloppy mode">
+
+In strict mode (modules, classes, this runner), writing to a read-only property throws. In old non-module scripts it **fails silently**: the assignment is ignored and your code carries on with the old value. If "my assignment didn't do anything" ever happens to you in a legacy codebase, check for frozen objects and read-only properties.
+
+</Callout>
+
+## Getters and setters
+
+Instead of a `value`, a property can have a **getter** (`get`) and/or **setter** (`set`): functions that run when the property is read or written. You've used them in classes; under the hood they're **accessor descriptors**. A neat senior trick is the **lazy property**: a getter that does expensive work on first access, then replaces itself with a plain value so it never runs again:
+
+<CodeExample output={`(building the report...)
+42 pandas
+42 pandas`}>
+
+```js
+const stats = {
+  get report() {
+    console.log("(building the report...)"); // expensive work
+    const value = "42 pandas";
+    // Replace the getter with a plain data property
+    Object.defineProperty(this, "report", {
+      value,
+      enumerable: true,
+    });
+    return value;
+  },
+};
+
+console.log(stats.report); // runs the getter
+console.log(stats.report); // just reads the stored value
+```
+
+</CodeExample>
+
+Getters are great for derived values (`get total()`), but keep them cheap and free of side effects. A getter that sends a network request or changes state surprises everybody, including the debugger, which calls getters when it shows an object.
+
+## Freezing and sealing
+
+Three built-in functions lock down a whole object:
+
+| Function | Add properties | Delete properties | Change values |
+| --- | --- | --- | --- |
+| `Object.preventExtensions(obj)` | ❌ | ✅ | ✅ |
+| `Object.seal(obj)` | ❌ | ❌ | ✅ |
+| `Object.freeze(obj)` | ❌ | ❌ | ❌ |
+
+All three are **shallow**: they lock the object itself, not the objects inside it. A frozen config with a nested `limits` object can still have its limits changed. For real immutability, freeze recursively:
+
+<CodeExample output={`still changeable: 999
+TypeError
+10 true`}>
+
+```js
+const shallow = Object.freeze({ limits: { upload: 10 } });
+shallow.limits.upload = 999; // the inner object isn't frozen!
+console.log("still changeable:", shallow.limits.upload);
+
+function deepFreeze(obj) {
+  for (const value of Object.values(obj)) {
+    if (typeof value === "object" && value !== null) {
+      deepFreeze(value);
+    }
+  }
+  return Object.freeze(obj);
+}
+
+const settings = deepFreeze({ theme: "dark", limits: { upload: 10 } });
+try {
+  settings.limits.upload = 999;
+} catch (error) {
+  console.log(error.name);
+}
+console.log(settings.limits.upload, Object.isFrozen(settings.limits));
+```
+
+</CodeExample>
+
+Freezing is useful for constants, configuration and **value objects** (you'll meet those in the design patterns module), and for catching accidental mutation in development. Immer (the library inside Redux Toolkit), for example, freezes the state it produces, so an accidental mutation throws instead of causing a subtle bug. Don't freeze large data structures in hot paths just because you can: the real protection against accidental mutation is a habit of creating new objects (`{ ...state, done: true }`).
+
+## Symbols
+
+A **symbol** is a primitive value that is guaranteed to be **unique**. Its main job is to be a property key that can never clash with anyone else's:
+
+<CodeExample output={`false
+true
+Symbol(id) id
+7
+[ 'name' ] {"name":"Mei"}
+[ Symbol(id) ]`}>
+
+```js
+console.log(Symbol("id") === Symbol("id")); // always unique
+console.log(Symbol.for("id") === Symbol.for("id")); // registry
+
+const id = Symbol("id"); // "id" is only a description
+console.log(id.toString(), id.description);
+
+// A library can tag your objects without clashing with your keys
+const user = { name: "Mei" };
+user[id] = 7;
+console.log(user[id]);
+console.log(Object.keys(user), JSON.stringify(user)); // skipped
+console.log(Object.getOwnPropertySymbols(user)); // but not secret
+```
+
+</CodeExample>
+
+- Every `Symbol("id")` call creates a new, different symbol. `Symbol.for("id")` instead looks the symbol up in a global registry, so the same name always gives the same symbol (even across iframes).
+- Symbol keys are skipped by `Object.keys`, `for...in` and `JSON.stringify`, so they're good for metadata. They're **not private**, though: `Object.getOwnPropertySymbols` and `Reflect.ownKeys` find them. For real privacy, use `#private` fields.
+
+### Well-known symbols: hooks into the language
+
+The most important symbols are built in. The language itself looks them up on your objects, which lets your classes plug into syntax:
+
+| Symbol | Used by |
+| --- | --- |
+| `Symbol.iterator` | `for...of`, spread `[...x]`, destructuring, `Array.from` |
+| `Symbol.asyncIterator` | `for await...of` |
+| `Symbol.toPrimitive` | converting to a number or string: `+x`, `` `${x}` ``, `x > 3`, `x + 1` |
+| `Symbol.toStringTag` | `Object.prototype.toString` (`[object Something]`) |
+
+You met `Symbol.iterator` with generators. It works without them too: return an object with a `next()` method. `Symbol.asyncIterator` is the async twin you saw powering `for await` in [the previous lesson](/learn/javascript/the-event-loop-in-depth). And `Symbol.toPrimitive` decides what your object becomes in maths and strings:
+
+<CodeExample output={`[ 1, 2, 3, 4, 5 ]
+tick 1
+tick 2
+£12.50 12.5 25 true`}>
+
+```js
+class Range {
+  constructor(from, to) {
+    this.from = from;
+    this.to = to;
+  }
+  [Symbol.iterator]() {
+    let current = this.from;
+    const last = this.to;
+    return {
+      next: () =>
+        current <= last
+          ? { value: current++, done: false }
+          : { value: undefined, done: true },
+    };
+  }
+}
+console.log([...new Range(1, 5)]);
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const ticker = {
+  async *[Symbol.asyncIterator]() {
+    for (let i = 1; i <= 2; i++) {
+      await wait(10);
+      yield `tick ${i}`;
+    }
+  },
+};
+for await (const tick of ticker) console.log(tick);
+
+const price = {
+  pence: 1250,
+  [Symbol.toPrimitive](hint) {
+    // hint: "number", "string" or "default"
+    if (hint === "number") return this.pence / 100;
+    return `£${(this.pence / 100).toFixed(2)}`;
+  },
+};
+console.log(`${price}`, +price, price * 2, price > 10);
+```
+
+</CodeExample>
+
+Use `Symbol.toPrimitive` sparingly: a `Money` object that silently turns into a float can hide rounding bugs. An explicit `price.format()` is often clearer.
+
+## Proxy: intercepting an object
+
+A **Proxy** wraps a **target** object and lets you intercept the fundamental operations on it: reading a property, writing one, checking `in`, deleting, listing keys, calling a function. You pass a **handler** whose methods are called **traps**:
+
+| Trap | Intercepts |
+| --- | --- |
+| `get(target, key, receiver)` | `proxy.key`, `proxy[key]` |
+| `set(target, key, value, receiver)` | `proxy.key = value` (must return `true` on success) |
+| `has(target, key)` | `key in proxy` |
+| `deleteProperty(target, key)` | `delete proxy.key` |
+| `ownKeys(target)` | `Object.keys`, `for...in`, spread, `JSON.stringify` |
+| `apply`, `construct` | calling the proxy, `new proxy()` (for function targets) |
+
+Any trap you don't define falls through to the target as if there were no proxy. And for each trap there's a matching function on **`Reflect`** that performs the **default** behaviour, so a trap can do its extra work and then hand over to the normal operation. The simplest useful proxy logs every access:
+
+<CodeExample output={`read name
+wrote likes = 1
+read likes
+1`}>
+
+```js
+const panda = { name: "Mei", likes: 0 };
+
+const watched = new Proxy(panda, {
+  get(target, key, receiver) {
+    console.log(`read ${String(key)}`);
+    return Reflect.get(target, key, receiver);
+  },
+  set(target, key, value, receiver) {
+    console.log(`wrote ${String(key)} = ${value}`);
+    return Reflect.set(target, key, value, receiver);
+  },
+});
+
+watched.name;
+watched.likes = 1;
+console.log(watched.likes);
+```
+
+</CodeExample>
+
+(`String(key)` because keys can also be symbols, which don't convert to strings in template literals.)
+
+### Default values
+
+A `get` trap can answer for properties that don't exist. Here, any missing item has a stock of `0`, so `+=` just works:
+
+<CodeExample output={`12 0
+5 { bamboo: 12, dumplings: 5 }`}>
+
+```js
+function withDefault(target, fallback) {
+  return new Proxy(target, {
+    get(obj, key, receiver) {
+      return key in obj ? Reflect.get(obj, key, receiver) : fallback;
+    },
+  });
+}
+
+const stock = withDefault({ bamboo: 12 }, 0);
+console.log(stock.bamboo, stock.dumplings);
+stock.dumplings += 5;
+console.log(stock.dumplings, { ...stock });
+```
+
+</CodeExample>
+
+### Validation
+
+A `set` trap can check every write. Throw for bad values; return `true` for success. (If a `set` trap returns `false`, strict-mode code gets a vague `TypeError` about the trap "returning falsish", so throwing your own error with a clear message is kinder.)
+
+<CodeExample output={`TypeError: age must be a whole number from 0 to 150
+{ name: 'Mei', age: 4 }`}>
+
+```js
+const isValidAge = (v) => Number.isInteger(v) && v >= 0 && v <= 150;
+
+const person = new Proxy({ name: "Mei", age: 3 }, {
+  set(target, key, value, receiver) {
+    if (key === "age" && !isValidAge(value)) {
+      throw new TypeError("age must be a whole number from 0 to 150");
+    }
+    return Reflect.set(target, key, value, receiver);
+  },
+});
+
+person.age = 4;
+try {
+  person.age = -1;
+} catch (error) {
+  console.log(`${error.name}: ${error.message}`);
+}
+console.log({ ...person });
+```
+
+</CodeExample>
+
+### Hiding and protecting properties
+
+`has`, `ownKeys` and `deleteProperty` let you hide internal fields and protect required ones:
+
+<CodeExample output={`true false
+[ 'name' ] {"name":"Mei"}
+TypeError: name is required`}>
+
+```js
+const isInternal = (key) => String(key).startsWith("_");
+
+const user = new Proxy({ name: "Mei", _passwordHash: "x1f" }, {
+  has: (obj, key) => !isInternal(key) && key in obj,
+  ownKeys: (obj) => Reflect.ownKeys(obj).filter((k) => !isInternal(k)),
+  deleteProperty(obj, key) {
+    if (key === "name") throw new TypeError("name is required");
+    return Reflect.deleteProperty(obj, key);
+  },
+});
+
+console.log("name" in user, "_passwordHash" in user);
+console.log(Object.keys(user), JSON.stringify(user));
+try {
+  delete user.name;
+} catch (error) {
+  console.log(`${error.name}: ${error.message}`);
+}
+```
+
+</CodeExample>
+
+That's a convenience, not security: `user._passwordHash` can still be read directly (we didn't trap `get`), and the original object is untouched. Don't send password hashes to places where hiding them matters.
+
+### Why Reflect, and not just target[key]?
+
+`Reflect.get(target, key, receiver)` looks like a long way of writing `target[key]`, but the third argument matters. The **receiver** is the object the property was originally read from, and getters need it as their `this`. It makes a difference as soon as inheritance is involved:
+
+<CodeExample output={`Hi, Mei
+Hi, Bao`}>
+
+```js
+const base = {
+  first: "Mei",
+  get greeting() {
+    return `Hi, ${this.first}`;
+  },
+};
+
+const sloppy = new Proxy(base, { get: (t, key) => t[key] });
+const correct = new Proxy(base, {
+  get: (t, key, receiver) => Reflect.get(t, key, receiver),
+});
+
+const bao1 = Object.create(sloppy); // inherits from the proxy
+bao1.first = "Bao";
+const bao2 = Object.create(correct);
+bao2.first = "Bao";
+
+console.log(bao1.greeting); // getter ran with this = base: wrong
+console.log(bao2.greeting); // this = bao2: right
+```
+
+</CodeExample>
+
+`Reflect` methods also **return** `true`/`false` where the old `Object.*` versions throw (`Reflect.defineProperty`, `Reflect.set`), and `Reflect.ownKeys` lists string **and** symbol keys. Rule of thumb: inside a trap, forward to the `Reflect` method with the same name and the same arguments.
+
+## Reactivity: how Vue and MobX know what changed
+
+Now the "magic". Vue 3's `reactive()` and MobX's observables are built on exactly this idea:
+
+1. While an **effect** (rendering a component, a computed value) runs, the `get` trap **tracks** which properties it reads.
+2. When a property is written, the `set` trap **triggers** the effects that read it, and only those.
+
+Here's the whole idea in under 40 lines. Notice the `WeakMap` from the [memory lesson](/learn/javascript/memory-and-garbage-collection): when a reactive object is no longer used, its bookkeeping disappears with it:
+
+<CodeExample output={`Total: £10
+Total: £15
+Total: £12`}>
+
+```js
+const effectsFor = new WeakMap(); // target -> Map(key -> Set)
+let activeEffect = null;
+
+function track(target, key) {
+  if (!activeEffect) return;
+  if (!effectsFor.has(target)) effectsFor.set(target, new Map());
+  const byKey = effectsFor.get(target);
+  if (!byKey.has(key)) byKey.set(key, new Set());
+  byKey.get(key).add(activeEffect);
+}
+
+function trigger(target, key) {
+  effectsFor.get(target)?.get(key)?.forEach((fn) => fn());
+}
+
+function reactive(target) {
+  return new Proxy(target, {
+    get(obj, key, receiver) {
+      track(obj, key); // someone is reading: remember who
+      return Reflect.get(obj, key, receiver);
+    },
+    set(obj, key, value, receiver) {
+      const old = obj[key];
+      const ok = Reflect.set(obj, key, value, receiver);
+      if (!Object.is(old, value)) trigger(obj, key); // re-run
+      return ok;
+    },
+  });
+}
+
+function effect(fn) {
+  activeEffect = fn;
+  fn(); // the first run records what fn reads
+  activeEffect = null;
+}
+
+const cart = reactive({ items: 2, price: 5, coupon: "" });
+effect(() => {
+  console.log(`Total: £${cart.items * cart.price}`);
+});
+
+cart.items = 3; // the effect read items: it re-runs
+cart.price = 5; // same value: nothing to do
+cart.coupon = "PANDA"; // nobody read coupon: nothing happens
+cart.price = 4;
+```
+
+</CodeExample>
+
+Real libraries add a lot on top: re-tracking on every run (an `if` can change what an effect reads), batching several writes into one update, wrapping nested objects lazily, arrays and Maps, and scheduling effects as microtasks. But the core is this: **Proxy traps turn plain property access into a dependency graph.** Vue 2, before Proxy existed, used `Object.defineProperty` getters and setters instead, which is why it couldn't notice new properties being added (`Vue.set` existed for exactly that). Proxies fixed it.
+
+## Costs and pitfalls
+
+Proxies are powerful, and that's exactly why seniors are careful with them.
+
+- **Speed.** Every operation on a proxy calls a trap function, and the JIT can't use its shape and inline cache tricks from [the first lesson](/learn/javascript/how-engines-run-code). Property access through a proxy is often many times slower than on a plain object. It's fine for app state that's read a few hundred times per update, not for a 100,000-item array in a hot loop (Vue offers `markRaw` and `shallowRef` for exactly that).
+- **Identity.** `proxy !== target`. Code that stores the raw object in a `Set` and later looks for the proxy (or the other way round) won't find it.
+- **Bypassing.** Changes made directly to the **target** skip all traps. Keep the raw object private (create it inside the function that makes the proxy) so nobody can go around your validation.
+- **Internal slots and private fields.** Built-ins like `Map`, `Set` and `Date`, and classes with `#private` fields, store data in places only the real object can reach. Call their methods through a proxy and `this` is the proxy, so they throw:
+
+<CodeExample output={`TypeError
+TypeError
+1 1`}>
+
+```js
+const plain = new Proxy(new Map([["a", 1]]), {});
+try {
+  plain.size; // Map's getter runs with this = proxy
+} catch (error) {
+  console.log(error.name);
+}
+
+class Account {
+  #balance = 10;
+  get balance() {
+    return this.#balance;
+  }
+}
+try {
+  new Proxy(new Account(), {}).balance;
+} catch (error) {
+  console.log(error.name);
+}
+
+// The fix for built-ins: run methods on the real object
+const fixed = new Proxy(new Map([["a", 1]]), {
+  get(target, key) {
+    const value = Reflect.get(target, key, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  },
+});
+console.log(fixed.size, fixed.get("a"));
+```
+
+</CodeExample>
+
+- **Surprise.** `state.count++` that secretly re-renders a page, or `user.posts` that secretly queries a database, is wonderful until someone puts it in a loop. When you build something with proxies, make the magic obvious in names and documentation. In application code, a plain class with explicit methods (`store.setCount(…)`) is often the better choice; reach for a Proxy when you're building a **library-like** layer that many developers will use.
+
+<Quiz
+  question="Object.freeze(config) is called on const config = { theme: 'dark', limits: { upload: 10 } }. In strict mode, what happens with config.limits.upload = 50?"
+  options={[
+    "It throws a TypeError, because config is frozen",
+    "It works: freeze is shallow, so the nested limits object can still change",
+    "It's silently ignored",
+    "It replaces the whole limits object",
+  ]}
+  answer={1}
+  explanation="Object.freeze only locks the object you pass it. config.limits can't be replaced, but the object it points to isn't frozen, so its properties can still change. Use a recursive deepFreeze to lock nested objects too."
+/>
+
+<Quiz
+  question="Inside a Proxy's get trap, why is return Reflect.get(target, key, receiver) better than return target[key]?"
+  options={[
+    "Reflect.get is faster",
+    "target[key] doesn't work with symbol keys",
+    "Reflect.get passes the receiver, so getters run with the right this, for example when another object inherits from the proxy",
+    "target[key] triggers the get trap again and loops forever",
+  ]}
+  answer={2}
+  explanation="target[key] runs getters with this set to the target. Reflect.get with the receiver runs them with this set to the object the property was actually read from, which matters for inheritance and for other proxies in the chain. It also keeps the trap's behaviour identical to the default."
+/>
+
+<Exercise
+  title="A validating, observable store"
+  starter={`function createStore(initial, schema) {
+  const listeners = new Set();
+
+  // TODO: wrap a COPY of initial in a Proxy with set and
+  // deleteProperty traps that validate, protect and notify.
+  const state = initial;
+
+  return {
+    state,
+    subscribe(fn) {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    },
+  };
+}
+
+const store = createStore(
+  { title: "Untitled", likes: 0, published: false },
+  { title: "string", likes: "number", published: "boolean" },
+);
+const unsubscribe = store.subscribe((key, value, old) => {
+  console.log(\`\${key}: \${old} → \${value}\`);
+});
+
+store.state.likes += 1;
+store.state.title = "Bamboo";
+store.state.title = "Bamboo"; // same value: no message
+for (const attempt of [
+  () => (store.state.likes = "lots"),
+  () => (store.state.author = "Mei"),
+  () => delete store.state.title,
+]) {
+  try {
+    attempt();
+  } catch (error) {
+    console.log(\`\${error.name}: \${error.message}\`);
+  }
+}
+unsubscribe();
+store.state.published = true; // nobody is listening any more
+console.log(JSON.stringify(store.state));
+`}
+  tests={[
+    { name: "The demo prints the expected lines", check: `__output.join("|") === "likes: 0 → 1|title: Untitled → Bamboo|TypeError: likes must be a number|TypeError: Unknown field \\"author\\"|TypeError: Can't delete \\"title\\"|{\\"title\\":\\"Bamboo\\",\\"likes\\":1,\\"published\\":true}"` },
+    { name: "Rejects values of the wrong type with a TypeError", check: `(() => { const s = createStore({ n: 1 }, { n: "number", tag: "string" }); try { s.state.n = "x"; return false; } catch (e) { return e instanceof TypeError && e.message === "n must be a number" && s.state.n === 1; } })()` },
+    { name: "Rejects fields that aren't in the schema", check: `(() => { const s = createStore({}, { tag: "string" }); s.state.tag = "new"; try { s.state.zzz = 1; return false; } catch (e) { return e instanceof TypeError && e.message === "Unknown field \\"zzz\\"" && !("zzz" in s.state) && s.state.tag === "new"; } })()` },
+    { name: "Refuses to delete fields", check: `(() => { const s = createStore({ a: "x" }, { a: "string" }); try { delete s.state.a; return false; } catch (e) { return e instanceof TypeError && e.message === "Can't delete \\"a\\"" && s.state.a === "x"; } })()` },
+    { name: "Notifies every listener after the change, skips unchanged values, and unsubscribe works", check: `(() => { const s = createStore({ n: 1 }, { n: "number" }); const a = []; const b = []; let seen; s.subscribe((k, v, o) => { a.push([k, v, o].join()); seen = s.state.n; }); const off = s.subscribe((k, v) => b.push(v)); s.state.n++; off(); s.state.n = 10; s.state.n = 10; return a.join("|") === "n,2,1|n,10,2" && b.join() === "2" && seen === 10; })()` },
+    { name: "Works on a copy, so the original object can't bypass it", check: `(() => { const init = { a: 1 }; const s = createStore(init, { a: "number" }); s.state.a = 2; return init.a === 1 && s.state.a === 2; })()` },
+  ]}
+>
+
+Build a tiny state store, the kind of thing a framework gives you. `createStore(initial, schema)` returns `{ state, subscribe }`, where `state` is a **Proxy** around a **copy** of `initial` and `schema` maps each allowed field to its `typeof` type (`"string"`, `"number"`, `"boolean"`).
+
+The `set` trap must:
+
+1. Throw a `TypeError` with the message `Unknown field "author"` (with the field's name) for keys that aren't in the schema.
+2. Throw a `TypeError` with the message `likes must be a number` (field and type from the schema) when `typeof value` doesn't match.
+3. Do nothing (and notify nobody) when the new value is the same as the old one (use `Object.is`).
+4. Otherwise store the value **first**, then call every listener with `(key, value, oldValue)`, and return `true`.
+
+The `deleteProperty` trap must throw a `TypeError` with the message `Can't delete "title"` (with the field's name). Reading needs no trap. `subscribe` is done.
+
+<Hint>
+
+Start with `const state = new Proxy({ ...initial }, { set(target, key, value, receiver) { ... }, deleteProperty(target, key) { ... } });`. In `set`, check `!(key in schema)` first and throw a `new TypeError(...)` built with a template literal (use `String(key)`, since keys can be symbols), then compare `typeof value !== schema[key]`. Save `const old = target[key];`, `return true` early if `Object.is(old, value)`, then call `Reflect.set(target, key, value, receiver)` and `listeners.forEach((fn) => fn(key, value, old));` before returning `true`.
+
+</Hint>
+
+<Solution>
+
+```js
+function createStore(initial, schema) {
+  const listeners = new Set();
+
+  const state = new Proxy({ ...initial }, {
+    set(target, key, value, receiver) {
+      if (!(key in schema)) {
+        throw new TypeError(`Unknown field "${String(key)}"`);
+      }
+      if (typeof value !== schema[key]) {
+        throw new TypeError(`${String(key)} must be a ${schema[key]}`);
+      }
+      const old = target[key];
+      if (Object.is(old, value)) return true; // nothing changed
+      Reflect.set(target, key, value, receiver);
+      listeners.forEach((fn) => fn(key, value, old));
+      return true;
+    },
+    deleteProperty(target, key) {
+      throw new TypeError(`Can't delete "${String(key)}"`);
+    },
+  });
+
+  return {
+    state,
+    subscribe(fn) {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    },
+  };
+}
+
+const store = createStore(
+  { title: "Untitled", likes: 0, published: false },
+  { title: "string", likes: "number", published: "boolean" },
+);
+const unsubscribe = store.subscribe((key, value, old) => {
+  console.log(`${key}: ${old} → ${value}`);
+});
+
+store.state.likes += 1;
+store.state.title = "Bamboo";
+store.state.title = "Bamboo"; // same value: no message
+for (const attempt of [
+  () => (store.state.likes = "lots"),
+  () => (store.state.author = "Mei"),
+  () => delete store.state.title,
+]) {
+  try {
+    attempt();
+  } catch (error) {
+    console.log(`${error.name}: ${error.message}`);
+  }
+}
+unsubscribe();
+store.state.published = true; // nobody is listening any more
+console.log(JSON.stringify(store.state));
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Every property has a **descriptor**: `writable`, `enumerable`, `configurable` (all `false` by default with `Object.defineProperty`), or a `get`/`set` pair. Lazy getters can replace themselves with a value.
+- `preventExtensions` < `seal` < `freeze`, and all three are **shallow**; freeze recursively for real immutability. Strict mode throws on forbidden writes; sloppy mode ignores them silently.
+- **Symbols** are unique keys, skipped by `Object.keys` and JSON but not private. **Well-known symbols** (`Symbol.iterator`, `Symbol.asyncIterator`, `Symbol.toPrimitive`, `Symbol.toStringTag`) plug your objects into language features.
+- A **Proxy** intercepts operations with **traps** (`get`, `set`, `has`, `deleteProperty`, `ownKeys`...); **Reflect** performs the default behaviour, with the right **receiver**. Uses: defaults, validation, logging, hiding fields, and **reactivity** (track reads in `get`, trigger effects in `set`), as in Vue and MobX.
+- Pitfalls: proxies are **slower**, `proxy !== target`, writes to the raw target **bypass** traps, built-ins and `#private` fields break unless methods run on the real object, and hidden magic surprises your teammates. Use them for library-like layers, not everywhere.

@@ -1,0 +1,571 @@
+---
+title: Code Review and Technical Leadership
+description: Review JavaScript for what matters, write kind and specific feedback, plan with design docs, tame tech debt, estimate honestly, mentor juniors and run blameless postmortems.
+duration: 25
+xp: 30
+---
+
+There comes a point where your biggest impact is no longer the code you type. It's the bug you catch in someone else's pull request, the design the team agrees on before anyone writes a line, the junior who gets twice as good because you paired with them, and the calm postmortem after a bad night. That's **technical leadership**, and you don't need a "lead" title to do it. This lesson is a practical kit for all of it. 🧭
+
+## What code review is for
+
+Code review isn't a gate where seniors prove they're clever. It has three jobs:
+
+1. **Catch problems while they're cheap**: bugs, security holes, designs that will hurt in six months.
+2. **Spread knowledge**: now at least two people understand this code, and both the author and the reviewer learn something.
+3. **Keep the codebase consistent**, so the next person can find their way around.
+
+Review in roughly this order. If the design is wrong, polishing variable names is wasted effort:
+
+| Area | Questions to ask in a JavaScript codebase |
+| --- | --- |
+| **Correctness** | Does it do what the ticket says? Empty arrays, `null`/`undefined`, `0` and `""`, duplicates, two requests at the same time? Every promise awaited or handled? |
+| **Design** | Is it in the right layer (route handler vs use case vs repository)? Simpler than it could be, or more general than needed? |
+| **Tests** | Do tests cover the new behaviour and its edge cases? Would they fail if the code were broken? |
+| **Security** | Is input validated? `innerHTML` with user data, SQL built from strings, secrets in code, personal data in logs or WebSocket broadcasts? |
+| **Operability** | Timeouts on network calls? Useful logs and metrics? A safe migration, a feature flag, a way to roll back? |
+| **Performance** | Only where it matters: queries in a loop (N+1), `includes` inside a loop over big arrays, huge bundles, needless re-renders. |
+| **Readability** | Do names say what things are? Would a newcomer follow it? Is there a comment for the *why*? |
+
+Leave formatting and simple rules to machines. **Prettier** formats, **ESLint** catches things like `==`, unused variables and (with typescript-eslint's `no-floating-promises`) forgotten `await`s, and **TypeScript** catches whole classes of mistakes. Run them in CI, so humans spend review time on what tools can't judge.
+
+## Reading code like a reviewer
+
+Some bugs slide straight past a reader in "looks fine to me" mode. Experienced reviewers keep a mental list of JavaScript's usual suspects:
+
+<CodeExample output={`[ 1, 10, 100, 9 ]
+[ 1, 9, 10, 100 ]
+[ 1, NaN, 3 ]
+[ 1, 7, 11 ]
+10 0
+saved after forEach: []
+saved with Promise.all: [ 1, 2, 3 ]`}>
+
+```js
+// 1. Sorting numbers
+console.log([10, 9, 1, 100].sort());
+console.log([10, 9, 1, 100].sort((a, b) => a - b));
+
+// 2. map passes (value, index), and parseInt takes a radix
+console.log(["1", "7", "11"].map(parseInt));
+console.log(["1", "7", "11"].map(Number));
+
+// 3. || treats 0 and "" as missing
+const settings = { maxVotes: 0 };
+console.log(settings.maxVotes || 10, settings.maxVotes ?? 10);
+
+// 4. forEach doesn't wait for async callbacks
+const save = (id) => new Promise((r) => setTimeout(r, 10, id));
+const saved = [];
+[1, 2, 3].forEach(async (id) => saved.push(await save(id)));
+console.log("saved after forEach:", saved);
+
+const all = await Promise.all([1, 2, 3].map(save));
+console.log("saved with Promise.all:", all);
+```
+
+</CodeExample>
+
+- `sort()` without a compare function sorts **as strings**, so `100` comes before `9`.
+- `map(parseInt)` calls `parseInt("7", 1)`, because `map` passes the index as the second argument, and parseInt reads it as the number base.
+- `||` replaces **every** falsy value, so a deliberate `0` becomes `10`. `??` only replaces `null` and `undefined`.
+- `forEach` ignores the promises its callback returns: the code after it runs before anything is saved. Use `for...of` with `await`, or `Promise.all`.
+
+Others on the list: `==` instead of `===`, mutating arguments or React state, floats for money (`0.1 + 0.2`), a `catch` that swallows every error, `this` lost in a callback, and a `Map` or array that grows forever. When you spot one, the most useful comment asks for a **test** that proves the bug, so it can never quietly come back.
+
+## Writing kind, specific feedback
+
+Here's a pull request that looks reasonable at first glance:
+
+```js
+// PR #212: "Presenters can close a poll"
+app.post("/polls/:id/close", async (req, res) => {
+  const poll = await polls.findById(req.params.id);
+  poll.closed = true;
+  polls.save(poll);
+  for (const s of wss.clients) s.send(JSON.stringify(poll));
+  res.json(poll);
+});
+```
+
+And here are review comments that help the author rather than judge them. The label at the start (a convention called **Conventional Comments**) says how much each one matters:
+
+- **issue (blocking):** Nothing checks that the caller owns this poll, so any logged-in user can close anyone's poll. Could we reuse the `requireOwner` middleware from the edit route, with a test for the 403?
+- **issue (blocking):** `polls.save(poll)` isn't awaited. If the save fails, we've already told every screen the poll is closed, and the rejection goes unhandled.
+- **question:** What should happen for an unknown id? Right now `poll` is `null`, line 3 throws a TypeError, and the user gets a 500. Did you mean a 404?
+- **suggestion:** This sends the update to **every** connected client, including people watching other polls, and the full poll object contains the owner's email. What do you think about broadcasting `{ type: "closed", pollId }` to this poll's viewers only?
+- **nit (non-blocking):** `s` → `socket` reads a bit more easily.
+- **praise:** Going through the `polls` repository instead of querying the database here keeps this route easy to test. 👍
+
+What makes these work:
+
+| Instead of… | Try… | Why |
+| --- | --- | --- |
+| "This is wrong." | "Unknown ids crash with a TypeError (500); should this be a 404?" | Says **what**, **why**, and a way forward |
+| "Why would you do it like this??" | "What made you choose X? I'd have expected Y because…" | A real question invites discussion; maybe they know something you don't |
+| "You forgot the tests." | "Could we add a test for closing someone else's poll?" | About the **code**, not the person |
+| Twenty nits, no summary | "Two blocking issues (auth, missing await); the rest are nits" | The author knows what matters |
+| Silence about good work | "Nice, this is much clearer than before" | Praise tells people what to keep doing |
+
+As an **author**: keep pull requests small (a few hundred lines; huge PRs get skimmed, not reviewed), write a description (what, why, how to test, screenshots for UI), review your own diff before asking anyone, and remember comments are about the code. As a **reviewer**: answer within a day, approve with "just nits left" instead of another round, and move long back-and-forth threads to a quick call.
+
+<Callout type="tip" title="Ask for tests that fail first">
+
+"Could you add a test that fails without this fix?" is one of the most valuable review comments there is. It proves the bug was understood, documents it, and guards against it forever. It's also a gentle way to discover that a fix doesn't fix anything.
+
+</Callout>
+
+## Design docs and RFCs
+
+For anything that takes more than a few days, touches several teams, or is hard to undo (a new service, a database change, a public API, a protocol between client and server), write a short **design doc** before building it. Some companies call it an **RFC** ("request for comments"). An hour of discussion on a document saves weeks of rewriting code, and writing the "alternatives" section often reveals that the first idea wasn't the best.
+
+A template that works (1–3 pages is plenty):
+
+```markdown
+# Design: Live results for PandaPoll
+
+Author: Mei · Reviewers: Kai, Luna · Status: In review
+
+## Context
+Results refresh every 10 s by polling; presenters want "instant".
+
+## Goals and non-goals
+- Goal: results on every screen within 1 s, for 5,000 viewers
+- Non-goal: live comments (later, maybe)
+
+## Proposal
+WebSockets via `ws`, results batched twice per second,
+Redis pub/sub between servers. Message protocol: ...
+
+## Estimates
+Peak 500 votes/s, 10,000 messages/s out (see sheet).
+
+## Alternatives considered
+- Faster polling: 5,000 requests/s for little gain
+- Server-Sent Events: fine for screens, but phones also send
+
+## Risks and open questions
+Reconnect storms on deploy? Corporate proxies blocking WS?
+
+## Rollout and testing
+Feature flag per event, load test with 10k clients, rollback.
+```
+
+The two most valuable sections are **non-goals** (they stop the project from quietly growing) and **alternatives considered** (they prove you didn't just pick the first idea, and they save the next person from researching the same options). Once a decision is made, record it in an **ADR** (architecture decision record): a one-page Markdown file in the repository, such as `docs/adr/0007-websockets-for-live-results.md`, saying what was decided, why, and what you gave up. A year later, "why on earth is it built like this?" has an answer.
+
+## Tech debt
+
+**Tech debt** is the extra cost of changing code that was written in a hurry or has grown messy. Like a loan, it charges **interest**: every feature that touches that code takes longer. And like a loan, some debt is a sensible business tool ("ship for the conference, clean up next sprint", written down as a ticket). The danger is debt nobody tracks and code nobody dares to touch.
+
+Not all ugly code is worth fixing, though. The interest is only paid when you **change** the code. A quick way to find where debt really hurts is to combine how often each file changes with how often those changes cause bugs, both of which you can pull out of `git log`:
+
+<CodeExample output={` 576  votes/count.js (620 lines)
+ 270  live/broadcast.js (340 lines)
+ 105  polls/routes.js (210 lines)
+   1  legacy/export.js (1900 lines)`}>
+
+```js
+// From `git log` over the last 90 days, plus each file's size
+const files = [
+  { file: "votes/count.js", commits: 48, fixes: 11, lines: 620 },
+  { file: "polls/routes.js", commits: 35, fixes: 2, lines: 210 },
+  { file: "legacy/export.js", commits: 1, fixes: 0, lines: 1900 },
+  { file: "live/broadcast.js", commits: 27, fixes: 9, lines: 340 },
+];
+
+// Pain: how often we change it x how often changing it breaks it
+const hotspots = files
+  .map((f) => ({ ...f, pain: f.commits * (1 + f.fixes) }))
+  .sort((a, b) => b.pain - a.pain);
+
+for (const { file, pain, lines } of hotspots) {
+  const score = String(pain).padStart(4);
+  console.log(`${score}  ${file} (${lines} lines)`);
+}
+```
+
+</CodeExample>
+
+The 1,900-line legacy file is the ugliest, but nobody touches it, so it costs almost nothing. `votes/count.js` changes every other day and keeps breaking: that's where a refactor pays back fastest. Bring numbers like these to planning, along with the cost in the team's language ("every change to vote counting takes 3 days and a hotfix"). In practice:
+
+- **Pay as you go**: leave code you're already changing a little better (the "boy scout rule").
+- **Reserve capacity**: many teams keep 10–20% of each sprint for debt, instead of hoping for a clean-up month that never comes.
+- **Refactor behind tests**: write characterisation tests that pin down today's behaviour first, then change the code in small, safe steps.
+
+## Estimates
+
+Estimates go wrong in predictable ways: we picture the happy path, forget testing, review and rollout, and give one number that everyone hears as a promise. Two habits fix most of it. First, **break the work down** into pieces of a day or two, including the boring parts. Second, give each piece a **range** (best, likely, worst) and add them up honestly. A quick simulation shows why adding up the "likely" numbers doesn't work:
+
+<CodeExample output={`Sum of "likely" guesses: 12 days
+Chance of finishing in 12 days: 5%
+50% sure: 14.6 days
+85% sure: 16.5 days`}>
+
+```js
+// A seeded random generator: the same "random" numbers every run
+function mulberry32(seed) {
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// A random duration between best and worst, most often near likely
+function sample([best, likely, worst], random) {
+  const u = random();
+  const split = (likely - best) / (worst - best);
+  return u < split
+    ? best + Math.sqrt(u * (worst - best) * (likely - best))
+    : worst - Math.sqrt((1 - u) * (worst - best) * (worst - likely));
+}
+
+const tasks = {
+  "WebSocket server": [2, 3, 6],
+  "Redis pub/sub": [1, 2, 5],
+  "Big-screen UI": [2, 3, 5],
+  "Tests + review": [1, 2, 4],
+  "Load test + rollout": [1, 2, 5],
+};
+
+const random = mulberry32(42);
+const runs = Array.from({ length: 10_000 }, () =>
+  Object.values(tasks).reduce((sum, t) => sum + sample(t, random), 0),
+).sort((a, b) => a - b);
+
+const likelySum = Object.values(tasks).reduce((s, t) => s + t[1], 0);
+const chance = Math.round(
+  runs.filter((days) => days <= likelySum).length / 100,
+);
+const percentile = (p) => runs[Math.floor((p / 100) * runs.length)];
+
+console.log(`Sum of "likely" guesses: ${likelySum} days`);
+console.log(`Chance of finishing in ${likelySum} days: ${chance}%`);
+console.log(`50% sure: ${percentile(50).toFixed(1)} days`);
+console.log(`85% sure: ${percentile(85).toFixed(1)} days`);
+```
+
+</CodeExample>
+
+This is a **Monte Carlo** estimate: it "builds" the feature 10,000 times, picking a random duration for each task, and looks at the spread of totals. (The seeded random generator makes the run repeatable, just like the injected `random` in the retry helper.) Every task has a longer tail on the bad side than on the good side, so the most likely total is well above the sum of the likely parts. The sum of "likely" guesses, 12 days, only happens about 5% of the time.
+
+So say "about three weeks; 85% confident in 17 days", and update the estimate as soon as you learn something. A surprise on day 2 is a conversation; a surprise on the deadline is a crisis.
+
+## Mentoring juniors
+
+A team with one brilliant senior and three stuck juniors is slower than a team where everyone grows. Things that work:
+
+- **Pair, and let them drive.** You navigate and ask questions; they type. People learn by doing, not by watching you be fast.
+- **Ask before you tell.** "What happens if two votes arrive at the same moment?" teaches more than "add a lock". Then let them find it.
+- **Explain the why.** "We inject the clock *so the tests don't wait 30 seconds*" sticks; "always inject the clock" doesn't.
+- **Give stretch tasks with a safety net**: real, small, well-defined work that's slightly too hard, with you available.
+- **Make it safe to not know.** Say "I don't know, let's find out" yourself. A junior afraid to ask can lose days stuck in silence.
+- **Review generously.** On a junior's PR, pick the 2–3 points that matter most and explain them; don't bury them in nits.
+- **Praise in public, correct in private.**
+
+## On-call and blameless postmortems
+
+Once real people depend on your system, someone has to answer when it breaks at 3 a.m. Good **on-call** is designed, not endured:
+
+- **Alert on symptoms users feel** (error rate, latency, "WebSocket connections dropped 50%"), not on every CPU spike. An alert nobody needs to act on trains people to ignore alerts.
+- Every alert links to a **runbook**: what it means, how to check, how to mitigate.
+- During an incident, **mitigate first, investigate later**: roll back, turn off the feature flag, add servers. Finding the root cause can wait until users are fine.
+- Name an **incident commander** who coordinates (and isn't the one typing fixes), and post short updates in one channel.
+- Keep rotations humane: at least 5–6 people, a hand-over each week, and time off after a rough night.
+
+After every significant incident, write a **postmortem**. Its job is learning, not punishment, so it must be **blameless**: assume everyone acted reasonably with what they knew at the time, and ask how the **system** allowed the failure. People who are blamed hide mistakes; people who feel safe report near-misses before they become outages.
+
+| Blaming | Blameless |
+| --- | --- |
+| "Bao deployed during the keynote." | "Our deploy tool allowed deploys during a live event, and nothing showed one was running." |
+| "Kai should have noticed the alert." | "The alert fired in a channel with 200 other alerts that day." |
+| Action item: "Be more careful." | Action item: "Block deploys while an event is live; reconnect with backoff and jitter." |
+
+A useful technique is the **five whys**: keep asking "why?" until you reach something you can fix in the system. *The screens froze.* Why? All WebSocket servers restarted at once. Why? The deploy replaced every server in one step. Why? The deploy config was copied from the stateless API. Why did that hurt so much? 5,000 clients reconnected instantly with no backoff, and the new servers fell over. Now there are three concrete fixes, and none of them is "Bao".
+
+```markdown
+# Postmortem: live results froze during a keynote
+
+Date: 2026-09-14 · Duration: 23 min · Severity: SEV-2
+
+## Summary
+## Impact (who noticed what, for how long)
+## Timeline (UTC)
+09:02 Deploy v4.18 starts
+09:04 Alert: WebSocket connections -80%
+09:06 Kai (on-call) acknowledges, opens #inc-412
+09:11 Rollback starts
+09:25 Connections back to normal
+## Root causes and contributing factors
+## What went well / what went badly / where we got lucky
+## Action items (each with an owner and a ticket)
+```
+
+Share postmortems widely and track the action items like any other work. A postmortem whose action items never get done is just a sad story.
+
+<Callout type="note" title="Leadership without a title">
+
+Writing the design doc nobody asked for, fixing the flaky test everyone ignores, onboarding the new person, saying "I think we're underestimating this" in planning, running a calm incident: that's what technical leadership looks like day to day. Senior engineers are measured less by their own output and more by how much better the team works because they're there.
+
+</Callout>
+
+<Quiz
+  question="You review a big pull request and find one real bug and fifteen small style preferences. What's the most helpful review?"
+  options={[
+    "Request changes on all sixteen points equally, so nothing is missed",
+    "Approve it, because style comments slow people down",
+    "Mark the bug as blocking and ask for a test that fails without the fix, label the rest as nits, and summarise what really matters",
+    "Rewrite the code yourself and push it to their branch",
+  ]}
+  answer={2}
+  explanation="Labels like issue and nit tell the author what must change and what's optional, a summary keeps the real bug from drowning in style comments, and a failing test stops it from coming back. Most style points belong in Prettier and ESLint anyway."
+/>
+
+<Quiz
+  question="An engineer accidentally ran a database migration against production instead of staging. Which action item fits a blameless postmortem best?"
+  options={[
+    "Remind all engineers to be more careful with migrations",
+    "Remove that engineer's production access",
+    "Run production migrations only from CI, and make the tool show the target database and ask for confirmation",
+    "Mention the incident in the engineer's performance review",
+  ]}
+  answer={2}
+  explanation="Blameless postmortems fix the system that made the mistake easy. 'Be careful' changes nothing, and punishing people teaches everyone to hide mistakes. A safer process protects every engineer, including the next new one."
+/>
+
+<Exercise
+  title="Code review: fix the live results summary"
+  starter={`import { describe, it, expect } from "vitest";
+
+// PR #318: "Live results summary for the big screen"
+function summarizeVotes(v, p) {
+  var r = {};
+  var t = 0;
+  var seen = [];
+  v.reverse(); // latest votes first
+  for (var i = 1; i < v.length; i++) {
+    var x = v[i];
+    if (x.pollId == p.id && !seen.includes(x.voterId)) {
+      seen.push(x.voterId);
+      if (r[x.option]) {
+        r[x.option]++;
+      } else {
+        r[x.option] = 1;
+      }
+      t++;
+    }
+  }
+  var res = [];
+  for (var k in r) {
+    var pc = Math.round((r[k] / t) * 100);
+    res.push({ option: k, count: r[k], percent: pc });
+  }
+  res.sort((a, b) => a.count < b.count);
+  return { total: t, results: res };
+}
+
+// ---- Tests (don't change them) ----
+const poll = { id: 7, options: ["tabs", "spaces", "both"] };
+const vote = (voterId, option, pollId = 7) =>
+  ({ pollId, voterId, option });
+
+describe("summarizeVotes", () => {
+  it("counts every vote for this poll, and only this poll", () => {
+    const votes = [vote("a", "tabs"), vote("b", "spaces"),
+      vote("c", "spaces", 8), vote("d", "spaces")];
+    const { total, results } = summarizeVotes(votes, poll);
+    expect(total).toBe(3);
+    expect(results[0]).toEqual(
+      { option: "spaces", count: 2, percent: 67 });
+  });
+
+  it("counts a voter once, for their latest choice", () => {
+    const votes = [vote("a", "tabs"), vote("b", "tabs"),
+      vote("a", "spaces")];
+    const { total, results } = summarizeVotes(votes, poll);
+    expect(total).toBe(2);
+    expect(results.slice(0, 2)).toEqual([
+      { option: "tabs", count: 1, percent: 50 },
+      { option: "spaces", count: 1, percent: 50 },
+    ]);
+  });
+
+  it("lists every option, most votes first", () => {
+    const votes = [vote("a", "both"), vote("b", "spaces"),
+      vote("c", "both")];
+    const { results } = summarizeVotes(votes, poll);
+    expect(results.map((r) => r.option))
+      .toEqual(["both", "spaces", "tabs"]);
+    expect(results[2]).toEqual(
+      { option: "tabs", count: 0, percent: 0 });
+  });
+
+  it("handles a poll with no votes yet", () => {
+    expect(summarizeVotes([], poll)).toEqual({
+      total: 0,
+      results: [
+        { option: "tabs", count: 0, percent: 0 },
+        { option: "spaces", count: 0, percent: 0 },
+        { option: "both", count: 0, percent: 0 },
+      ],
+    });
+  });
+
+  it("ignores options that aren't in the poll", () => {
+    const votes = [vote("a", "toString"), vote("b", "emacs"),
+      vote("c", "tabs")];
+    const { total, results } = summarizeVotes(votes, poll);
+    expect(total).toBe(1);
+    expect(results[0]).toEqual(
+      { option: "tabs", count: 1, percent: 100 });
+  });
+
+  it("doesn't change the votes array", () => {
+    const votes = [vote("a", "tabs"), vote("b", "spaces")];
+    const copy = structuredClone(votes);
+    summarizeVotes(votes, poll);
+    expect(votes).toEqual(copy);
+  });
+});
+`}
+  tests={[
+    { name: "All 6 tests in the file pass", check: `__vitest.failed === 0 && __vitest.passed === 6` },
+    { name: "Works for another poll (latest vote wins, zero options listed, sorted)", check: `(() => { const r = summarizeVotes([{ pollId: "q", voterId: 1, option: "no" }, { pollId: "q", voterId: 2, option: "yes" }, { pollId: "q", voterId: 3, option: "yes" }, { pollId: "q", voterId: 1, option: "yes" }, { pollId: "z", voterId: 4, option: "no" }], { id: "q", options: ["no", "maybe", "yes"] }); return JSON.stringify(r) === JSON.stringify({ total: 3, results: [{ option: "yes", count: 3, percent: 100 }, { option: "no", count: 0, percent: 0 }, { option: "maybe", count: 0, percent: 0 }] }); })()` },
+    { name: "Works on frozen input, and rounds percentages", check: `(() => { const votes = Object.freeze([1, 2, 3, 4, 5, 6].map((n) => Object.freeze({ pollId: 1, voterId: "v" + n, option: n % 3 === 0 ? "b" : "a" }))); const r = summarizeVotes(votes, { id: 1, options: ["a", "b", "constructor"] }); return r.total === 6 && r.results[0].option === "a" && r.results[0].percent === 67 && r.results[1].percent === 33 && r.results[2].option === "constructor" && r.results[2].count === 0; })()` },
+    { name: "Ignores votes for options like __proto__ that aren't in the poll", check: `(() => { const r = summarizeVotes([{ pollId: 5, voterId: "x", option: "__proto__" }, { pollId: 5, voterId: "y", option: "hasOwnProperty" }], { id: 5, options: ["up", "down"] }); return r.total === 0 && r.results.length === 2 && r.results.every((x) => x.count === 0 && x.percent === 0); })()` },
+  ]}
+>
+
+A teammate's pull request adds the results summary for PandaPoll's big screen. It "works on my machine", but the tests at the bottom tell a different story. Review it the way you'd want your own code reviewed: find the bugs, fix them, and leave the function cleaner than you found it. Don't change the tests.
+
+What `summarizeVotes(votes, poll)` should do:
+
+- `votes` is an array of `{ pollId, voterId, option }` in the order they arrived; `poll` is `{ id, options }`.
+- Only votes for **this** poll and for one of **its options** count.
+- Voters can change their mind: each voter counts **once**, for their **latest** valid vote.
+- Return `{ total, results }`, where `results` has **every** option of the poll as `{ option, count, percent }` (percent rounded, and 0 when there are no votes), sorted by count, most first. Ties keep the poll's order.
+- Never change the `votes` array the caller passed in.
+
+Bugs to hunt for: an off-by-one, a mutated argument, a broken sort, an object used as a dictionary, and a few missing requirements. While you're there, use `const`/`let` and names that say what things are.
+
+<Hint>
+
+Start over rather than patching every line. Loop with `for (const { pollId, voterId, option } of votes)` and keep a `Map` from voter id to their latest option: `latest.set(voterId, option)` overwrites earlier votes, so no `reverse()` is needed. Only store votes where `pollId === poll.id && poll.options.includes(option)`. Then build `new Map(poll.options.map((o) => [o, 0]))` so every option starts at 0, count the values of the first map, and map the entries to result objects. A compare function must return a **number**: `(a, b) => b.count - a.count`. `Array.prototype.sort` is stable, so ties keep their order.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect } from "vitest";
+
+// PR #318: "Live results summary for the big screen"
+// votes: [{ pollId, voterId, option }] in the order they arrived
+function summarizeVotes(votes, poll) {
+  // A voter may change their mind: their latest valid vote counts
+  const latestChoice = new Map(); // voterId -> option
+  for (const { pollId, voterId, option } of votes) {
+    if (pollId === poll.id && poll.options.includes(option)) {
+      latestChoice.set(voterId, option);
+    }
+  }
+
+  const counts = new Map(poll.options.map((option) => [option, 0]));
+  for (const option of latestChoice.values()) {
+    counts.set(option, counts.get(option) + 1);
+  }
+
+  const total = latestChoice.size;
+  const percentOf = (count) =>
+    total === 0 ? 0 : Math.round((count / total) * 100);
+
+  const results = [...counts].map(([option, count]) => ({
+    option,
+    count,
+    percent: percentOf(count),
+  }));
+  // sort is stable, so ties keep the poll's order
+  results.sort((a, b) => b.count - a.count);
+  return { total, results };
+}
+
+// ---- Tests (don't change them) ----
+const poll = { id: 7, options: ["tabs", "spaces", "both"] };
+const vote = (voterId, option, pollId = 7) =>
+  ({ pollId, voterId, option });
+
+describe("summarizeVotes", () => {
+  it("counts every vote for this poll, and only this poll", () => {
+    const votes = [vote("a", "tabs"), vote("b", "spaces"),
+      vote("c", "spaces", 8), vote("d", "spaces")];
+    const { total, results } = summarizeVotes(votes, poll);
+    expect(total).toBe(3);
+    expect(results[0]).toEqual(
+      { option: "spaces", count: 2, percent: 67 });
+  });
+
+  it("counts a voter once, for their latest choice", () => {
+    const votes = [vote("a", "tabs"), vote("b", "tabs"),
+      vote("a", "spaces")];
+    const { total, results } = summarizeVotes(votes, poll);
+    expect(total).toBe(2);
+    expect(results.slice(0, 2)).toEqual([
+      { option: "tabs", count: 1, percent: 50 },
+      { option: "spaces", count: 1, percent: 50 },
+    ]);
+  });
+
+  it("lists every option, most votes first", () => {
+    const votes = [vote("a", "both"), vote("b", "spaces"),
+      vote("c", "both")];
+    const { results } = summarizeVotes(votes, poll);
+    expect(results.map((r) => r.option))
+      .toEqual(["both", "spaces", "tabs"]);
+    expect(results[2]).toEqual(
+      { option: "tabs", count: 0, percent: 0 });
+  });
+
+  it("handles a poll with no votes yet", () => {
+    expect(summarizeVotes([], poll)).toEqual({
+      total: 0,
+      results: [
+        { option: "tabs", count: 0, percent: 0 },
+        { option: "spaces", count: 0, percent: 0 },
+        { option: "both", count: 0, percent: 0 },
+      ],
+    });
+  });
+
+  it("ignores options that aren't in the poll", () => {
+    const votes = [vote("a", "toString"), vote("b", "emacs"),
+      vote("c", "tabs")];
+    const { total, results } = summarizeVotes(votes, poll);
+    expect(total).toBe(1);
+    expect(results[0]).toEqual(
+      { option: "tabs", count: 1, percent: 100 });
+  });
+
+  it("doesn't change the votes array", () => {
+    const votes = [vote("a", "tabs"), vote("b", "spaces")];
+    const copy = structuredClone(votes);
+    summarizeVotes(votes, poll);
+    expect(votes).toEqual(copy);
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Code review catches problems early, spreads knowledge and keeps code consistent. Check correctness and design before names; let Prettier, ESLint and TypeScript handle the rest.
+- Know JavaScript's usual suspects: `sort()` without a comparator, `map(parseInt)`, `||` vs `??`, async `forEach`, missing `await`, mutated arguments.
+- Write comments that are **specific, kind and labelled** (issue, question, suggestion, nit, praise), about the code and not the person, and ask for tests that fail without the fix.
+- Write a short **design doc** before big or hard-to-undo work; **non-goals** and **alternatives** are the key sections. Record decisions in **ADRs**.
+- Tackle **tech debt** where change and bugs cluster, not where code is merely ugly; pay it down continuously.
+- Estimate with **ranges** and include the boring tasks; the sum of "likely" guesses is almost always too optimistic.
+- **Mentor** by letting juniors drive, asking questions and explaining the why.
+- On-call: alert on symptoms, mitigate first, and learn with **blameless postmortems** whose action items fix the system.

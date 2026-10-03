@@ -1,0 +1,692 @@
+---
+title: Bundling and Caching
+description: Ship less JavaScript with bundlers, tree shaking, code splitting and compression, then make repeat visits instant with Cache-Control, ETags, CDNs and stale-while-revalidate.
+duration: 25
+xp: 30
+---
+
+The fastest request is the one that never happens, and the second fastest is a small one. Your code might be quick once it runs, but first it has to travel over a phone network, be parsed and compiled, and only then can it start. On a mid-range phone, 1 MB of JavaScript can take **seconds** just to parse and compile. 📦
+
+This lesson covers both halves of the problem: shipping **less** code (bundlers, tree shaking, code splitting, compression) and downloading it **less often** (HTTP caching, ETags, CDNs and service workers).
+
+## What bundlers do
+
+You write code as hundreds of small modules with `import` and `export` (see [Modules](/learn/javascript/modules)), plus npm packages, TypeScript, JSX and CSS. Browsers could load all those files one by one, but hundreds of requests and untranslated TypeScript don't make a fast site. A **bundler** turns your source into a few optimised files:
+
+1. **Resolve**: starting from an **entry** file (`main.js`), follow every `import` to build the **module graph**.
+2. **Transform**: turn TypeScript, JSX and modern syntax into plain JavaScript browsers understand.
+3. **Bundle**: combine modules into a few **chunks**, dropping unused code (**tree shaking**).
+4. **Optimise**: minify, add **content hashes** to file names (`app.3f9a1c.js`), and write source maps for debugging.
+
+The tools you'll meet: **Vite** (the usual choice for new projects; it uses esbuild and Rollup, with the faster Rolldown taking over), **esbuild** (extremely fast, written in Go), **Rollup** (great for libraries), **webpack** (older, very configurable, still in many big apps), **Turbopack** (Next.js), and **Parcel**. They differ in speed and configuration, but all do the same four steps.
+
+Here's the first step in miniature: walking the module graph from an entry. A real bundler does exactly this, with real `import` statements:
+
+<CodeExample output={`[ 'format.js', 'api.js', 'cart.js', 'main.js' ]
+[ 'api.js', 'charts.js', 'admin.js' ]`}>
+
+```js
+// Each module and the modules it imports
+const graph = {
+  "main.js": ["cart.js", "format.js"],
+  "cart.js": ["format.js", "api.js"],
+  "format.js": [],
+  "api.js": [],
+  "admin.js": ["api.js", "charts.js"],
+  "charts.js": [],
+};
+
+function bundle(entry) {
+  const seen = new Set();
+  const order = [];
+  function visit(file) {
+    if (seen.has(file)) return; // each module only once
+    seen.add(file);
+    for (const dep of graph[file]) visit(dep);
+    order.push(file); // dependencies come first
+  }
+  visit(entry);
+  return order;
+}
+
+console.log(bundle("main.js"));
+console.log(bundle("admin.js"));
+```
+
+</CodeExample>
+
+Notice three things a real bundler also does. Modules that nothing imports from `main.js` (`charts.js`, `admin.js`) never end up in the main bundle. Every module is included **once**, however many files import it. And `api.js` is needed by **both** entries, so a bundler would put it in a **shared chunk** that both pages load and the browser caches once.
+
+## Tree shaking
+
+**Tree shaking** removes code you import nothing from, down to individual functions. It works because ES module `import` and `export` are **static**: the bundler can see exactly what's used without running anything.
+
+```js
+// utils.js
+export function formatPrice(cents) { /* ... */ }
+export function bigChartHelper() { /* 40 KB of code */ }
+
+// main.js: only formatPrice ends up in the bundle
+import { formatPrice } from "./utils.js";
+```
+
+Things that stop tree shaking:
+
+- **CommonJS** (`require`, `module.exports`) is dynamic, so bundlers mostly have to keep all of it. Prefer packages that ship ES modules (`lodash-es` rather than `lodash`, or better, a small focused package).
+- **Importing everything**: `import * as _ from "lodash-es"` and then passing `_` around makes it hard to tell what's used. Import the functions you need by name.
+- **Side effects**: if importing a module **does** something (adds a polyfill, registers a global, injects CSS), the bundler can't drop it even if you use none of its exports. Libraries declare that they're safe to drop with `"sideEffects": false` in their `package.json` (or a list of files that do have side effects, like CSS):
+
+```json
+{
+  "name": "my-ui-library",
+  "type": "module",
+  "sideEffects": ["*.css"]
+}
+```
+
+## Code splitting with dynamic import()
+
+Most users of your shop never open the admin charts or the PDF export. Why should everybody download that code? A **dynamic import**, `import("./charts.js")`, loads a module **when the code runs**, and returns a promise for its exports. Bundlers see it and automatically put that module (and everything only it uses) in a **separate chunk**:
+
+```js
+const button = document.querySelector("#show-chart");
+
+button.addEventListener("click", async () => {
+  // charts.js and its 200 KB chart library load on the first click
+  const { drawChart } = await import("./charts.js");
+  drawChart(document.querySelector("#chart"), sales);
+});
+```
+
+In React, `lazy` does the same for components, with `<Suspense>` showing a fallback while the chunk loads:
+
+```jsx
+import { lazy, Suspense } from "react";
+
+const AdminPage = lazy(() => import("./AdminPage.jsx"));
+
+function App() {
+  return (
+    <Suspense fallback={<p>Loading…</p>}>
+      {isAdmin && <AdminPage />}
+    </Suspense>
+  );
+}
+```
+
+Splitting **by route** (each page its own chunk) is the most effective start, and frameworks like Next.js do it for you. The downside of lazy code is a wait on first use, so a common trick is to **start the download early**, when the user hovers over the button or when the browser is idle. Like `import()`, a good loader only downloads once, however often it's called:
+
+<CodeExample output={`downloading charts.js...
+same module: true
+📈 3 → 5 → 8`}>
+
+```js
+function lazy(load) {
+  let promise = null;
+  return () => (promise ??= load()); // start once, share it
+}
+
+// Pretend import("./charts.js"): 100 ms of downloading
+const loadCharts = lazy(() => {
+  console.log("downloading charts.js...");
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve({ draw: (data) => `📈 ${data.join(" → ")}` });
+    }, 100);
+  });
+});
+
+// Hover starts the download, the click uses it
+const onHover = () => loadCharts();
+const onClick = async () => (await loadCharts()).draw([3, 5, 8]);
+
+const preloaded = onHover();
+const result = await onClick();
+console.log("same module:", (await preloaded) === (await loadCharts()));
+console.log(result);
+```
+
+</CodeExample>
+
+<Callout type="tip" title="Don't split too finely">
+
+Every chunk is a separate request with its own overhead, and a chunk that's always needed straight away is just a slower bundle. Split off **big** things that **many** users don't need: routes, editors, charts, maps, PDF and spreadsheet libraries.
+
+</Callout>
+
+## Minification and compression
+
+**Minification** rewrites code to be smaller without changing what it does: removing spaces and comments, shortening local variable names, dropping unreachable code. Bundlers do it in production builds (with esbuild, Terser, SWC or oxc):
+
+```js
+// before: 139 characters
+function calculateTotal(items) {
+  // add up the prices
+  let total = 0;
+  for (const item of items) total += item.price;
+  return total;
+}
+
+// after: 72 characters
+function calculateTotal(t){let l=0;for(const o of t)l+=o.price;return l}
+```
+
+**Source maps** (`.map` files) map the minified code back to your original files, so stack traces and DevTools still show your real code and line numbers.
+
+On top of that, servers **compress** text responses (HTML, CSS, JavaScript, JSON, SVG) with **gzip** or the newer **Brotli** (often 15–20% smaller than gzip). The browser says what it understands in the `Accept-Encoding` request header, and the server answers with `Content-Encoding: br`. Code is very repetitive, so it compresses extremely well. Run this to see how well gzip shrinks some JavaScript:
+
+<TryIt code={`const source = \`
+export function formatPrice(cents, currency = "GBP") {
+  return new Intl.NumberFormat("en-GB", {
+    style: "currency",
+    currency,
+  }).format(cents / 100);
+}
+export function formatDate(date) {
+  return new Intl.DateTimeFormat("en-GB").format(date);
+}
+\`.repeat(40);
+
+async function gzipSize(text) {
+  const stream = new Blob([text]).stream()
+    .pipeThrough(new CompressionStream("gzip"));
+  const buffer = await new Response(stream).arrayBuffer();
+  return buffer.byteLength;
+}
+
+const original = new TextEncoder().encode(source).length;
+const gzipped = await gzipSize(source);
+console.log("original:", original, "bytes");
+console.log("gzipped: ", gzipped, "bytes");
+console.log(\`that's \${(100 * gzipped / original).toFixed(1)}%\`);`}
+/>
+
+That example is unusually repetitive, but real bundles still shrink to roughly a quarter of their size. Hosting platforms and CDNs compress automatically, so mostly you just need to check that it's on (look for `content-encoding` in the Network panel).
+
+<Callout type="warning" title="Compression doesn't make parsing cheaper">
+
+Compression shrinks the **download**, but the browser still has to decompress, parse and compile every byte of the original code. 300 KB of gzipped JavaScript is about 1 MB of code to process. That's why removing and splitting code beats compressing it.
+
+</Callout>
+
+## Images and fonts
+
+JavaScript is the most expensive byte, but images are usually the **most** bytes. The essentials:
+
+```html
+<!-- The LCP hero: modern formats, sizes, loaded early -->
+<picture>
+  <source srcset="hero-800.avif 800w, hero-1600.avif 1600w"
+          type="image/avif" />
+  <img src="hero-800.jpg"
+       srcset="hero-800.jpg 800w, hero-1600.jpg 1600w"
+       sizes="(max-width: 800px) 100vw, 800px"
+       width="800" height="450" alt="Pandas eating bamboo"
+       fetchpriority="high" />
+</picture>
+
+<!-- Further down the page: only load when scrolled near -->
+<img src="team.webp" width="400" height="300" alt="Our team"
+     loading="lazy" />
+```
+
+- Use **AVIF** or **WebP** instead of JPEG and PNG (often half the size), and **SVG** for icons and logos.
+- Serve **responsive** sizes with `srcset` and `sizes`: a phone shouldn't download a 3000-pixel image.
+- Always set **`width` and `height`** (or CSS `aspect-ratio`), so the browser reserves the space and nothing jumps (CLS).
+- **`loading="lazy"`** for images below the fold, but never on the LCP image; give that one `fetchpriority="high"`.
+- **Fonts**: use **WOFF2**, only the weights and characters you need (subsetting), `font-display: swap` so text shows immediately, and preload the one or two fonts used above the fold. Or use the system font stack and download nothing.
+
+## Bundle analysis
+
+You can't shrink what you can't see. A **bundle analyser** draws a map of your bundle, each module a rectangle sized by its bytes, and almost every team that looks for the first time finds a surprise: a date library with every locale, two versions of the same package, a whole icon set for three icons.
+
+```bash
+# Vite / Rollup: writes stats.html with a treemap of the bundle
+npm i -D rollup-plugin-visualizer
+
+# Any bundler with source maps
+npx source-map-explorer dist/assets/*.js
+
+# How much does a package cost before you install it?
+# Check https://bundlephobia.com or https://pkg-size.dev
+
+# Fail CI when the bundle grows past a budget
+npm i -D size-limit @size-limit/preset-app
+```
+
+Make bundle size part of code review: a pull request that adds 80 KB for a date picker deserves a conversation.
+
+## HTTP caching with Cache-Control
+
+Now the other half: not downloading things again. Every HTTP response can say how it may be **cached** with the **`Cache-Control`** header. Browsers, CDNs and proxies all obey it. The directives you'll use most:
+
+| Directive | Meaning |
+| --- | --- |
+| `max-age=3600` | Fresh for 3,600 seconds: reuse without asking the server |
+| `s-maxage=600` | Same, but only for shared caches (CDNs), overriding `max-age` there |
+| `no-cache` | You **may** store it, but must check with the server before each reuse |
+| `no-store` | Never store it anywhere (for sensitive data) |
+| `private` | Only the user's browser may cache it, not CDNs (personal data) |
+| `public` | Any cache may store it |
+| `immutable` | It will never change: don't even revalidate on reload |
+| `stale-while-revalidate=60` | After it expires, you may serve the old copy for 60 more seconds while fetching a fresh one in the background |
+
+The names are confusing: **`no-cache` does not mean "don't cache"**. It means "always revalidate". `no-store` is the one that means "don't keep it".
+
+The winning strategy for web apps combines this with the content hashes from the bundler:
+
+- **Hashed assets** (`app.3f9a1c.js`, `logo.8b2e.svg`): the name changes whenever the content changes, so the content at a given URL never changes. Cache them **forever**: `public, max-age=31536000, immutable`.
+- **HTML** (`index.html`): it points to the current hashed files, so it must always be checked: `no-cache`. A deploy then takes effect on the next page load.
+- **API responses**: it depends. Public, slow-changing data can get a short `max-age`; personal data gets `private, no-cache` or `no-store`.
+
+<CodeExample output={`/assets/app.3f9a1c.js → public, max-age=31536000, immutable
+/ → no-cache
+/api/me → private, no-store`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const app = express();
+
+// Content-hashed file names: the content never changes
+app.get("/assets/:file", (req, res) => {
+  res.set("Cache-Control", "public, max-age=31536000, immutable");
+  res.type("application/javascript").send("console.log('hi');");
+});
+
+// The HTML says which hashed files to load: always check it
+app.get("/", (req, res) => {
+  res.set("Cache-Control", "no-cache");
+  res.send('<script src="/assets/app.3f9a1c.js"></script>');
+});
+
+// Personal data: never store it anywhere
+app.get("/api/me", (req, res) => {
+  res.set("Cache-Control", "private, no-store");
+  res.json({ name: "Mei" });
+});
+
+for (const url of ["/assets/app.3f9a1c.js", "/", "/api/me"]) {
+  const res = await request(app).get(url);
+  console.log(url, "→", res.headers["cache-control"]);
+}
+```
+
+</CodeExample>
+
+In a real Express app, `express.static("dist", { immutable: true, maxAge: "1y" })` sets these headers for your built assets, and most hosting platforms (Vercel, Netlify, Cloudflare Pages) do it automatically for hashed files.
+
+## ETags and 304 Not Modified
+
+`no-cache` says "check before reuse". How does the browser check without downloading everything again? With a **validator**. The server sends an **`ETag`** (entity tag): a short fingerprint of the content, like a hash or a version number. Next time, the browser sends it back in **`If-None-Match`**. If the content hasn't changed, the server answers **`304 Not Modified`** with an **empty** body, and the browser reuses its copy:
+
+```text
+GET /article                      →  200 OK
+                                     ETag: "v1"
+                                     Cache-Control: no-cache
+                                     { ...12 KB of JSON... }
+
+GET /article                      →  304 Not Modified
+If-None-Match: "v1"                  ETag: "v1"
+                                     (no body: use your copy)
+
+GET /article   (after an edit)    →  200 OK
+If-None-Match: "v1"                  ETag: "v2"
+                                     { ...the new version... }
+```
+
+The round trip still happens, but a 304 is tiny, and the server can often skip the expensive part (rendering, serialising) too. Here's that exchange, with the article's version number as the ETag:
+
+<CodeExample output={`200 "v1" 35 bytes
+304 "v1" 0 bytes
+200 "v2" Caching 102`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const article = { version: 1, title: "Caching 101" };
+
+const app = express();
+app.get("/article", (req, res) => {
+  const etag = `"v${article.version}"`;
+  res.set("ETag", etag);
+  res.set("Cache-Control", "no-cache");
+  if (req.get("If-None-Match") === etag) {
+    return res.status(304).end(); // your copy is still good
+  }
+  res.json(article);
+});
+
+const first = await request(app).get("/article");
+console.log(first.status, first.headers.etag,
+  first.text.length, "bytes");
+
+const second = await request(app)
+  .get("/article")
+  .set("If-None-Match", first.headers.etag);
+console.log(second.status, second.headers.etag,
+  second.text.length, "bytes");
+
+article.version = 2;
+article.title = "Caching 102";
+const third = await request(app)
+  .get("/article")
+  .set("If-None-Match", first.headers.etag);
+console.log(third.status, third.headers.etag, third.body.title);
+```
+
+</CodeExample>
+
+A few details matter in practice:
+
+- ETags are **quoted strings**. A **weak** ETag starts with `W/` (`W/"v1"`) and means "equivalent content" rather than byte-for-byte identical. For `If-None-Match`, weak and strong tags compare the same way.
+- `If-None-Match` can hold **several** tags (`"v1", "v2"`) or `*`.
+- Real Express already adds a weak ETag to `res.send` and `res.json` responses and answers 304 for you. Setting your own (a version number, an `updatedAt` timestamp or a hash) gives you control, and the same pattern works in any server.
+- The older validator is **`Last-Modified`** / **`If-Modified-Since`** with a date. ETags are more precise.
+
+## CDNs
+
+A **CDN** (content delivery network: Cloudflare, Fastly, Akamai, CloudFront, or the one built into your host) is a set of caching servers all over the world. A user in Sydney gets your files from a server in Sydney instead of from your origin server in Frankfurt, which saves hundreds of milliseconds per request, and your server only handles the cache misses.
+
+CDNs follow `Cache-Control` (and `s-maxage` for CDN-only lifetimes), and add their own tools: **purging** a URL after a deploy or an edit, and caching rules per path.
+
+The danger is caching something **personal**. A real incident pattern: a team adds `Cache-Control: public, max-age=60` to a page "for speed", the page shows the logged-in user's name, and for the next minute the CDN serves one customer's account page to everybody. Rules of thumb:
+
+- Anything that depends on cookies or the `Authorization` header gets `private` or `no-store`.
+- If a response varies by a request header, say so with **`Vary`** (`Vary: Accept-Encoding`, `Vary: Accept-Language`), so caches store one copy per variant.
+- Don't put `public` on responses that set cookies.
+
+## Stale-while-revalidate
+
+Sometimes "fresh" doesn't need to mean "this second". A product list can be a minute old; what matters is that it's **fast**. The **stale-while-revalidate** strategy says: when the cached copy has just expired, return it **immediately** anyway, and fetch a fresh copy in the background for the next request. Only when it's much too old do you make the user wait.
+
+It's a `Cache-Control` directive for browsers and CDNs (`max-age=60, stale-while-revalidate=300`), and also a great pattern in your own code: it's what data-fetching libraries like SWR and TanStack Query are named after and built on. Here's an in-memory version for a server, with an injected **clock** so it's easy to test, like the fakes in [Mocks and Async Tests](/learn/javascript/mocks-and-async-tests):
+
+<CodeExample output={`t=0: loading prices (v1)
+t=0: v1
+t=30: v1
+t=90: loading prices (v2)
+t=90: v1
+t=95: v2
+t=500: loading prices (v3)
+t=500: v3`}>
+
+```js
+function createSwrCache({ load, maxAge, staleFor, clock }) {
+  const entries = new Map();
+
+  async function refresh(key) {
+    const value = await load(key);
+    entries.set(key, { value, storedAt: clock.now() });
+    return value;
+  }
+
+  return async function get(key) {
+    const entry = entries.get(key);
+    const age = entry ? clock.now() - entry.storedAt : Infinity;
+
+    if (age <= maxAge) return entry.value; // fresh
+    if (age <= maxAge + staleFor) {
+      // stale: answer now, refresh in the background (once)
+      entry.refreshing ??= refresh(key).catch(() => {
+        entry.refreshing = null; // try again next time
+      });
+      return entry.value;
+    }
+    return refresh(key); // missing or too old: wait
+  };
+}
+
+const clock = { time: 0, now() { return this.time; } };
+let version = 0;
+const getPrices = createSwrCache({
+  maxAge: 60,
+  staleFor: 120,
+  clock,
+  load: async () => {
+    version++;
+    console.log(`t=${clock.time}: loading prices (v${version})`);
+    return `v${version}`;
+  },
+});
+
+for (const t of [0, 30, 90, 95, 500]) {
+  clock.time = t;
+  console.log(`t=${t}:`, await getPrices("all"));
+}
+```
+
+</CodeExample>
+
+At `t=90` the copy is stale but usable, so the user gets `v1` instantly while `v2` loads in the background. At `t=500` the copy is far too old to show, so that request waits for `v3`. The `??=` makes sure that many requests arriving during a refresh share **one** background load instead of starting one each.
+
+## Service workers
+
+A **service worker** is a script the browser runs **between** your page and the network. It can answer requests from its own **Cache Storage**, which makes pages load with no network at all (offline apps and PWAs):
+
+```js
+// sw.js
+const CACHE = "assets-v42";
+
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  if (!url.pathname.startsWith("/assets/")) return; // network
+
+  // Cache first: hashed assets never change
+  event.respondWith(
+    caches.open(CACHE).then(async (cache) => {
+      const cached = await cache.match(event.request);
+      if (cached) return cached;
+      const response = await fetch(event.request);
+      cache.put(event.request, response.clone());
+      return response;
+    }),
+  );
+});
+
+// main.js
+navigator.serviceWorker.register("/sw.js");
+```
+
+Typical strategies are **cache first** for hashed assets, **network first** (fall back to the cache when offline) for HTML and API calls, and **stale-while-revalidate** for things like avatars. In practice, use **Workbox**, which packages these strategies, because service workers are powerful and easy to get wrong: a buggy one can keep serving an old version of your site to users until it's replaced. Add one when you need offline support, not as a default.
+
+<Quiz
+  question="Your build outputs app.3f9a1c.js and index.html. Which Cache-Control headers fit best?"
+  options={[
+    "Both: no-store",
+    "app.3f9a1c.js: public, max-age=31536000, immutable. index.html: no-cache",
+    "app.3f9a1c.js: no-cache. index.html: public, max-age=31536000, immutable",
+    "Both: public, max-age=31536000"
+  ]}
+  answer={1}
+  explanation="The hashed file's content can never change (a new build gets a new name), so it can be cached forever. index.html must always be revalidated, because it's what points browsers to the newest hashed files after a deploy."
+/>
+
+<Quiz
+  question="A browser sends If-None-Match with the same ETag the server would send now. What should the server answer?"
+  options={[
+    "200 OK with the full body again",
+    "304 Not Modified with an empty body",
+    "204 No Content",
+    "412 Precondition Failed"
+  ]}
+  answer={1}
+  explanation="A matching ETag means the browser's copy is still current, so the server sends 304 Not Modified with no body (but with the ETag and caching headers), and the browser reuses what it has."
+/>
+
+<Exercise
+  title="ETags for the products API"
+  starter={`import express from "express";
+import request from "supertest";
+
+const products = new Map([
+  [1, { id: 1, name: "Bamboo mug", price: 12 }],
+  [2, { id: 2, name: "Panda socks", price: 8 }],
+]);
+
+// TODO: the first 16 hex characters of the SHA-256 hash
+// of text, in double quotes, e.g. "2cf24dba5fb0a30e"
+async function etagFor(text) {
+  return "";
+}
+
+// TODO: send data as JSON with ETag and Cache-Control
+// headers, or an empty 304 if If-None-Match matches
+async function sendCached(req, res, data) {
+  res.json(data);
+}
+
+const app = express();
+app.use(express.json());
+
+app.get("/api/products", async (req, res) => {
+  await sendCached(req, res, [...products.values()]);
+});
+
+app.get("/api/products/:id", async (req, res) => {
+  const product = products.get(Number(req.params.id));
+  if (!product) {
+    return res.status(404).json({ error: "Product not found" });
+  }
+  await sendCached(req, res, product);
+});
+
+app.patch("/api/products/:id", (req, res) => {
+  const product = products.get(Number(req.params.id));
+  if (!product) {
+    return res.status(404).json({ error: "Product not found" });
+  }
+  if (typeof req.body.price === "number") {
+    product.price = req.body.price;
+  }
+  res.json(product);
+});
+
+// Try it: the second request sends the ETag back
+const first = await request(app).get("/api/products/1");
+console.log(first.status, first.headers.etag);
+
+const second = await request(app)
+  .get("/api/products/1")
+  .set("If-None-Match", first.headers.etag ?? "");
+console.log(second.status, JSON.stringify(second.text));
+`}
+  tests={[
+    { name: "etagFor gives a quoted, 16-character SHA-256 prefix", check: `(await etagFor("hello")) === '"2cf24dba5fb0a30e"' && (await etagFor("hello!")) !== (await etagFor("hello"))` },
+    { name: "Responses have a matching ETag and Cache-Control: no-cache", check: `await (async () => { const res = await require("supertest")(app).get("/api/products/2"); return res.status === 200 && res.body.name === "Panda socks" && /^"[0-9a-f]{16}"$/.test(res.headers.etag ?? "") && res.headers.etag === (await etagFor(res.text)) && res.headers["cache-control"] === "no-cache"; })()` },
+    { name: "A matching If-None-Match gets an empty 304 with the ETag", check: `await (async () => { const api = require("supertest")(app); const a = await api.get("/api/products"); const b = await api.get("/api/products").set("If-None-Match", a.headers.etag); return a.status === 200 && b.status === 304 && b.text === "" && b.headers.etag === a.headers.etag && b.headers["cache-control"] === "no-cache"; })()` },
+    { name: "A different ETag gets the full response", check: `await (async () => { const res = await require("supertest")(app).get("/api/products/1").set("If-None-Match", '"0000000000000000"'); return res.status === 200 && res.body.name === "Bamboo mug"; })()` },
+    { name: "Handles lists, weak tags and *", check: `await (async () => { const api = require("supertest")(app); const tag = (await api.get("/api/products/1")).headers.etag; const list = await api.get("/api/products/1").set("If-None-Match", '"abc", ' + tag); const weak = await api.get("/api/products/1").set("If-None-Match", "W/" + tag); const star = await api.get("/api/products/1").set("If-None-Match", "*"); return list.status === 304 && weak.status === 304 && star.status === 304; })()` },
+    { name: "A changed product gets a new ETag and the old one no longer matches", check: `await (async () => { const api = require("supertest")(app); const before = await api.get("/api/products/2"); await api.patch("/api/products/2").send({ price: 99 }); const after = await api.get("/api/products/2").set("If-None-Match", before.headers.etag); return after.status === 200 && after.body.price === 99 && after.headers.etag !== before.headers.etag; })()` },
+    { name: "Missing products still get a 404", check: `await (async () => (await require("supertest")(app).get("/api/products/42")).status === 404)()` },
+  ]}
+>
+
+The shop's frontend polls the products API every few seconds, and most of the time nothing has changed. Make the API send **ETags**, so unchanged responses become tiny `304`s:
+
+1. **`etagFor(text)`**: hash `text` with SHA-256 using `crypto.subtle.digest`, turn the first **8 bytes** into **16 lowercase hex characters**, and return them **in double quotes**. `etagFor("hello")` gives `"2cf24dba5fb0a30e"` (with the quotes).
+2. **`sendCached(req, res, data)`**: turn `data` into a JSON string, compute its ETag and set the `ETag` header and `Cache-Control: no-cache`. Then read `If-None-Match`: if it matches, answer **`304`** with an empty body; otherwise send the JSON with status 200 (`res.type("json").send(body)`).
+3. `If-None-Match` matches when it's `*`, or when any of its comma-separated tags equals the ETag after trimming spaces and removing a `W/` prefix.
+
+The routes already call `sendCached`, so changing a price with `PATCH` changes the JSON and therefore the ETag.
+
+<Hint>
+
+For the hash: `const bytes = new TextEncoder().encode(text); const hash = await crypto.subtle.digest("SHA-256", bytes);` then `[...new Uint8Array(hash)].slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("")`. For matching: `const header = req.get("If-None-Match") ?? "";` then `header.trim() === "*" || header.split(",").map((t) => t.trim().replace(/^W\//, "")).includes(etag)`. Set both headers **before** the 304 check, so the 304 carries them too.
+
+</Hint>
+
+<Solution>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const products = new Map([
+  [1, { id: 1, name: "Bamboo mug", price: 12 }],
+  [2, { id: 2, name: "Panda socks", price: 8 }],
+]);
+
+async function etagFor(text) {
+  const bytes = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = [...new Uint8Array(hash)]
+    .slice(0, 8)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `"${hex}"`;
+}
+
+function matches(header, etag) {
+  if (!header) return false;
+  if (header.trim() === "*") return true;
+  return header
+    .split(",")
+    .map((tag) => tag.trim().replace(/^W\//, ""))
+    .includes(etag);
+}
+
+async function sendCached(req, res, data) {
+  const body = JSON.stringify(data);
+  const etag = await etagFor(body);
+  res.set("ETag", etag);
+  res.set("Cache-Control", "no-cache");
+  if (matches(req.get("If-None-Match"), etag)) {
+    return res.status(304).end();
+  }
+  res.type("json").send(body);
+}
+
+const app = express();
+app.use(express.json());
+
+app.get("/api/products", async (req, res) => {
+  await sendCached(req, res, [...products.values()]);
+});
+
+app.get("/api/products/:id", async (req, res) => {
+  const product = products.get(Number(req.params.id));
+  if (!product) {
+    return res.status(404).json({ error: "Product not found" });
+  }
+  await sendCached(req, res, product);
+});
+
+app.patch("/api/products/:id", (req, res) => {
+  const product = products.get(Number(req.params.id));
+  if (!product) {
+    return res.status(404).json({ error: "Product not found" });
+  }
+  if (typeof req.body.price === "number") {
+    product.price = req.body.price;
+  }
+  res.json(product);
+});
+
+// Try it: the second request sends the ETag back
+const first = await request(app).get("/api/products/1");
+console.log(first.status, first.headers.etag);
+
+const second = await request(app)
+  .get("/api/products/1")
+  .set("If-None-Match", first.headers.etag ?? "");
+console.log(second.status, JSON.stringify(second.text));
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Bundlers** (Vite, esbuild, Rollup, webpack) follow the module graph from an entry, transform TypeScript/JSX, combine modules into chunks and add content hashes.
+- **Tree shaking** drops unused exports. It needs ES modules and code without import-time **side effects** (`"sideEffects"` in `package.json`).
+- **Code splitting** with `import()` and React's `lazy` loads routes and heavy features on demand; preload on hover to hide the wait.
+- **Minify** and **compress** (gzip/Brotli), but remember the browser still parses every byte. Optimise images (AVIF/WebP, `srcset`, `width`/`height`, lazy below the fold) and fonts (WOFF2, subsets, `font-display: swap`).
+- Look at your bundle with an **analyser** and guard it with a **size budget** in CI.
+- **`Cache-Control`**: hashed assets `public, max-age=31536000, immutable`; HTML `no-cache` (= always revalidate); personal data `private` or `no-store` (= never store).
+- **ETags** + `If-None-Match` turn unchanged responses into empty **304 Not Modified** answers.
+- **CDNs** cache close to users; never cache personal responses publicly, and use `Vary` for variants.
+- **Stale-while-revalidate** serves a slightly old copy instantly while refreshing in the background; **service workers** (with Workbox) add offline caching when you really need it.

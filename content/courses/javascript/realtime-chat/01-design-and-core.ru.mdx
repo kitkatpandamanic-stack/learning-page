@@ -1,0 +1,1049 @@
+---
+title: "Часть 1: проект и ядро"
+description: "Дизайн-документ чата реального времени: протокол сообщений, модель данных и оценки нагрузки. Затем ядро с комнатами, присутствием, лимитами и историей, покрытое тестами."
+duration: 25
+xp: 30
+---
+
+Добро пожаловать в **итоговый проект (capstone) уровня 3** — финальный проект всего курса JavaScript! 🎓 За три части вы спроектируете, соберёте и выпустите **PandaChat** — чат реального времени: люди входят в комнаты вроде `#general`, видят, кто сейчас в сети, замечают надпись «Bo печатает…» и получают каждое сообщение в момент отправки, ничего не перезагружая. Если Wi-Fi пропадёт на несколько секунд, приложение тихо переподключится и наверстает пропущенное.
+
+Чат — любимый вопрос на собеседованиях по проектированию систем (system design), и не зря. Все функции помещаются на стикер, но сделать их **хорошо** — значит затронуть почти всё, что важно senior-инженеру: долгоживущие соединения, рассылку (fan-out), защиту от злоупотреблений, нестабильные сети и состояние, разбросанное по многим серверам. Вам пригодится весь уровень 3:
+
+| Часть | Что строим | Какие уроки используем |
+| --- | --- | --- |
+| 1 | Дизайн-документ и ядро чата, полностью покрытое тестами | [Проектирование систем](/learn/javascript/designing-systems), [Чистая архитектура](/learn/javascript/clean-architecture), [Внедрение зависимостей и моделирование предметной области](/learn/javascript/dependency-injection-and-domain-modelling) |
+| 2 | WebSocket-сервер: аутентификация, валидация, комнаты, присутствие, heartbeat | [Функции реального времени и отказоустойчивость](/learn/javascript/real-time-and-resilience), [Аутентификация и сессии](/learn/javascript/authentication-and-sessions), [XSS и инъекции](/learn/javascript/xss-and-injection) |
+| 3 | React-клиент, который переподключается сам, а затем масштабирование и выпуск | [Эффекты и данные](/learn/javascript/effects-and-data), [Быстрый код в браузере](/learn/javascript/fast-code-in-the-browser), [Функции реального времени и отказоустойчивость](/learn/javascript/real-time-and-resilience) |
+
+Как и в итоговом проекте уровня 2, код растёт от части к части: упражнение каждой части начинается с готового кода предыдущей, поэтому имена остаются одними и теми же до самого конца.
+
+## Начинаем с дизайн-документа
+
+Senior-разработчики начинают не с кода, а с **дизайн-документа (design doc)**: одной-двух страниц о том, что мы строим, чего мы *не* строим и какие компромиссы (trade-offs) выбрали и почему. Написать его — час работы, а сэкономить он может недели на создание не того. Ещё это способ рано получить полезную обратную связь: услышать «а что будет, если у пользователя открыты две вкладки?» в документе гораздо дешевле, чем на код-ревью.
+
+### Требования
+
+| Вид | Требование |
+| --- | --- |
+| Функциональное | Пользователи входят в систему и заходят в **комнаты** по имени (`general`, `pandas-fan-club`) |
+| Функциональное | Сообщение, отправленное в комнату, **вживую** доходит до всех в ней; новички видят недавнюю историю |
+| Функциональное | Все видят, кто в комнате (**присутствие**, presence), и кто печатает |
+| Функциональное | Старые сообщения можно подгружать постранично («Загрузить ещё») |
+| Нефункциональное | Сообщение доходит до остальных быстрее чем за 200 мс (p99) |
+| Нефункциональное | Никто не может завалить комнату сообщениями: можно отправить короткую серию, а дальше примерно одно сообщение в секунду |
+| Нефункциональное | Оборванное соединение восстанавливается само и догоняет пропущенное |
+| Нефункциональное | Плохой ввод (сломанный JSON, огромные сообщения, неизвестные команды) никогда не роняет сервер |
+
+**Вне рамок версии 1:** личные сообщения, редактирование и удаление сообщений, файлы и картинки, отметки о прочтении, push-уведомления, поиск. Если записать это явно, проект не будет тихо разрастаться, а у всех появится список, о котором можно спорить при планировании v2.
+
+### Почему WebSocket?
+
+Есть четыре классических способа доставлять обновления с сервера в браузер, и выбор между ними — первое большое решение:
+
+| Техника | Как работает | Подходит для | Цена |
+| --- | --- | --- | --- |
+| Polling (опрос) | каждые несколько секунд спрашивать «есть новости?» | дашбордов, которым можно немного отставать | медленные обновления, много пустых запросов |
+| Long polling (долгий опрос) | сервер держит запрос открытым, пока не появятся новости | старых браузеров и прокси | новый запрос после каждого сообщения |
+| Server-Sent Events | один долгий HTTP-ответ, в который сервер пишет события | лент новостей, уведомлений | только от сервера к клиенту; отправка — обычными запросами |
+| WebSocket | одно долгоживущее двустороннее соединение | чатов, игр, совместной работы | серверы с состоянием, масштабировать сложнее |
+
+Чат отправляет много маленьких сообщений в **обе** стороны (сообщения, «печатает», входы в комнаты), поэтому лучше всего подходит **WebSocket**. Честно говоря, сработали бы и Server-Sent Events плюс `POST` на каждое сообщение, и такую схему проще поставить за обычную HTTP-инфраструктуру. «Мы выбрали X» — это половина решения; «мы выбрали X, а не Y, потому что Z» — та половина, которая поможет следующему инженеру.
+
+## Протокол сообщений
+
+WebSocket переносит только текст (или байты). Что этот текст **значит**, решаем мы, поэтому **протокол (protocol)** — самая важная часть дизайна: сервер и все клиенты должны договориться о нём, а поменять его трудно, когда приложения уже установлены на телефонах людей. Наше правило простое: каждое сообщение — это **JSON-объект с полем `type`**.
+
+Что может отправлять клиент:
+
+| `type` | Другие поля | Что делает |
+| --- | --- | --- |
+| `join` | `room` | входит в комнату |
+| `leave` | `room` | выходит из неё |
+| `message` | `room`, `text` | публикует сообщение |
+| `typing` | `room` | «я печатаю» (клиенты шлют его не чаще раза в секунду) |
+| `history` | `room`, `before`, `limit` | запрашивает старые сообщения |
+
+Что отправляет сервер:
+
+| `type` | Другие поля | Когда |
+| --- | --- | --- |
+| `welcome` | `user` | сразу после подключения |
+| `joined` | `room`, `members`, `history` | ответ на `join` |
+| `left` | `room` | ответ на `leave` |
+| `message` | `room`, `message` | кто-то (возможно, вы) написал сообщение |
+| `presence` | `room`, `action`, `user`, `members` | кто-то вошёл или вышел |
+| `typing` | `room`, `user` | кто-то другой печатает |
+| `history` | `room`, `messages` | ответ на `history` |
+| `error` | `code`, `message` | что-то пошло не так |
+
+Вот короткий разговор; строки клиента отмечены `→`, строки сервера — `←`:
+
+```text
+→ { "type": "join", "room": "general" }
+← { "type": "joined", "room": "general",
+    "members": [{ "id": "u1", "name": "Mei" }], "history": [] }
+→ { "type": "message", "room": "general", "text": "Привет! 🐼" }
+← { "type": "message", "room": "general",
+    "message": { "id": "m1", "room": "general", "text": "Привет! 🐼",
+                 "user": { "id": "u1", "name": "Mei" }, "at": 1767268800000 } }
+→ { "type": "message", "room": "general", "text": "" }
+← { "type": "error", "code": "invalid_text",
+    "message": "В сообщении должно быть от 1 до 500 символов" }
+```
+
+Здесь спрятано несколько решений:
+
+- **Клиент никогда не говорит, кто он.** В том, что отправляют клиенты, нет поля `user`: сервер знает пользователя по соединению, которое было аутентифицировано один раз при открытии. Поле, которое контролирует клиент, — это поле, которое контролирует атакующий.
+- **У ошибок есть `code` для программ и `message` для людей.** Клиент может отреагировать на `rate_limited`, не разбирая текст, а мы можем переформулировать (или перевести) сообщения, ничего никому не сломав.
+- **Отправитель получает своё сообщение обратно.** Это эхо подтверждает, что сервер принял и сохранил сообщение, и несёт серверные `id` и время. Пока оно не пришло, клиент может показывать сообщение как «отправляется…».
+
+### Модель данных
+
+Единственное, что мы обязаны хранить, — это сообщения. В продакшене они попадают в таблицу вроде этой (в части 1 мы держим их в памяти):
+
+```sql
+CREATE TABLE messages (
+  id         TEXT PRIMARY KEY,      -- сортируемый по времени, например UUIDv7
+  room       TEXT NOT NULL,
+  user_id    TEXT NOT NULL REFERENCES users (id),
+  text       TEXT NOT NULL CHECK (length(text) BETWEEN 1 AND 500),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX messages_by_room ON messages (room, id);
+```
+
+Индекс подходит под наш единственный важный запрос: «последние 50 сообщений в этой комнате до сообщения X». **Присутствия** (кто сейчас в сети) в базе данных нет вообще: оно принадлежит живым соединениям, меняется каждую секунду и исчезает при перезапуске сервера. И это правильно, ведь соединения тоже исчезают.
+
+## Прикидка на салфетке
+
+Насколько большой должна быть система? Оценим для здорового сообщества: 100 000 человек в день, в час пик в сети пятая часть из них, каждый онлайн-пользователь отправляет примерно одно сообщение в минуту, в комнатах примерно по 25 человек:
+
+<CodeExample output={`Открытых соединений в пик: 20 000
+Входящих: 333/с, исходящих: 8 333/с
+Сообщений в день: 3 000 000
+Хранилище за год: 329 ГБ
+Память на соединения: 1 ГБ`}>
+
+```js
+const fmt = (n) =>
+  Math.round(n).toLocaleString("en-US").replaceAll(",", " ");
+
+const dailyUsers = 100_000;
+const onlineAtPeak = 0.2;         // доля пользователей онлайн разом
+const messagesPerMinute = 1;      // на одного пользователя онлайн
+const roomSize = 25;              // сколько людей получает сообщение
+
+const connections = dailyUsers * onlineAtPeak;
+const incoming = (connections * messagesPerMinute) / 60;
+const outgoing = incoming * roomSize;
+console.log(`Открытых соединений в пик: ${fmt(connections)}`);
+console.log(`Входящих: ${fmt(incoming)}/с, исходящих: ${fmt(outgoing)}/с`);
+
+const messagesPerDay = dailyUsers * 30;
+const bytesPerMessage = 300;      // текст, id, комната, время
+const gbPerYear = (messagesPerDay * bytesPerMessage * 365) / 1e9;
+console.log(`Сообщений в день: ${fmt(messagesPerDay)}`);
+console.log(`Хранилище за год: ${fmt(gbPerYear)} ГБ`);
+
+const kbPerConnection = 50;       // буферы сокета + наши объекты
+const memoryGb = (connections * kbPerConnection) / 1e6;
+console.log(`Память на соединения: ${memoryGb} ГБ`);
+```
+
+</CodeExample>
+
+Что говорят эти числа:
+
+- **20 000 открытых соединений** — нормально для Node: один процесс выдерживает десятки тысяч в основном простаивающих WebSocket-соединений. Но несколько серверов нам всё равно понадобятся — ради надёжности и деплоев, а с ними приходит самая трудная проблема систем реального времени (часть 3): сообщение, отправленное на сервер A, должно дойти и до тех, кто подключён к серверу B.
+- **333 сообщения на вход и 8 333 на выход в секунду.** Чат — система с **рассылкой (fan-out)**: каждое сообщение записывается один раз, а доставляется 25 раз. Дешёвой нужно сделать именно доставку.
+- **329 ГБ в год** годами помещаются на один сервер PostgreSQL. Экзотическая база данных не нужна.
+- **1 ГБ памяти** на соединения: заложите его в оперативную память серверов и не храните большие объекты на каждое соединение.
+
+### Выбранные компромиссы
+
+| Решение | Мы выбрали | Потому что | Цена |
+| --- | --- | --- | --- |
+| Транспорт | WebSocket | двусторонний, малая задержка, мало накладных расходов на сообщение | серверы с состоянием, особая настройка балансировщика |
+| Доставка | живые сообщения + история при (повторном) входе | просто; переподключившийся клиент догоняет по истории | сообщение во время долгого обрыва есть только в истории |
+| Порядок | сервер ставит время и упорядочивает сообщения в комнате | один источник истины о том, «что было раньше» | часы клиентов неважны, но у комнаты один писатель |
+| Страницы истории | **курсор (cursor)** (`before` — id сообщения) | стабилен, пока приходят новые сообщения | нельзя перепрыгнуть на «страницу 7» |
+| Флуд | корзина токенов (token bucket) на пользователя | разрешает короткие серии, ограничивает затяжной спам | позже счётчики придётся разделять между серверами |
+| Присутствие | в памяти, на каждом сервере | быстро и исчезает вместе с соединениями | между серверами нужен pub/sub (часть 3) |
+
+<Callout type="tip" title="«Ровно один раз» — (почти) миф">
+
+Сети теряют данные. Сообщение может дойти, а соединение — оборваться до того, как вернётся «получил», и клиент не знает, отправлять ли снова. Реальные системы выбирают **не более одного раза** (at most once: никогда не переотправлять; можно потерять) или **хотя бы один раз** (at least once: переотправлять; возможны дубли) плюс устранение дублей по id. Мы начинаем с «не более одного раза» для живых сообщений, а пробелы заполняет история при повторном входе. Если сказать это вслух в дизайн-документе, система не будет обещать того, чего не может выполнить.
+
+</Callout>
+
+## Страницы, которые не съезжают
+
+В таблице компромиссов сказано, что история использует **курсор**, а не номера страниц. Вот почему. Представьте: вы открыли комнату, прочитали 3 самых новых сообщения, и пока вы прокручивали вверх к «Загрузить ещё», пришли два новых:
+
+<CodeExample output={`первый экран: m5 m6 m7
+страница 2:   m4 m5 m6
+до m5:        m2 m3 m4`}>
+
+```js
+const messages = [];
+const post = (id) => messages.push({ id, text: `message ${id}` });
+["m1", "m2", "m3", "m4", "m5", "m6", "m7"].forEach(post);
+const ids = (list) => list.map((m) => m.id).join(" ");
+
+// Номера страниц: страница 1 — это `size` самых новых сообщений.
+function pageByNumber(list, page, size) {
+  const end = list.length - (page - 1) * size;
+  return list.slice(Math.max(0, end - size), end);
+}
+
+// Курсор: `size` сообщений прямо перед известным сообщением.
+function pageBefore(list, before, size) {
+  const end = list.findIndex((m) => m.id === before);
+  return list.slice(Math.max(0, end - size), end);
+}
+
+const first = pageByNumber(messages, 1, 3);
+console.log("первый экран:", ids(first));
+
+post("m8"); // пока мы читаем, приходят новые сообщения...
+post("m9");
+
+console.log("страница 2:  ", ids(pageByNumber(messages, 2, 3)));
+console.log("до m5:       ", ids(pageBefore(messages, "m5", 3)));
+```
+
+</CodeExample>
+
+С номерами страниц «страница 2» отсчитывается от самого нового сообщения, поэтому, когда приходят два новых, она съезжает: `m5` и `m6` вы увидите **дважды**. Курсор говорит «3 сообщения до `m5`», и это означает одно и то же, что бы ни пришло потом. В SQL это `WHERE room = $1 AND id < $2 ORDER BY id DESC LIMIT 50`, и именно поэтому важны сортируемые по времени id и индекс `(room, id)`. Так листаются все ленты, которыми вы пользовались (Slack, X, API GitHub).
+
+## Время под нашим контролем
+
+Ограничение частоты (rate limiting) — это про время, а код, который напрямую читает `Date.now()`, тестировать медленно и ненадёжно. Как в уроке [Внедрение зависимостей и моделирование предметной области](/learn/javascript/dependency-injection-and-domain-modelling), ядро получает **часы (clock)** как параметр — функцию, которая возвращает время в миллисекундах. Продакшен передаёт `Date.now`, тесты — **фейковые часы (fake clock)**, которые идут, только когда так скажет тест.
+
+Ограничитель частоты — это **корзина токенов (token bucket)** из урока [Функции реального времени и отказоустойчивость](/learn/javascript/real-time-and-resilience), без изменений (её параметр с часами называется `now`): у каждого пользователя есть корзина на `capacity` токенов; сообщение стоит один токен; токены возвращаются со скоростью `perSecond`, но никогда не больше `capacity`. Это позволяет быструю серию («привет!», «как дела?», «🐼»), но не флуд:
+
+<CodeExample output={`серия: [ true, true, true, false ]
+через 1,5 с: true false
+через минуту: [ true, true, true, false ]
+часы: 61500`}>
+
+```js
+/** Часы для тестов: время идёт, только когда это скажет тест. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+const clock = fakeClock();
+const bucket = createTokenBucket({
+  capacity: 3,
+  perSecond: 1,
+  now: clock,
+});
+const burst = () => Array.from({ length: 4 }, () => bucket.take());
+
+console.log("серия:", burst());
+clock.advance(1500);
+console.log("через 1,5 с:", bucket.take(), bucket.take());
+clock.advance(60_000);
+console.log("через минуту:", burst());
+console.log("часы:", clock());
+```
+
+</CodeExample>
+
+Минута тишины возвращает только три токена, а не шестьдесят: именно `Math.min` не даёт пользователю накопить на флуд. А весь тест занял ноль настоящих миллисекунд, потому что `clock.advance(60_000)` просто меняет число. Функция со свойствами (`clock()` и `clock.advance()`) — изящный приём JavaScript: одно значение одновременно служит и часами, и пультом управления ими.
+
+## Сервис чата
+
+**Ядро** PandaChat ничего не знает о WebSocket, React или базах данных. Это слой сценариев использования (use cases) из урока [Чистая архитектура](/learn/javascript/clean-architecture): обычные функции, которые следят за соблюдением правил. Мы строим его **фабричной функцией (factory function)** `createChatService({ clock, newId, limits })`: она хранит состояние в замыканиях (`rooms`, `buckets`, `listeners`), до которых никто снаружи не дотянется, и возвращает объект с методами.
+
+Как остальные части узнают, что что-то произошло? Сервис — это **наблюдатель (observer)**, то есть генератор событий (event emitter), как в уроке [SOLID и классические паттерны](/learn/javascript/solid-and-classic-patterns): `subscribe(listener)` регистрирует функцию, сервис вызывает её на каждое событие, а `subscribe` возвращает функцию для отписки. В части 2 на сервис подпишется WebSocket-сервер и будет пересылать события нужным сокетам. Вот начало сервиса с методом `join`:
+
+<CodeExample output={`general: Mei (join)
+general: Bo (join)
+[ 'Mei', 'Bo' ]
+ChatError invalid_room Плохое название комнаты`}>
+
+```js
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService() {
+  const rooms = new Map(); // имя -> { members, messages }
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError("invalid_room", "Плохое название комнаты");
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({ type: "presence", room: name, action: "join", user });
+    }
+    return { room: name, members: members(name) };
+  }
+
+  return { subscribe, join, members };
+}
+
+const chat = createChatService();
+const stop = chat.subscribe((event) => {
+  console.log(`${event.room}: ${event.user.name} (${event.action})`);
+});
+
+chat.join("general", { id: "u1", name: "Mei" });
+const reply = chat.join("general", { id: "u2", name: "Bo" });
+chat.join("general", { id: "u2", name: "Bo" }); // повторно: без события
+console.log(reply.members.map((user) => user.name));
+
+stop();
+chat.join("random", { id: "u1", name: "Mei" }); // никто не слушает
+try {
+  chat.join("Party Room!", { id: "u1", name: "Mei" });
+} catch (error) {
+  console.log(error.name, error.code, error.message);
+}
+```
+
+</CodeExample>
+
+Обратите внимание на детали:
+
+- **Повторный вход безвреден.** Переподключившийся клиент снова отправляет `join`, и второй вызов возвращает тот же ответ без второго объявления. Операции, которые безопасно повторять, называются **идемпотентными (idempotent)**, и с ними легко делать повторные попытки.
+- **`Map` для участников, а не массив или обычный объект.** Поиск по id быстрый, порядок вставки сохраняется (участники перечислены в порядке входа), а id вроде `"__proto__"` не сможет сделать ничего странного.
+- **Ошибки несут `code`**: `ChatError("invalid_room", ...)`. В части 2 сервер будет превращать их прямо в ответы `{ type: "error", code, message }`.
+- **Название комнаты проверяется по шаблону-«белому списку» (allow-list)** (`/^[a-z0-9-]{1,30}$/`), а не по «чёрному списку». Сервис создаёт только комнаты с безопасными короткими названиями.
+
+Остальные методы написаны в том же стиле. Их напишете вы в упражнении:
+
+- **`postMessage(room, userId, text)`** проверяет, в таком порядке: является ли пользователь **участником** комнаты (`not_member`)? Длина **обрезанного** (trimmed) текста от 1 до 500 символов (`invalid_text`)? Есть ли токен в **корзине** пользователя (`rate_limited`)? Плохой ввод отклоняется *до* того, как он потратит токен. Затем метод сохраняет `{ id, room, user, text, at }`, держит в памяти только `keep` самых новых сообщений, отправляет событие `message` и возвращает сообщение.
+- **`leave(room, userId)`** и **`leaveAll(userId)`**: выводят пользователя из одной комнаты или из всех сразу (когда закрывается его соединение), с событием `presence` для каждой.
+- **`history(room, { before, limit })`**: постраничная навигация по курсору, как выше.
+
+<Callout type="warning" title="Растущий Map — это утечка памяти">
+
+Каждая комната хранит свои сообщения в массиве, а каждый пользователь получает корзину токенов. Без `keep` массив оживлённой комнаты рос бы, пока у процесса не кончится память, — классическая утечка из урока [Память и сборка мусора](/learn/javascript/memory-and-garbage-collection). В продакшене история живёт в базе данных, а в памяти остаётся только небольшое окно недавних сообщений; корзины пользователей, которые давно молчат, тоже стоит удалять (хорошая задача для раздела «Что дальше»).
+
+</Callout>
+
+## Тестируем ядро
+
+Ядро — это обычный JavaScript с внедрёнными временем и id, поэтому его тестам не нужны ни сервер, ни моки. `beforeEach` создаёт свежий сервис с фейковыми часами, предсказуемыми id (`m1`, `m2`, …) и маленькими лимитами и записывает каждое событие:
+
+```js
+describe("сервис чата", () => {
+  let clock, chat, events;
+
+  beforeEach(() => {
+    clock = fakeClock(1_000_000);
+    let n = 0;
+    chat = createChatService({
+      clock,
+      newId: () => `m${++n}`,
+      limits: { burst: 3, perSecond: 1 },
+    });
+    events = [];
+    chat.subscribe((event) => events.push(event));
+  });
+
+  it("join добавляет участников и объявляет о каждом один раз", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    chat.join("general", bo);
+    expect(chat.members("general")).toEqual([mei, bo]);
+    expect(events.map((e) => `${e.action} ${e.user.name}`))
+      .toEqual(["join Mei", "join Bo"]);
+  });
+});
+```
+
+Тест, которому нужно, чтобы прошло время, вызывает `clock.advance(1000)`, и сервис сразу это видит, потому что у них одни и те же часы. Чтобы проверить `code` ошибки, `toThrow` принимает асимметричный матчер (asymmetric matcher): `toThrow(expect.objectContaining({ code: "rate_limited" }))`.
+
+<Quiz
+  question="Почему клиент не отправляет свой id пользователя с каждым сообщением, например { type: 'message', room: 'general', user: 'u1', text: 'Hi' }?"
+  options={[
+    "Чтобы JSON был короче",
+    "Потому что кто угодно может вписать в сообщение любой id; сервер должен брать пользователя из соединения, которое он аутентифицировал",
+    "Потому что WebSocket не умеет передавать числа",
+    "Потому что id пользователей генерирует база данных",
+  ]}
+  answer={1}
+  explanation="Всё, что присылает клиент, можно подделать. Сервер аутентифицирует соединение один раз, при открытии, и привязывает к нему пользователя, поэтому автор сообщения всегда берётся из собственных записей сервера."
+/>
+
+<Quiz
+  question="Пока пользователь прокручивает вверх и нажимает «Загрузить ещё», продолжают приходить новые сообщения. Почему история использует «50 сообщений до сообщения X», а не «страницу 2»?"
+  options={[
+    "Номера страниц в JavaScript работают медленнее",
+    "Потому что страница 2 отсчитывается от самого нового сообщения, поэтому съезжает при появлении новых и показывает часть сообщений дважды; курсор всегда означает одни и те же сообщения",
+    "Потому что курсоры занимают меньше памяти в браузере",
+    "Потому что WebSocket не поддерживает числа в сообщениях",
+  ]}
+  answer={1}
+  explanation="Со смещениями каждое новое сообщение сдвигает старые дальше вниз, и следующая страница перекрывается с той, что у вас уже есть. Курсор привязан к id сообщения, поэтому следующая страница начинается ровно там, где закончилась предыдущая, что бы ни пришло между ними."
+/>
+
+<Exercise
+  title="Соберите: ядро чата"
+  starter={`import { describe, it, expect, beforeEach } from "vitest";
+
+// ---------- ошибки ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- время ----------
+
+/** Часы для тестов: время идёт, только когда это скажет тест. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- сервис чата ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // символов в сообщении
+  keep: 200, // сколько сообщений хранит комната
+  burst: 5, // сообщений одной серией...
+  perSecond: 1, // ...а дальше по одному в секунду
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // имя -> { members, messages }
+  const buckets = new Map(); // id пользователя -> корзина токенов
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "В названии комнаты только a-z, 0-9 и -, до 30 символов",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", \`Сначала войдите в комнату \${name}\`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    // TODO 1: уберите пользователя из комнаты и отправьте событие
+    // "presence" с action "leave" и оставшимися участниками.
+    // Верните true или false, если его в комнате не было.
+    return false;
+  }
+
+  function leaveAll(userId) {
+    // TODO 1: выйдите из всех комнат пользователя (при отключении);
+    // верните названия комнат, из которых он вышел
+    return [];
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    // TODO 2: проверьте членство (not_member), обрезанный текст
+    // (invalid_text), затем корзину пользователя (rate_limited).
+    // Сохраните { id, room, user, text, at }, храните не больше
+    // config.keep сообщений, отправьте { type: "message", room,
+    // message } и верните сообщение.
+    throw new ChatError("todo", "postMessage ещё не написан");
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    // TODO 3: \`limit\` сообщений прямо перед сообщением с id
+    // \`before\` (или самые новые), от старых к новым
+    return [];
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- тесты: ядро (часть 1) ----------
+
+const mei = { id: "u1", name: "Mei" };
+const bo = { id: "u2", name: "Bo" };
+
+describe("сервис чата", () => {
+  let clock, chat, events;
+
+  beforeEach(() => {
+    clock = fakeClock(1_000_000);
+    let n = 0;
+    chat = createChatService({
+      clock,
+      newId: () => \`m\${++n}\`,
+      limits: { burst: 3, perSecond: 1 },
+    });
+    events = [];
+    chat.subscribe((event) => events.push(event));
+  });
+
+  it("join добавляет участников и объявляет о каждом один раз", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    chat.join("general", bo);
+    expect(chat.members("general")).toEqual([mei, bo]);
+    expect(events.map((e) => \`\${e.action} \${e.user.name}\`))
+      .toEqual(["join Mei", "join Bo"]);
+  });
+
+  it.each(["", "General", "no spaces", "a".repeat(31), 42])(
+    'отклоняет название комнаты "%s"',
+    (name) => {
+      expect(() => chat.join(name, mei)).toThrow("В названии комнаты");
+    },
+  );
+
+  it("публикует обрезанное сообщение и сообщает слушателям", () => {
+    chat.join("general", mei);
+    const message = chat.postMessage("general", "u1", "  Hi!  ");
+    expect(message).toEqual({
+      id: "m1", room: "general", user: mei, text: "Hi!",
+      at: 1_000_000,
+    });
+    expect(events.at(-1)).toEqual({
+      type: "message", room: "general", message,
+    });
+  });
+
+  it("отклоняет сообщения от тех, кто не вошёл в комнату", () => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+    expect(() => chat.postMessage("random", "u1", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+  });
+
+  it.each([
+    ["пустое", ""],
+    ["из одних пробелов", "   "],
+    ["слишком длинное", "x".repeat(501)],
+    ["не текст", 42],
+  ])("отклоняет сообщение: %s", (_label, text) => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u1", text))
+      .toThrow(expect.objectContaining({ code: "invalid_text" }));
+  });
+
+  it("leave объявляет об уходе, и ушедший не может писать", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    expect(chat.leave("general", "u2")).toBe(true);
+    expect(chat.leave("general", "u2")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      action: "leave", user: bo, members: [mei],
+    });
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow("Сначала войдите в комнату general");
+  });
+
+  it("history листает назад по курсору", () => {
+    chat.join("general", mei);
+    for (const text of ["a", "b", "c"]) {
+      chat.postMessage("general", "u1", text);
+      clock.advance(1000);
+    }
+    const texts = (list) => list.map((m) => m.text).join("");
+    expect(texts(chat.history("general"))).toBe("abc");
+    expect(texts(chat.history("general", { limit: 2 }))).toBe("bc");
+    expect(texts(chat.history("general", { before: "m2" }))).toBe("a");
+    expect(chat.history("nowhere")).toEqual([]);
+  });
+
+  // TODO 4: три теста лимита (burst равен 3, perSecond равен 1):
+  // - можно отправить серию из 3 сообщений, 4-е отклоняется
+  // - через 999 мс всё ещё отказ, через 1000 мс можно ещё одно
+  // - минута ожидания не копит больше, чем на одну серию
+});`}
+  tests={[
+    { name: "Все тесты в редакторе проходят, включая ваши три теста лимита", check: `__vitest.failed === 0 && __vitest.passed >= 17` },
+    { name: "leave() и leaveAll() выводят людей из комнат и объявляют об этом", check: `(() => { const c = createChatService({ clock: fakeClock(0), newId: () => 'x' }); const ev = []; c.subscribe((e) => ev.push(e)); const ann = { id: 'a', name: 'Ann' }; const ben = { id: 'b', name: 'Ben' }; c.join('one', ann); c.join('two', ann); c.join('one', ben); const left = c.leave('one', 'a'); const again = c.leave('one', 'a'); const unknown = c.leave('nowhere', 'a'); const all = c.leaveAll('a'); const none = c.leaveAll('zed'); const leaves = ev.filter((e) => e.action === 'leave'); return left === true && again === false && unknown === false && JSON.stringify(all) === '["two"]' && Array.isArray(none) && none.length === 0 && leaves.length === 2 && leaves.every((e) => e.type === 'presence' && e.user.name === 'Ann') && leaves[0].room === 'one' && JSON.stringify(leaves[0].members) === JSON.stringify([ben]) && leaves[1].room === 'two' && leaves[1].members.length === 0 && c.members('one').length === 1 && c.members('two').length === 0; })()` },
+    { name: "postMessage() сохраняет обрезанное сообщение с id, автором и временем и объявляет о нём", check: `(() => { const clock = fakeClock(5000); const c = createChatService({ clock, newId: () => 'id-7' }); const ev = []; c.subscribe((e) => ev.push(e)); const ann = { id: 'a', name: 'Ann' }; c.join('one', ann); clock.advance(250); const m = c.postMessage('one', 'a', '  Hello there  '); const last = ev.at(-1); return m.id === 'id-7' && m.room === 'one' && m.user.name === 'Ann' && m.text === 'Hello there' && m.at === 5250 && last.type === 'message' && last.room === 'one' && last.message === m && c.history('one').length === 1 && c.history('one')[0].text === 'Hello there'; })()` },
+    { name: "postMessage() отклоняет чужих, плохой текст и флуд с правильными кодами", check: `(() => { const clock = fakeClock(0); const c = createChatService({ clock, newId: () => 'x', limits: { maxLength: 10, burst: 2, perSecond: 0.5 } }); c.join('one', { id: 'a', name: 'Ann' }); c.join('one', { id: 'b', name: 'Ben' }); const post = (room, user, text) => { try { c.postMessage(room, user, text); return 'ok'; } catch (e) { return e instanceof ChatError ? e.code : 'other'; } }; const r = [post('one', 'zed', 'hi'), post('two', 'a', 'hi'), post('one', 'a', ''), post('one', 'a', '   '), post('one', 'a', 'x'.repeat(11)), post('one', 'a', null), post('one', 'a', ' ' + 'x'.repeat(10) + ' '), post('one', 'a', 'hi'), post('one', 'a', 'hi'), post('one', 'b', 'hi')]; clock.advance(1999); const early = post('one', 'a', 'hi'); clock.advance(1); const later = post('one', 'a', 'hi'); return r.join() === 'not_member,not_member,invalid_text,invalid_text,invalid_text,invalid_text,ok,ok,rate_limited,ok' && early === 'rate_limited' && later === 'ok'; })()` },
+    { name: "Каждая комната хранит только свои самые новые сообщения (limits.keep)", check: `(() => { let n = 0; const c = createChatService({ clock: fakeClock(0), newId: () => 'm' + ++n, limits: { keep: 3, burst: 100 } }); const ann = { id: 'a', name: 'Ann' }; c.join('one', ann); c.join('two', ann); for (const t of ['1', '2', '3', '4', '5']) c.postMessage('one', 'a', t); c.postMessage('two', 'a', 'other'); return c.history('one').map((m) => m.text).join() === '3,4,5' && c.history('two').length === 1; })()` },
+    { name: "history() листает назад с before и limit", check: `(() => { let n = 0; const c = createChatService({ clock: fakeClock(0), newId: () => 'm' + ++n, limits: { burst: 1000 } }); c.join('one', { id: 'a', name: 'Ann' }); for (let i = 1; i <= 120; i++) c.postMessage('one', 'a', 'msg ' + i); const ids = (list) => list.map((m) => m.id).join(); const last50 = c.history('one'); return last50.length === 50 && last50[0].id === 'm71' && last50[49].id === 'm120' && ids(c.history('one', { limit: 3 })) === 'm118,m119,m120' && ids(c.history('one', { before: 'm71', limit: 2 })) === 'm69,m70' && c.history('one', { limit: 500 }).length === 100 && ids(c.history('one', { limit: 0 })) === 'm120' && c.history('one', { before: 'm1' }).length === 0 && ids(c.history('one', { before: 'm3' })) === 'm1,m2' && c.history('one', { before: 'nope' }).length === 0 && c.history('nowhere').length === 0 && ids(c.join('one', { id: 'b', name: 'Bo' }).history) === ids(last50); })()` },
+    { name: "Ваши тесты ловят корзину, которая никогда не отказывает", check: `(await __retest([["if (tokens < 1) return false;", "if (tokens < 0) return false;"]])).failed > __vitest.failed` },
+    { name: "Ваши тесты ловят корзину, которая не пополняется", check: `(await __retest([["const earned = ((t - updated) / 1000) * perSecond;", "const earned = 0;"]])).failed > __vitest.failed` },
+    { name: "Ваши тесты ловят корзину, которая копит без предела", check: `(await __retest([["tokens = Math.min(capacity, tokens + earned);", "tokens = tokens + earned;"]])).failed > __vitest.failed` },
+  ]}
+>
+
+Соберите ядро PandaChat. `ChatError`, `fakeClock`, `createTokenBucket` и начало `createChatService` (с `subscribe`, `members`, `join`, `typing` и `bucketFor`) уже готовы, как и большинство тестов. Не меняйте `createTokenBucket`: проверки будут подбрасывать в него ошибки, чтобы узнать, заметят ли их ваши тесты. Вам нужно написать:
+
+1. **`leave(name, userId)`**: если пользователь в комнате, уберите его, отправьте событие `{ type: "presence", room, action: "leave", user, members }` (с **оставшимися** участниками, как это делает `join`) и верните `true`; иначе верните `false`. **`leaveAll(userId)`** выводит пользователя из всех его комнат и возвращает их названия.
+2. **`postMessage(name, userId, text)`**: выбросьте `ChatError("not_member", …)`, если пользователя нет в комнате; `ChatError("invalid_text", …)`, если `text` не строка или длина **обрезанного** текста не от 1 до `config.maxLength`; `ChatError("rate_limited", "Помедленнее, пожалуйста")`, когда `bucketFor(userId).take()` отвечает отказом. Затем соберите `{ id: newId(), room: name, user, text, at: clock() }` с обрезанным текстом, добавьте его в `room.messages`, удалите самое старое, если сообщений больше `config.keep`, отправьте событие `{ type: "message", room: name, message }` и верните сообщение.
+3. **`history(name, { before, limit = 50 })`**: сообщения комнаты от старых к новым, не больше `limit` штук (целые числа зажимаются в диапазон 1–100; всё остальное означает 50). Без `before` — самые новые; с `before` — те, что идут прямо **перед** сообщением с этим id, или `[]`, если такого сообщения нет (и для неизвестных комнат тоже).
+4. **Три теста лимита** в блоке `describe` (у сервиса там `burst: 3, perSecond: 1`): серия из 3 сообщений проходит, а 4-е выбрасывает `rate_limited`; после `clock.advance(999)` сообщение всё ещё отклоняется, а ещё через миллисекунду — проходит; и после минуты тишины пользователь всё равно не может отправить больше 3 сообщений подряд.
+
+<Hint>
+
+Для `leave` скопируйте поиск из `typing`: `const room = rooms.get(name); const user = room?.members.get(userId);`. `leaveAll` перебирает `rooms.keys()` и вызывает `leave` для каждой комнаты. В `postMessage` выражение `typeof text === "string" ? text.trim() : ""` превращает любой неподходящий тип в пустую (недопустимую) строку. В `history` вызов `messages.findIndex((m) => m.id === before)` находит, где заканчивается страница, а `messages.slice(Math.max(0, end - size), end)` вырезает её. В третьем тесте убедитесь, что корзина пользователя существует **до** того, как пройдёт минута (сначала отправьте одно сообщение), иначе копить будет нечего.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ---------- ошибки ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- время ----------
+
+/** Часы для тестов: время идёт, только когда это скажет тест. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- сервис чата ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // символов в сообщении
+  keep: 200, // сколько сообщений хранит комната
+  burst: 5, // сообщений одной серией...
+  perSecond: 1, // ...а дальше по одному в секунду
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // имя -> { members, messages }
+  const buckets = new Map(); // id пользователя -> корзина токенов
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "В названии комнаты только a-z, 0-9 и -, до 30 символов",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Сначала войдите в комнату ${name}`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) return false;
+    room.members.delete(userId);
+    emit({
+      type: "presence",
+      room: name,
+      action: "leave",
+      user,
+      members: members(name),
+    });
+    return true;
+  }
+
+  function leaveAll(userId) {
+    const left = [];
+    for (const name of rooms.keys()) {
+      if (leave(name, userId)) left.push(name);
+    }
+    return left;
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Сначала войдите в комнату ${name}`);
+    }
+    const clean = typeof text === "string" ? text.trim() : "";
+    if (clean.length < 1 || clean.length > config.maxLength) {
+      throw new ChatError(
+        "invalid_text",
+        `В сообщении должно быть от 1 до ${config.maxLength} символов`,
+      );
+    }
+    if (!bucketFor(userId).take()) {
+      throw new ChatError("rate_limited", "Помедленнее, пожалуйста");
+    }
+    const message = {
+      id: newId(),
+      room: name,
+      user,
+      text: clean,
+      at: clock(),
+    };
+    room.messages.push(message);
+    if (room.messages.length > config.keep) room.messages.shift();
+    emit({ type: "message", room: name, message });
+    return message;
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    const messages = rooms.get(name)?.messages ?? [];
+    const size = Number.isInteger(limit)
+      ? Math.min(Math.max(limit, 1), 100)
+      : 50;
+    let end = messages.length;
+    if (before !== undefined) {
+      end = messages.findIndex((m) => m.id === before);
+      if (end === -1) return []; // неизвестное или уже удалённое
+    }
+    return messages.slice(Math.max(0, end - size), end);
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- тесты: ядро (часть 1) ----------
+
+const mei = { id: "u1", name: "Mei" };
+const bo = { id: "u2", name: "Bo" };
+
+describe("сервис чата", () => {
+  let clock, chat, events;
+
+  beforeEach(() => {
+    clock = fakeClock(1_000_000);
+    let n = 0;
+    chat = createChatService({
+      clock,
+      newId: () => `m${++n}`,
+      limits: { burst: 3, perSecond: 1 },
+    });
+    events = [];
+    chat.subscribe((event) => events.push(event));
+  });
+
+  it("join добавляет участников и объявляет о каждом один раз", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    chat.join("general", bo);
+    expect(chat.members("general")).toEqual([mei, bo]);
+    expect(events.map((e) => `${e.action} ${e.user.name}`))
+      .toEqual(["join Mei", "join Bo"]);
+  });
+
+  it.each(["", "General", "no spaces", "a".repeat(31), 42])(
+    'отклоняет название комнаты "%s"',
+    (name) => {
+      expect(() => chat.join(name, mei)).toThrow("В названии комнаты");
+    },
+  );
+
+  it("публикует обрезанное сообщение и сообщает слушателям", () => {
+    chat.join("general", mei);
+    const message = chat.postMessage("general", "u1", "  Hi!  ");
+    expect(message).toEqual({
+      id: "m1", room: "general", user: mei, text: "Hi!",
+      at: 1_000_000,
+    });
+    expect(events.at(-1)).toEqual({
+      type: "message", room: "general", message,
+    });
+  });
+
+  it("отклоняет сообщения от тех, кто не вошёл в комнату", () => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+    expect(() => chat.postMessage("random", "u1", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+  });
+
+  it.each([
+    ["пустое", ""],
+    ["из одних пробелов", "   "],
+    ["слишком длинное", "x".repeat(501)],
+    ["не текст", 42],
+  ])("отклоняет сообщение: %s", (_label, text) => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u1", text))
+      .toThrow(expect.objectContaining({ code: "invalid_text" }));
+  });
+
+  it("leave объявляет об уходе, и ушедший не может писать", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    expect(chat.leave("general", "u2")).toBe(true);
+    expect(chat.leave("general", "u2")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      action: "leave", user: bo, members: [mei],
+    });
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow("Сначала войдите в комнату general");
+  });
+
+  it("history листает назад по курсору", () => {
+    chat.join("general", mei);
+    for (const text of ["a", "b", "c"]) {
+      chat.postMessage("general", "u1", text);
+      clock.advance(1000);
+    }
+    const texts = (list) => list.map((m) => m.text).join("");
+    expect(texts(chat.history("general"))).toBe("abc");
+    expect(texts(chat.history("general", { limit: 2 }))).toBe("bc");
+    expect(texts(chat.history("general", { before: "m2" }))).toBe("a");
+    expect(chat.history("nowhere")).toEqual([]);
+  });
+
+  it("разрешает серию сообщений, а потом отказывает", () => {
+    chat.join("general", mei);
+    for (let i = 0; i < 3; i++) {
+      chat.postMessage("general", "u1", `hi ${i}`);
+    }
+    expect(() => chat.postMessage("general", "u1", "one more"))
+      .toThrow(expect.objectContaining({ code: "rate_limited" }));
+  });
+
+  it("восстанавливает по одному сообщению в секунду", () => {
+    chat.join("general", mei);
+    for (let i = 0; i < 3; i++) chat.postMessage("general", "u1", "hi");
+    clock.advance(999);
+    expect(() => chat.postMessage("general", "u1", "hi")).toThrow();
+    clock.advance(1);
+    expect(chat.postMessage("general", "u1", "hi").text).toBe("hi");
+  });
+
+  it("никогда не копит больше, чем на одну серию", () => {
+    chat.join("general", mei);
+    chat.postMessage("general", "u1", "hi");
+    clock.advance(60_000);
+    for (let i = 0; i < 3; i++) chat.postMessage("general", "u1", "hi");
+    expect(() => chat.postMessage("general", "u1", "hi")).toThrow();
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- **Дизайн-документ**: требования и то, что не входит в рамки, выбор WebSocket вместо polling и Server-Sent Events, **JSON-протокол**, где у каждого сообщения есть `type`, а у ошибок — `code`, модель данных, оценки (20 000 соединений, 8 333 доставки в секунду, 329 ГБ в год) и таблица компромиссов.
+- **Постраничную навигацию по курсору**, которая остаётся правильной, пока приходят новые сообщения.
+- **Корзину токенов** с внедрёнными часами и `fakeClock`, с которыми минута проходит мгновенно.
+- **`createChatService`**: комнаты, идемпотентный вход, события присутствия, сообщения, которые проходят валидацию и ограничение частоты и хранятся в истории ограниченного размера, и API наблюдателя (`subscribe`) для всех, кому нужно знать о событиях.
+- Быстрый **набор тестов Vitest**, который доказывает правила, включая тесты, ловящие сломанный ограничитель частоты.
+
+Ядро работает, но достучаться до него пока никто не может. В **части 2** мы поставим его за WebSocket-сервер реального времени с аутентификацией, валидацией, комнатами, присутствием и heartbeat. ⚡

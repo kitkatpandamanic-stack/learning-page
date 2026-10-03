@@ -1,0 +1,516 @@
+---
+title: Memory and Garbage Collection
+description: Learn how JavaScript allocates and frees memory, why apps still leak, how to fix the usual suspects with cleanup, WeakMap and AbortController, and how to hunt leaks with heap snapshots.
+duration: 22
+xp: 25
+---
+
+JavaScript has a **garbage collector**: you never free memory by hand, and you can't get the use-after-free bugs that plague C. So memory isn't your problem, right? Ask anyone who has kept a single-page app open in a tab all day, or run a Node server for a week. The tab creeps up to 2 GB and gets sluggish; the server's memory graph climbs like a staircase until it's killed and restarted. The garbage collector frees what's **unreachable**, and leaks happen when your code keeps things reachable by accident. This lesson shows how the collector thinks, and the handful of patterns behind almost every real leak. 🧹
+
+## The stack and the heap
+
+A running program keeps data in two places:
+
+- The **stack** holds the call stack you met in the [first lesson of this module](/learn/javascript/how-engines-run-code): one frame per running function, with its local variables. It's small, fast, and cleans itself up: when a function returns, its frame is gone.
+- The **heap** is a big pool of memory for everything that has to outlive a single call or whose size isn't known in advance: objects, arrays, functions, closures, Maps, long strings.
+
+A variable that holds an object doesn't hold the object itself. It holds a **reference**: an arrow pointing into the heap. Copying the variable copies the arrow:
+
+<CodeExample output={`Bao
+Bao`}>
+
+```js
+let a = { name: "Mei" }; // the object lives on the heap
+let b = a; // copies the reference, not the object
+b.name = "Bao";
+console.log(a.name); // one object, two arrows
+
+a = null; // removes one arrow...
+console.log(b.name); // ...the object is still reachable via b
+
+b = null; // no arrows left: it's garbage now
+```
+
+</CodeExample>
+
+(Engines are clever about where things physically live; small numbers, for example, are usually stored directly instead of on the heap. "References to heap objects" is the model that matters for leaks.)
+
+## Reachability and mark-and-sweep
+
+The garbage collector's one question is: **can the program still reach this object?** It starts from the **roots**:
+
+- global variables (`globalThis`, module-level variables in a long-lived module),
+- the local variables of every function on the call stack,
+- everything the host is holding for you: pending timers and their callbacks, event listeners on live DOM nodes, pending promises with callbacks attached, open sockets.
+
+From the roots it follows every reference (properties, array items, Map entries, variables captured by closures...) and **marks** everything it can reach. Then it **sweeps**: everything unmarked is freed.
+
+```text
+ roots ─▶ app ─▶ store ─▶ listeners ─▶ [fn1, fn2]
+                   │                     │
+                   └─▶ state             └─▶ (closure) bigData ✓
+
+ oldPage ◀─▶ oldHeader      (pointing at each other, but nothing
+                             reachable points at them: both freed)
+```
+
+Two consequences:
+
+- **Cycles are fine.** Two objects pointing at each other but unreachable from any root are collected together. (Old Internet Explorer counted references instead and leaked cycles; modern engines don't.)
+- **A leak is just a forgotten reference.** Memory you no longer need, but that's still reachable from a root, can never be freed. The collector is doing its job perfectly; the bug is in your references.
+
+## Generational garbage collection
+
+Marking the whole heap takes time, and while the collector works, your JavaScript may have to pause. Engines make this cheap with one observation, the **generational hypothesis**: *most objects die young*. The temporary array in a `map`, the object you return from a function and destructure straight away, the strings you build for a log line: they're garbage within microseconds.
+
+So the heap is split in two (V8's names):
+
+| Area | What lives there | How it's cleaned |
+| --- | --- | --- |
+| **Young generation** (the nursery) | new objects | Often and fast: a **scavenger** copies the few survivors out and wipes the rest in one go. Its cost depends on the survivors, not the garbage. |
+| **Old generation** | objects that survived a couple of young collections | Rarely: full **mark-sweep-compact**, done mostly **incrementally** (in small slices between your tasks) and **concurrently** on helper threads, to keep pauses short. |
+
+What this means in practice: short-lived garbage is cheap, but not free. A hot loop that allocates millions of small objects per second keeps the scavenger busy (that's called **GC pressure**, and it shows up in the Performance panel as "Minor GC"). Long-lived data that grows forever ends up in the old generation, makes every full collection slower, and eventually hits the heap limit: `FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory` is a message Node developers learn to fear.
+
+## What leaks in real JavaScript apps
+
+Almost every leak you'll meet is one of these.
+
+### 1. Caches and maps that only grow
+
+A Map used as a cache is a root-reachable collection: nothing in it is ever freed unless you delete it. Memoising by a key that's always new (a timestamp, a request id, a user's search text) is a leak with a nice name:
+
+<CodeExample output={`entries after a busy day: 50000`}>
+
+```js
+const cache = new Map();
+
+function formatPrice(amount, currency) {
+  const key = `${amount}:${currency}`;
+  if (!cache.has(key)) {
+    cache.set(key, `${currency} ${amount.toFixed(2)}`);
+  }
+  return cache.get(key);
+}
+
+// Every distinct amount adds an entry, forever
+for (let cents = 0; cents < 50_000; cents++) {
+  formatPrice(cents / 100, "GBP");
+}
+console.log("entries after a busy day:", cache.size);
+```
+
+</CodeExample>
+
+Every cache needs a **limit** (a maximum size, a time to live, or both). The classic policy is **LRU**, *least recently used*: when the cache is full, drop the entry nobody has asked for the longest. You'll build one in the exercise. In production, libraries such as `lru-cache` do this well.
+
+### 2. Listeners and subscriptions that are never removed
+
+Every `addEventListener`, `store.subscribe`, `socket.on` or `emitter.on` gives the **source** a reference to your callback, and through its closure, to everything the callback uses. If the source lives longer than the thing that subscribed (a global store, `window`, a WebSocket), the subscriber can never be freed:
+
+<CodeExample output={`leaky store: 1000 listeners
+clean store: 0 listeners`}>
+
+```js
+function createStore() {
+  const listeners = new Set();
+  return {
+    subscribe(fn) {
+      listeners.add(fn);
+      return () => listeners.delete(fn); // the cleanup
+    },
+    get listenerCount() {
+      return listeners.size;
+    },
+  };
+}
+
+const leaky = createStore();
+const clean = createStore();
+
+function mountLeakyWidget() {
+  const rows = new Array(1_000).fill("🐼"); // the widget's data
+  leaky.subscribe(() => rows.length); // never unsubscribed
+}
+
+function mountCleanWidget() {
+  const rows = new Array(1_000).fill("🐼");
+  const unsubscribe = clean.subscribe(() => rows.length);
+  return unsubscribe; // the caller runs it on unmount
+}
+
+// The user opens and closes the widget 1,000 times
+for (let i = 0; i < 1_000; i++) {
+  mountLeakyWidget();
+  const unmount = mountCleanWidget();
+  unmount();
+}
+console.log(`leaky store: ${leaky.listenerCount} listeners`);
+console.log(`clean store: ${clean.listenerCount} listeners`);
+```
+
+</CodeExample>
+
+The leaky store holds 1,000 dead widgets, each with its own `rows` array, and will call all 1,000 callbacks on every change. This is exactly why React's `useEffect` lets you return a **cleanup function**, and why every good `subscribe` API returns an `unsubscribe`.
+
+### 3. Timers that are never cleared
+
+An active `setInterval` is a root: its callback, and everything that callback's closure references, stays alive until `clearInterval`. A polling interval started by a component that was later removed keeps polling (and keeping the component's data alive) forever. The same applies to a `setTimeout` that reschedules itself.
+
+### 4. Closures that hold more than they need
+
+A closure keeps alive every variable it uses. That's the point of closures, but it's easy to capture something big by accident:
+
+<CodeExample output={`10001`}>
+
+```js
+function createLogger() {
+  const history = []; // lives as long as `log` does
+  return function log(message) {
+    history.push(message);
+    return history.length;
+  };
+}
+
+const log = createLogger(); // module-level: lives forever
+for (let i = 0; i < 10_000; i++) log(`request ${i}`);
+console.log(log("one more")); // all of them kept in memory
+```
+
+</CodeExample>
+
+The subtle version: a handler that only needs `response.items.length` but closes over the whole `response` keeps the whole response alive as long as the handler exists. Copy out what you need into a small variable before creating long-lived callbacks.
+
+### 5. Detached DOM nodes
+
+You remove an element from the page with `element.remove()`, but a JavaScript variable, array or Map still points at it. The element (and its whole subtree, and their listeners) is now **detached**: not in the document, not collectable. Classic sources are "remember the last selected row" variables and caches keyed by elements. Clear those references when you remove the element, or use a `WeakMap` (next section).
+
+### 6. Accidental globals
+
+In old "sloppy mode" scripts, assigning to an undeclared variable (`totl = 5` instead of `total = 5`) silently creates a global, which lives forever. Modules, classes and strict mode turn this into an error, which is one more reason to always use them:
+
+<CodeExample output={`ReferenceError`}>
+
+```js
+function addUp(prices) {
+  let total = 0;
+  for (const price of prices) {
+    totl = total + price; // typo!
+  }
+  return total;
+}
+
+try {
+  addUp([1, 2, 3]);
+} catch (error) {
+  console.log(error.name); // strict mode: no accidental global
+}
+```
+
+</CodeExample>
+
+<Callout type="warning" title="The staircase graph">
+
+A healthy app's memory graph is a **sawtooth**: memory rises as you allocate, drops when the collector runs, and the lows stay level. A leak looks like a **staircase**: every drop ends a bit higher than the last. On a server, that staircase usually ends with the process being killed for running out of memory, restarting, and the whole thing starting again. Restarting "fixes" it, which is why some leaks survive in production for years.
+
+</Callout>
+
+## WeakMap and WeakSet: data that follows its object
+
+Often you want to attach extra information to objects you don't own: how many times a DOM element was clicked, which objects you've already processed, a computed value for a request object. A normal `Map` keyed by the object keeps the object alive forever. A **`WeakMap`** holds its keys **weakly**: the entry doesn't count as a reference, and when the key object becomes unreachable elsewhere, the entry disappears with it.
+
+<CodeExample output={`2
+1
+undefined
+true false`}>
+
+```js
+// Extra data for objects we don't own (DOM nodes, requests...)
+const clickCounts = new WeakMap();
+
+function trackClick(element) {
+  clickCounts.set(element, (clickCounts.get(element) ?? 0) + 1);
+  return clickCounts.get(element);
+}
+
+const saveButton = { id: "save" }; // imagine real DOM elements
+const helpButton = { id: "help" };
+trackClick(saveButton);
+console.log(trackClick(saveButton));
+console.log(trackClick(helpButton));
+console.log(clickCounts.get({ id: "save" })); // a different object
+
+// WeakSet: "have I seen this object?"
+const validated = new WeakSet();
+validated.add(saveButton);
+console.log(validated.has(saveButton), validated.has(helpButton));
+```
+
+</CodeExample>
+
+When `saveButton` is removed and forgotten, its count goes with it, no cleanup code required. The price: keys must be **objects** (or non-registered symbols), and you can't loop over a WeakMap or ask for its size, because its contents depend on when the collector last ran. Frameworks use WeakMaps everywhere for exactly this "metadata for an object" job (Vue's reactivity system, which you'll meet in the next lesson, is one).
+
+## WeakRef and FinalizationRegistry: handle with care
+
+Two more advanced tools give you a weak reference to a **single** object:
+
+<CodeExample output={`1 true`}>
+
+```js
+let photo = { id: 1, pixels: new Uint8Array(1_000_000) };
+const ref = new WeakRef(photo);
+
+// deref() gives the object back, or undefined once it's collected
+console.log(ref.deref()?.id, ref.deref() === photo);
+```
+
+</CodeExample>
+
+```js
+// Calls you back (maybe!) after an object was collected
+const registry = new FinalizationRegistry((id) => {
+  console.log(`photo ${id} was collected`);
+});
+registry.register(photo, photo.id);
+photo = null; // later, maybe much later, maybe never
+```
+
+They sound perfect for caches and cleanup, but the language spec gives almost no guarantees: **when** an object is collected (if ever) depends on the engine, the memory pressure and the moon's phase. A finalisation callback may run late, or not at all if the page closes first. Use them only as an optimisation, for example a cache that's *allowed* to lose entries, and never for anything your program needs to be correct: closing files, saving data, releasing locks. For those, write explicit `close()`/`dispose()` methods. (Newer JavaScript adds the `using` keyword, which calls `[Symbol.dispose]()` automatically at the end of a block; it's arriving in engines and in TypeScript now.)
+
+## Removing many listeners at once with AbortController
+
+Cleaning up five listeners and a timer one by one is tedious, and every forgotten one leaks. `addEventListener` accepts a **`signal`** option: when its `AbortController` aborts, every listener registered with that signal is removed in one go. The signal also fires its own `abort` event, which is a handy place to clear timers:
+
+<CodeExample output={`A got hi
+B got hi
+after abort: true`}>
+
+```js
+const socket = new EventTarget(); // e.g. a WebSocket or window
+const controller = new AbortController();
+const { signal } = controller;
+
+socket.addEventListener(
+  "message",
+  (event) => console.log("A got", event.detail),
+  { signal },
+);
+socket.addEventListener(
+  "message",
+  (event) => console.log("B got", event.detail),
+  { signal },
+);
+const timer = setInterval(() => console.log("ping"), 1000);
+signal.addEventListener("abort", () => clearInterval(timer));
+
+socket.dispatchEvent(new CustomEvent("message", { detail: "hi" }));
+
+controller.abort(); // the widget closes: everything cleaned up
+socket.dispatchEvent(new CustomEvent("message", { detail: "?" }));
+console.log("after abort:", signal.aborted);
+```
+
+</CodeExample>
+
+The same signal can cancel `fetch` requests too (`fetch(url, { signal })`), so one `controller.abort()` in a component's cleanup tears down its listeners, its timers and its in-flight requests together. In React that looks like this:
+
+```jsx
+useEffect(() => {
+  const controller = new AbortController();
+  const { signal } = controller;
+  window.addEventListener("resize", onResize, { signal });
+  window.addEventListener("keydown", onKey, { signal });
+  fetch(`/api/items/${id}`, { signal }).then(/* ... */);
+  return () => controller.abort(); // one line of cleanup
+}, [id]);
+```
+
+## Finding leaks with DevTools
+
+When you suspect a leak, don't guess: **measure**. Chrome's DevTools (Firefox and Safari have similar tools) give you:
+
+- **Performance panel** with the *Memory* checkbox: record while you repeat an action (open and close a dialog ten times). A staircase in the JS heap line after forcing garbage collection (the 🗑️ button) means something is kept.
+- **Memory panel → Heap snapshot**: a full picture of every object on the heap. The **three-snapshot technique** works well: take a snapshot, repeat the suspicious action a few times, take another, repeat again, take a third. In the third snapshot, choose *Objects allocated between snapshots 1 and 2*. Things that were created then and are *still* alive are your suspects.
+- **Retainers**: select a suspicious object and the bottom panel shows the chain of references keeping it alive, all the way to a root. That chain points at the line to fix: often a listener, a Map or a closure. Typing `Detached` in the class filter finds detached DOM trees.
+- **Allocation instrumentation on timeline**: shows *when* objects were allocated and which of them survived, as blue bars that stay blue.
+
+For Node, the same tools work through the inspector:
+
+```bash
+node --inspect server.js         # then open chrome://inspect
+node --heapsnapshot-signal=SIGUSR2 server.js
+kill -USR2 <pid>                 # writes a .heapsnapshot file
+node --max-old-space-size=4096 build.js   # raise the heap limit (MB)
+```
+
+```js
+// A quick look from inside the process
+const { heapUsed, rss } = process.memoryUsage();
+console.log(`${Math.round(heapUsed / 1024 / 1024)} MB heap used`);
+```
+
+Raising the heap limit is fine for a big one-off build. For a server that slowly fills any limit you give it, it only delays the crash: find the retainer.
+
+<Quiz
+  question="A dashboard adds window.addEventListener('resize', this.layout) every time a chart is created, and charts are created and destroyed as the user switches tabs. What happens to the destroyed charts?"
+  options={[
+    "They're garbage collected as soon as they leave the page",
+    "They stay in memory, because window (a root) still references the listener, which references the chart",
+    "The browser removes listeners automatically when an object is destroyed",
+    "Nothing, because cycles between window and the chart are collected",
+  ]}
+  answer={1}
+  explanation="window is reachable from the roots and keeps a reference to every listener added to it. Each listener keeps its chart reachable (through this or its closure), so destroyed charts can never be collected, and they keep running on every resize. Remove the listener on destroy, or register it with an AbortController's signal and abort."
+/>
+
+<Quiz
+  question="Why can't you loop over a WeakMap or read its size?"
+  options={[
+    "Because WeakMaps are slower than Maps",
+    "Because its keys are private fields",
+    "Because entries vanish whenever the garbage collector frees a key, so the answer would depend on GC timing",
+    "Because WeakMaps can only hold one entry",
+  ]}
+  answer={2}
+  explanation="An entry lives exactly as long as its key is reachable elsewhere. When that stops being true depends on when the collector runs, which is unpredictable, so the language doesn't let your code observe it through size or iteration."
+/>
+
+<Exercise
+  title="A bounded LRU cache"
+  starter={`class LRUCache {
+  #map = new Map();
+
+  constructor(limit, onEvict = () => {}) {
+    this.limit = limit;
+    this.onEvict = onEvict;
+  }
+
+  get size() {
+    return this.#map.size;
+  }
+
+  has(key) {
+    return this.#map.has(key);
+  }
+
+  get(key) {
+    // TODO: a hit should make this key the most recently used
+    return this.#map.get(key);
+  }
+
+  set(key, value) {
+    // TODO: make this key the newest, and evict the oldest
+    // entry (calling onEvict) when there are too many
+    this.#map.set(key, value);
+    return this;
+  }
+
+  keys() {
+    return [...this.#map.keys()];
+  }
+}
+
+const thumbnails = new LRUCache(3, (key) => {
+  console.log(\`evicted \${key}\`);
+});
+thumbnails.set("cat.png", "🐱");
+thumbnails.set("dog.png", "🐶");
+thumbnails.set("panda.png", "🐼");
+thumbnails.get("cat.png"); // cat is fresh again
+thumbnails.set("fox.png", "🦊"); // the cache is full
+console.log(thumbnails.keys());
+console.log(thumbnails.size, thumbnails.get("dog.png"));
+`}
+  tests={[
+    { name: "The demo evicts dog.png and keeps 3 entries", check: `__output.join("|") === "evicted dog.png|[ 'panda.png', 'cat.png', 'fox.png' ]|3 undefined"` },
+    { name: "Never holds more than limit entries", check: `(() => { const c = new LRUCache(2); c.set("a", 1).set("b", 2).set("c", 3); return c.size === 2 && !c.has("a") && c.get("b") === 2 && c.get("c") === 3; })()` },
+    { name: "get() makes a key the most recently used", check: `(() => { const c = new LRUCache(3); c.set("a", 1); c.set("b", 2); c.set("c", 3); c.get("a"); c.set("d", 4); return c.keys().join() === "c,a,d"; })()` },
+    { name: "Updating a key refreshes it without evicting anything", check: `(() => { const c = new LRUCache(3); c.set("a", 1); c.set("b", 2); c.set("c", 3); c.set("a", 10); const full = c.keys().join(); c.set("d", 4); return full === "b,c,a" && c.get("a") === 10 && !c.has("b") && c.keys().join() === "c,d,a"; })()` },
+    { name: "has() doesn't refresh, and a miss returns undefined without adding", check: `(() => { const c = new LRUCache(2); c.set("a", 1); c.set("b", 2); const had = c.has("a"); c.set("c", 3); const miss = c.get("zzz"); return had && !c.has("a") && miss === undefined && c.size === 2 && !c.has("zzz"); })()` },
+    { name: "onEvict gets the evicted key and value", check: `(() => { const log = []; const c = new LRUCache(1, (k, v) => log.push(k + "=" + v)); c.set("x", 1); c.set("y", 2); c.set("y", 3); c.set("z", 4); return log.join() === "x=1,y=3"; })()` },
+  ]}
+>
+
+Build a cache that can't grow forever. `LRUCache(limit, onEvict)` keeps at most `limit` entries; when a new key would go over the limit, it drops the **least recently used** one. The class already stores entries in a private `Map`. Finish it:
+
+1. **`get(key)`**: on a hit, return the value **and** make the key the most recently used. On a miss, return `undefined` (and don't add anything).
+2. **`set(key, value)`**: store the value as the most recently used entry (updating an existing key refreshes it too). If the cache now has more than `limit` entries, remove the least recently used one and call `onEvict(key, value)` with it. Return `this`, so calls can be chained.
+3. `has`, `size` and `keys()` (oldest first) are done. `has` should **not** count as a use.
+
+The trick: a `Map` remembers **insertion order**, and its first key is the oldest. To move a key to the end, `delete` it and `set` it again.
+
+<Hint>
+
+In `get`: `if (!this.#map.has(key)) return undefined;`, then read the value, `delete` the key and `set` it again before returning the value. In `set`: `delete` the key first (so an existing key moves to the end), then `set` it. If `this.#map.size > this.limit`, the oldest key is `this.#map.keys().next().value`; read its value, delete it, and call `this.onEvict(oldest, oldValue)`.
+
+</Hint>
+
+<Solution>
+
+```js
+class LRUCache {
+  #map = new Map();
+
+  constructor(limit, onEvict = () => {}) {
+    this.limit = limit;
+    this.onEvict = onEvict;
+  }
+
+  get size() {
+    return this.#map.size;
+  }
+
+  has(key) {
+    return this.#map.has(key);
+  }
+
+  get(key) {
+    if (!this.#map.has(key)) return undefined;
+    const value = this.#map.get(key);
+    this.#map.delete(key); // move it to the end:
+    this.#map.set(key, value); // now it's the newest
+    return value;
+  }
+
+  set(key, value) {
+    this.#map.delete(key);
+    this.#map.set(key, value);
+    if (this.#map.size > this.limit) {
+      const oldest = this.#map.keys().next().value;
+      const oldValue = this.#map.get(oldest);
+      this.#map.delete(oldest);
+      this.onEvict(oldest, oldValue);
+    }
+    return this;
+  }
+
+  keys() {
+    return [...this.#map.keys()];
+  }
+}
+
+const thumbnails = new LRUCache(3, (key) => {
+  console.log(`evicted ${key}`);
+});
+thumbnails.set("cat.png", "🐱");
+thumbnails.set("dog.png", "🐶");
+thumbnails.set("panda.png", "🐼");
+thumbnails.get("cat.png"); // cat is fresh again
+thumbnails.set("fox.png", "🦊"); // the cache is full
+console.log(thumbnails.keys());
+console.log(thumbnails.size, thumbnails.get("dog.png"));
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Objects live on the **heap**; variables hold **references** to them. The garbage collector frees whatever is no longer **reachable** from the roots (globals, the call stack, timers, listeners...), using **mark-and-sweep**. Cycles are no problem.
+- **Generational GC**: most objects die young, so new objects are collected often and cheaply; survivors move to the old generation, which is collected incrementally and concurrently.
+- A **leak** is a forgotten reference. The usual suspects: unbounded **caches/Maps**, **listeners and subscriptions** never removed, **timers** never cleared, **closures** holding big data, **detached DOM nodes**, accidental **globals**.
+- Give every cache a limit (e.g. **LRU** with a `Map`), and every subscription an **unsubscribe**.
+- **WeakMap/WeakSet** attach data to objects without keeping them alive. **WeakRef/FinalizationRegistry** are non-deterministic: optimisations only, never for correctness.
+- **AbortController**: pass `{ signal }` to many listeners and fetches, and one `abort()` cleans them all up.
+- Find leaks by measuring: the Performance panel's memory graph, **heap snapshots** (three-snapshot technique, retainers, `Detached`), and `node --inspect` on servers.

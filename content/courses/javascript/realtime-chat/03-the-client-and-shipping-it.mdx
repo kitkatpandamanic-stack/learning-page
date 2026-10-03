@@ -1,0 +1,1637 @@
+---
+title: "Part 3: The client and shipping it"
+description: Build a React chat client that reconnects with backoff and jitter and shows members and typing, then plan scaling with Redis pub/sub, graceful shutdown, Docker, CI and monitoring.
+duration: 25
+xp: 30
+---
+
+PandaChat's server works: it authenticates, validates, broadcasts to rooms and sweeps dead sockets, and its tests prove it. In this last part we give it a face, a **React client** that people would actually enjoy using, and then we plan how to run it for real: on several servers, behind a load balancer, deployed without dropping everyone, and watched by monitoring. 🚀
+
+The client is where the network's bad manners become visible. Wi-Fi drops, laptops sleep, servers restart during deploys. A good real-time client **expects** that: it shows its connection state honestly, reconnects on its own without hammering the server, and catches up on what it missed. You'll use effects and cleanup from the [Effects and Data](/learn/javascript/effects-and-data) lesson, throttling from the [Fast Code in the Browser](/learn/javascript/fast-code-in-the-browser) lesson, backoff with jitter from the [Real-time and Resilience](/learn/javascript/real-time-and-resilience) lesson and state machines from the [DI and Domain Modelling](/learn/javascript/dependency-injection-and-domain-modelling) lesson.
+
+## One page, server and client
+
+PandaDev's previews can run a `ws` server **and** a React app together, on the same in-memory network, so this part's exercise is one page: the server from Parts 1 and 2 at the top (unchanged; its tests stay behind in their test files, because the preview runs React, not Vitest), then the client. Two small differences from Part 2: the page imports only `WebSocketServer` from `ws`, because the browser already has a `WebSocket`; and nothing calls `chat.sweep()` on a timer here.
+
+On your machine they are two projects: the server runs in Node, and the client is a Vite + React app in the browser. The code is the same:
+
+```bash
+# the server
+cd pandachat-server && npm install ws && node server.js
+# the client, in another terminal
+npm create vite@latest pandachat-web -- --template react
+cd pandachat-web && npm install && npm run dev
+```
+
+## The connection is a state machine
+
+The client's connection is always in exactly one of four states, and the UI shows which one:
+
+| State | Means | Moves to |
+| --- | --- | --- |
+| `connecting` | the first attempt is in flight | `online` (joined), `reconnecting` (closed), `unauthorized` (4001) |
+| `online` | joined the room; sending is allowed | `reconnecting` (closed) |
+| `reconnecting` | lost the connection; a retry is scheduled | `online`, `reconnecting` again, `unauthorized` |
+| `unauthorized` | the server said 4001: retrying won't help | nothing: the user must sign in again |
+
+Three rules fall out of the table, and each one fixes a bug real chat apps have shipped:
+
+- **"Online" means joined, not "socket open".** The socket opens before the server has authenticated us and before the `join` is answered. The status turns `online` on the `joined` reply, and that is also when the retry counter goes back to zero. (Resetting it on `open` means a server that accepts and then immediately closes would be retried at full speed forever.)
+- **Never retry 4001.** An expired ticket won't get better by trying again; a loop of reconnects with a bad ticket is a small denial-of-service attack on your own server.
+- **The send button follows the state.** It's disabled unless the state is `online`, so nobody types a message into a void.
+
+## Reconnecting without a stampede
+
+When a deploy restarts a server, all of its 20,000 clients lose their connection **at the same moment**. If they all reconnect immediately, they hit the next server like a wave, and if it falls over, they all retry again, together. This is the **thundering herd**, and the cure has two parts: **exponential backoff** (wait 100 ms, then 200, 400, 800... up to a cap) and **jitter** (randomise the wait, so the herd spreads out):
+
+<CodeExample output={`[ 100, 200, 400, 800, 1000, 1000 ]
+[ 50, 100, 200, 400, 500, 500 ]
+client: online
+server: down
+client: closed (1001), retry in 100 ms
+client: closed (1006), retry in 200 ms
+client: closed (1006), retry in 400 ms
+server: up again
+client: online`}>
+
+```js
+import { WebSocketServer } from "ws";
+
+const RETRY = { base: 100, max: 1000 };
+
+function backoffDelay(attempt, random = Math.random) {
+  const ceiling = Math.min(RETRY.max, RETRY.base * 2 ** attempt);
+  return Math.round(ceiling / 2 + (random() * ceiling) / 2);
+}
+
+console.log([0, 1, 2, 3, 4, 5].map((n) => backoffDelay(n, () => 1)));
+console.log([0, 1, 2, 3, 4, 5].map((n) => backoffDelay(n, () => 0)));
+
+// A server that goes down for a while
+let wss = new WebSocketServer({ port: 4000 });
+setTimeout(() => {
+  console.log("server: down");
+  for (const socket of wss.clients) socket.close(1001, "Restarting");
+  wss.close();
+}, 50);
+setTimeout(() => {
+  console.log("server: up again");
+  wss = new WebSocketServer({ port: 4000 });
+}, 600);
+
+// A client that keeps trying, waiting longer each time
+let attempt = 0;
+function connect() {
+  const ws = new WebSocket("ws://localhost:4000");
+  ws.onopen = () => {
+    console.log("client: online");
+    attempt = 0;
+  };
+  ws.onclose = (event) => {
+    const delay = backoffDelay(attempt, () => 1); // no jitter here
+    attempt += 1;
+    if (attempt > 6) return; // a demo, not forever
+    console.log(`client: closed (${event.code}), retry in ${delay} ms`);
+    setTimeout(connect, delay);
+  };
+}
+connect();
+setTimeout(() => wss.close(), 1500); // tidy up
+```
+
+</CodeExample>
+
+In the [Real-time and Resilience](/learn/javascript/real-time-and-resilience) lesson we used **full jitter** (wait a random time between 0 and the backoff). We use **equal jitter**: between **half** of the backoff and all of it. Full jitter spreads the herd a little better, but can retry after 0 ms; equal jitter guarantees each retry waits at least half the schedule, which is kinder to a struggling server and makes the client's behaviour easier to reason about. The preview uses tiny numbers (100 ms, capped at 1 s) so you don't wait; production would start around 1 second and cap at 30.
+
+Here's what **not** to do. This little page runs a server and a client that always retries after 500 ms. Drop the connection, then stop the server and watch the client knock on a closed door twice a second, forever. Now imagine 20,000 of them:
+
+<TryIt
+  language="react"
+  code={`import { useState, useEffect } from "react";
+import { createRoot } from "react-dom/client";
+import { WebSocketServer } from "ws";
+
+// ---- a tiny server (Node in real life) ----
+let wss;
+function startServer() {
+  wss = new WebSocketServer({ port: 4000 });
+  wss.on("connection", (socket) => {
+    socket.send(JSON.stringify({ type: "welcome" }));
+  });
+}
+function stopServer() {
+  for (const socket of wss.clients) socket.close(1001, "Restart");
+  wss.close();
+}
+const dropAll = () => {
+  for (const socket of wss.clients) socket.terminate();
+};
+startServer();
+
+// ---- the browser side: a naive reconnecting hook ----
+function useConnection(url) {
+  const [status, setStatus] = useState("connecting");
+  const [log, setLog] = useState([]);
+  const note = (text) => setLog((list) => [...list.slice(-5), text]);
+
+  useEffect(() => {
+    let socket;
+    let timer;
+    let stopped = false;
+    function connect() {
+      socket = new WebSocket(url);
+      socket.onopen = () => setStatus("online");
+      socket.onclose = (event) => {
+        if (stopped) return;
+        setStatus("reconnecting");
+        note(\`closed with \${event.code}, retrying in 500 ms\`);
+        timer = setTimeout(connect, 500); // always 500 ms: naive!
+      };
+    }
+    connect();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+      socket.close();
+    };
+  }, [url]);
+
+  return { status, log };
+}
+
+function App() {
+  const { status, log } = useConnection("ws://localhost:4000");
+  const [serverUp, setServerUp] = useState(true);
+  function toggleServer() {
+    if (serverUp) stopServer();
+    else startServer();
+    setServerUp(!serverUp);
+  }
+  return (
+    <main>
+      <p className={\`status \${status}\`}>Status: {status}</p>
+      <button onClick={dropAll}>Drop the connection</button>{" "}
+      <button onClick={toggleServer}>
+        {serverUp ? "Stop the server" : "Start the server"}
+      </button>
+      <ul>
+        {log.map((line, i) => (
+          <li key={i}>{line}</li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);`}
+/>
+
+## The useChat hook
+
+All the networking lives in one custom hook, `useChat({ token, room })`, which returns plain state for the components (`status`, `me`, `messages`, `members`, `typing`, `error`) and two functions (`sendMessage`, `sendTyping`). The components never touch a socket. Its skeleton:
+
+```jsx
+useEffect(() => {
+  let socket;
+  let attempt = 0;
+  let retryTimer;
+  let stopped = false; // set by the cleanup below
+
+  function connect() {
+    socket = new WebSocket(`${SERVER_URL}/?${params}`);
+    socketRef.current = socket; // for sendMessage()
+    socket.onopen = () => socket.send(join);
+    socket.onmessage = (event) => handle(JSON.parse(event.data));
+    socket.onclose = (event) => {
+      // stopped? 4001? otherwise: retry after backoffDelay(attempt)
+    };
+  }
+
+  connect();
+  return () => {
+    stopped = true;            // no reconnecting after unmount
+    clearTimeout(retryTimer);
+    socket.close();
+  };
+}, [token, room]);
+```
+
+Why it's built this way:
+
+- **The effect owns the socket's whole life.** It connects, reconnects and, in the cleanup, closes. When the component unmounts (or `room` changes), the cleanup sets `stopped`, so the `close` that it causes doesn't trigger a reconnect. Forgetting this is the classic "zombie socket" bug: a chat you left keeps reconnecting in the background.
+- **Mutable connection details live in the effect's closure**, not in React state: `attempt`, `retryTimer` and `socket` change without needing a re-render. The current socket is also kept in a **ref** so that `sendMessage`, which runs outside the effect, can reach it.
+- **Updates use the function form**, `setMessages((list) => [...list, msg.message])`. The `onmessage` handler was created once, when the effect ran; with `setMessages([...messages, ...])` it would see the `messages` of that first render forever (a **stale closure**) and lose messages.
+- **Rejoining catches up.** After a reconnect, the client sends `join` again and the server answers with `members` and recent `history`. The client **replaces** its list with that history instead of appending to it, so it gets the messages it missed while offline, with no duplicates. That's the "history on (re)join" decision from Part 1's design doc, paying off.
+
+## Typing indicators, cheaply
+
+"Bo is typing…" looks trivial, and it's a nice little performance problem. Every keystroke could send a `typing` event to 25 people: a fast typist would generate hundreds of messages a minute that nobody needs. So both ends are careful:
+
+- **The sender throttles.** `sendTyping()` sends at most one `typing` event per second (`TYPING_EVERY`), however fast you type: the throttle from the [Fast Code in the Browser](/learn/javascript/fast-code-in-the-browser) lesson, done with a timestamp in a ref.
+- **The receiver expires.** There's no "stopped typing" message (it would get lost when someone closes the tab anyway). Each `typing` event (re)starts a timer for that user; when it runs out after `TYPING_MS`, or when their message arrives, they're removed from the list. The timers are kept in a `Map` by user id and cleared in the effect's cleanup, so none fire after unmount.
+
+## Shipping it
+
+The code is done. Running it for thousands of people is a different job, and it's mostly about the things **between** the code: servers, load balancers, deploys and monitoring. Here's the plan, as you'd put it in the second half of the design doc.
+
+### Many servers: pub/sub with Redis
+
+One Node process holds tens of thousands of sockets, but we want at least two, for redundancy and for deploys without downtime. Then Mei may be connected to server A and Bo to server B, and the service on A has never heard of Bo. Our design makes the fix surprisingly small, because **every** delivery already goes through the service's events. We publish those events to **Redis pub/sub**, and each server forwards what it receives to its own sockets:
+
+```js
+import { createClient } from "redis"; // npm install redis
+
+const pub = createClient({ url: process.env.REDIS_URL });
+const sub = pub.duplicate();
+await Promise.all([pub.connect(), sub.connect()]);
+
+// 1. Local events go to every server (including this one)...
+service.subscribe((event) => {
+  pub.publish("chat-events", JSON.stringify(event));
+});
+
+// 2. ...and every server delivers them to its own sockets.
+await sub.subscribe("chat-events", (raw) => {
+  deliverToLocalSockets(JSON.parse(raw)); // the broadcast loop
+});
+```
+
+`createChatServer` changes in one place: its broadcast loop listens to the Redis subscription instead of the service directly. But in-memory state has to move too, and the design doc should say where:
+
+| State | Today (one process) | With many servers |
+| --- | --- | --- |
+| Messages | an array per room, 200 kept | PostgreSQL, through a repository with the same methods |
+| Room members | a `Map` per room | a Redis set per room (`SADD room:general u1`), with a count per user for several tabs |
+| Rate limits | a token bucket per user | in Redis, updated atomically by a small Lua script |
+| Sockets | `wss.clients` | stay local: a socket can only live in one process |
+
+For very large systems, one `chat-events` channel becomes a bottleneck (every server receives every event); channels per room, or a log like Kafka or NATS JetStream, fix that. You don't need them at 8,000 deliveries a second.
+
+### Load balancers and sticky sessions
+
+The load balancer must pass the WebSocket **upgrade** through and must not cut idle connections after its usual 60 seconds:
+
+```nginx
+location /chat {
+  proxy_pass http://pandachat_servers;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_read_timeout 1h;    # our heartbeat keeps it busy anyway
+}
+```
+
+**Sticky sessions** (sending a client to the same server every time) aren't needed for plain WebSockets: a connection stays on its server for its whole life. And because our reconnect rejoins and reloads history, a client that lands on a **different** server after a reconnect simply carries on. That's a design that can lose any server at any moment, which is exactly what deploys and autoscaling do. (Libraries that fall back to long polling, like Socket.IO, *do* need sticky sessions, because each poll is a separate HTTP request.)
+
+### Graceful shutdown and health checks
+
+Platforms like Kubernetes, Fly.io or Render stop a container by sending **SIGTERM**, waiting a while, then killing it. Used well, that pause makes deploys invisible:
+
+```js
+// server.js (Node)
+let ready = true;
+app.get("/health/live", (req, res) => res.sendStatus(200));
+app.get("/health/ready", async (req, res) => {
+  const ok = ready && (await pub.ping()) === "PONG";
+  res.sendStatus(ok ? 200 : 503);
+});
+
+process.on("SIGTERM", () => {
+  ready = false;              // 1. the LB stops sending new clients
+  clearInterval(heartbeat);
+  setTimeout(() => {
+    chat.close();             // 2. 1001 to everyone: they reconnect
+    httpServer.close(() => process.exit(0)); //  elsewhere, jittered
+  }, 5_000);
+  setTimeout(() => process.exit(1), 25_000).unref(); // 3. never hang
+});
+```
+
+**Liveness** says "the process works" (restart it if not); **readiness** says "send me traffic" (it turns false during shutdown, or when Redis is unreachable). The short pause before closing gives the load balancer time to notice. Thanks to backoff with jitter, the 1001 doesn't cause a stampede on the remaining servers. Roll servers out one at a time, and only 1/N of your users reconnect at once.
+
+### Docker and CI
+
+The server ships as a small, non-root image, and CI runs the tests from Parts 1 and 2 on every pull request:
+
+```dockerfile
+FROM node:24-alpine
+ENV NODE_ENV=production
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY src/ ./src/
+USER node
+EXPOSE 8080
+HEALTHCHECK CMD wget -qO- http://localhost:8080/health/live || exit 1
+CMD ["node", "src/server.js"]
+```
+
+```yaml
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npx vitest run          # the core and server tests
+      - run: npm audit --audit-level=high
+      - run: docker build -t pandachat:${{ github.sha }} .
+```
+
+The client is a static Vite build (`npm run build`) served from a CDN with hashed, `immutable` file names, as in the [Bundling and Caching](/learn/javascript/bundling-and-caching) lesson. Its WebSocket URL comes from build-time config (`VITE_CHAT_URL`), which is fine because it's not a secret; the **ticket** endpoint, behind the session cookie, is what protects the connection.
+
+### Observability
+
+Before launch, decide what "working" means in numbers, and make sure you can see them:
+
+| Signal | Metric | Why |
+| --- | --- | --- |
+| Load | open connections per server (a gauge) | capacity planning, uneven balancing |
+| Traffic | messages in/s and deliveries out/s | the fan-out from the design doc |
+| Latency | time from receiving a message to sending it on (p50, p99) | the 200 ms requirement |
+| Errors | error replies by `code`, `internal` errors | `rate_limited` spikes = abuse or a buggy client |
+| Churn | connects and heartbeat terminations per minute | a reconnect storm, or a network problem |
+| Client side | time to reconnect, reported by the browser | what users actually feel |
+
+With `prom-client` in Node, a gauge and a histogram are a few lines (`new Gauge({ name: "chat_connections", ... })`, `connections.inc()` on connect, `.dec()` on close). Then the capacity maths, using the numbers from Part 1:
+
+<CodeExample output={`no backoff: 200,000 connections/s
+with jitter: 40,000 connections/s
+spread over 10 s: 2,000 connections/s
+servers for 1.5x the peak, plus a spare: 4`}>
+
+```js
+const clients = 20_000;          // connected to one server
+const fmt = (n) => Math.round(n).toLocaleString("en-US");
+
+// A deploy restarts the server: everyone reconnects.
+// Retrying at once, they all arrive within ~100 ms:
+console.log(`no backoff: ${fmt(clients / 0.1)} connections/s`);
+
+// With jitter, the first retry is spread over 0.5-1 s
+// (base 1000 ms in production), so the peak is about:
+console.log(`with jitter: ${fmt(clients / 0.5)} connections/s`);
+
+// A bigger first delay (or the server telling clients when
+// to come back) can spread them over 10 s:
+console.log(`spread over 10 s: ${fmt(clients / 10)} connections/s`);
+
+// How many servers? Keep each one well below its limit,
+// and add one spare so a deploy or a crash still fits:
+const perServer = 10_000;        // what a load test showed is safe
+const servers = Math.ceil(clients * 1.5 / perServer) + 1;
+console.log(`servers for 1.5x the peak, plus a spare: ${servers}`);
+```
+
+</CodeExample>
+
+Even with jitter, a server restart means tens of thousands of new connections per second for a moment, each one authenticating and loading history. That's why the load test should include a **reconnect storm** (kill a server under load, watch the others), not just steady traffic.
+
+### The launch checklist
+
+| Area | Check |
+| --- | --- |
+| Protocol | every message validated; `maxPayload` set; unknown types and bad JSON answered, never thrown |
+| Security | `wss://` only; single-use tickets; `Origin` checked; no user ids trusted from clients; rate limits on messages **and** on connections per IP |
+| Reliability | heartbeat on; graceful shutdown tested; at least two servers; Redis and the database have backups and alerts |
+| Clients | backoff with jitter; no retries on 4001; rejoin reloads history; zombie sockets impossible (cleanup) |
+| Observability | connections, fan-out, latency, error codes and churn on a dashboard; alerts on p99 latency and error rate |
+| Delivery | CI runs tests and an audit; images tagged with the commit; deploys roll one server at a time |
+
+<Callout type="tip" title="Rehearse the bad day">
+
+Before launch, break things on purpose in staging: kill a server under load, restart Redis, deploy during a load test, disconnect a laptop's Wi-Fi for a minute. Each rehearsal either proves the design works or finds a bug while it's cheap. Afterwards, write down what you learned (blameless, as in the [Code Review and Leadership](/learn/javascript/code-review-and-leadership) lesson) and add it to the checklist.
+
+</Callout>
+
+<Quiz
+  question="PandaChat runs on two servers behind a load balancer, without Redis. Mei (on server A) and Bo (on server B) both join #general. What happens when Mei sends a message?"
+  options={[
+    "Both see it, because the load balancer copies messages between servers",
+    "Only the people connected to server A see it: B's chat service never hears about it, so Bo doesn't get it",
+    "The message is lost for everyone",
+    "Server B rejects Mei's message because she isn't its member",
+  ]}
+  answer={1}
+  explanation="Each process only knows its own sockets and its own in-memory rooms. A message posted on A is emitted to A's listeners only. Publishing events to a shared channel (Redis pub/sub) lets every server deliver them to its own sockets, which is why the design routes every delivery through events."
+/>
+
+<Exercise
+  title="Build it: The finished chat"
+  language="react"
+  html={`<style>
+  main { max-width: 560px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  .status { margin: 0; font-size: 14px; color: #a1a1c2; }
+  .status::before { content: "● "; }
+  .status.online::before { color: #4ade80; }
+  .status.connecting::before, .status.reconnecting::before { color: #facc15; }
+  .status.unauthorized::before { color: #f87171; }
+  .layout { display: grid; grid-template-columns: 1fr 110px; gap: 10px; }
+  .messages { height: 220px; overflow-y: auto; margin: 0; padding: 8px; list-style: none; border-radius: 10px; background: #ffffff0d; }
+  .messages li { padding: 3px 0; }
+  .messages li.mine strong { color: #c4b5fd; }
+  .members { margin: 0; padding: 8px; list-style: none; font-size: 14px; border-radius: 10px; background: #ffffff08; }
+  .members li::before { content: "🟢 "; font-size: 10px; }
+  .typing { min-height: 1.5em; margin: 4px 0; font-size: 14px; color: #a1a1c2; font-style: italic; }
+  .error { margin: 4px 0; color: #fca5a5; font-size: 14px; }
+  .send { display: flex; gap: 8px; }
+  .send input { flex: 1; }
+  .send button:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+<div id="root"></div>`}
+  starter={`import { useState, useEffect, useRef } from "react";
+import { createRoot } from "react-dom/client";
+import { WebSocketServer } from "ws";
+
+// ============ the server: Parts 1 and 2 ============
+// (unchanged; their tests stay in the test files)
+
+// ---------- errors ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- time ----------
+
+/** A clock for tests: time only moves when a test says so. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- the chat service ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // characters per message
+  keep: 200, // messages kept per room
+  burst: 5, // messages in a quick burst...
+  perSecond: 1, // ...then one per second
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // name -> { members, messages }
+  const buckets = new Map(); // user id -> token bucket
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "Room names use a-z, 0-9 and -, up to 30 characters",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", \`Join \${name} first\`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) return false;
+    room.members.delete(userId);
+    emit({
+      type: "presence",
+      room: name,
+      action: "leave",
+      user,
+      members: members(name),
+    });
+    return true;
+  }
+
+  function leaveAll(userId) {
+    const left = [];
+    for (const name of rooms.keys()) {
+      if (leave(name, userId)) left.push(name);
+    }
+    return left;
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", \`Join \${name} first\`);
+    }
+    const clean = typeof text === "string" ? text.trim() : "";
+    if (clean.length < 1 || clean.length > config.maxLength) {
+      throw new ChatError(
+        "invalid_text",
+        \`Messages have 1 to \${config.maxLength} characters\`,
+      );
+    }
+    if (!bucketFor(userId).take()) {
+      throw new ChatError("rate_limited", "Slow down a little");
+    }
+    const message = {
+      id: newId(),
+      room: name,
+      user,
+      text: clean,
+      at: clock(),
+    };
+    room.messages.push(message);
+    if (room.messages.length > config.keep) room.messages.shift();
+    emit({ type: "message", room: name, message });
+    return message;
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    const messages = rooms.get(name)?.messages ?? [];
+    const size = Number.isInteger(limit)
+      ? Math.min(Math.max(limit, 1), 100)
+      : 50;
+    let end = messages.length;
+    if (before !== undefined) {
+      end = messages.findIndex((m) => m.id === before);
+      if (end === -1) return []; // unknown, or too old to keep
+    }
+    return messages.slice(Math.max(0, end - size), end);
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- the realtime server ----------
+
+function send(socket, message) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function createChatServer({ port, service, authenticate }) {
+  // maxPayload: refuse frames bigger than 16 KB (a chat message
+  // is at most 500 characters, so anything bigger is abuse)
+  const wss = new WebSocketServer({ port, maxPayload: 16 * 1024 });
+
+  // Every event from the service goes to the sockets in its room.
+  const unsubscribe = service.subscribe((event) => {
+    for (const socket of wss.clients) {
+      if (!socket.rooms?.has(event.room)) continue;
+      const own = socket.user.id === event.user?.id;
+      if (event.type === "typing" && own) continue;
+      send(socket, event);
+    }
+  });
+
+  wss.on("connection", (socket, req) => {
+    const url = new URL(req.url, "http://localhost");
+    const user = authenticate(url.searchParams.get("token"));
+    if (!user) {
+      socket.close(4001, "Unauthorized");
+      return;
+    }
+    socket.user = user;
+    socket.rooms = new Set();
+    socket.isAlive = true;
+    socket.on("pong", () => {
+      socket.isAlive = true;
+    });
+    socket.on("message", (data) => handle(socket, data));
+    socket.on("close", () => {
+      socket.rooms.clear();
+      service.leaveAll(user.id);
+    });
+    send(socket, { type: "welcome", user });
+  });
+
+  function handle(socket, data) {
+    let msg;
+    try {
+      msg = JSON.parse(String(data));
+    } catch {
+      send(socket, {
+        type: "error",
+        code: "bad_json",
+        message: "Messages must be JSON",
+      });
+      return;
+    }
+    try {
+      route(socket, msg);
+    } catch (error) {
+      const known = error instanceof ChatError;
+      if (!known) console.error("Unexpected:", error.message);
+      send(socket, {
+        type: "error",
+        code: known ? error.code : "internal",
+        message: known ? error.message : "Something went wrong",
+      });
+    }
+  }
+
+  function route(socket, msg) {
+    const { user, rooms } = socket;
+    switch (msg?.type) {
+      case "join": {
+        const joined = service.join(msg.room, user);
+        rooms.add(msg.room);
+        send(socket, { type: "joined", ...joined });
+        break;
+      }
+      case "leave":
+        rooms.delete(msg.room);
+        service.leave(msg.room, user.id);
+        send(socket, { type: "left", room: msg.room });
+        break;
+      case "message":
+        service.postMessage(msg.room, user.id, msg.text);
+        break;
+      case "typing":
+        service.typing(msg.room, user.id);
+        break;
+      case "history": {
+        if (!rooms.has(msg.room)) {
+          throw new ChatError("not_member", \`Join \${msg.room} first\`);
+        }
+        const messages = service.history(msg.room, {
+          before: msg.before,
+          limit: msg.limit,
+        });
+        send(socket, { type: "history", room: msg.room, messages });
+        break;
+      }
+      default:
+        throw new ChatError(
+          "unknown_type",
+          \`Unknown message type: \${msg?.type}\`,
+        );
+    }
+  }
+
+  // A real interval calls this every 30 s (see the lesson).
+  function sweep() {
+    for (const socket of wss.clients) {
+      if (!socket.isAlive) {
+        socket.terminate();
+        continue;
+      }
+      socket.isAlive = false;
+      socket.ping();
+    }
+  }
+
+  function close() {
+    unsubscribe();
+    for (const socket of wss.clients) {
+      socket.close(1001, "Server shutting down");
+    }
+    wss.close();
+  }
+
+  return { wss, sweep, close };
+}
+
+const TOKENS = new Map([
+  ["mei-token", { id: "u1", name: "Mei" }],
+  ["bo-token", { id: "u2", name: "Bo" }],
+  ["kai-token", { id: "u3", name: "Kai" }],
+]);
+const service = createChatService();
+const chat = createChatServer({
+  port: 4000,
+  service,
+  authenticate: (token) => TOKENS.get(token) ?? null,
+});
+
+// ================= the client =================
+
+const SERVER_URL = "ws://localhost:4000";
+const RETRY = { base: 100, max: 1000 }; // ms; production: 1000 / 30000
+const TYPING_MS = 1000; // how long "is typing" stays up
+const TYPING_EVERY = 1000; // send "typing" at most this often
+
+/** Exponential backoff with "equal jitter". */
+function backoffDelay(attempt, random = Math.random) {
+  // TODO 1: double RETRY.base for every attempt, but never more
+  // than RETRY.max; then wait between half of that and all of it
+  return 0;
+}
+
+function useChat({ token, room }) {
+  const [status, setStatus] = useState("connecting");
+  const [me, setMe] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [typing, setTyping] = useState([]);
+  const [error, setError] = useState("");
+  const socketRef = useRef(null);
+  const lastTypingRef = useRef(0);
+
+  useEffect(() => {
+    let socket;
+    let attempt = 0;
+    let retryTimer;
+    let stopped = false;
+    const typingTimers = new Map();
+
+    function stopTyping(user) {
+      clearTimeout(typingTimers.get(user.id));
+      typingTimers.delete(user.id);
+      setTyping((list) => list.filter((u) => u.id !== user.id));
+    }
+
+    function handle(msg) {
+      switch (msg.type) {
+        case "welcome":
+          setMe(msg.user);
+          break;
+        case "joined":
+          attempt = 0;
+          setStatus("online");
+          setMembers(msg.members);
+          setMessages(msg.history);
+          break;
+        case "message":
+          setMessages((list) => [...list, msg.message]);
+          stopTyping(msg.message.user);
+          break;
+        // TODO 3: "presence" (new members list) and "typing" (add
+        // the user once; remove them after TYPING_MS, starting
+        // the timer again if they type again)
+        case "error":
+          setError(msg.message);
+          break;
+      }
+    }
+
+    function connect() {
+      const params = new URLSearchParams({ token });
+      socket = new WebSocket(\`\${SERVER_URL}/?\${params}\`);
+      socketRef.current = socket;
+      socket.onopen = () => {
+        socket.send(JSON.stringify({ type: "join", room }));
+      };
+      socket.onmessage = (event) => handle(JSON.parse(event.data));
+      socket.onclose = (event) => {
+        socketRef.current = null;
+        // TODO 2: do nothing if the component is gone (stopped).
+        // Code 4001: show "unauthorized" and give up. Otherwise
+        // show "reconnecting" and connect() again after
+        // backoffDelay(attempt) ms, counting the attempt.
+      };
+    }
+
+    connect();
+    return () => {
+      stopped = true;
+      clearTimeout(retryTimer);
+      for (const timer of typingTimers.values()) clearTimeout(timer);
+      socket.close();
+    };
+  }, [token, room]);
+
+  function send(type, data = {}) {
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ type, room, ...data }));
+    return true;
+  }
+
+  function sendMessage(text) {
+    setError("");
+    return send("message", { text });
+  }
+  function sendTyping() {
+    // TODO 4: send "typing", at most once every TYPING_EVERY ms
+    // (remember when you last sent it in lastTypingRef)
+  }
+
+  return {
+    status, me, messages, members, typing, error,
+    sendMessage, sendTyping,
+  };
+}
+
+// ---------- components ----------
+
+const STATUS_TEXT = {
+  connecting: "Connecting…",
+  online: "Online",
+  reconnecting: "Reconnecting…",
+  unauthorized: "Please sign in again",
+};
+
+function StatusBar({ status, me }) {
+  const who = status === "online" && me ? \` as \${me.name}\` : "";
+  return (
+    <p className={\`status \${status}\`}>
+      {STATUS_TEXT[status]}
+      {who}
+    </p>
+  );
+}
+
+function MemberList({ members }) {
+  return (
+    <ul className="members">
+      {members.map((user) => (
+        <li key={user.id}>{user.name}</li>
+      ))}
+    </ul>
+  );
+}
+
+function MessageList({ messages, me }) {
+  const listRef = useRef(null);
+  useEffect(() => {
+    const list = listRef.current; // keep the newest message in view
+    list.scrollTop = list.scrollHeight;
+  }, [messages]);
+  return (
+    <ul className="messages" ref={listRef}>
+      {messages.map((m) => (
+        <li key={m.id} className={m.user.id === me?.id ? "mine" : ""}>
+          <strong>{m.user.name}:</strong> {m.text}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function TypingIndicator({ users }) {
+  // TODO 5: "Bo is typing…" or "Bo and Kai are typing…"
+  return <p className="typing" />;
+}
+
+function SendForm({ disabled, onSend, onTyping }) {
+  const [text, setText] = useState("");
+  function handleSubmit(event) {
+    event.preventDefault();
+    if (!text.trim()) return;
+    if (onSend(text.trim())) setText("");
+  }
+  return (
+    <form className="send" onSubmit={handleSubmit}>
+      <input
+        name="text"
+        value={text}
+        placeholder="Say something nice"
+        autoComplete="off"
+        onChange={(event) => {
+          setText(event.target.value);
+          onTyping();
+        }}
+      />
+      <button disabled={disabled}>Send</button>
+    </form>
+  );
+}
+
+function App({ token = "mei-token", room = "general" }) {
+  const chat = useChat({ token, room });
+  return (
+    <main>
+      <header>
+        <h1># {room}</h1>
+        <StatusBar status={chat.status} me={chat.me} />
+      </header>
+      <div className="layout">
+        <MessageList messages={chat.messages} me={chat.me} />
+        <MemberList members={chat.members} />
+      </div>
+      <TypingIndicator users={chat.typing} />
+      {chat.error && <p className="error">{chat.error}</p>}
+      <SendForm
+        disabled={chat.status !== "online"}
+        onSend={chat.sendMessage}
+        onTyping={chat.sendTyping}
+      />
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);`}
+  tests={[
+    { name: "1 online", check: `(await __waitFor(() => document.querySelector('.status')?.classList.contains('online'), 600), document.querySelector('.status').textContent === 'Online as Mei' && [...document.querySelectorAll('.members li')].map((li) => li.textContent).join() === 'Mei' && service.members('general').map((u) => u.name).join() === 'Mei')` },
+    { name: "2 send", check: `(await __type('input[name=text]', '  Hello, pandas!  '), await __click('form.send button'), await __waitFor(() => document.querySelectorAll('.messages li').length === 1, 600), document.querySelector('.messages li').textContent === 'Mei: Hello, pandas!' && document.querySelector('.messages li').className === 'mine' && document.querySelector('input[name=text]').value === '' && service.history('general').length === 1)` },
+    { name: "3 bo joins", check: `(window.bo = new WebSocket('ws://localhost:4000/?token=bo-token'), window.boInbox = [], bo.onmessage = (e) => boInbox.push(JSON.parse(e.data)), await __waitFor(() => bo.readyState === 1, 600), bo.send(JSON.stringify({ type: 'join', room: 'general' })), await __waitFor(() => document.querySelectorAll('.members li').length === 2, 600), [...document.querySelectorAll('.members li')].map((li) => li.textContent).join() === 'Mei,Bo')` },
+    { name: "4 typing then message", check: `(bo.send(JSON.stringify({ type: 'typing', room: 'general' })), await __waitFor(() => document.querySelector('.typing')?.textContent === 'Bo is typing…', 600)) && (bo.send(JSON.stringify({ type: 'message', room: 'general', text: 'Hi Mei!' })), await __waitFor(() => [...document.querySelectorAll('.messages li')].some((li) => li.textContent === 'Bo: Hi Mei!' && li.className === ''), 600)) && !document.querySelector('.typing')?.textContent` },
+    { name: "5 typing times out", check: `(bo.send(JSON.stringify({ type: 'typing', room: 'general' })), await __waitFor(() => document.querySelector('.typing')?.textContent === 'Bo is typing…', 600)) && await __waitFor(() => !document.querySelector('.typing')?.textContent, 2000)` },
+    { name: "6 typing throttled", check: `(boInbox.length = 0, await __type('input[name=text]', 'W'), await __type('input[name=text]', 'Wh'), await __type('input[name=text]', 'Wha'), await __type('input[name=text]', 'What'), await __type('input[name=text]', ''), await __waitFor(() => boInbox.some((m) => m.type === 'typing'), 600), [1, 2].includes(boInbox.filter((m) => m.type === 'typing' && m.user.name === 'Mei').length))` },
+    { name: "7 reconnect + catch up", check: `(boInbox.length = 0, [...chat.wss.clients].filter((s) => s.user?.id === 'u1').forEach((s) => s.terminate()), await __waitFor(() => boInbox.some((m) => m.type === 'presence' && m.action === 'leave'), 600), bo.send(JSON.stringify({ type: 'message', room: 'general', text: 'Did you miss me?' })), await __waitFor(() => document.querySelector('.status')?.classList.contains('online') && [...document.querySelectorAll('.messages li')].some((li) => li.textContent === 'Bo: Did you miss me?'), 600)) && [...document.querySelectorAll('.messages li')].map((li) => li.textContent).join('|') === 'Mei: Hello, pandas!|Bo: Hi Mei!|Bo: Did you miss me?' && boInbox.some((m) => m.type === 'presence' && m.action === 'join' && m.user.name === 'Mei')` },
+    { name: "8 backoff while down", check: `await (async () => { const Real = window.WebSocket; let attempts = 0; window.WebSocket = class extends Real { constructor(...args) { super(...args); attempts++; } }; try { chat.close(); const down = await __waitFor(() => document.querySelector('.status')?.classList.contains('reconnecting'), 600); if (!down) return false; const text = document.querySelector('.status').textContent; const disabled = document.querySelector('form.send button').disabled; await new Promise((r) => setTimeout(r, 800)); const tries = attempts; const stillDown = document.querySelector('.status').classList.contains('reconnecting'); window.chat2 = createChatServer({ port: 4000, service, authenticate: (t) => TOKENS.get(t) ?? null }); const back = await __waitFor(() => document.querySelector('.status')?.classList.contains('online'), 2000); return down && text === 'Reconnecting…' && disabled && stillDown && tries >= 2 && tries <= 6 && back && !document.querySelector('form.send button').disabled; } finally { window.WebSocket = Real; } })()` },
+    { name: "9 bad token", check: `await (async () => { const Real = window.WebSocket; let attempts = 0; window.WebSocket = class extends Real { constructor(...args) { super(...args); attempts++; } }; const el = document.createElement('div'); document.body.append(el); const root = require('react-dom/client').createRoot(el); try { root.render(require('react').createElement(App, { token: 'nope' })); const shown = await __waitFor(() => el.querySelector('.status')?.textContent === 'Please sign in again', 600); await new Promise((r) => setTimeout(r, 300)); return shown && attempts === 1 && el.querySelector('form.send button').disabled; } finally { window.WebSocket = Real; root.unmount(); el.remove(); } })()` },
+    { name: "10 unmount", check: `await (async () => { const el = document.createElement('div'); document.body.append(el); const root = require('react-dom/client').createRoot(el); root.render(require('react').createElement(App, { token: 'kai-token' })); const online = await __waitFor(() => el.querySelector('.status.online'), 600); const inRoom = service.members('general').some((u) => u.name === 'Kai'); root.unmount(); el.remove(); const gone = await __waitFor(() => !service.members('general').some((u) => u.name === 'Kai'), 600); await new Promise((r) => setTimeout(r, 400)); return online && inRoom && gone && !service.members('general').some((u) => u.name === 'Kai'); })()` },
+    { name: "11 rate limit error", check: `await (async () => { for (let i = 0; i < 8; i++) { await __type('input[name=text]', 'spam ' + i); await __click('form.send button'); } const shown = await __waitFor(() => document.querySelector('.error')?.textContent === 'Slow down a little', 600); return shown; })()` },
+    { name: "12 backoffDelay", check: `backoffDelay(0, () => 1) === 100 && backoffDelay(0, () => 0) === 50 && backoffDelay(1, () => 1) === 200 && backoffDelay(2, () => 0.5) === 300 && backoffDelay(3, () => 1) === 800 && backoffDelay(4, () => 1) === 1000 && backoffDelay(20, () => 0) === 500 && backoffDelay(1) >= 100 && backoffDelay(1) <= 200` },
+  ]}
+>
+
+The whole of PandaChat is in the editor: the server from Parts 1 and 2 at the top, started on port 4000 with three users (`mei-token`, `bo-token` and `kai-token`), and the React client below it. The components and most of `useChat` are ready, and the app already connects and sends messages. Finish the client:
+
+1. **`backoffDelay(attempt, random = Math.random)`**: the ceiling is `RETRY.base * 2 ** attempt`, but at most `RETRY.max`; return `Math.round(ceiling / 2 + random() * ceiling / 2)` (equal jitter).
+2. **Reconnecting**, in `socket.onclose`: do nothing if `stopped` (the component is gone). For code `4001`, set the status to `"unauthorized"` and stop. Otherwise set `"reconnecting"` and call `connect` again after `backoffDelay(attempt)` ms (keep the timer in `retryTimer`), then add one to `attempt`. (`"joined"` already resets it to 0.)
+3. **`handle`**: a `"presence"` message replaces the members with `msg.members`. A `"typing"` message adds `msg.user` to `typing` (once, even if they keep typing) and starts a `TYPING_MS` timer that calls `stopTyping(user)`; a new `typing` from the same user restarts their timer (keep timers in `typingTimers` by user id).
+4. **`sendTyping()`**: send `"typing"` with `send("typing")`, but at most once every `TYPING_EVERY` ms: compare `Date.now()` with the time in `lastTypingRef.current`.
+5. **`TypingIndicator`**: a `<p className="typing">` with `"Bo is typing…"` for one user or `"Bo and Kai are typing…"` for more (names joined with `" and "`); an empty `<p className="typing" />` when nobody is.
+
+Press Run and say hello. The checks then connect as Bo to talk to you, typing and all, drop your connection, stop and restart the server, and render the app with other tokens.
+
+<Hint>
+
+`backoffDelay` is two lines: `const ceiling = Math.min(RETRY.max, RETRY.base * 2 ** attempt);` then the `return`. In `onclose`, the order is: `if (stopped) return;`, the 4001 check (with `return`), `setStatus("reconnecting")`, `retryTimer = setTimeout(connect, backoffDelay(attempt))`, `attempt += 1`. For typing: `clearTimeout(typingTimers.get(user.id))`, then `typingTimers.set(user.id, setTimeout(() => stopTyping(user), TYPING_MS))`, and `setTyping((list) => list.some((u) => u.id === user.id) ? list : [...list, user])`. In `sendTyping`, save `Date.now()` in `lastTypingRef.current` each time you send.
+
+</Hint>
+
+<Solution>
+
+```jsx
+import { useState, useEffect, useRef } from "react";
+import { createRoot } from "react-dom/client";
+import { WebSocketServer } from "ws";
+
+// ============ the server: Parts 1 and 2 ============
+// (unchanged; their tests stay in the test files)
+
+// ---------- errors ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- time ----------
+
+/** A clock for tests: time only moves when a test says so. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- the chat service ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // characters per message
+  keep: 200, // messages kept per room
+  burst: 5, // messages in a quick burst...
+  perSecond: 1, // ...then one per second
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // name -> { members, messages }
+  const buckets = new Map(); // user id -> token bucket
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "Room names use a-z, 0-9 and -, up to 30 characters",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Join ${name} first`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) return false;
+    room.members.delete(userId);
+    emit({
+      type: "presence",
+      room: name,
+      action: "leave",
+      user,
+      members: members(name),
+    });
+    return true;
+  }
+
+  function leaveAll(userId) {
+    const left = [];
+    for (const name of rooms.keys()) {
+      if (leave(name, userId)) left.push(name);
+    }
+    return left;
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Join ${name} first`);
+    }
+    const clean = typeof text === "string" ? text.trim() : "";
+    if (clean.length < 1 || clean.length > config.maxLength) {
+      throw new ChatError(
+        "invalid_text",
+        `Messages have 1 to ${config.maxLength} characters`,
+      );
+    }
+    if (!bucketFor(userId).take()) {
+      throw new ChatError("rate_limited", "Slow down a little");
+    }
+    const message = {
+      id: newId(),
+      room: name,
+      user,
+      text: clean,
+      at: clock(),
+    };
+    room.messages.push(message);
+    if (room.messages.length > config.keep) room.messages.shift();
+    emit({ type: "message", room: name, message });
+    return message;
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    const messages = rooms.get(name)?.messages ?? [];
+    const size = Number.isInteger(limit)
+      ? Math.min(Math.max(limit, 1), 100)
+      : 50;
+    let end = messages.length;
+    if (before !== undefined) {
+      end = messages.findIndex((m) => m.id === before);
+      if (end === -1) return []; // unknown, or too old to keep
+    }
+    return messages.slice(Math.max(0, end - size), end);
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- the realtime server ----------
+
+function send(socket, message) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function createChatServer({ port, service, authenticate }) {
+  // maxPayload: refuse frames bigger than 16 KB (a chat message
+  // is at most 500 characters, so anything bigger is abuse)
+  const wss = new WebSocketServer({ port, maxPayload: 16 * 1024 });
+
+  // Every event from the service goes to the sockets in its room.
+  const unsubscribe = service.subscribe((event) => {
+    for (const socket of wss.clients) {
+      if (!socket.rooms?.has(event.room)) continue;
+      const own = socket.user.id === event.user?.id;
+      if (event.type === "typing" && own) continue;
+      send(socket, event);
+    }
+  });
+
+  wss.on("connection", (socket, req) => {
+    const url = new URL(req.url, "http://localhost");
+    const user = authenticate(url.searchParams.get("token"));
+    if (!user) {
+      socket.close(4001, "Unauthorized");
+      return;
+    }
+    socket.user = user;
+    socket.rooms = new Set();
+    socket.isAlive = true;
+    socket.on("pong", () => {
+      socket.isAlive = true;
+    });
+    socket.on("message", (data) => handle(socket, data));
+    socket.on("close", () => {
+      socket.rooms.clear();
+      service.leaveAll(user.id);
+    });
+    send(socket, { type: "welcome", user });
+  });
+
+  function handle(socket, data) {
+    let msg;
+    try {
+      msg = JSON.parse(String(data));
+    } catch {
+      send(socket, {
+        type: "error",
+        code: "bad_json",
+        message: "Messages must be JSON",
+      });
+      return;
+    }
+    try {
+      route(socket, msg);
+    } catch (error) {
+      const known = error instanceof ChatError;
+      if (!known) console.error("Unexpected:", error.message);
+      send(socket, {
+        type: "error",
+        code: known ? error.code : "internal",
+        message: known ? error.message : "Something went wrong",
+      });
+    }
+  }
+
+  function route(socket, msg) {
+    const { user, rooms } = socket;
+    switch (msg?.type) {
+      case "join": {
+        const joined = service.join(msg.room, user);
+        rooms.add(msg.room);
+        send(socket, { type: "joined", ...joined });
+        break;
+      }
+      case "leave":
+        rooms.delete(msg.room);
+        service.leave(msg.room, user.id);
+        send(socket, { type: "left", room: msg.room });
+        break;
+      case "message":
+        service.postMessage(msg.room, user.id, msg.text);
+        break;
+      case "typing":
+        service.typing(msg.room, user.id);
+        break;
+      case "history": {
+        if (!rooms.has(msg.room)) {
+          throw new ChatError("not_member", `Join ${msg.room} first`);
+        }
+        const messages = service.history(msg.room, {
+          before: msg.before,
+          limit: msg.limit,
+        });
+        send(socket, { type: "history", room: msg.room, messages });
+        break;
+      }
+      default:
+        throw new ChatError(
+          "unknown_type",
+          `Unknown message type: ${msg?.type}`,
+        );
+    }
+  }
+
+  // A real interval calls this every 30 s (see the lesson).
+  function sweep() {
+    for (const socket of wss.clients) {
+      if (!socket.isAlive) {
+        socket.terminate();
+        continue;
+      }
+      socket.isAlive = false;
+      socket.ping();
+    }
+  }
+
+  function close() {
+    unsubscribe();
+    for (const socket of wss.clients) {
+      socket.close(1001, "Server shutting down");
+    }
+    wss.close();
+  }
+
+  return { wss, sweep, close };
+}
+
+const TOKENS = new Map([
+  ["mei-token", { id: "u1", name: "Mei" }],
+  ["bo-token", { id: "u2", name: "Bo" }],
+  ["kai-token", { id: "u3", name: "Kai" }],
+]);
+const service = createChatService();
+const chat = createChatServer({
+  port: 4000,
+  service,
+  authenticate: (token) => TOKENS.get(token) ?? null,
+});
+
+// ================= the client =================
+
+const SERVER_URL = "ws://localhost:4000";
+const RETRY = { base: 100, max: 1000 }; // ms; production: 1000 / 30000
+const TYPING_MS = 1000; // how long "is typing" stays up
+const TYPING_EVERY = 1000; // send "typing" at most this often
+
+/** Exponential backoff with "equal jitter". */
+function backoffDelay(attempt, random = Math.random) {
+  const ceiling = Math.min(RETRY.max, RETRY.base * 2 ** attempt);
+  return Math.round(ceiling / 2 + (random() * ceiling) / 2);
+}
+
+function useChat({ token, room }) {
+  const [status, setStatus] = useState("connecting");
+  const [me, setMe] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [typing, setTyping] = useState([]);
+  const [error, setError] = useState("");
+  const socketRef = useRef(null);
+  const lastTypingRef = useRef(0);
+
+  useEffect(() => {
+    let socket;
+    let attempt = 0;
+    let retryTimer;
+    let stopped = false;
+    const typingTimers = new Map();
+
+    function stopTyping(user) {
+      clearTimeout(typingTimers.get(user.id));
+      typingTimers.delete(user.id);
+      setTyping((list) => list.filter((u) => u.id !== user.id));
+    }
+
+    function handle(msg) {
+      switch (msg.type) {
+        case "welcome":
+          setMe(msg.user);
+          break;
+        case "joined":
+          attempt = 0;
+          setStatus("online");
+          setMembers(msg.members);
+          setMessages(msg.history);
+          break;
+        case "message":
+          setMessages((list) => [...list, msg.message]);
+          stopTyping(msg.message.user);
+          break;
+        case "presence":
+          setMembers(msg.members);
+          break;
+        case "typing": {
+          const { user } = msg;
+          clearTimeout(typingTimers.get(user.id));
+          const timer = setTimeout(() => stopTyping(user), TYPING_MS);
+          typingTimers.set(user.id, timer);
+          setTyping((list) =>
+            list.some((u) => u.id === user.id) ? list : [...list, user],
+          );
+          break;
+        }
+        case "error":
+          setError(msg.message);
+          break;
+      }
+    }
+
+    function connect() {
+      const params = new URLSearchParams({ token });
+      socket = new WebSocket(`${SERVER_URL}/?${params}`);
+      socketRef.current = socket;
+      socket.onopen = () => {
+        socket.send(JSON.stringify({ type: "join", room }));
+      };
+      socket.onmessage = (event) => handle(JSON.parse(event.data));
+      socket.onclose = (event) => {
+        socketRef.current = null;
+        if (stopped) return;
+        if (event.code === 4001) {
+          setStatus("unauthorized");
+          return;
+        }
+        setStatus("reconnecting");
+        retryTimer = setTimeout(connect, backoffDelay(attempt));
+        attempt += 1;
+      };
+    }
+
+    connect();
+    return () => {
+      stopped = true;
+      clearTimeout(retryTimer);
+      for (const timer of typingTimers.values()) clearTimeout(timer);
+      socket.close();
+    };
+  }, [token, room]);
+
+  function send(type, data = {}) {
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ type, room, ...data }));
+    return true;
+  }
+
+  function sendMessage(text) {
+    setError("");
+    return send("message", { text });
+  }
+  function sendTyping() {
+    const now = Date.now();
+    if (now - lastTypingRef.current < TYPING_EVERY) return;
+    lastTypingRef.current = now;
+    send("typing");
+  }
+
+  return {
+    status, me, messages, members, typing, error,
+    sendMessage, sendTyping,
+  };
+}
+
+// ---------- components ----------
+
+const STATUS_TEXT = {
+  connecting: "Connecting…",
+  online: "Online",
+  reconnecting: "Reconnecting…",
+  unauthorized: "Please sign in again",
+};
+
+function StatusBar({ status, me }) {
+  const who = status === "online" && me ? ` as ${me.name}` : "";
+  return (
+    <p className={`status ${status}`}>
+      {STATUS_TEXT[status]}
+      {who}
+    </p>
+  );
+}
+
+function MemberList({ members }) {
+  return (
+    <ul className="members">
+      {members.map((user) => (
+        <li key={user.id}>{user.name}</li>
+      ))}
+    </ul>
+  );
+}
+
+function MessageList({ messages, me }) {
+  const listRef = useRef(null);
+  useEffect(() => {
+    const list = listRef.current; // keep the newest message in view
+    list.scrollTop = list.scrollHeight;
+  }, [messages]);
+  return (
+    <ul className="messages" ref={listRef}>
+      {messages.map((m) => (
+        <li key={m.id} className={m.user.id === me?.id ? "mine" : ""}>
+          <strong>{m.user.name}:</strong> {m.text}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function TypingIndicator({ users }) {
+  if (users.length === 0) return <p className="typing" />;
+  const names = users.map((user) => user.name);
+  const who = names.join(" and ");
+  const verb = names.length === 1 ? "is" : "are";
+  return <p className="typing">{`${who} ${verb} typing…`}</p>;
+}
+
+function SendForm({ disabled, onSend, onTyping }) {
+  const [text, setText] = useState("");
+  function handleSubmit(event) {
+    event.preventDefault();
+    if (!text.trim()) return;
+    if (onSend(text.trim())) setText("");
+  }
+  return (
+    <form className="send" onSubmit={handleSubmit}>
+      <input
+        name="text"
+        value={text}
+        placeholder="Say something nice"
+        autoComplete="off"
+        onChange={(event) => {
+          setText(event.target.value);
+          onTyping();
+        }}
+      />
+      <button disabled={disabled}>Send</button>
+    </form>
+  );
+}
+
+function App({ token = "mei-token", room = "general" }) {
+  const chat = useChat({ token, room });
+  return (
+    <main>
+      <header>
+        <h1># {room}</h1>
+        <StatusBar status={chat.status} me={chat.me} />
+      </header>
+      <div className="layout">
+        <MessageList messages={chat.messages} me={chat.me} />
+        <MemberList members={chat.members} />
+      </div>
+      <TypingIndicator users={chat.typing} />
+      {chat.error && <p className="error">{chat.error}</p>}
+      <SendForm
+        disabled={chat.status !== "online"}
+        onSend={chat.sendMessage}
+        onTyping={chat.sendTyping}
+      />
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- A **React chat client** whose networking lives in one hook, `useChat`: a connection **state machine** (`connecting`, `online`, `reconnecting`, `unauthorized`), reconnects with **exponential backoff and equal jitter**, no retries on 4001, no zombie sockets after unmount, and a rejoin that **catches up** from history without duplicates.
+- **Typing indicators** that are throttled when sent and expire when received, and a send form that follows the connection state.
+- A **shipping plan**: Redis pub/sub for many servers and what state moves where, load-balancer settings for upgrades, graceful shutdown on SIGTERM with liveness and readiness checks, a non-root Docker image, CI, the metrics that matter, capacity and reconnect-storm maths, and a launch checklist.
+- And the finished platform: a tested core, a hardened WebSocket server and a resilient client, designed from a one-page doc to a launch plan.
+
+## Take it further
+
+PandaChat is a real foundation. Each of these teaches something new:
+
+1. **Go multi-server**: put the Redis pub/sub adapter in, move members and rate limits to Redis, and test it with two `createChatServer` instances in one test (sharing a fake bus object) before touching a real Redis.
+2. **Persist history**: a `MessageRepository` with the in-memory version and a PostgreSQL version passing the same contract tests, time-sortable ids (UUIDv7), and a "Load older" button in the client using the `history` message with `before`.
+3. **Several tabs per user**: count connections per user in the service, so closing one tab doesn't announce that Mei left while her other tab is still open.
+4. **Delivery you can trust**: let clients send a `clientId` with each message, show it as "sending…" until the echo arrives, resend after a reconnect, and have the server ignore duplicates (idempotency keys from the [Real-time and Resilience](/learn/javascript/real-time-and-resilience) lesson).
+5. **Private rooms and moderation**: only invited users may join, moderators can remove messages and mute users, and every decision is checked on the server.
+
+## Congratulations! 🎉🐼
+
+You've finished the **whole PandaDev JavaScript course**, all four levels. Think back to where you started: `console.log("Hello, World!")`, variables and your first `if`. Since then you've built a to-do app and a number-guessing game, worked with the DOM, written classes and modules, fetched data from APIs, tested with Vitest, built React apps and Express APIs, looked inside the engine and the event loop, hunted memory leaks, measured and optimised, secured APIs, designed architectures and systems, and now designed, built and planned the launch of a real-time platform from a blank page.
+
+That isn't a beginner's toolkit any more: it's the toolkit of a senior JavaScript engineer. The skills that matter most from here are the ones no course can finish for you: reading other people's code, shipping small things often, learning from every incident, and helping the people around you grow. Build something you care about, put it in front of real users, and keep going. We're proud of you. 💚

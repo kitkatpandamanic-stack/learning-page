@@ -1,0 +1,859 @@
+---
+title: Внедрение зависимостей и моделирование предметной области
+description: Внедряйте часы, fetch и логгеры через конструкторы и фабрики, связывайте всё в корне композиции, моделируйте домен объектами-значениями, сущностями, доменными событиями и конечными автоматами.
+duration: 25
+xp: 30
+---
+
+У одной команды биллинга был набор тестов, который падал в последний день каждого месяца — и только после 23:00 по Лондону. Утром воспроизвести это никто не мог, поэтому тест целый год считался «нестабильным». Причина: одна функция напрямую вызывала `new Date()`, и арифметика дат ломалась, когда «сегодня» по UTC уже было «завтра». Исправление заняло десять минут — как только кто-то сделал часы **внедряемыми** и написал тест ровно на этот момент. ⏰
+
+У этого урока две половины, которые связаны друг с другом. **Внедрение зависимостей (dependency injection)** делает код тестируемым и заменяемым: всё, что касается внешнего мира, передаётся снаружи. **Моделирование предметной области (domain modelling)** делает оставшийся код (ваши бизнес-правила) трудным для неправильного использования: значения, которые нельзя испортить, объекты, которые сами охраняют свои правила, события, которые сообщают о случившемся, и конечные автоматы, в которых невозможные состояния действительно невозможны.
+
+## Жёстко зашитые зависимости
+
+Вот типичный код до того, как кто-то задумался о его тестировании:
+
+```js
+// ❌ Жёстко зашито: сам тянется за всем подряд
+async function sendTrialReminders() {
+  const res = await fetch("https://api.example.com/users?trial=1");
+  const users = await res.json();
+  for (const user of users) {
+    const days = Math.ceil(
+      (new Date(user.trialEndsAt) - Date.now()) / 86_400_000,
+    );
+    if (days >= 0 && days <= 3) {
+      await fetch("https://mail.example.com/send", { /* ... */ });
+    }
+  }
+  console.log(`Reminders sent at ${new Date().toISOString()}`);
+}
+```
+
+Чтобы его протестировать, понадобились бы настоящий API пользователей, настоящий почтовый сервер и способ менять время. Случай «осталось 3 дня» не проверить, пока не дождёшься дня, когда у кого-то пробный период действительно закончится через 3 дня. Функция решает и **что** делать, и **как** общаться с миром, и разделить эти две части нельзя.
+
+Внедрять нужно не всё. Чистые помощники (функцию `formatPrice`, lodash) спокойно импортируйте. Внедряйте то, что **медленно, недетерминированно или имеет побочные эффекты**:
+
+- **Время**: `Date.now()`, `new Date()`, таймеры.
+- **Случайность и идентификаторы**: `Math.random()`, `crypto.randomUUID()`.
+- **Ввод-вывод**: `fetch`, базы данных, файлы, почта, очереди.
+- **Окружение**: конфигурация, `process.env`, фича-флаги.
+- **Вывод, который вы хотите проверять**: логгеры, метрики.
+
+## Внедрение через конструктор и фабрику
+
+**Внедрение зависимостей** (DI) означает просто: фрагмент кода **получает** своих помощников, а не создаёт и не импортирует их сам. У класса они приходят через **конструктор**, у фабричной функции — через объект параметров (в прошлом уроке вы так и делали: `createLoyalty({ accounts, rewards })`). Код зависит только от маленьких **портов**: часы — это «что угодно с `now()`», почтовик — «что угодно с `send(to, text)`»:
+
+<CodeExample output={`[ [ 'mei@pandadev.test', 'Пробный период закончится через 3 дн.' ] ]
+[ 'Отправлено напоминаний о пробном периоде: 1' ]`}>
+
+```js
+const DAY = 24 * 60 * 60 * 1000;
+
+class TrialReminders {
+  #users;
+  #clock;
+  #mailer;
+  #logger;
+
+  constructor({ users, clock, mailer, logger }) {
+    this.#users = users;
+    this.#clock = clock;
+    this.#mailer = mailer;
+    this.#logger = logger;
+  }
+
+  async run() {
+    const now = this.#clock.now();
+    let sent = 0;
+    for (const user of await this.#users.listTrials()) {
+      const days = Math.ceil((new Date(user.trialEndsAt) - now) / DAY);
+      if (days >= 0 && days <= 3) {
+        await this.#mailer.send(
+          user.email,
+          `Пробный период закончится через ${days} дн.`,
+        );
+        sent++;
+      }
+    }
+    this.#logger.info(`Отправлено напоминаний о пробном периоде: ${sent}`);
+    return sent;
+  }
+}
+
+// В тесте (или здесь): фейки для каждого порта
+const outbox = [];
+const logs = [];
+const reminders = new TrialReminders({
+  users: {
+    listTrials: async () => [
+      { email: "mei@pandadev.test", trialEndsAt: "2026-03-03T12:00Z" },
+      { email: "bao@pandadev.test", trialEndsAt: "2026-03-10T12:00Z" },
+      { email: "zoe@pandadev.test", trialEndsAt: "2026-02-27T12:00Z" },
+    ],
+  },
+  clock: { now: () => new Date("2026-03-01T09:00Z") },
+  mailer: { send: async (to, text) => void outbox.push([to, text]) },
+  logger: { info: (message) => logs.push(message) },
+});
+
+await reminders.run();
+console.log(outbox);
+console.log(logs);
+```
+
+</CodeExample>
+
+Часы заморожены на 1 марта, 09:00, поэтому случай «осталось 3 дня» проверяется уже сегодня — как и случай «последний день месяца, 23:00». В продакшене `main.js` создаёт класс с настоящими зависимостями: `{ now: () => new Date() }`, почтовиком, который обращается к вашему почтовому провайдеру, и настоящим логгером.
+
+Фабричная версия — та же идея без `this`: `function createTrialReminders({ users, clock, mailer, logger }) { return { async run() { … } }; }`. Используйте стиль, принятый в вашей кодовой базе: JavaScript-проекты тяготеют к фабрикам, проекты на NestJS и Angular — к классам.
+
+<Callout type="warning" title="Осторожно со значениями по умолчанию">
+
+Вариант `function createTrialReminders({ clock = systemClock } = {})` соблазнителен: продакшен-коду не нужно ничего передавать. Но тест, который забыл передать фейк, теперь молча использует **настоящие** часы (или настоящий почтовик, что ещё хуже). Делайте зависимости в ядре **обязательными**, а настоящие передавайте в одном месте — в корне композиции. Похожая ловушка в браузере: если сохранить настоящий `fetch` в объекте и вызвать его как `deps.fetch(url)`, Chrome выбросит `TypeError: Illegal invocation`, потому что `fetch` ожидает, что `this` — это `window`. Сначала деструктурируйте его (`const { fetch } = deps`) или передавайте `(...args) => fetch(...args)`.
+
+</Callout>
+
+## Корень композиции
+
+Если каждый фрагмент получает свои зависимости, кто-то должен их создать. Этот «кто-то» — **корень композиции (composition root)**: **одно** место, обычно `main.js` или `server.js`, где собираются и соединяются настоящие реализации. Это единственный файл, который знает: «мы используем PostgreSQL, SendGrid и Express». В Node на вашем компьютере это выглядит примерно так:
+
+```js
+// src/main.js: единственный файл, который знает настоящие реализации
+import pg from "pg";
+import { createPostgresAccounts } from "./loyalty/adapters/postgres-accounts.js";
+import { createLoyalty } from "./loyalty/use-cases/loyalty.js";
+import { createApp } from "./loyalty/adapters/http.js";
+import { createLogger } from "./shared/logger.js";
+
+const config = {
+  databaseUrl: process.env.DATABASE_URL,
+  port: Number(process.env.PORT ?? 3000),
+};
+
+const logger = createLogger({ level: "info" });
+const pool = new pg.Pool({ connectionString: config.databaseUrl });
+const clock = { now: () => new Date() };
+
+const loyalty = createLoyalty({
+  accounts: createPostgresAccounts(pool),
+  clock,
+  logger,
+});
+const app = createApp({ loyalty, logger });
+
+app.listen(config.port, () => logger.info(`Listening on ${config.port}`));
+```
+
+Удобная привычка — поместить связывание в функцию, которая принимает **переопределения (overrides)**, чтобы тесты и скрипты могли собрать тот же граф, заменив пару частей. Здесь настоящая версия обращается к встроенному практическому API PandaDev (он работает без интернета и всегда даёт одни и те же ответы; настоящие API работают так же), а тестовая подставляет фейковый источник погоды:
+
+<CodeExample output={`🧊 Reykjavik: ощущается как -2°C, одевайтесь теплее
+🌬️ Reykjavik: ветер 45 км/ч
+London: предупреждений нет
+---
+🧊 Testville: ощущается как -30°C, одевайтесь теплее`}>
+
+```js
+// --- сценарий использования: ничего не знает об HTTP ---
+function createWeatherAlerts({ weather, notify, coldBelow = 0 }) {
+  return {
+    async check(city) {
+      const now = await weather.current(city);
+      const alerts = [];
+      if (now.feelsLike < coldBelow) {
+        alerts.push(
+          `🧊 ${now.city}: ощущается как ${now.feelsLike}°C, одевайтесь теплее`,
+        );
+      }
+      if (now.windKph >= 40) {
+        alerts.push(`🌬️ ${now.city}: ветер ${now.windKph} км/ч`);
+      }
+      if (alerts.length === 0) alerts.push(`${now.city}: предупреждений нет`);
+      alerts.forEach(notify);
+    },
+  };
+}
+
+// --- адаптер: практический API ---
+function createWeatherClient({ fetch, baseUrl }) {
+  return {
+    async current(city) {
+      const url = `${baseUrl}/weather?city=${encodeURIComponent(city)}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Ошибка запроса погоды: ${res.status}`);
+      return res.json();
+    },
+  };
+}
+
+// --- корень композиции: настоящие части, которые можно переопределить ---
+function buildServices(overrides = {}) {
+  const config = { apiUrl: "https://api.pandadev.test", coldBelow: 0 };
+  const weather =
+    overrides.weather ??
+    createWeatherClient({ fetch, baseUrl: config.apiUrl });
+  const notify = overrides.notify ?? ((text) => console.log(text));
+  return {
+    alerts: createWeatherAlerts({
+      weather,
+      notify,
+      coldBelow: config.coldBelow,
+    }),
+  };
+}
+
+const { alerts } = buildServices();
+await alerts.check("Reykjavik");
+await alerts.check("London");
+
+console.log("---");
+const test = buildServices({
+  weather: {
+    current: async () => ({ city: "Testville", feelsLike: -30, windKph: 5 }),
+  },
+});
+await test.alerts.check("anywhere");
+```
+
+</CodeExample>
+
+Прочитайте корень композиции — и вы знаете всю архитектуру: какие адаптеры существуют и кто ими пользуется. Всё остальное остаётся тестируемым.
+
+## Нужен ли вам DI-контейнер?
+
+В Java и C# связыванием обычно занимается **DI-контейнер (DI container)**: вы регистрируете классы, а контейнер сам определяет порядок и всё создаёт. В JavaScript контейнеры тоже есть (InversifyJS, tsyringe, Awilix), а в некоторые фреймворки они встроены: **NestJS** и **Angular** автоматически внедряют параметры конструктора. Вот Awilix в Node-проекте:
+
+```js
+import { createContainer, asFunction, asValue } from "awilix";
+
+const container = createContainer();
+container.register({
+  clock: asValue({ now: () => new Date() }),
+  accounts: asFunction(createPostgresAccounts).singleton(),
+  loyalty: asFunction(createLoyalty).singleton(),
+});
+
+// Awilix видит, что createLoyalty нужны { accounts, clock }
+const loyalty = container.resolve("loyalty");
+```
+
+Большинству JavaScript-приложений он **не нужен**. Благодаря функциям и объектным литералам ручное связывание получается коротким, а `main.js` на 40 строк явный: «перейти к определению» работает, а пропущенная зависимость — очевидный `undefined`, а не ошибка контейнера при запуске. Контейнеры оправданы, когда на нём построен ваш фреймворк (NestJS, Angular), когда граф огромен или когда нужны **времена жизни (lifetimes)** вроде «один экземпляр на запрос». Но даже тогда то, что живёт в рамках запроса (текущий пользователь, транзакция базы данных), часто проще передавать обычными аргументами функций или создавать в middleware: `req.services = createRequestServices({ user: req.user })`.
+
+## Объекты-значения
+
+Теперь вторая половина: моделирование домена так, чтобы правила было трудно нарушить. **Объект-значение (value object)** определяется только своим значением: две купюры по £5 взаимозаменяемы, а «изменить» одну на самом деле значит сделать новую. Объекты-значения:
+
+- **Неизменяемы**: `Object.freeze(this)`, а каждая операция возвращает **новый** объект.
+- **Сравниваются по значению** методом `equals` (`===` сравнивает ссылки).
+- **Всегда корректны**: конструктор отвергает плохие значения, поэтому если у вас есть `Money`, то он правильный.
+
+Деньги — классический пример и заодно классический баг: числа с плавающей точкой не могут точно хранить `0.1`. Храните деньги в целых **минимальных единицах** (пенсах, центах):
+
+<CodeExample output={`0.30000000000000004
+0.30 GBP
+false true
+TypeError
+Нельзя сложить GBP и EUR
+Деньги хранятся в целых пенсах, получено 9.5`}>
+
+```js
+class Money {
+  constructor(pence, currency) {
+    if (!Number.isInteger(pence)) {
+      throw new TypeError(
+        `Деньги хранятся в целых пенсах, получено ${pence}`,
+      );
+    }
+    if (!/^[A-Z]{3}$/.test(currency)) {
+      throw new TypeError(`Неизвестная валюта: ${currency}`);
+    }
+    this.pence = pence;
+    this.currency = currency;
+    Object.freeze(this); // никто не сможет изменить его потом
+  }
+
+  static of(amount, currency) {
+    return new Money(Math.round(amount * 100), currency);
+  }
+
+  add(other) {
+    if (other.currency !== this.currency) {
+      throw new Error(`Нельзя сложить ${this.currency} и ${other.currency}`);
+    }
+    return new Money(this.pence + other.pence, this.currency);
+  }
+
+  times(factor) {
+    return new Money(Math.round(this.pence * factor), this.currency);
+  }
+
+  equals(other) {
+    return (
+      other instanceof Money &&
+      other.pence === this.pence &&
+      other.currency === this.currency
+    );
+  }
+
+  toString() {
+    return `${(this.pence / 100).toFixed(2)} ${this.currency}`;
+  }
+}
+
+console.log(0.1 + 0.2);
+const sum = Money.of(0.1, "GBP").add(Money.of(0.2, "GBP"));
+console.log(String(sum));
+console.log(sum === Money.of(0.3, "GBP"), sum.equals(Money.of(0.3, "GBP")));
+
+try {
+  sum.pence = 0; // строгий режим: присваивание замороженному объекту — ошибка
+} catch (error) {
+  console.log(error.name);
+}
+try {
+  sum.add(Money.of(1, "EUR"));
+} catch (error) {
+  console.log(error.message);
+}
+try {
+  new Money(9.5, "GBP");
+} catch (error) {
+  console.log(error.message);
+}
+```
+
+</CodeExample>
+
+Хорошие кандидаты в объекты-значения прячутся в любой кодовой базе под видом обычных строк и чисел: адреса электронной почты (обрезаны и приведены к нижнему регистру один раз, проверены один раз), диапазоны дат (начало раньше конца), количества, координаты, денежные суммы. Замена `price: 12.5` на `Money` убирает целую категорию багов. Два замечания: `Object.freeze` — **поверхностная** заморозка (замораживайте и вложенные объекты или делайте объекты-значения плоскими), а для отображения используйте `Intl.NumberFormat`, а не самодельное форматирование.
+
+## Сущности, инварианты и доменные события
+
+**Сущность (entity)** — противоположность: у неё есть **идентичность**, которая сохраняется, пока меняются данные. Заказ `A-1001` — один и тот же заказ до и после оплаты, а два заказа с одинаковыми позициями — всё равно два разных заказа. Сравнивайте сущности по **id**, а не по полям.
+
+Именно в сущностях живут **инварианты (invariants)** — правила, которые должны выполняться **всегда**, например «у всех позиций заказа положительное количество» или «оформленный заказ нельзя редактировать». Обеспечивайте каждый инвариант в **одном** месте — в методах сущности — и не оставляйте других входов: приватные поля (`#lines`) и никаких сеттеров. Тогда ни обработчик маршрута, ни скрипт, ни коллега не смогут привести заказ в сломанное состояние, даже случайно.
+
+Когда происходит что-то значимое, сущность может ещё и записать **доменное событие (domain event)** («OrderPlaced»). Сценарий использования сохраняет сущность, а затем публикует события, и письма со статистикой реагируют на них, а сущность даже не знает об их существовании (паттерн «наблюдатель» из [урока 1](/learn/javascript/solid-and-classic-patterns)):
+
+<CodeExample output={`9.50 GBP
+Количество должно быть целым числом не меньше 1
+Заказ A-1001 в статусе placed, его нельзя изменить
+1 OrderPlaced 9.50 GBP 2026-03-01T09:00:00.000Z
+[]
+[ 'A-1001' ]`}>
+
+```js
+class Money {
+  constructor(pence, currency) {
+    this.pence = pence;
+    this.currency = currency;
+    Object.freeze(this);
+  }
+  add(other) {
+    return new Money(this.pence + other.pence, this.currency);
+  }
+  times(n) {
+    return new Money(this.pence * n, this.currency);
+  }
+  toString() {
+    return `${(this.pence / 100).toFixed(2)} ${this.currency}`;
+  }
+}
+
+class DomainError extends Error {}
+
+class Order {
+  #lines = [];
+  #status = "draft";
+  #events = [];
+
+  constructor(id, currency) {
+    this.id = id;
+    this.currency = currency;
+  }
+
+  get status() {
+    return this.#status;
+  }
+
+  get total() {
+    return this.#lines.reduce(
+      (sum, line) => sum.add(line.price.times(line.qty)),
+      new Money(0, this.currency),
+    );
+  }
+
+  addLine(sku, qty, price) {
+    this.#mustBeDraft();
+    if (!Number.isInteger(qty) || qty < 1) {
+      throw new DomainError(
+        "Количество должно быть целым числом не меньше 1",
+      );
+    }
+    this.#lines.push({ sku, qty, price });
+  }
+
+  place(now) {
+    this.#mustBeDraft();
+    if (this.#lines.length === 0) {
+      throw new DomainError("Нельзя оформить пустой заказ");
+    }
+    this.#status = "placed";
+    this.#events.push({
+      type: "OrderPlaced",
+      orderId: this.id,
+      total: String(this.total),
+      at: now.toISOString(),
+    });
+  }
+
+  pullEvents() {
+    const events = this.#events;
+    this.#events = [];
+    return events;
+  }
+
+  #mustBeDraft() {
+    if (this.#status !== "draft") {
+      throw new DomainError(
+        `Заказ ${this.id} в статусе ${this.#status}, его нельзя изменить`,
+      );
+    }
+  }
+}
+
+const order = new Order("A-1001", "GBP");
+order.addLine("bamboo-tea", 2, new Money(350, "GBP"));
+order.addLine("panda-mug", 1, new Money(250, "GBP"));
+console.log(String(order.total));
+
+function attempt(action) {
+  try {
+    action();
+  } catch (error) {
+    console.log(error.message);
+  }
+}
+attempt(() => order.addLine("tea", 0, new Money(350, "GBP")));
+order.place(new Date("2026-03-01T09:00Z"));
+attempt(() => order.addLine("late", 1, new Money(100, "GBP")));
+
+// Сценарий использования сохранил бы заказ, а ПОТОМ опубликовал события:
+const published = [];
+const handlers = { OrderPlaced: (e) => published.push(e.orderId) };
+const events = order.pullEvents();
+const [placed] = events;
+console.log(events.length, placed.type, placed.total, placed.at);
+console.log(order.pullEvents()); // уже забрали, поэтому пусто
+for (const event of events) handlers[event.type]?.(event);
+console.log(published);
+```
+
+</CodeExample>
+
+Важны две детали. `place` получает `now` как аргумент, а не вызывает `new Date()`: сущность остаётся чистой, а сценарий использования передаёт `clock.now()`. И события публикуются **после** сохранения. Если сначала отправить письмо «заказ подтверждён», а потом запись в базу данных не удастся, клиент получит письмо о заказе, которого не существует. (Большие системы делают это надёжным с помощью **таблицы outbox (outbox table)**: события сохраняются в той же транзакции, что и заказ, а отдельный обработчик их публикует.)
+
+<Callout type="note" title="Сколько моделирования вам нужно?">
+
+Эти идеи взяты из **предметно-ориентированного проектирования (Domain-Driven Design, DDD)** — в книге Эрика Эванса (Eric Evans) гораздо больше: агрегаты, ограниченные контексты, общий с бизнесом «единый язык» (ubiquitous language). Берите то, что помогает. Объекты-значения окупаются почти везде; сущности с приватным состоянием — когда правила настоящие; полный словарь DDD — в больших доменах с множеством правил вроде банков, страхования и логистики, а для блога это перебор.
+
+</Callout>
+
+## Конечные автоматы
+
+Многие объекты проходят через **рабочий процесс (workflow)**: заказ переходит из «ожидает оплаты» в «оплачен» и в «отправлен»; WebSocket-соединение подключается, открывается, обрывается, переподключается. Обычно первая версия — куча логических флагов: `isLoading`, `isConnected`, `hasError`, `isRetrying`. Четыре логических значения дают 16 комбинаций, большинство из которых бессмысленны («подключено, **и** переподключается, **и** загружается?»), и баги живут как раз в этих комбинациях.
+
+У **конечного автомата (finite state machine, FSM)** ровно **одно** текущее состояние и **таблица переходов (transition table)**, где для каждого состояния перечислено, какие события разрешены и куда они ведут. Всё, чего нет в таблице, отвергается:
+
+<CodeExample output={`idle --CONNECT--> connecting
+connecting --OPENED--> open
+open --DROPPED--> reconnecting
+true false
+reconnecting --OPENED--> open
+Недопустимое событие CONNECT в состоянии open
+Недопустимое событие toString в состоянии open
+open --CLOSE--> closed
+[]`}>
+
+```js
+const connectionMachine = {
+  initial: "idle",
+  states: {
+    idle: { CONNECT: "connecting" },
+    connecting: {
+      OPENED: "open",
+      FAILED: "reconnecting",
+      CLOSE: "closed",
+    },
+    open: { DROPPED: "reconnecting", CLOSE: "closed" },
+    reconnecting: {
+      OPENED: "open",
+      GAVE_UP: "closed",
+      CLOSE: "closed",
+    },
+    closed: {},
+  },
+};
+
+function createMachine(definition, { onTransition = () => {} } = {}) {
+  let state = definition.initial;
+  const allowed = (event) =>
+    Object.hasOwn(definition.states[state], event); // не "toString"!
+
+  return {
+    get state() {
+      return state;
+    },
+    can: allowed,
+    send(event) {
+      if (!allowed(event)) {
+        throw new Error(
+          `Недопустимое событие ${event} в состоянии ${state}`,
+        );
+      }
+      const from = state;
+      state = definition.states[state][event];
+      onTransition({ from, event, to: state });
+      return state;
+    },
+  };
+}
+
+const connection = createMachine(connectionMachine, {
+  onTransition: ({ from, event, to }) =>
+    console.log(`${from} --${event}--> ${to}`),
+});
+
+connection.send("CONNECT");
+connection.send("OPENED");
+connection.send("DROPPED");
+console.log(connection.can("OPENED"), connection.can("DROPPED"));
+connection.send("OPENED");
+for (const event of ["CONNECT", "toString"]) {
+  try {
+    connection.send(event);
+  } catch (error) {
+    console.log(error.message);
+  }
+}
+connection.send("CLOSE");
+console.log(Object.keys(connectionMachine.states[connection.state]));
+```
+
+</CodeExample>
+
+Что вы получаете от нескольких строк:
+
+- **Невозможные состояния невозможны.** Есть одна строка `state`, и она может принимать только одно из пяти значений.
+- **Рабочий процесс — это данные.** Таблица описывает весь жизненный цикл на одном экране; продакт-менеджер может её проверить, а вы — нарисовать её в виде диаграммы.
+- **Недопустимые действия громко падают**, а не срабатывают наполовину: «отправить отменённый заказ» — это ошибка, а не обращение в поддержку.
+- **Одна точка для побочных эффектов.** `onTransition` — место, где можно писать в лог, обновлять интерфейс или планировать переподключение.
+
+В React строка статуса (`"idle" | "loading" | "success" | "error"`) в `useState` или `useReducer`, чей редьюсер — таблица переходов, — это та же идея. Для сложных рабочих процессов (вложенные состояния, таймеры, параллельные состояния) стандартный инструмент — библиотека **XState**:
+
+```js
+import { createMachine, createActor } from "xstate";
+
+const machine = createMachine({
+  initial: "idle",
+  states: {
+    idle: { on: { CONNECT: "connecting" } },
+    connecting: { on: { OPENED: "open", FAILED: "reconnecting" } },
+    // ...
+  },
+});
+const actor = createActor(machine).start();
+actor.send({ type: "CONNECT" });
+```
+
+<Quiz
+  question="Что из этого лучше всего подходит на роль объекта-значения, а не сущности?"
+  options={[
+    "Аккаунт клиента, который сохраняет свой id, пока меняется его адрес",
+    "Заказ, который переходит из «ожидает оплаты» в «оплачен» и в «отправлен»",
+    "Цена 12.50 GBP, где любые две цены по 12.50 GBP взаимозаменяемы",
+    "Сессия пользователя с идентификатором сессии",
+  ]}
+  answer={2}
+  explanation="Цена определяется только своим значением, поэтому она должна быть неизменяемой и сравниваться через equals. У аккаунтов, заказов и сессий есть идентичность, которая сохраняется, пока меняются их данные, поэтому они — сущности."
+/>
+
+<Quiz
+  question="Сценарий использования вызывает order.place(), затем публикует событие OrderPlaced (которое отправляет клиенту письмо), а затем сохраняет заказ. Чем опасен такой порядок шагов?"
+  options={[
+    "События нужно публиковать до создания сущности",
+    "Если сохранение не удастся, клиент уже получит письмо о заказе, который так и не был сохранён",
+    "Публикация событий медленнее сохранения, поэтому она должна идти последней",
+    "Никакой опасности: порядок шагов не важен",
+  ]}
+  answer={1}
+  explanation="Сначала сохраните, потом публикуйте. Иначе неудачная запись оставит внешний мир в уверенности, что произошло то, чего не было. Большие системы используют таблицу outbox, чтобы события сохранялись в той же транзакции, что и изменение."
+/>
+
+<Exercise
+  title="Распутайте оплату заказа"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ---- ДО: сильная связанность. Прочитайте, а затем замените. ----
+// Списывает деньги за отменённые заказы, меняет переданный заказ
+// и не тестируется без настоящего платёжного сервера.
+async function payOrder(order) {
+  const res = await fetch("https://pay.pandadev.test/charges", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ orderId: order.id, amount: order.total }),
+  });
+  if (!res.ok) throw new Error("Payment failed");
+  order.status = "paid";
+  order.paidAt = new Date(Date.now()).toISOString();
+  console.log("Order " + order.id + " paid");
+  return order;
+}
+
+// ---- ПОСЛЕ ----
+const transitions = {
+  pending: { PAY: "paid", CANCEL: "cancelled" },
+  paid: { SHIP: "shipped", CANCEL: "cancelled" },
+  shipped: { DELIVER: "delivered" },
+  delivered: {},
+  cancelled: {},
+};
+
+// TODO 1: верните следующий статус или выбросьте
+// Error("Can't <EVENT> an order that is <status>")
+// для любого события, которого нет в таблице.
+function nextStatus(status, event) {
+  return transitions[status][event];
+}
+
+// TODO 2: никаких fetch, Date или console снаружи: только deps.
+//   pay(order): СНАЧАЛА проверьте переход, затем POST
+//     { orderId, amount } в формате JSON на paymentsUrl + "/charges";
+//     если !res.ok, выбросьте Error("Payment failed for order <id>");
+//     верните НОВЫЙ заказ со status "paid" и
+//     paidAt: clock.now().toISOString(); залогируйте "Order <id> paid".
+//   cancel(order): верните НОВЫЙ заказ со status "cancelled";
+//     залогируйте "Order <id> cancelled".
+function createOrderService({ fetch, clock, logger, paymentsUrl }) {
+  return {
+    async pay(order) {},
+    cancel(order) {},
+  };
+}
+
+// ---- тесты (не меняйте их) ----
+function fakes({ ok = true } = {}) {
+  return {
+    fetch: vi.fn().mockResolvedValue({ ok, status: ok ? 201 : 402 }),
+    clock: { now: () => new Date("2026-05-01T10:00:00Z") },
+    logger: { info: vi.fn() },
+    paymentsUrl: "https://pay.test",
+  };
+}
+const order = { id: "A1", total: 3000, status: "pending" };
+
+describe("заказы", () => {
+  it("разрешает только переходы из таблицы", () => {
+    expect(nextStatus("pending", "PAY")).toBe("paid");
+    expect(nextStatus("paid", "SHIP")).toBe("shipped");
+    expect(() => nextStatus("shipped", "CANCEL")).toThrow(
+      "Can't CANCEL an order that is shipped",
+    );
+  });
+
+  it("оплата: списывает деньги, ставит время и пишет в лог", async () => {
+    const deps = fakes();
+    const paid = await createOrderService(deps).pay(order);
+    expect(paid).toEqual({
+      ...order,
+      status: "paid",
+      paidAt: "2026-05-01T10:00:00.000Z",
+    });
+    expect(order.status).toBe("pending");
+    expect(deps.fetch).toHaveBeenCalledWith(
+      "https://pay.test/charges",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(deps.logger.info).toHaveBeenCalledWith("Order A1 paid");
+  });
+
+  it("никогда не списывает деньги за отменённый заказ", async () => {
+    const deps = fakes();
+    const cancelled = { ...order, status: "cancelled" };
+    await expect(createOrderService(deps).pay(cancelled)).rejects
+      .toThrow("Can't PAY an order that is cancelled");
+    expect(deps.fetch).not.toHaveBeenCalled();
+  });
+
+  it("отклонённый платёж ничего не меняет", async () => {
+    const deps = fakes({ ok: false });
+    await expect(createOrderService(deps).pay(order)).rejects
+      .toThrow("Payment failed for order A1");
+    expect(deps.logger.info).not.toHaveBeenCalled();
+  });
+
+  it("отменяет ожидающие заказы, но не отправленные", () => {
+    const service = createOrderService(fakes());
+    expect(service.cancel(order).status).toBe("cancelled");
+    expect(order.status).toBe("pending");
+    expect(() => service.cancel({ ...order, status: "shipped" }))
+      .toThrow("Can't CANCEL");
+  });
+});
+`}
+  tests={[
+    { name: "Все тесты в редакторе проходят", check: `__vitest.failed === 0 && __vitest.passed >= 5` },
+    { name: "nextStatus следует таблице и отвергает всё остальное", check: `(() => { const bad = (s, e) => { try { nextStatus(s, e); return false; } catch (err) { return err.message === "Can't " + e + " an order that is " + s; } }; return nextStatus("pending", "CANCEL") === "cancelled" && nextStatus("shipped", "DELIVER") === "delivered" && bad("delivered", "PAY") && bad("pending", "SHIP") && bad("paid", "PAY") && bad("pending", "toString"); })()` },
+    { name: "pay отправляет платёж в формате JSON и возвращает новый оплаченный заказ", check: `await (async () => { const calls = []; const logs = []; const svc = createOrderService({ fetch: async (url, options) => { calls.push([url, options]); return { ok: true, status: 201 }; }, clock: { now: () => new Date("2027-01-02T03:04:05Z") }, logger: { info: (m) => logs.push(m) }, paymentsUrl: "https://p.example" }); const o = { id: "Z9", total: 1250, status: "pending", note: "gift" }; const paid = await svc.pay(o); const [url, opts] = calls[0] ?? []; const body = JSON.parse(opts?.body ?? "{}"); const type = opts?.headers?.["Content-Type"] ?? opts?.headers?.["content-type"]; return calls.length === 1 && url === "https://p.example/charges" && opts.method === "POST" && /json/.test(type) && body.orderId === "Z9" && body.amount === 1250 && paid !== o && paid.status === "paid" && paid.note === "gift" && paid.paidAt === "2027-01-02T03:04:05.000Z" && o.status === "pending" && !("paidAt" in o) && logs.join() === "Order Z9 paid"; })()` },
+    { name: "pay проверяет переход до того, как что-либо списать", check: `await (async () => { let charged = 0; const svc = createOrderService({ fetch: async () => { charged++; return { ok: true }; }, clock: { now: () => new Date() }, logger: { info() {} }, paymentsUrl: "x" }); const results = []; for (const status of ["paid", "shipped", "cancelled"]) { try { await svc.pay({ id: "Q", total: 1, status }); results.push("no error"); } catch (e) { results.push(e.message); } } return charged === 0 && results.join("|") === "Can't PAY an order that is paid|Can't PAY an order that is shipped|Can't PAY an order that is cancelled"; })()` },
+    { name: "Отклонённый платёж отклоняет промис и ничего не пишет в лог", check: `await (async () => { const logs = []; const svc = createOrderService({ fetch: async () => ({ ok: false, status: 402 }), clock: { now: () => new Date() }, logger: { info: (m) => logs.push(m) }, paymentsUrl: "x" }); const o = { id: "K7", total: 5, status: "pending" }; try { await svc.pay(o); return false; } catch (e) { return e.message === "Payment failed for order K7" && logs.length === 0 && o.status === "pending"; } })()` },
+    { name: "cancel возвращает новый заказ, пишет в лог и соблюдает таблицу", check: `await (async () => { const logs = []; const svc = createOrderService({ fetch: async () => ({ ok: true }), clock: { now: () => new Date() }, logger: { info: (m) => logs.push(m) }, paymentsUrl: "x" }); const p = { id: "C3", total: 5, status: "paid" }; const c = await svc.cancel(p); let refused = false; try { await svc.cancel({ id: "C4", total: 5, status: "delivered" }); } catch (e) { refused = e.message === "Can't CANCEL an order that is delivered"; } return c !== p && c.status === "cancelled" && p.status === "paid" && logs.join() === "Order C3 cancelled" && refused; })()` },
+    { name: "createOrderService использует только внедрённые зависимости", check: `!/Date\\.now|new Date|console\\./.test(createOrderService.toString())` },
+  ]}
+>
+
+Превратите сильно связанную функцию `payOrder` в маленькие внедряемые и тестируемые части под защитой конечного автомата. Таблица переходов и тесты готовы:
+
+1. **`nextStatus(status, event)`** возвращает следующий статус из `transitions` и выбрасывает `Error("Can't <EVENT> an order that is <status>")` для любого события, которое таблица не разрешает, включая коварные вроде `"toString"` (используйте `Object.hasOwn`, как в автомате из урока).
+2. **`createOrderService({ fetch, clock, logger, paymentsUrl })`** возвращает:
+   - `async pay(order)`: проверьте переход **до того**, как что-либо списывать, затем отправьте `POST` с `{ orderId, amount }` (это `id` и `total` заказа) в формате JSON на `paymentsUrl + "/charges"` с заголовком `Content-Type: application/json`. Если `!res.ok`, выбросьте `Error("Payment failed for order <id>")`. Иначе верните **новый** заказ со `status: "paid"` и `paidAt: clock.now().toISOString()` и вызовите `logger.info("Order <id> paid")`.
+   - `cancel(order)`: верните **новый** заказ со статусом `"cancelled"` (если таблица это разрешает) и залогируйте `"Order <id> cancelled"`.
+
+Используйте только внедрённые `fetch`, `clock` и `logger`: никаких `Date` и `console`. Переданные объекты заказов никогда не должны меняться.
+
+<Hint>
+
+`nextStatus`: если `!Object.hasOwn(transitions[status], event)`, выбросьте `new Error("Can't " + event + " an order that is " + status)`; иначе верните `transitions[status][event]`. В `pay` самой первой строкой вызовите `const status = nextStatus(order.status, "PAY")`, чтобы для недопустимого заказа ошибка возникла до запуска `fetch`. Результат соберите через spread: `const paid = { ...order, status, paidAt: clock.now().toISOString() };`.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect, vi } from "vitest";
+
+const transitions = {
+  pending: { PAY: "paid", CANCEL: "cancelled" },
+  paid: { SHIP: "shipped", CANCEL: "cancelled" },
+  shipped: { DELIVER: "delivered" },
+  delivered: {},
+  cancelled: {},
+};
+
+function nextStatus(status, event) {
+  if (!Object.hasOwn(transitions[status] ?? {}, event)) {
+    throw new Error(`Can't ${event} an order that is ${status}`);
+  }
+  return transitions[status][event];
+}
+
+function createOrderService({ fetch, clock, logger, paymentsUrl }) {
+  return {
+    async pay(order) {
+      const status = nextStatus(order.status, "PAY"); // до списания
+      const res = await fetch(`${paymentsUrl}/charges`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId: order.id, amount: order.total }),
+      });
+      if (!res.ok) {
+        throw new Error(`Payment failed for order ${order.id}`);
+      }
+      const paid = {
+        ...order,
+        status,
+        paidAt: clock.now().toISOString(),
+      };
+      logger.info(`Order ${order.id} paid`);
+      return paid;
+    },
+
+    cancel(order) {
+      const status = nextStatus(order.status, "CANCEL");
+      logger.info(`Order ${order.id} cancelled`);
+      return { ...order, status };
+    },
+  };
+}
+
+// ---- тесты (не меняйте их) ----
+function fakes({ ok = true } = {}) {
+  return {
+    fetch: vi.fn().mockResolvedValue({ ok, status: ok ? 201 : 402 }),
+    clock: { now: () => new Date("2026-05-01T10:00:00Z") },
+    logger: { info: vi.fn() },
+    paymentsUrl: "https://pay.test",
+  };
+}
+const order = { id: "A1", total: 3000, status: "pending" };
+
+describe("заказы", () => {
+  it("разрешает только переходы из таблицы", () => {
+    expect(nextStatus("pending", "PAY")).toBe("paid");
+    expect(nextStatus("paid", "SHIP")).toBe("shipped");
+    expect(() => nextStatus("shipped", "CANCEL")).toThrow(
+      "Can't CANCEL an order that is shipped",
+    );
+  });
+
+  it("оплата: списывает деньги, ставит время и пишет в лог", async () => {
+    const deps = fakes();
+    const paid = await createOrderService(deps).pay(order);
+    expect(paid).toEqual({
+      ...order,
+      status: "paid",
+      paidAt: "2026-05-01T10:00:00.000Z",
+    });
+    expect(order.status).toBe("pending");
+    expect(deps.fetch).toHaveBeenCalledWith(
+      "https://pay.test/charges",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(deps.logger.info).toHaveBeenCalledWith("Order A1 paid");
+  });
+
+  it("никогда не списывает деньги за отменённый заказ", async () => {
+    const deps = fakes();
+    const cancelled = { ...order, status: "cancelled" };
+    await expect(createOrderService(deps).pay(cancelled)).rejects
+      .toThrow("Can't PAY an order that is cancelled");
+    expect(deps.fetch).not.toHaveBeenCalled();
+  });
+
+  it("отклонённый платёж ничего не меняет", async () => {
+    const deps = fakes({ ok: false });
+    await expect(createOrderService(deps).pay(order)).rejects
+      .toThrow("Payment failed for order A1");
+    expect(deps.logger.info).not.toHaveBeenCalled();
+  });
+
+  it("отменяет ожидающие заказы, но не отправленные", () => {
+    const service = createOrderService(fakes());
+    expect(service.cancel(order).status).toBe("cancelled");
+    expect(order.status).toBe("pending");
+    expect(() => service.cancel({ ...order, status: "shipped" }))
+      .toThrow("Can't CANCEL");
+  });
+});
+
+// В main.js корень композиции подключил бы настоящие зависимости:
+// createOrderService({
+//   fetch: (...args) => fetch(...args),
+//   clock: { now: () => new Date() },
+//   logger: console,
+//   paymentsUrl: "https://pay.pandadev.test",
+// });
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Внедрение зависимостей**: код получает своих помощников (через конструктор или параметры фабрики), а не тянется за ними сам. Внедряйте время, случайность, ввод-вывод, конфигурацию и логирование; обычные помощники можно импортировать.
+- Делайте зависимости в ядре **обязательными**, а настоящие собирайте в **корне композиции** (`main.js`), лучше всего в функции, которая принимает переопределения для тестов и скриптов.
+- **DI-контейнеры** (Awilix, InversifyJS, NestJS) автоматизируют связывание. Большинство JavaScript-приложений понятнее связывать вручную; берите контейнер, когда его ожидает ваш фреймворк.
+- **Объекты-значения** (`Money`, `Email`) неизменяемы (`Object.freeze`), сравниваются через `equals` и корректны с момента создания. Храните деньги в целых минимальных единицах.
+- У **сущностей** есть идентичность, и они охраняют свои **инварианты** в одном месте — приватными полями и методами вместо сеттеров.
+- **Доменные события** фиксируют, что произошло; публикуйте их **после** сохранения.
+- **Конечные автоматы** заменяют кучу логических флагов одним состоянием и таблицей переходов, которая отвергает недопустимые события, — для заказов, соединений и статусов интерфейса.

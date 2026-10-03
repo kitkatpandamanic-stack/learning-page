@@ -1,0 +1,831 @@
+---
+title: Чистая архитектура в JavaScript
+description: Разделите Node-приложение на домен, сценарии использования и адаптеры, соблюдайте правило зависимостей, пишите порты и репозитории, держите маршруты Express тонкими и тестируйте каждый слой с фейками.
+duration: 25
+xp: 25
+---
+
+Большинство бэкендов на Node начинаются одинаково: маршрут Express проверяет тело запроса, выполняет SQL-запрос, применяет правило скидки, отправляет письмо и возвращает JSON — всё в 60 строках. Это быстро, и для маленького приложения это нормально. Потом приложение растёт. Одна команда, с которой я работал, хотела перевести нагруженный сервис с MongoDB на PostgreSQL и нашла запросы к Mongo в обработчиках маршрутов, в middleware, в cron-задачах и даже в серверном компоненте React. «Двухнедельная миграция» заняла квартал. 🏗️
+
+**Чистая архитектура (clean architecture)** — это способ организовать код так, чтобы его важная часть, ваши **бизнес-правила**, не зависела от деталей вроде веб-фреймворка или базы данных. В этом уроке вы узнаете её слои, единственное правило, которое их связывает, как выразить **порты** в языке без интерфейсов, паттерн **«репозиторий»** и как Express становится «просто адаптером», который легко заменить и легко протестировать.
+
+## Три слоя
+
+Представьте приложение в виде колец: в центре — самый важный и самый стабильный код:
+
+| Слой (layer) | Что содержит | О чём знает |
+| --- | --- | --- |
+| **Домен** (domain, ядро) | Бизнес-данные и правила: аккаунт, «нельзя потратить больше баллов, чем у вас есть» | Ни о чём, кроме обычного JavaScript |
+| **Сценарии использования** (use cases, слой приложения) | По функции на каждое действие пользователя: `redeemReward`, `earnPoints` | О домене, а также о **портах**: договорённых формах для хранилища, почты, платежей |
+| **Адаптеры** (adapters, инфраструктура) | Маршруты Express, репозитории для PostgreSQL, почтовый клиент, CLI, обработчик очереди | Обо всём: они подключают внешний мир к сценариям использования |
+
+Ещё это называют **порты и адаптеры (ports and adapters)** или **гексагональной архитектурой (hexagonal architecture)**. Детали различаются, а идея одна: внутренняя часть определяет, что ей **нужно** («что-то, что умеет загружать и сохранять аккаунты»), а внешняя это **предоставляет** (репозиторий для PostgreSQL в продакшене, репозиторий в памяти в тестах).
+
+В настоящем проекте организуйте папки **сначала по фичам**, а внутри каждой фичи — по слоям. Деление на `controllers/`, `services/`, `models/` на верхнем уровне разбрасывает одну фичу по всему дереву; папки фич держат всё о бонусных баллах вместе и сразу показывают, что можно удалить, когда фича уходит:
+
+```text
+src/
+├── loyalty/
+│   ├── domain/        account.js, errors.js       (чистый JS)
+│   ├── use-cases/     redeem-reward.js, earn-points.js
+│   ├── adapters/      http.js, postgres-accounts.js
+│   └── loyalty.test.js
+├── orders/
+│   └── ...такая же структура...
+├── shared/            logger.js, http-errors.js
+└── main.js            связывает всё вместе
+```
+
+## Домен: просто правила
+
+Домен — это код, который можно показать продакт-менеджеру. В нём **нет** `import express`, нет SQL и нет `fetch`. Здесь правила бонусных баллов — чистые функции, которые принимают и возвращают обычные объекты, а ошибки говорят на языке бизнеса:
+
+<CodeExample output={`{ id: 'a1', name: 'Mei', points: 170 } 120
+20
+NotEnoughPoints: Плюшевая панда стоит 300, а у вас 20
+true
+ValidationError: баллы должны быть целым положительным числом`}>
+
+```js
+// loyalty/domain/errors.js
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name; // имя подкласса
+  }
+}
+class ValidationError extends DomainError {}
+class NotEnoughPoints extends DomainError {}
+
+// loyalty/domain/account.js: только правила, без ввода-вывода
+function earn(account, points) {
+  if (!Number.isInteger(points) || points <= 0) {
+    throw new ValidationError(
+      "баллы должны быть целым положительным числом",
+    );
+  }
+  return { ...account, points: account.points + points };
+}
+
+function redeem(account, reward) {
+  if (account.points < reward.cost) {
+    throw new NotEnoughPoints(
+      `${reward.name} стоит ${reward.cost}, а у вас ${account.points}`,
+    );
+  }
+  return { ...account, points: account.points - reward.cost };
+}
+
+const mei = { id: "a1", name: "Mei", points: 120 };
+const richer = earn(mei, 50);
+console.log(richer, mei.points); // оригинал не изменился
+const afterTea = redeem(richer, { name: "Бамбуковый чай", cost: 150 });
+console.log(afterTea.points);
+
+try {
+  redeem(afterTea, { name: "Плюшевая панда", cost: 300 });
+} catch (error) {
+  console.log(`${error.name}: ${error.message}`);
+  console.log(error instanceof DomainError);
+}
+try {
+  earn(mei, 2.5);
+} catch (error) {
+  console.log(`${error.name}: ${error.message}`);
+}
+```
+
+</CodeExample>
+
+Эти функции только принимают и возвращают значения, поэтому их тесты выполняются за микросекунды — без базы данных, без сервера и без моков. Одни и те же правила обслуживают HTTP API, админский CLI и ночную пакетную задачу. Обратите внимание, чего здесь **нет**: никаких `404` или `409`. Коды ответа HTTP — забота веба; домен выбрасывает `NotEnoughPoints`, а веб-адаптер решает, что это означает `409 Conflict`.
+
+Чистые функции над обычными объектами — один хороший стиль для домена на JavaScript. Классы с приватными полями — другой; вы увидите их в следующем уроке. В любом случае правила живут в **одном** месте.
+
+## Правило зависимостей
+
+Правило, благодаря которому слои работают: **зависимости в исходном коде направлены внутрь**.
+
+- `domain/` ничего не импортирует из сценариев использования и адаптеров (и никаких npm-пакетов с вводом-выводом).
+- `use-cases/` импортируют домен, но никогда — `express`, `pg` или `node:fs`.
+- `adapters/` могут импортировать что угодно, включая сценарии использования, которые они вызывают.
+
+Данные по-прежнему текут в обе стороны (запрос приходит, строка возвращается из базы данных), но **импорты** направлены только внутрь. Сценарий использования никогда не импортирует репозиторий для PostgreSQL: он **получает** что-то с нужными методами. Это правило можно проверять в CI с помощью ESLint, чтобы случайный `import pg` в сценарии использования ломал сборку:
+
+```js
+// eslint.config.js
+export default [
+  {
+    files: ["src/*/domain/**", "src/*/use-cases/**"],
+    rules: {
+      "no-restricted-imports": ["error", {
+        patterns: ["**/adapters/**", "express", "pg", "node:*"],
+      }],
+    },
+  },
+];
+```
+
+Если нужно больше, инструменты вроде `dependency-cruiser` умеют рисовать и проверять весь граф зависимостей.
+
+## Порты в JavaScript
+
+В Java или TypeScript порт — это `interface`. В обычном JavaScript интерфейсов нет, поэтому **порт (port)** — просто договорённость: «объект с такими методами, которые принимают такие аргументы и возвращают такие промисы». Две привычки делают эту договорённость настоящей:
+
+1. **Запишите её** с помощью JSDoc `@typedef`. Редакторы (включая VS Code) его читают, а с `// @ts-check` в начале файла подчёркивают код, который её нарушает.
+2. **Проверьте её тестами**: общий **контрактный тест (contract test)**, который обязана пройти каждая реализация.
+
+**Репозиторий (repository)** — самый распространённый порт: объект, который выглядит как коллекция доменных объектов (`get`, `save`, иногда `list`) и скрывает, как они хранятся. Порты делают `async`, даже когда первая реализация синхронна, потому что настоящая (база данных) будет асинхронной:
+
+<CodeExample output={`✓ in-memory реализует AccountRepository > возвращает null для неизвестного id
+✓ in-memory реализует AccountRepository > сохраняет и загружает аккаунты
+✓ in-memory реализует AccountRepository > возвращает копии, поэтому несохранённые изменения теряются
+
+Tests  3 passed (3)`}>
+
+```js
+// @ts-check
+import { describe, it, expect } from "vitest";
+
+/**
+ * @typedef {{ id: string, name: string, points: number }} Account
+ *
+ * Порт: то, что сценариям использования нужно от хранилища.
+ * @typedef {object} AccountRepository
+ * @property {(id: string) => Promise<Account | null>} get
+ * @property {(account: Account) => Promise<void>} save
+ */
+
+/** @returns {AccountRepository} */
+function createInMemoryAccounts(...seed) {
+  const rows = new Map(seed.map((a) => [a.id, structuredClone(a)]));
+  return {
+    async get(id) {
+      const row = rows.get(id);
+      return row ? structuredClone(row) : null; // копия, как из БД
+    },
+    async save(account) {
+      rows.set(account.id, structuredClone(account));
+    },
+  };
+}
+
+// Контракт: тесты, которые обязана пройти КАЖДАЯ реализация порта
+function accountRepositoryContract(name, makeRepo) {
+  describe(`${name} реализует AccountRepository`, () => {
+    it("возвращает null для неизвестного id", async () => {
+      expect(await makeRepo().get("nope")).toBeNull();
+    });
+
+    it("сохраняет и загружает аккаунты", async () => {
+      const repo = makeRepo();
+      const mei = { id: "a1", name: "Mei", points: 5 };
+      await repo.save(mei);
+      expect(await repo.get("a1")).toEqual(mei);
+    });
+
+    it("возвращает копии, поэтому несохранённые изменения теряются", async () => {
+      const repo = makeRepo();
+      await repo.save({ id: "a1", name: "Mei", points: 5 });
+      const account = await repo.get("a1");
+      account.points = 999; // изменили, но не сохранили
+      expect((await repo.get("a1")).points).toBe(5);
+    });
+  });
+}
+
+accountRepositoryContract("in-memory", () => createInMemoryAccounts());
+// В настоящем проекте тот же контракт проверяют на PostgreSQL:
+// accountRepositoryContract("postgres", () => createPostgresAccounts(pool));
+```
+
+</CodeExample>
+
+Репозиторий в памяти намеренно хранит и возвращает **копии** (`structuredClone`). Настоящая база данных тоже каждый раз отдаёт новый объект, и изменения теряются, если их не сохранить. Если бы фейк возвращал тот самый объект, который хранит, сценарий использования, который **забыл** вызвать `save`, проходил бы все тесты и молча терял данные в продакшене. Фейк полезен, только если ведёт себя как настоящий объект, а контрактный тест — способ это доказать.
+
+В TypeScript порт становится `interface AccountRepository { … }`, и компилятор проверяет каждую реализацию; контрактный тест всё равно стоит иметь, потому что типы не скажут вам, что `save` действительно сохраняет.
+
+### Версия для PostgreSQL
+
+В Node на вашем компьютере продакшен-адаптер реализует тот же порт на SQL. Он переводит строки таблицы в доменные объекты и обратно, так что никто выше него не видит строк базы данных:
+
+```js
+// loyalty/adapters/postgres-accounts.js
+export function createPostgresAccounts(pool) {
+  return {
+    async get(id) {
+      const { rows } = await pool.query(
+        "SELECT id, name, points FROM accounts WHERE id = $1",
+        [id],
+      );
+      return rows[0] ?? null;
+    },
+    async save(account) {
+      await pool.query(
+        `INSERT INTO accounts (id, name, points)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (id) DO UPDATE
+         SET name = EXCLUDED.name, points = EXCLUDED.points`,
+        [account.id, account.name, account.points],
+      );
+    },
+  };
+}
+```
+
+```bash
+npm install pg
+```
+
+`$1, $2, $3` — это **параметры**: драйвер отправляет значения отдельно от SQL, и именно это защищает от SQL-инъекций (подробнее — в модуле о безопасности). Здесь же имена столбцов вроде `created_at` превращались бы в `createdAt`. Когда один сценарий использования должен атомарно изменить несколько строк, слой адаптеров отвечает и за **транзакцию** (`BEGIN … COMMIT` на одном клиенте из `pool.connect()`); частый приём — адаптер `withTransaction(fn)`, который передаёт сценарию использования репозитории, привязанные к этой транзакции.
+
+Стоит ли это преобразование усилий? Это главная цена такой архитектуры. Для CRUD-приложения, где таблицы **и есть** бизнес, запросы через ORM вроде Prisma или Drizzle прямо из маршрута могут быть верным решением. Выигрыш появляется, когда есть настоящие правила, которые нужно защищать и тестировать.
+
+## Сценарии использования: по функции на действие пользователя
+
+**Сценарий использования (use case)**, его ещё называют сервисом приложения (application service), — это сценарий одного действия пользователя. Он загружает нужное через порты, даёт **домену** принять решение, сохраняет результат и возвращает обычные данные. Собственных бизнес-правил и HTTP в нём нет:
+
+<CodeExample output={`{ reward: 'Бамбуковый чай', pointsLeft: 20 }
+NotEnoughPoints: Плюшевая панда стоит 300, а у вас 20
+20
+NotFound: Не найдено: награда с id r9`}>
+
+```js
+// --- домен (сокращённо, из примера выше) ---
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class NotFound extends DomainError {}
+class NotEnoughPoints extends DomainError {}
+
+function redeem(account, reward) {
+  if (account.points < reward.cost) {
+    throw new NotEnoughPoints(
+      `${reward.name} стоит ${reward.cost}, а у вас ${account.points}`,
+    );
+  }
+  return { ...account, points: account.points - reward.cost };
+}
+
+// --- адаптер: репозитории в памяти ---
+function inMemoryRepo(...seed) {
+  const rows = new Map(seed.map((x) => [x.id, structuredClone(x)]));
+  return {
+    get: async (id) => structuredClone(rows.get(id)) ?? null,
+    save: async (x) => void rows.set(x.id, structuredClone(x)),
+  };
+}
+
+// --- сценарии использования: получают порты, правил не содержат ---
+function createLoyalty({ accounts, rewards }) {
+  async function load(repo, id, what) {
+    const item = await repo.get(id);
+    if (!item) throw new NotFound(`Не найдено: ${what} с id ${id}`);
+    return item;
+  }
+
+  return {
+    async redeemReward({ accountId, rewardId }) {
+      const account = await load(accounts, accountId, "аккаунт");
+      const reward = await load(rewards, rewardId, "награда");
+      const updated = redeem(account, reward); // решает домен
+      await accounts.save(updated);
+      return { reward: reward.name, pointsLeft: updated.points };
+    },
+    async balance(accountId) {
+      const { id, points } = await load(accounts, accountId, "аккаунт");
+      return { id, points };
+    },
+  };
+}
+
+const loyalty = createLoyalty({
+  accounts: inMemoryRepo({ id: "a1", name: "Mei", points: 170 }),
+  rewards: inMemoryRepo(
+    { id: "r1", name: "Бамбуковый чай", cost: 150 },
+    { id: "r2", name: "Плюшевая панда", cost: 300 },
+  ),
+});
+
+console.log(await loyalty.redeemReward({ accountId: "a1", rewardId: "r1" }));
+for (const rewardId of ["r2", "r9"]) {
+  try {
+    await loyalty.redeemReward({ accountId: "a1", rewardId });
+  } catch (error) {
+    console.log(`${error.name}: ${error.message}`);
+    if (rewardId === "r2") {
+      console.log((await loyalty.balance("a1")).points);
+    }
+  }
+}
+```
+
+</CodeExample>
+
+Неудачная попытка обмена выбросила ошибку **до** `save`, поэтому у Mei по-прежнему 20 баллов. `createLoyalty` принимает репозитории как параметры: это **внедрение зависимостей (dependency injection)**, и в следующем уроке вы разовьёте эту идею. Сценарии использования принимают один **входной объект** (`{ accountId, rewardId }`), а не `req`, поэтому один и тот же сценарий можно вызвать из HTTP-маршрута, команды CLI, обработчика очереди или теста.
+
+<Callout type="tip" title="Это правило или шаг?">
+
+Быстрый способ понять, где место коду: если продакт-менеджер описал бы его как **правило** («баллы не могут уйти в минус», «золотые участники получают двойные баллы»), он идёт в домен. Если это **шаг** («загрузить аккаунт, проверить правило, сохранить, отправить чек»), это сценарий использования. Если в нём упоминается технология («разобрать JSON-тело», «выполнить этот SQL»), это адаптер.
+
+</Callout>
+
+## Express — просто адаптер
+
+В чистой архитектуре Express — это **механизм доставки (delivery mechanism)**. Обработчик маршрута делает три маленькие вещи: превращает запрос в обычные входные данные, вызывает **один** сценарий использования, превращает результат в ответ. Ошибки переводятся в **одном** middleware для ошибок, которое сопоставляет доменные ошибки с кодами ответа. Всё остальное — баг, поэтому оно уходит дальше, в стандартный обработчик Express, как `500`.
+
+Маршрутам нужен только «объект с `balance` и `redeemReward`», поэтому весь HTTP-слой можно собрать и проверить с крошечным **фейковым** объектом сценариев использования:
+
+<CodeExample output={`GET /accounts/a1 → 200 { id: 'a1', points: 170 }
+GET /accounts/zz → 404 { error: 'Не найдено: аккаунт с id zz' }
+POST /accounts/a1/redemptions → 201 { reward: 'Бамбуковый чай', pointsLeft: 20 }
+POST /accounts/a1/redemptions → 400 { error: 'нужно передать rewardId' }
+POST /accounts/a1/redemptions → 409 { error: 'Плюшевая панда стоит 300' }
+GET /accounts/boom → 500 {}`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends DomainError {}
+class NotFound extends DomainError {}
+class NotEnoughPoints extends DomainError {}
+
+// loyalty/adapters/http.js: HTTP на входе, сценарий, HTTP на выходе
+const errorStatus = [
+  [ValidationError, 400],
+  [NotFound, 404],
+  [NotEnoughPoints, 409],
+];
+
+function createApp({ loyalty }) {
+  const app = express();
+  app.use(express.json());
+
+  app.get("/accounts/:id", async (req, res) => {
+    res.json(await loyalty.balance(req.params.id));
+  });
+
+  app.post("/accounts/:id/redemptions", async (req, res) => {
+    const receipt = await loyalty.redeemReward({
+      accountId: req.params.id,
+      rewardId: req.body?.rewardId,
+    });
+    res.status(201).json(receipt);
+  });
+
+  app.use((error, req, res, next) => {
+    const match = errorStatus.find(([Type]) => error instanceof Type);
+    if (!match) return next(error); // настоящий баг: 500
+    res.status(match[1]).json({ error: error.message });
+  });
+  return app;
+}
+
+// HTTP-слою достаточно фейкового объекта сценариев использования
+const fakeLoyalty = {
+  async balance(id) {
+    if (id === "boom") throw new TypeError("ой, баг");
+    if (id !== "a1") throw new NotFound(`Не найдено: аккаунт с id ${id}`);
+    return { id, points: 170 };
+  },
+  async redeemReward({ rewardId }) {
+    if (!rewardId) throw new ValidationError("нужно передать rewardId");
+    if (rewardId === "r2") {
+      throw new NotEnoughPoints("Плюшевая панда стоит 300");
+    }
+    return { reward: "Бамбуковый чай", pointsLeft: 20 };
+  },
+};
+
+const api = request(createApp({ loyalty: fakeLoyalty }));
+const calls = [
+  ["get", "/accounts/a1"],
+  ["get", "/accounts/zz"],
+  ["post", "/accounts/a1/redemptions", { rewardId: "r1" }],
+  ["post", "/accounts/a1/redemptions", {}],
+  ["post", "/accounts/a1/redemptions", { rewardId: "r2" }],
+  ["get", "/accounts/boom"],
+];
+for (const [method, url, body] of calls) {
+  const res = await api[method](url).send(body);
+  console.log(method.toUpperCase(), url, "→", res.status, res.body);
+}
+```
+
+</CodeExample>
+
+Каждый маршрут занимает две-три строки, и в этом весь смысл. Если в обработчике появляются `if` про баллы или награды, значит, правила утекают из домена. Случай с `500` тоже важен: неожиданный `TypeError` **не** превращается в вежливый `400`, потому что баги, спрятанные за вежливыми кодами ответа, найти гораздо труднее. (В продакшене обработчик 500 записывает стек вызовов в лог и возвращает общее сообщение.)
+
+Заменить Express на Fastify или добавить рядом GraphQL API теперь значит написать новый адаптер. Сценарии использования и домен не меняются.
+
+## Тестирование каждого слоя
+
+Чистая архитектура почти бесплатно даёт вам стратегию тестирования:
+
+- **Домен**: много быстрых модульных тестов на обычных значениях. Фейки не нужны вовсе.
+- **Сценарии использования**: модульные тесты с **репозиториями в памяти** (фейками), которые проверяют результаты и то, что сохранилось.
+- **Адаптеры**: по несколько тестов на каждый. HTTP-адаптер — с фейковым сценарием использования (как выше или с `vi.fn()`, чтобы проверить, с чем его вызвали); каждый репозиторий — **контрактным тестом** на настоящей тестовой базе данных в CI.
+- **Сквозные тесты (end to end)**: несколько тестов через настоящее приложение с настоящими адаптерами, чтобы доказать, что всё правильно связано.
+
+Вот HTTP-адаптер, протестированный с моком сценария использования. Тесты проверяют две вещи, за которые отвечает адаптер: что внутрь передаются правильные входные данные и что результат или ошибка правильно переводятся наружу:
+
+<CodeExample output={`✓ POST /accounts/:id/redemptions > передаёт id в сценарий использования
+✓ POST /accounts/:id/redemptions > переводит NotEnoughPoints в 409
+
+Tests  2 passed (2)`}>
+
+```js
+import { describe, it, expect, vi } from "vitest";
+import express from "express";
+import request from "supertest";
+
+class NotEnoughPoints extends Error {}
+
+function createApp({ loyalty }) {
+  const app = express();
+  app.use(express.json());
+  app.post("/accounts/:id/redemptions", async (req, res) => {
+    const receipt = await loyalty.redeemReward({
+      accountId: req.params.id,
+      rewardId: req.body?.rewardId,
+    });
+    res.status(201).json(receipt);
+  });
+  app.use((error, req, res, next) => {
+    if (!(error instanceof NotEnoughPoints)) return next(error);
+    res.status(409).json({ error: error.message });
+  });
+  return app;
+}
+
+describe("POST /accounts/:id/redemptions", () => {
+  it("передаёт id в сценарий использования", async () => {
+    const loyalty = {
+      redeemReward: vi.fn().mockResolvedValue({ pointsLeft: 1 }),
+    };
+    const res = await request(createApp({ loyalty }))
+      .post("/accounts/a7/redemptions")
+      .send({ rewardId: "r3" });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ pointsLeft: 1 });
+    expect(loyalty.redeemReward).toHaveBeenCalledWith({
+      accountId: "a7",
+      rewardId: "r3",
+    });
+  });
+
+  it("переводит NotEnoughPoints в 409", async () => {
+    const loyalty = {
+      redeemReward: vi
+        .fn()
+        .mockRejectedValue(new NotEnoughPoints("недостаточно баллов")),
+    };
+    const res = await request(createApp({ loyalty }))
+      .post("/accounts/a7/redemptions")
+      .send({ rewardId: "r3" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("недостаточно баллов");
+  });
+});
+```
+
+</CodeExample>
+
+Ни одному из этих тестов не нужны база данных, сеть или `vi.mock`: только обычные объекты, переданные внутрь. В кодовой базе их могут быть тысячи, и весь набор всё равно пройдёт за секунды.
+
+<Callout type="warning" title="Не стройте архитектуру для списка дел">
+
+Слои, порты и репозитории стоят кода: функции преобразования, лишние файлы, больше имён. Для прототипа, маленького CRUD-сервиса или внутреннего скрипта правильный выбор — Express плюс ORM напрямую (как в [Notes API](/learn/javascript/notes-api) на Уровне 2). Берите чистую архитектуру, когда **бизнес-правила** настоящие и их становится больше, когда приложение будет жить годами или над ним работают несколько команд. Её можно внедрять и постепенно: сначала перенесите правила в папку `domain/`, а репозиторий добавьте, когда тестирование впервые начнёт причинять боль.
+
+</Callout>
+
+<Quiz
+  question="Какой импорт внутри src/loyalty/use-cases/redeem-reward.js в проекте с чистой архитектурой нарушает правило зависимостей?"
+  options={[
+    "import { redeem } from \"../domain/account.js\"",
+    "import { NotFound } from \"../domain/errors.js\"",
+    "import { createPostgresAccounts } from \"../adapters/postgres-accounts.js\"",
+    "Никакой, потому что репозиторий передаётся как параметр",
+  ]}
+  answer={2}
+  explanation="Сценарии использования могут зависеть от домена, но никогда — от адаптеров. Репозиторий для PostgreSQL нужно создать в корне композиции (main.js) и передать в сценарий использования, который знает только порт: объект с get и save."
+/>
+
+<Quiz
+  question="Фейковый репозиторий в памяти возвращает тот самый объект, который хранит, а репозиторий для PostgreSQL при каждом get возвращает новый объект. Сценарий использования меняет аккаунт, но забывает вызвать save. Что произойдёт?"
+  options={[
+    "Изменение потеряется и в тестах с фейком, и в продакшене",
+    "Тесты с фейком пройдут, а в продакшене изменение молча потеряется",
+    "Тесты с фейком упадут, а в продакшене всё будет работать",
+    "JavaScript выбросит ошибку, потому что save не вызвали",
+  ]}
+  answer={1}
+  explanation="С фейком изменение вносится в сам хранимый объект, поэтому оно выглядит сохранённым. Настоящий репозиторий возвращает копию, и без save ничего не доходит до базы данных. Поэтому фейки должны хранить и возвращать копии, а общий контрактный тест должен проверять обе реализации."
+/>
+
+<Exercise
+  title="Запись на воркшопы, слой за слоем"
+  starter={`import { describe, it, expect } from "vitest";
+import express from "express";
+import request from "supertest";
+
+// ---------- домен (готов) ----------
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends DomainError {}
+class NotFound extends DomainError {}
+class WorkshopFull extends DomainError {}
+class AlreadyRegistered extends DomainError {}
+
+function register(workshop, email) {
+  if (typeof email !== "string" || !email.includes("@")) {
+    throw new ValidationError("a valid email is required");
+  }
+  if (workshop.attendees.includes(email)) {
+    throw new AlreadyRegistered(email + " is already registered");
+  }
+  if (workshop.attendees.length >= workshop.capacity) {
+    throw new WorkshopFull(workshop.title + " is full");
+  }
+  return { ...workshop, attendees: [...workshop.attendees, email] };
+}
+
+// ---------- TODO 1: адаптер: репозиторий в памяти ----------
+// get(id) → КОПИЯ воркшопа или null; save(workshop)
+// Оба async. Заполните его переданными воркшопами.
+function createInMemoryWorkshops(...seed) {
+  return {};
+}
+
+// ---------- TODO 2: сценарий использования ----------
+// register({ workshopId, email }):
+//   загрузить (NotFound "No workshop with id <id>", если нет),
+//   дать решить домену, сохранить и вернуть
+//   { workshop: <title>, seatsLeft: <capacity - attendees> }
+function createRegistrations({ workshops }) {
+  return {};
+}
+
+// ---------- TODO 3: адаптер: тонкое приложение Express ----------
+// POST /workshops/:id/registrations с телом { email }
+//   → 201 + результат сценария использования
+// Middleware ошибок: ValidationError 400, NotFound 404,
+// WorkshopFull и AlreadyRegistered 409 (тело { error }),
+// всё остальное → next(error)
+function createApp({ registrations }) {
+  const app = express();
+  return app;
+}
+
+// ---------- тесты (не меняйте их) ----------
+function makeApp() {
+  const workshops = createInMemoryWorkshops(
+    { id: "w1", title: "Intro to Node", capacity: 2, attendees: [] },
+  );
+  const registrations = createRegistrations({ workshops });
+  return { workshops, api: request(createApp({ registrations })) };
+}
+const url = "/workshops/w1/registrations";
+
+describe("запись на воркшопы", () => {
+  it("записывает участника и сообщает, сколько мест осталось", async () => {
+    const { api, workshops } = makeApp();
+    const res = await api.post(url).send({ email: "mei@pandadev.test" });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ workshop: "Intro to Node", seatsLeft: 1 });
+    const saved = await workshops.get("w1");
+    expect(saved.attendees).toEqual(["mei@pandadev.test"]);
+  });
+
+  it("отклоняет плохой email с кодом 400", async () => {
+    const res = await makeApp().api.post(url).send({ email: "nope" });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "a valid email is required" });
+  });
+
+  it("отвечает 404 для неизвестного воркшопа", async () => {
+    const res = await makeApp().api
+      .post("/workshops/w9/registrations")
+      .send({ email: "mei@pandadev.test" });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("No workshop with id w9");
+  });
+
+  it("отвечает 409 на повторы и заполненные воркшопы", async () => {
+    const { api } = makeApp();
+    await api.post(url).send({ email: "a@pandadev.test" });
+    const again = await api.post(url).send({ email: "a@pandadev.test" });
+    expect(again.status).toBe(409);
+    await api.post(url).send({ email: "b@pandadev.test" });
+    const full = await api.post(url).send({ email: "c@pandadev.test" });
+    expect(full.status).toBe(409);
+    expect(full.body.error).toBe("Intro to Node is full");
+  });
+
+  it("репозиторий выдаёт копии", async () => {
+    const { workshops } = makeApp();
+    const w = await workshops.get("w1");
+    w.attendees.push("sneaky@pandadev.test");
+    expect((await workshops.get("w1")).attendees).toEqual([]);
+    expect(await workshops.get("w9")).toBeNull();
+  });
+});
+`}
+  tests={[
+    { name: "Все тесты в редакторе проходят", check: `__vitest.failed === 0 && __vitest.passed >= 5` },
+    { name: "Репозиторий хранит и возвращает копии", check: `await (async () => { const w = { id: "x", title: "T", capacity: 1, attendees: [] }; const repo = createInMemoryWorkshops(w); w.title = "changed"; const a = await repo.get("x"); a.attendees.push("q@q"); const b = await repo.get("x"); await repo.save({ ...b, capacity: 9 }); const c = await repo.get("x"); return b.title === "T" && b.attendees.length === 0 && a !== b && c.capacity === 9 && (await repo.get("nope")) === null; })()` },
+    { name: "Сценарий использования сохраняет через репозиторий и возвращает число свободных мест", check: `await (async () => { const workshops = createInMemoryWorkshops({ id: "k", title: "Kotlin", capacity: 3, attendees: ["a@a"] }); const r = await createRegistrations({ workshops }).register({ workshopId: "k", email: "b@b" }); const saved = await workshops.get("k"); return r.workshop === "Kotlin" && r.seatsLeft === 1 && saved.attendees.join() === "a@a,b@b"; })()` },
+    { name: "Сценарий использования ничего не сохраняет, когда домен отказывает", check: `await (async () => { let saves = 0; const store = { id: "k", title: "K", capacity: 1, attendees: ["a@a"] }; const workshops = { get: async () => structuredClone(store), save: async () => { saves++; } }; try { await createRegistrations({ workshops }).register({ workshopId: "k", email: "b@b" }); return false; } catch (e) { return e instanceof WorkshopFull && saves === 0; } })()` },
+    { name: "Сценарий использования выбрасывает NotFound для неизвестных воркшопов", check: `await (async () => { try { await createRegistrations({ workshops: createInMemoryWorkshops() }).register({ workshopId: "zz", email: "a@a" }); return false; } catch (e) { return e instanceof NotFound && e.message === "No workshop with id zz"; } })()` },
+    { name: "Маршрут тонкий: он передаёт входные данные в сценарий использования", check: `await (async () => { const calls = []; const registrations = { register: async (input) => { calls.push(input); return { ok: 1 }; } }; const res = await require("supertest")(createApp({ registrations })).post("/workshops/w42/registrations").send({ email: "kim@pandadev.test" }); return res.status === 201 && res.body.ok === 1 && calls.length === 1 && calls[0].workshopId === "w42" && calls[0].email === "kim@pandadev.test"; })()` },
+    { name: "Ошибки переводятся в 400 / 404 / 409, а баги — в 500", check: `await (async () => { const statuses = []; for (const error of [new ValidationError("v"), new NotFound("n"), new WorkshopFull("f"), new AlreadyRegistered("d"), new TypeError("bug")]) { const registrations = { register: async () => { throw error; } }; const res = await require("supertest")(createApp({ registrations })).post("/workshops/w1/registrations").send({ email: "a@a" }); statuses.push(res.status + (res.status < 500 ? ":" + res.body.error : "")); } return statuses.join(",") === "400:v,404:n,409:f,409:d,500"; })()` },
+  ]}
+>
+
+Соберите фичу записи на воркшопы в стиле чистой архитектуры. **Домен** (`register` и классы ошибок) и **тесты** готовы. Остальные слои пишете вы:
+
+1. **`createInMemoryWorkshops(...seed)`**: репозиторий с `async get(id)` (**копия** воркшопа или `null`) и `async save(workshop)`. Храните тоже копии, чтобы изменения исходных объектов не просачивались внутрь.
+2. **`createRegistrations({ workshops })`**: возвращает `{ register({ workshopId, email }) }`. Загрузите воркшоп (если его нет, выбросьте `NotFound` с сообщением `"No workshop with id <id>"`), дайте решить доменной функции `register`, сохраните результат и верните `{ workshop: <title>, seatsLeft: <capacity минус attendees> }`.
+3. **`createApp({ registrations })`**: приложение Express с `express.json()` и маршрутом `POST /workshops/:id/registrations`, который вызывает сценарий использования с `{ workshopId, email }` и отвечает `201` с его результатом. Один middleware для ошибок сопоставляет `ValidationError` → 400, `NotFound` → 404, `WorkshopFull` и `AlreadyRegistered` → 409, каждый раз с `{ error: message }`; всё остальное уходит в `next(error)`.
+
+Проверки тестируют и каждый слой отдельно, со своими фейками, поэтому держите маршрут тонким, а правила — в домене.
+
+<Hint>
+
+Репозиторий — это `createInMemoryAccounts` из раздела «Порты в JavaScript» со `structuredClone` на входе и на выходе. Сценарий использования — это `redeemReward` из раздела «Сценарии использования» с `register(workshop, email)` посередине; `seatsLeft` — это `updated.capacity - updated.attendees.length`. Для приложения скопируйте форму `createApp` и список `errorStatus` из раздела «Express — просто адаптер».
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect } from "vitest";
+import express from "express";
+import request from "supertest";
+
+// ---------- домен (готов) ----------
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends DomainError {}
+class NotFound extends DomainError {}
+class WorkshopFull extends DomainError {}
+class AlreadyRegistered extends DomainError {}
+
+function register(workshop, email) {
+  if (typeof email !== "string" || !email.includes("@")) {
+    throw new ValidationError("a valid email is required");
+  }
+  if (workshop.attendees.includes(email)) {
+    throw new AlreadyRegistered(email + " is already registered");
+  }
+  if (workshop.attendees.length >= workshop.capacity) {
+    throw new WorkshopFull(workshop.title + " is full");
+  }
+  return { ...workshop, attendees: [...workshop.attendees, email] };
+}
+
+// ---------- адаптер: репозиторий в памяти ----------
+function createInMemoryWorkshops(...seed) {
+  const rows = new Map(seed.map((w) => [w.id, structuredClone(w)]));
+  return {
+    async get(id) {
+      const row = rows.get(id);
+      return row ? structuredClone(row) : null;
+    },
+    async save(workshop) {
+      rows.set(workshop.id, structuredClone(workshop));
+    },
+  };
+}
+
+// ---------- сценарий использования ----------
+function createRegistrations({ workshops }) {
+  return {
+    async register({ workshopId, email }) {
+      const workshop = await workshops.get(workshopId);
+      if (!workshop) {
+        throw new NotFound(`No workshop with id ${workshopId}`);
+      }
+      const updated = register(workshop, email);
+      await workshops.save(updated);
+      return {
+        workshop: updated.title,
+        seatsLeft: updated.capacity - updated.attendees.length,
+      };
+    },
+  };
+}
+
+// ---------- адаптер: тонкое приложение Express ----------
+const errorStatus = [
+  [ValidationError, 400],
+  [NotFound, 404],
+  [WorkshopFull, 409],
+  [AlreadyRegistered, 409],
+];
+
+function createApp({ registrations }) {
+  const app = express();
+  app.use(express.json());
+
+  app.post("/workshops/:id/registrations", async (req, res) => {
+    const result = await registrations.register({
+      workshopId: req.params.id,
+      email: req.body?.email,
+    });
+    res.status(201).json(result);
+  });
+
+  app.use((error, req, res, next) => {
+    const match = errorStatus.find(([Type]) => error instanceof Type);
+    if (!match) return next(error);
+    res.status(match[1]).json({ error: error.message });
+  });
+  return app;
+}
+
+// ---------- тесты (не меняйте их) ----------
+function makeApp() {
+  const workshops = createInMemoryWorkshops(
+    { id: "w1", title: "Intro to Node", capacity: 2, attendees: [] },
+  );
+  const registrations = createRegistrations({ workshops });
+  return { workshops, api: request(createApp({ registrations })) };
+}
+const url = "/workshops/w1/registrations";
+
+describe("запись на воркшопы", () => {
+  it("записывает участника и сообщает, сколько мест осталось", async () => {
+    const { api, workshops } = makeApp();
+    const res = await api.post(url).send({ email: "mei@pandadev.test" });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ workshop: "Intro to Node", seatsLeft: 1 });
+    const saved = await workshops.get("w1");
+    expect(saved.attendees).toEqual(["mei@pandadev.test"]);
+  });
+
+  it("отклоняет плохой email с кодом 400", async () => {
+    const res = await makeApp().api.post(url).send({ email: "nope" });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "a valid email is required" });
+  });
+
+  it("отвечает 404 для неизвестного воркшопа", async () => {
+    const res = await makeApp().api
+      .post("/workshops/w9/registrations")
+      .send({ email: "mei@pandadev.test" });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("No workshop with id w9");
+  });
+
+  it("отвечает 409 на повторы и заполненные воркшопы", async () => {
+    const { api } = makeApp();
+    await api.post(url).send({ email: "a@pandadev.test" });
+    const again = await api.post(url).send({ email: "a@pandadev.test" });
+    expect(again.status).toBe(409);
+    await api.post(url).send({ email: "b@pandadev.test" });
+    const full = await api.post(url).send({ email: "c@pandadev.test" });
+    expect(full.status).toBe(409);
+    expect(full.body.error).toBe("Intro to Node is full");
+  });
+
+  it("репозиторий выдаёт копии", async () => {
+    const { workshops } = makeApp();
+    const w = await workshops.get("w1");
+    w.attendees.push("sneaky@pandadev.test");
+    expect((await workshops.get("w1")).attendees).toEqual([]);
+    expect(await workshops.get("w9")).toBeNull();
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- В чистой архитектуре три слоя: **домен** (правила, обычный JavaScript), **сценарии использования** (по функции на действие пользователя, общаются с портами) и **адаптеры** (Express, PostgreSQL, почта, CLI).
+- **Правило зависимостей**: импорты направлены внутрь. Сценарии использования получают адаптеры, но никогда их не импортируют. Проверять это можно правилом ESLint `no-restricted-imports`.
+- В JavaScript **порт** — это договорённая форма объекта: опишите её через JSDoc `@typedef` (или `interface` в TypeScript) и подтвердите общим **контрактным тестом**.
+- **Репозиторий** прячет хранилище за `get`/`save`. Фейки в памяти должны возвращать **копии**, как настоящая база данных.
+- Express — **просто адаптер**: тонкие маршруты превращают запросы во входные данные сценариев использования, а один middleware для ошибок сопоставляет доменные ошибки с кодами ответа (неизвестные ошибки остаются 500).
+- Организуйте папки **по фичам**, а внутри каждой фичи — по слоям.
+- Тестируйте домен обычными значениями, сценарии использования — с репозиториями в памяти, адаптеры — с фейками и контрактными тестами, и держите несколько сквозных тестов. Для маленьких CRUD-приложений всё это можно пропустить.

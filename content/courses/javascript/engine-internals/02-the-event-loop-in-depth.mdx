@@ -1,0 +1,442 @@
+---
+title: The Event Loop in Depth
+description: Predict the exact order of tasks, microtasks, promises and await, avoid starving the loop, keep pages responsive by chunking long tasks, and meet Node's event loop phases and async iteration.
+duration: 23
+xp: 25
+---
+
+In [Callbacks and the Event Loop](/learn/javascript/callbacks-and-the-event-loop) you met the event loop: one thread, a call stack, a task queue, and microtasks that jump the queue. That picture is enough to write async code. To **debug** it (a UI that freezes, a log that appears in the "wrong" order, a test that passes alone and fails in the suite), you need the precise rules. This lesson gives you those rules, then puts them to work: keeping pages responsive, and how Node's loop differs from the browser's. 🔁
+
+## One thread, two queues
+
+JavaScript runs your code on **one thread**. While a function runs, nothing else in JavaScript can happen: no other callback, no click handler, and in the browser not even a repaint of the page. Everything that happens "later" waits in a queue:
+
+| Queue | Also called | What goes in |
+| --- | --- | --- |
+| **Task queue** | macrotask queue | `setTimeout`/`setInterval` callbacks, events (clicks, key presses), network and `MessageChannel` messages, the script itself |
+| **Microtask queue** | job queue | promise reactions (`.then`/`.catch`/`.finally` callbacks, code after `await`), `queueMicrotask`, `MutationObserver` |
+
+The loop itself is short. In the browser, one turn looks like this:
+
+```text
+ ┌──────────────────────────────────────────────────────────┐
+ │ 1. take ONE task from the task queue and run it          │
+ │ 2. run ALL microtasks, including ones queued by          │
+ │    microtasks, until the microtask queue is empty        │
+ │ 3. time for a new frame? (about every 16.7 ms at 60 Hz)  │
+ │      requestAnimationFrame callbacks → style → layout    │
+ │      → paint                                             │
+ │ 4. back to 1                                             │
+ └──────────────────────────────────────────────────────────┘
+```
+
+Two rules follow, and they explain almost every print-order puzzle:
+
+1. **Microtasks always run before the next task.** A `.then` callback beats a `setTimeout(fn, 0)` that was scheduled earlier.
+2. **The microtask queue is drained completely.** A microtask that queues another microtask gets it run in the same turn, before any task.
+
+## The exact order
+
+Here's a puzzle with every kind of callback. Read it, write down your answer, then check:
+
+<CodeExample output={`1: script start
+2: script end
+3: then 1
+4: queueMicrotask
+5: queued inside then 1
+6: then 2
+7: timeout 1
+8: microtask from timeout 1
+9: timeout 2`}>
+
+```js
+console.log("1: script start");
+
+setTimeout(() => {
+  console.log("7: timeout 1");
+  Promise.resolve().then(() => {
+    console.log("8: microtask from timeout 1");
+  });
+}, 0);
+setTimeout(() => console.log("9: timeout 2"), 0);
+
+Promise.resolve()
+  .then(() => {
+    console.log("3: then 1");
+    queueMicrotask(() => console.log("5: queued inside then 1"));
+  })
+  .then(() => console.log("6: then 2"));
+
+queueMicrotask(() => console.log("4: queueMicrotask"));
+console.log("2: script end");
+```
+
+</CodeExample>
+
+The trace:
+
+| Phase | Prints | Why |
+| --- | --- | --- |
+| The script (a task) | 1, 2 | Synchronous code finishes first. It queued two timers and two microtasks (`then 1`, `queueMicrotask`). |
+| Microtasks | 3, 4 | In the order they were queued. `then 1` queues "5", and finishing it queues `then 2`. |
+| Still microtasks | 5, 6 | The queue isn't empty yet, so they run too, still before any timer. |
+| Task: timeout 1 | 7 | Now the loop takes the first timer. It queues a microtask... |
+| Microtasks | 8 | ...which runs **before** the next task. |
+| Task: timeout 2 | 9 | |
+
+Notice that `then 2` waited for `then 1` to **finish**: each `.then` in a chain is queued only when the previous step settles. That's why "5", queued *inside* `then 1`, beats "6".
+
+## async functions are promise chains
+
+`async`/`await` is built on promises, so the same rules apply. The precise model:
+
+- Calling an `async` function runs its body **synchronously**, up to the first `await`.
+- `await x` pauses the function and **returns control to the caller**. The rest of the function is queued as a **microtask** once `x` has settled (even if `x` isn't a promise at all, like `await null`).
+- The `async` function itself always returns a promise, which resolves with whatever it `return`s.
+
+<CodeExample output={`A: start
+B: start
+sync code done
+A: after first await
+B: after first await
+A: after second await
+B: after second await`}>
+
+```js
+async function task(name) {
+  console.log(`${name}: start`);
+  await null;
+  console.log(`${name}: after first await`);
+  await null;
+  console.log(`${name}: after second await`);
+}
+
+task("A");
+task("B");
+console.log("sync code done");
+```
+
+</CodeExample>
+
+The two calls **interleave** at every `await`. Under the hood, the engine turns the function into something very close to this promise chain:
+
+```js
+function task(name) {
+  console.log(`${name}: start`);
+  return Promise.resolve(null)
+    .then(() => {
+      console.log(`${name}: after first await`);
+      return null;
+    })
+    .then(() => {
+      console.log(`${name}: after second await`);
+    });
+}
+```
+
+Two practical consequences:
+
+- **Code before the first `await` is synchronous.** If it throws, the error still becomes a rejected promise (not a normal exception), so callers must `await` or `.catch` it.
+- **Every `await` is a point where other code can run** and change shared state. A classic race: `if (!cache.has(id)) { const user = await load(id); cache.set(id, user); }` called twice in a row starts **two** loads, because both calls passed the `has` check before either got past its `await`. The fix is to store the **promise** in the cache straight away, as you'll do in the system design module.
+
+<Callout type="warning" title="Don't depend on exact microtask counts">
+
+How many microtask "hops" an `await` takes has changed between engine versions (`return await promise` versus `return promise` in an `async` function, for example). Use the rules above to understand code, but if your program is only correct because one `await` beats another by a tick, it's a race condition. Make the order explicit with `await`, `Promise.all` or a queue.
+
+</Callout>
+
+## Microtask starvation
+
+Rule 2 has a dark side. Since the loop drains **all** microtasks before moving on, a microtask that keeps queueing more microtasks never lets a task run:
+
+<CodeExample output={`timer finally ran after 100000 microtasks`}>
+
+```js
+let count = 0;
+
+setTimeout(() => {
+  console.log(`timer finally ran after ${count} microtasks`);
+}, 0);
+
+function spin() {
+  count++;
+  if (count < 100_000) queueMicrotask(spin); // stops eventually
+}
+queueMicrotask(spin);
+```
+
+</CodeExample>
+
+The timer was ready the whole time but had to wait for 100,000 microtasks. Without the limit, the page would freeze exactly like a `while (true)` loop: no clicks, no timers, no repaints. The same happens with a recursive promise loop such as `function poll() { return check().then(poll); }` if `check()` resolves straight away (from a cache, say). Always put a **task** (a timer, a network request) somewhere in a loop that could run forever.
+
+## Rendering and requestAnimationFrame
+
+In a browser, the screen can only be updated **between tasks** (step 3 of the loop). While your code runs, the page is frozen in its old state, so this shows nothing but the final number:
+
+```js
+for (let i = 1; i <= 100; i++) {
+  progress.textContent = `${i}%`; // the user only ever sees 100%
+}
+```
+
+For animations, use **`requestAnimationFrame(callback)`**. The browser calls it right before it paints the next frame, once per frame, in time with the screen's refresh rate (and pauses it in background tabs to save battery):
+
+```js
+function animate(time) {
+  // time: milliseconds since the page loaded
+  box.style.transform = `translateX(${(time / 10) % 300}px)`;
+  requestAnimationFrame(animate); // ask for the next frame
+}
+requestAnimationFrame(animate);
+```
+
+`setTimeout(animate, 16)` looks similar but drifts out of step with the screen, causing stutter, and keeps running in hidden tabs.
+
+## Long tasks: keep the page responsive
+
+At 60 frames per second the browser has about **16 ms** per frame. A **long task** is any task that takes more than **50 ms**; during it, the page can't react. Users notice from about 100 ms. The Core Web Vital **INP** (Interaction to Next Paint) measures exactly this: how long it takes from a click or key press until the screen shows the result. Long tasks are its number-one cause.
+
+When you have a lot of work to do on the main thread (filtering 50,000 rows, parsing a big file), split it into **chunks** and **yield** to the event loop between them by waiting for a new task. Other tasks (a click, a timer, a render) get their turn in the gaps:
+
+<CodeExample output={`processed 1, 2
+🖱️ click handled
+processed 3, 4
+processed 5, 6
+all done`}>
+
+```js
+const nextTask = () => new Promise((r) => setTimeout(r, 0));
+
+async function processAll(items, chunkSize) {
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const chunk = items.slice(i, i + chunkSize);
+    console.log(`processed ${chunk.join(", ")}`);
+    await nextTask(); // let the click (and rendering) in
+  }
+  console.log("all done");
+}
+
+// The user clicks while we're busy
+setTimeout(() => console.log("🖱️ click handled"), 0);
+processAll([1, 2, 3, 4, 5, 6], 2);
+```
+
+</CodeExample>
+
+Without the `await nextTask()`, the click would wait until all chunks were done. Note that `await null` or `await Promise.resolve()` would **not** help: those continue as a microtask, which runs before the click's task and before rendering.
+
+Newer browsers have a better tool, **`scheduler.yield()`**. It yields like a timer, but your code continues at the **front** of the queue instead of the back, so other code can't keep pushing your work further and further back (and it doesn't suffer from browsers clamping nested timers to at least 4 ms). Not every browser has it yet, so feature-detect:
+
+```js
+const yieldToMain = () =>
+  globalThis.scheduler?.yield
+    ? scheduler.yield()
+    : new Promise((resolve) => setTimeout(resolve, 0));
+
+for (const row of rows) {
+  render(row);
+  if (performance.now() - lastYield > 40) {
+    await yieldToMain();
+    lastYield = performance.now();
+  }
+}
+```
+
+Yielding by **time** (every ~40 ms) rather than every N items adapts to fast and slow devices. And when the work is pure calculation that doesn't touch the DOM, move it off the main thread entirely with a **Web Worker** (you'll do that in the performance module).
+
+<Callout type="tip" title="A war story">
+
+A dashboard team couldn't understand why typing in their search box felt "sticky" on office laptops but fine on their MacBooks. A profile showed a 400 ms task on every keystroke: re-filtering and re-rendering 20,000 rows at once. Debouncing the input and rendering the results in chunks brought it down to tasks of under 30 ms, without making anything "faster". Responsiveness is about the **longest** task, not the total time.
+
+</Callout>
+
+## Node's event loop
+
+Node.js uses the same language rules (tasks, microtasks, promises), but its loop comes from a C library called **libuv** and runs in **phases**. Each turn goes through them in order, and runs all microtasks after every single callback:
+
+```text
+ ┌─▶ timers          setTimeout / setInterval callbacks that are due
+ │   pending         some system callbacks (e.g. TCP errors)
+ │   poll            wait for I/O; run its callbacks (files, network)
+ │   check           setImmediate callbacks
+ └── close           'close' events (sockets, handles)
+```
+
+Node also has two scheduling functions the browser doesn't. Here's what they print, in Node on your machine:
+
+```js title="order.cjs"
+const fs = require("node:fs");
+
+setTimeout(() => console.log("timeout"), 0);
+setImmediate(() => console.log("immediate"));
+Promise.resolve().then(() => console.log("promise"));
+process.nextTick(() => console.log("nextTick"));
+console.log("sync");
+
+fs.readFile(__filename, () => {
+  setTimeout(() => console.log("io: timeout"), 0);
+  setImmediate(() => console.log("io: immediate"));
+});
+```
+
+```bash
+node order.cjs
+# sync
+# nextTick
+# promise
+# timeout        (timeout vs immediate here: not guaranteed!)
+# immediate
+# io: immediate  (inside an I/O callback: always first)
+# io: timeout
+```
+
+- **`process.nextTick(fn)`** runs `fn` as soon as the current operation finishes, **before** promise microtasks (in CommonJS; in an ES module the module code itself runs inside a promise job, so `promise` prints before `nextTick`). It's even more urgent than a microtask, which also means it can starve the loop. Node's own docs suggest `queueMicrotask` for most new code.
+- **`setImmediate(fn)`** runs `fn` in the **check** phase, right after I/O. Inside an I/O callback it always beats `setTimeout(fn, 0)`; at the top level their order depends on how fast the process started. It's Node's best "yield to the loop" tool.
+
+The rule for servers is the same as for pages: a long synchronous task (a huge `JSON.parse`, a slow regex, `bcrypt.hashSync`) blocks **every** request on that process, not just the current one.
+
+## Async iteration
+
+Some data arrives over time: pages from an API, lines from a file, messages from a socket. **Async iteration** lets you loop over it as if it were an array. An **async generator** (`async function*`) can both `await` and `yield`, and **`for await...of`** waits for each value:
+
+<CodeExample output={`(fetched page 1 of 3)
+The Bamboo Heist 7.8
+Panda Express to Mars 6.9
+Midnight in the Forest 8.1
+The Last Dumpling 7.2
+(fetched page 2 of 3)
+Code Red 6.4
+Snow Leopard Summer 7.6
+Stopped early: page 3 was never fetched`}>
+
+```js
+const API = "https://api.pandadev.test";
+
+async function* allMovies() {
+  for (let page = 1; ; page++) {
+    const res = await fetch(`${API}/movies?limit=4&page=${page}`);
+    const data = await res.json();
+    console.log(`(fetched page ${page} of ${data.totalPages})`);
+    yield* data.results; // hand out this page's movies one by one
+    if (page >= data.totalPages) return;
+  }
+}
+
+let shown = 0;
+for await (const movie of allMovies()) {
+  console.log(movie.title, movie.rating);
+  if (++shown === 6) break; // ends the generator too
+}
+console.log("Stopped early: page 3 was never fetched");
+```
+
+</CodeExample>
+
+(PandaDev has a practice API built in, so this works offline and gives the same answers every time. Real paginated APIs work the same way.)
+
+The generator is **lazy**: it only fetches the next page when the loop asks for more values, and `break` stops it for good. The caller doesn't know or care about pages at all. Behind the scenes, `for await` calls the object's `[Symbol.asyncIterator]()` method and awaits each `next()`, the async twin of the iteration protocol from [Map, Set and Generators](/learn/javascript/map-set-and-generators). Node streams, `fs.promises` file handles and web `ReadableStream`s are async iterables too:
+
+```js
+// In Node on your machine: read a big file line by line
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
+
+const lines = createInterface({ input: createReadStream("big.log") });
+for await (const line of lines) {
+  if (line.includes("ERROR")) console.log(line);
+}
+```
+
+<Quiz
+  question={'What does this print? async function f() { console.log("B"); await null; console.log("D"); } console.log("A"); setTimeout(() => console.log("E"), 0); f(); console.log("C");'}
+  options={["A, B, C, D, E", "A, C, B, D, E", "A, B, D, C, E", "A, B, C, E, D"]}
+  answer={0}
+  explanation="A prints first. Calling f() runs its body synchronously up to the await, so B prints next. The await hands control back and C prints. Then the microtask continues f and prints D. The timer is a task, so E comes last."
+/>
+
+<Quiz
+  question="A function processes 50,000 rows in chunks of 500 and writes await Promise.resolve() between chunks. Does the page stay responsive?"
+  options={[
+    "Yes, every await lets the browser handle clicks and repaint",
+    "No: the code after await runs as a microtask, so all chunks still run before any click or repaint",
+    "Yes, but only in Chrome",
+    "No, because await doesn't work inside loops",
+  ]}
+  answer={1}
+  explanation="Microtasks are drained before the loop takes the next task or renders, so awaiting an already-resolved promise never gives the browser a turn. Yield with a new task instead: setTimeout(resolve, 0) or scheduler.yield()."
+/>
+
+<Exercise
+  title="Process big lists without freezing"
+  starter={`async function processInChunks(items, chunkSize, work) {
+  // TODO: process chunkSize items at a time and give
+  // the event loop a turn between chunks.
+  const results = [];
+  for (let i = 0; i < items.length; i++) {
+    results.push(work(items[i], i));
+  }
+  return results;
+}
+
+const ids = Array.from({ length: 10 }, (_, i) => i + 1);
+setTimeout(() => console.log("🖱️ click handled"), 0);
+const squares = await processInChunks(ids, 4, (n) => n * n);
+console.log(squares.join(" "));
+`}
+  tests={[
+    { name: "The click is handled before the work finishes", check: `__output.join("|") === "🖱️ click handled|1 4 9 16 25 36 49 64 81 100"` },
+    { name: "Returns every result in order", check: `(await processInChunks(["a", "b", "c"], 2, (s) => s.toUpperCase())).join() === "A,B,C"` },
+    { name: "Passes the index to work, and handles an empty list", check: `(await processInChunks([10, 20, 30], 2, (x, i) => x + i)).join() === "10,21,32" && (await processInChunks([], 5, (x) => x)).length === 0` },
+    { name: "Returns a promise and runs the first chunk straight away", check: `(() => { let done = 0; const p = processInChunks([1, 2, 3, 4, 5, 6, 7], 3, () => done++); return p instanceof Promise && done === 3; })()` },
+    { name: "Other tasks run between chunks", check: `await (async () => { let done = 0; let seen = -1; const p = processInChunks(Array.from({ length: 9 }, (_, i) => i), 3, (x) => { done++; return x; }); setTimeout(() => { seen = done; }, 0); await p; return seen > 0 && seen < 9; })()` },
+  ]}
+>
+
+`processInChunks(items, chunkSize, work)` calls `work(item, index)` for every item and resolves with an array of the results, like an async `map`. Right now it does everything in one long task, so the click in the demo has to wait. Make it **yield** to the event loop:
+
+1. Process `chunkSize` items at a time. Start the **first** chunk straight away (synchronously, when the function is called).
+2. Between chunks, wait for a **new task** with `setTimeout(..., 0)`, so timers, clicks and rendering can run. (A microtask like `await null` doesn't count: try it and watch the checks fail!)
+3. Resolve with all results in the original order. The demo should print the click **first**, then `1 4 9 16 25 36 49 64 81 100`.
+
+<Hint>
+
+Make a helper `const nextTask = () => new Promise((resolve) => setTimeout(resolve, 0));`. Loop over chunk starts with `for (let start = 0; start < items.length; start += chunkSize)`, and at the top of the loop write `if (start > 0) await nextTask();`. Inside, an inner loop from `start` to `Math.min(start + chunkSize, items.length)` pushes `work(items[i], i)`.
+
+</Hint>
+
+<Solution>
+
+```js
+const nextTask = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+async function processInChunks(items, chunkSize, work) {
+  const results = [];
+  for (let start = 0; start < items.length; start += chunkSize) {
+    if (start > 0) await nextTask(); // let other tasks run
+    const end = Math.min(start + chunkSize, items.length);
+    for (let i = start; i < end; i++) {
+      results.push(work(items[i], i));
+    }
+  }
+  return results;
+}
+
+const ids = Array.from({ length: 10 }, (_, i) => i + 1);
+setTimeout(() => console.log("🖱️ click handled"), 0);
+const squares = await processInChunks(ids, 4, (n) => n * n);
+console.log(squares.join(" "));
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- One turn of the loop: run **one task**, then **all microtasks** (including new ones), then maybe **render** (rAF → style → layout → paint).
+- Tasks: timers, events, messages. Microtasks: promise reactions, code after `await`, `queueMicrotask`. Microtasks always run before the next task.
+- An `async` function runs synchronously until its first `await`; the rest continues as microtasks. Every `await` is a point where other code can run, so watch for races on shared state.
+- Endless microtasks **starve** the loop just like an endless loop; include a real task somewhere.
+- Tasks over **50 ms** are long tasks and hurt **INP**. Split work into chunks and yield with a **task** (`setTimeout(…, 0)`, `scheduler.yield()`), not a microtask; use `requestAnimationFrame` for animations and Web Workers for heavy computation.
+- Node's loop has **phases** (timers, poll, check...). `process.nextTick` runs before promise microtasks (in CommonJS); `setImmediate` runs after I/O.
+- **Async generators** and `for await...of` turn data that arrives over time (pages, lines, messages) into a lazy loop; `break` stops the producer.

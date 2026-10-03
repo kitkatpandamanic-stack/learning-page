@@ -1,0 +1,670 @@
+---
+title: Designing Systems
+description: Go from requirements to a design with back-of-the-envelope maths, stateless Node servers, load balancers, cache layers, replicas, shards, queues and the CAP trade-off.
+duration: 25
+xp: 25
+---
+
+Up to now, "the backend" has been one Express app on one machine. That's the right start, and plenty of successful products never need more. But when traffic grows, one Node process stops being enough, and you have to choose bigger pieces: more servers, caches, replicas, queues. **System design** is choosing those pieces and how they talk to each other. There's rarely one right answer, only trade-offs, so this lesson is about vocabulary and, more importantly, about reasoning: which piece do you need, and *why*? 🏗️
+
+Our running example for the whole module is **PandaPoll**: a presenter creates a poll ("Tabs or spaces?"), the audience votes from their phones, and everyone sees the results update live on the big screen.
+
+## Start with requirements, not boxes
+
+The classic mistake in design meetings (and interviews) is drawing boxes before anyone has agreed what the system must do. Write the requirements down first, in two kinds:
+
+| Kind | Question it answers | PandaPoll examples |
+| --- | --- | --- |
+| **Functional** | What does it do? | Create a poll; vote once per person; see live results; export results as CSV |
+| **Non-functional** | How well must it do it? | A vote is confirmed in under 300 ms; results reach every screen within 1 s; 99.9% uptime during events; no vote is ever lost |
+
+Non-functional requirements are the ones that shape the architecture. "Show live results" is a weekend project. "Show live results to 5,000 people at a conference, within a second, even if a server dies mid-keynote" is a system design problem.
+
+Also write down what's **out of scope**: "no anonymous polls in v1", "no comments". Scope that isn't written down grows quietly until nobody can build it in time.
+
+## Back-of-the-envelope maths
+
+Before choosing any technology, estimate the **load**. You want the order of magnitude, not precision: is it 10 requests per second or 10,000? Those need very different systems.
+
+<CodeExample output={`Votes per day:            3,000,000
+Average votes/s:          35
+Keynote votes/s:          500
+Updates/s, one per vote:  2,500,000
+Updates/s, 2 per second:  10,000
+Storage per year:         66 GB`}>
+
+```js
+const fmt = (n) => Math.round(n).toLocaleString("en-US");
+const show = (label, value) =>
+  console.log(`${label.padEnd(26)}${value}`);
+
+const pollsPerDay = 40_000;
+const votersPerPoll = 75;
+const votesPerDay = pollsPerDay * votersPerPoll;
+show("Votes per day:", fmt(votesPerDay));
+show("Average votes/s:", fmt(votesPerDay / 86_400));
+
+// The worst case: a keynote with 5,000 people,
+// who all vote within about 10 seconds
+const audience = 5_000;
+const peakVotes = audience / 10;
+show("Keynote votes/s:", fmt(peakVotes));
+
+// Live results: every vote updates every screen
+show("Updates/s, one per vote:", fmt(peakVotes * audience));
+show("Updates/s, 2 per second:", fmt(2 * audience));
+
+const bytesPerVote = 60;
+const gbPerYear = (votesPerDay * 365 * bytesPerVote) / 1e9;
+show("Storage per year:", `${fmt(gbPerYear)} GB`);
+```
+
+</CodeExample>
+
+Five minutes of arithmetic, and the design is already taking shape:
+
+- **35 votes per second on average is nothing.** One Node process and one Postgres database handle that easily. The *average* is misleading, though: PandaPoll's traffic comes in **spikes**, when a presenter says "vote now". Design for the peak.
+- **The real danger is fan-out.** Pushing new results to every screen after every vote means 2.5 million messages per second during one keynote. Sending a fresh snapshot twice a second instead means 10,000. Same user experience (nobody can read faster than that), 250× less work. That one decision matters more than any choice of framework.
+- **66 GB a year fits on one disk.** We don't need to split the database for years.
+
+A few numbers worth keeping in your head:
+
+| Rule of thumb | Value |
+| --- | --- |
+| Seconds in a day | 86,400 (about 10⁵) |
+| Read from memory | ~100 nanoseconds |
+| Read from an SSD | ~100 microseconds (1,000× slower) |
+| Round trip inside one data centre | ~0.5 ms |
+| Round trip Europe ↔ US | ~80–150 ms |
+| One Node process, simple JSON API | thousands of requests/s (one CPU core) |
+
+<Callout type="tip" title="Say your assumptions out loud">
+
+"75 voters per poll" and "everyone votes within 10 seconds" are guesses. That's fine: write them next to the numbers so others can challenge them ("our biggest customer runs 20,000-person events"). A design built on visible guesses can be corrected; one built on hidden guesses fails in production.
+
+</Callout>
+
+## Scaling up vs scaling out
+
+When one server isn't enough, there are two ways to grow:
+
+| | Scale **up** (vertical) | Scale **out** (horizontal) |
+| --- | --- | --- |
+| What | A bigger machine: more CPU and RAM | More machines (or processes) of the same size |
+| Pros | No code changes | Almost no upper limit; survives one machine dying |
+| Cons | There's a biggest machine, and it's still one point of failure | Needs a load balancer, and the servers must be **stateless** |
+| Good for | Databases (for a long time) | API servers, WebSocket servers, workers |
+
+There's a Node-specific twist. Your JavaScript runs on **one thread**, so a single Node process uses **one CPU core**, no matter how big the machine is. A 16-core server running one `node server.js` is mostly idle. In practice you scale out even on one machine: one process per core, using Node's `cluster` module or a process manager, or (most common today) several small containers behind a load balancer.
+
+```bash
+# On your machine: one Node process per CPU core with PM2
+npm install --global pm2
+pm2 start server.js -i max   # "max" = as many as there are cores
+pm2 list
+```
+
+## Stateless servers
+
+Scaling out only works if any server can handle any request. That means a server keeps **nothing important in its own memory** between requests: sessions go into a shared store (Redis or the database), uploaded files into object storage (like S3), and so on. Such a server is **stateless**.
+
+Here's what happens when it isn't. Two app servers sit behind a load balancer that takes turns:
+
+<CodeExample output={`app-2: not logged in
+app-2: mei
+app-1: mei`}>
+
+```js
+// Each "server" is a tiny app; sessions come from a store
+function createAppServer(name, sessions = new Map()) {
+  return {
+    name,
+    login(sid, user) {
+      sessions.set(sid, user);
+    },
+    me(sid) {
+      const user = sessions.get(sid);
+      return `${name}: ${user ?? "not logged in"}`;
+    },
+  };
+}
+
+function* roundRobin(servers) {
+  for (let i = 0; ; i++) yield servers[i % servers.length];
+}
+
+// ❌ Stateful: each server keeps sessions in its own memory
+let lb = roundRobin([createAppServer("app-1"),
+  createAppServer("app-2")]);
+lb.next().value.login("s1", "mei");
+console.log(lb.next().value.me("s1"));
+
+// ✅ Stateless: sessions live in one shared store
+const shared = new Map(); // Redis or a database in real life
+lb = roundRobin([createAppServer("app-1", shared),
+  createAppServer("app-2", shared)]);
+lb.next().value.login("s1", "mei");
+console.log(lb.next().value.me("s1"));
+console.log(lb.next().value.me("s1"));
+```
+
+</CodeExample>
+
+Mei logs in on `app-1`, her next request lands on `app-2`, and she's "logged out". This is a real and common bug: it works perfectly on a developer's laptop (one process) and breaks the day someone adds a second server. Notice the fix is **dependency injection** again: the server receives its session store instead of creating one, so production passes a shared Redis-backed store and tests pass a `Map`.
+
+Watch out for other hidden state in Node apps: in-memory rate-limit counters, a module-level `Map` used as a cache, files written to the local disk, `setInterval` jobs that would now run once **per process**. Each needs a shared home, or a deliberate decision that per-process is fine.
+
+## Load balancers and health checks
+
+A **load balancer** (LB) sits in front of your servers and spreads requests between them. It also runs **health checks** (calling something like `/health` every few seconds) and stops sending traffic to a server that doesn't answer. Two common strategies:
+
+<CodeExample output={`[ 'app-1', 'app-3', 'app-1', 'app-3' ]
+app-3`}>
+
+```js
+const servers = [
+  { name: "app-1", active: 12, healthy: true },
+  { name: "app-2", active: 3, healthy: false },
+  { name: "app-3", active: 7, healthy: true },
+];
+
+function* roundRobin(list) {
+  for (let i = 0; ; i++) yield list[i % list.length];
+}
+
+function leastConnections(list) {
+  return list
+    .filter((s) => s.healthy)
+    .reduce((best, s) => (s.active < best.active ? s : best));
+}
+
+const next = roundRobin(servers.filter((s) => s.healthy));
+console.log([1, 2, 3, 4].map(() => next.next().value.name));
+console.log(leastConnections(servers).name);
+```
+
+</CodeExample>
+
+**Round robin** takes turns, which is great when requests are similar. **Least connections** picks the least busy server, which matters when some requests are slow or long-lived (like WebSocket connections, next lesson). Both skip `app-2`, which failed its health check. You configure this in nginx, HAProxy or your cloud's load balancer rather than writing it, but now you know what the settings mean.
+
+A good health endpoint is cheap and honest: it says whether *this* process can do its job, without doing heavy work on every call.
+
+```js
+app.get("/health", async (req, res) => {
+  try {
+    await db.query("SELECT 1"); // can we reach the database?
+    res.json({ status: "ok" });
+  } catch {
+    res.status(503).json({ status: "db unreachable" });
+  }
+});
+```
+
+## Cache layers
+
+A **cache** keeps a copy of data somewhere faster, so you don't recompute or re-read it every time. A request for a PandaPoll page can be answered by several layers, from closest to the user to furthest:
+
+| Layer | What it caches | How you control it |
+| --- | --- | --- |
+| **Browser** | Scripts, images, API responses | `Cache-Control` headers, ETags |
+| **CDN** (Cloudflare, CloudFront…) | Static files and public pages, in data centres near users | `Cache-Control`, purging on deploy |
+| **App cache** (Redis, or a `Map` in one process) | Database results, computed values | Your code: cache-aside, TTLs, invalidation |
+| **Database** | Its own pages in memory | Mostly automatic |
+
+Every layer you can answer from is a request the layers behind it never see. Hashed bundle filenames with `Cache-Control: max-age=31536000, immutable` mean returning visitors download your JavaScript once, and the CDN serves it to everyone else. That's the cheapest scaling there is.
+
+### Cache-aside
+
+The most common app-level pattern is **cache-aside** (also called lazy loading): look in the cache; on a **miss**, load from the database and store the result for next time.
+
+<CodeExample output={`one at a time: 1 DB read
+all at once: 500 DB reads
+Tabs or spaces?`}>
+
+```js
+const db = new Map([[7, { id: 7, question: "Tabs or spaces?" }]]);
+let dbReads = 0;
+
+async function loadPoll(id) {
+  dbReads++;
+  await new Promise((r) => setTimeout(r, 50)); // a slow query
+  return db.get(id);
+}
+
+const cache = new Map();
+
+async function getPoll(id) {
+  if (cache.has(id)) return cache.get(id);  // 1. hit
+  const poll = await loadPoll(id);          // 2. miss: ask the DB
+  cache.set(id, poll);                      // 3. remember it
+  return poll;
+}
+
+await getPoll(7);
+await getPoll(7);
+await getPoll(7);
+console.log("one at a time:", dbReads, "DB read");
+
+// A keynote starts: 500 people open the poll at once
+cache.clear();
+dbReads = 0;
+const opens = Array.from({ length: 500 }, () => getPoll(7));
+const polls = await Promise.all(opens);
+console.log("all at once:", dbReads, "DB reads");
+console.log(polls[499].question);
+```
+
+</CodeExample>
+
+One at a time, the cache works perfectly. But look at the second part: 500 requests arrive together, they **all** miss (the first load hasn't finished when the others check), and the database gets 500 identical queries. This is a **cache stampede** (or "thundering herd"), and it strikes exactly when you need the cache most: at a traffic spike, or right after a deploy or a cache restart.
+
+The fix is **request coalescing**: the first miss starts the load and stores the **promise** in a `Map` of in-flight loads; every miss that arrives while it's running awaits that same promise. 500 requests, one query. JavaScript makes this unusually elegant, because a promise is a value you can share. You'll build it in the exercise.
+
+### Keeping caches fresh
+
+The famous joke says there are two hard things in computer science: cache invalidation, naming things and off-by-one errors. Your tools:
+
+| Tool | How it works | Trade-off |
+| --- | --- | --- |
+| **TTL** (time to live) | Each entry expires after N seconds | Simple and self-healing, but data can be N seconds stale |
+| **Invalidate on write** | When data changes, delete the cache key | Fresh, but every code path that writes must remember it |
+| **Both** | Invalidate on write, TTL as a safety net | What most real systems do |
+
+Delete the key **after** writing to the database, not before; otherwise another request can re-cache the old value in between. And choose the TTL from the product requirement: a poll's question can be cached for minutes, but its live vote counts maybe for half a second.
+
+<Callout type="warning" title="A cache you can't live without is a dependency">
+
+A team once restarted every Redis node at the same moment during a deploy. The cache came back empty, all traffic hit the database at once, and the database fell over, taking the site with it. Coalesce requests, add a little random **jitter** to TTLs so keys don't all expire together, and make sure the database can survive at least a cold start.
+
+</Callout>
+
+## Databases: indexes, replicas and shards
+
+The database is usually the hardest part to scale, because it holds the **state**. Reach for these tools in this order:
+
+**1. Indexes.** Before anything else, make sure queries use them. Without an index, "find the votes for poll 7" makes the database read **every** row, like `array.filter` over the whole table. An index is a sorted structure (usually a B-tree) that jumps straight to the matching rows, more like `map.get(7)`. A missing index is the single most common cause of a "slow database", and adding one is a one-line migration:
+
+```sql
+CREATE INDEX votes_poll_id_idx ON votes (poll_id);
+
+-- Ask Postgres how it runs a query: look for "Index Scan"
+-- rather than "Seq Scan" on big tables
+EXPLAIN ANALYZE SELECT * FROM votes WHERE poll_id = 7;
+```
+
+Indexes aren't free: every insert has to update them too, so index the columns you filter, join and sort by, not everything.
+
+**2. A bigger machine.** Scaling up a database is boring and works for a surprisingly long time.
+
+**3. Read replicas.** A **primary** takes all writes and streams changes to **replicas** that serve reads. Great for read-heavy apps. The catch is **replication lag**: a replica can be a little behind, so a user who just voted might not see their vote if you read from a replica. A common rule: read your **own** recent writes from the primary.
+
+**4. Sharding.** When the data or the writes are too much for one machine, split them: each **shard** holds part of the data, chosen by a **shard key** such as the poll id. The naive way is `hash(key) % numberOfShards`, but look what happens when you add a shard:
+
+<CodeExample output={`mei -> shard 1
+kai -> shard 0
+luna -> shard 0
+modulo, 3 -> 4 shards: moves 75%
+ring, 3 -> 4 shards: moves 27%`}>
+
+```js
+// FNV-1a: a small, fast string hash (same result everywhere)
+function hash(text) {
+  let h = 2166136261;
+  for (const ch of text) {
+    h = Math.imul(h ^ ch.codePointAt(0), 16777619);
+  }
+  h ^= h >>> 16; // mix the bits so similar keys spread out
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  return h >>> 0; // as an unsigned 32-bit number
+}
+
+const byModulo = (key, n) => hash(key) % n;
+
+for (const user of ["mei", "kai", "luna"]) {
+  console.log(user, "-> shard", byModulo(user, 3));
+}
+
+const users = Array.from({ length: 10_000 }, (_, i) => `u${i}`);
+const share = (moved) =>
+  `${Math.round((users.filter(moved).length / 10_000) * 100)}%`;
+
+console.log("modulo, 3 -> 4 shards: moves",
+  share((u) => byModulo(u, 3) !== byModulo(u, 4)));
+
+// Consistent hashing: each shard owns 100 points on a ring
+function createRing(shards) {
+  const points = shards
+    .flatMap((shard) =>
+      Array.from({ length: 100 }, (_, i) => ({
+        at: hash(`${shard}#${i}`),
+        shard,
+      })),
+    )
+    .sort((a, b) => a.at - b.at);
+  // a key belongs to the first point at or after its hash
+  return (key) => {
+    const h = hash(key);
+    return (points.find((p) => p.at >= h) ?? points[0]).shard;
+  };
+}
+
+const ring3 = createRing(["a", "b", "c"]);
+const ring4 = createRing(["a", "b", "c", "d"]);
+console.log("ring, 3 -> 4 shards: moves",
+  share((u) => ring3(u) !== ring4(u)));
+```
+
+</CodeExample>
+
+With `% n`, going from 3 to 4 shards moves **three quarters** of all data between machines. **Consistent hashing** places shards at many points on a ring of hash values; a key belongs to the next point along. Adding shard `d` only takes over the keys just before its points, about a quarter (the ideal for 4 shards is exactly 25%), and nothing moves between the old shards. Redis Cluster, Cassandra and DynamoDB all use a variant of this idea. (A real ring would use binary search instead of `find`, and a well-tested hash function from a library.)
+
+Notice the hash must give the **same answer on every server**, which is why it's a fixed algorithm here and not something random per process. Sharding is powerful but expensive: queries across shards, joins and transactions all get harder. Treat it as a last resort, after indexes, caching, a bigger machine and replicas.
+
+## Queues and background workers
+
+Some work doesn't need to happen while the user waits: exporting results, sending emails, resizing images. Put a **job** on a **queue**, answer **202 Accepted** straight away, and let separate **worker** processes do the slow part.
+
+<CodeExample output={`202 string
+{ status: 'queued' }
+{ status: 'done', result: 'poll-7.csv' }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const queue = [];         // RabbitMQ, SQS or Redis in real life
+const jobs = new Map();   // job id -> { status, result }
+
+const app = express();
+
+app.post("/polls/:id/export", (req, res) => {
+  const job = { id: crypto.randomUUID(), pollId: req.params.id };
+  jobs.set(job.id, { status: "queued" });
+  queue.push(job);
+  res.status(202).json({ jobId: job.id }); // answer straight away
+});
+
+app.get("/jobs/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "No such job" });
+  res.json(job);
+});
+
+// The worker runs in another process and does the slow part
+async function runWorker() {
+  while (queue.length > 0) {
+    const job = queue.shift();
+    jobs.set(job.id, { status: "running" });
+    await new Promise((r) => setTimeout(r, 100)); // build a CSV
+    const result = `poll-${job.pollId}.csv`;
+    jobs.set(job.id, { status: "done", result });
+  }
+}
+
+const res = await request(app).post("/polls/7/export");
+console.log(res.status, typeof res.body.jobId);
+
+const check = () => request(app).get(`/jobs/${res.body.jobId}`);
+console.log((await check()).body);
+await runWorker();
+console.log((await check()).body);
+```
+
+</CodeExample>
+
+The client gets a job id at once and can check `/jobs/:id` (or be told over a WebSocket) when the file is ready. Queues also **absorb spikes**: if 10,000 exports are requested in a minute, they wait in the queue while the workers catch up at their own pace, instead of overloading the database all at once. Slow CPU work also stays **off the API's event loop**, which keeps every other request fast.
+
+In Node, the popular choice is **BullMQ** on top of Redis:
+
+```js
+import { Queue, Worker } from "bullmq";
+const connection = { host: "localhost", port: 6379 };
+
+// In the API process
+const exports = new Queue("exports", { connection });
+await exports.add("csv", { pollId: 7 }, {
+  attempts: 3,
+  backoff: { type: "exponential", delay: 1000 },
+});
+
+// In the worker process (node worker.js)
+new Worker("exports", async (job) => {
+  return buildCsv(job.data.pollId);
+}, { connection });
+```
+
+Two things to plan for: a job can run **more than once** (a worker crashes halfway and the job is retried), so jobs must be safe to repeat; and jobs that keep failing go to a **dead-letter queue** where a human can look at them instead of retrying forever.
+
+## CAP in plain words
+
+When data lives on several machines, the network between them will sometimes break. During such a **partition**, a machine that can't reach the others has to choose:
+
+- **Consistency (C):** refuse to answer (or return an error) rather than risk giving out-of-date data.
+- **Availability (A):** answer with what it has, which might be stale.
+
+That's the **CAP theorem**: during a **P**artition you get **C** or **A**, not both. When the network is fine you can have both, so it's really a question of what each feature should do on a bad day. That's a **product** decision as much as a technical one:
+
+| Data | Better choice | Why |
+| --- | --- | --- |
+| Payments, ticket sales, "one vote per person" | Consistency | Selling the last seat twice costs real money and trust |
+| Live vote counts, likes, view counters | Availability | A count that's a second behind is fine |
+| A user's profile picture | Availability | A stale picture beats an error page |
+
+Systems that choose availability are usually **eventually consistent**: copies may disagree briefly but catch up once the network heals. PandaPoll's "results reach every screen within 1 s" requirement is that choice, written down. The vote itself must not be lost or counted twice, so recording a vote is a consistent write to the primary database.
+
+<Quiz
+  question="PandaPoll runs on one Node process that keeps rate-limit counters in a module-level Map. You add a second process behind a round-robin load balancer. What happens to the rate limit?"
+  options={[
+    "Nothing changes, the load balancer shares the Map between processes",
+    "Each process counts separately, so a client effectively gets about twice the allowed rate",
+    "The rate limit becomes twice as strict",
+    "Node refuses to start the second process",
+  ]}
+  answer={1}
+  explanation="The counters are hidden state in each process's memory. Requests alternate between processes, so each one only sees half the traffic. Shared state like this belongs in a shared store such as Redis, or you accept and document the per-process limit."
+/>
+
+<Quiz
+  question="Right after a deploy, 2,000 requests for the same poll arrive within 50 ms and the cache is empty. Without any special handling, how many database queries does cache-aside make?"
+  options={[
+    "1, because the cache stores the first result",
+    "Up to 2,000, because every request misses before the first load finishes",
+    "0, because the CDN answers them",
+    "2, one per cache layer",
+  ]}
+  answer={1}
+  explanation="That's a cache stampede: all requests check the cache before any load has finished, so all of them miss and query the database. Request coalescing shares one in-flight load between them."
+/>
+
+<Exercise
+  title="Cache-aside with a TTL and request coalescing"
+  starter={`function createFakeClock() {
+  let time = 0;
+  return {
+    now: () => time,
+    advance(ms) {
+      time += ms;
+    },
+  };
+}
+
+function createCache({ load, ttlMs, now = Date.now }) {
+  const entries = new Map(); // key -> { value, expiresAt }
+  const inFlight = new Map(); // key -> promise of the value
+  const stats = { hits: 0, misses: 0 };
+
+  async function get(key) {
+    // TODO: 1. a fresh entry is a hit
+    //       2. a miss joins a load that's already running
+    //       3. or starts one, stores the value with an expiry
+    //          and forgets the in-flight promise afterwards
+    stats.misses++;
+    return load(key);
+  }
+
+  function invalidate(key) {
+    // TODO: forget the cached value
+  }
+
+  return { get, invalidate, stats };
+}
+
+// ---- Try it ----
+const clock = createFakeClock();
+const prices = new Map([["tea", 3.5], ["cake", 4.25]]);
+let loads = 0;
+
+const cache = createCache({
+  ttlMs: 60_000,
+  now: clock.now,
+  load: async (item) => {
+    loads++;
+    await new Promise((r) => setTimeout(r, 20)); // slow query
+    return prices.get(item);
+  },
+});
+
+console.log(await cache.get("tea"), await cache.get("tea"));
+prices.set("tea", 4);
+clock.advance(30_000);
+console.log(await cache.get("tea")); // still fresh: 3.5
+clock.advance(30_000);
+console.log(await cache.get("tea")); // expired: 4
+
+const rush = Array.from({ length: 100 }, () => cache.get("cake"));
+const answers = await Promise.all(rush);
+console.log(answers.length, "answers,", loads, "loads");
+console.log(cache.stats);
+`}
+  tests={[
+    { name: "The demo prints 3.5 3.5 / 3.5 / 4 / 100 answers, 3 loads / the stats", check: `__output.join("|") === "3.5 3.5|3.5|4|100 answers, 3 loads|{ hits: 2, misses: 102 }"` },
+    { name: "A fresh entry is served without calling load again", check: `await (async () => { const c = createFakeClock(); let n = 0; const k = createCache({ load: async (x) => (n++, x + x), ttlMs: 1000, now: c.now }); const a = await k.get("ab"); const b = await k.get("ab"); c.advance(999); const d = await k.get("ab"); return a === "abab" && b === "abab" && d === "abab" && n === 1; })()` },
+    { name: "An entry expires exactly when ttlMs has passed, and a reload starts a new TTL", check: `await (async () => { const c = createFakeClock(); let n = 0; const k = createCache({ load: async () => ++n, ttlMs: 1000, now: c.now }); await k.get("a"); c.advance(1000); const v = await k.get("a"); c.advance(999); const w = await k.get("a"); c.advance(1); const z = await k.get("a"); return v === 2 && w === 2 && z === 3; })()` },
+    { name: "Concurrent misses for one key share one load; other keys load separately", check: `await (async () => { const c = createFakeClock(); let n = 0; const k = createCache({ load: (x) => new Promise((r) => setTimeout(() => r(x + (++n)), 30)), ttlMs: 1000, now: c.now }); const all = await Promise.all([k.get("a"), k.get("a"), k.get("b"), k.get("a"), k.get("b")]); return n === 2 && all[0] === all[1] && all[1] === all[3] && all[2] === all[4] && all[0] !== all[2]; })()` },
+    { name: "A failed load rejects every waiting caller, isn't cached, and the next get tries again", check: `await (async () => { const c = createFakeClock(); let n = 0; const k = createCache({ load: async () => { n++; await new Promise((r) => setTimeout(r, 10)); if (n === 1) throw new Error("db down"); return "ok"; }, ttlMs: 1000, now: c.now }); const r = await Promise.allSettled([k.get("a"), k.get("a")]); const v = await k.get("a"); return n === 2 && r.every((x) => x.status === "rejected" && x.reason.message === "db down") && v === "ok"; })()` },
+    { name: "invalidate() forces exactly one reload and ignores unknown keys", check: `await (async () => { const c = createFakeClock(); let n = 0; const k = createCache({ load: async () => ++n, ttlMs: 100000, now: c.now }); k.invalidate("never-seen"); await k.get("a"); k.invalidate("a"); const v = await k.get("a"); const w = await k.get("a"); return v === 2 && w === 2 && k.stats.hits === 1 && k.stats.misses === 2; })()` },
+  ]}
+>
+
+Finish `createCache` so PandaPoll's app servers can survive a keynote. The clock is **injected**: the cache calls `now()` to learn the time in milliseconds, so the checks use a fake clock instead of waiting (production passes `Date.now`, the default).
+
+1. **Hit:** if `entries` has the key and `now()` is still **before** its `expiresAt`, add 1 to `stats.hits` and return the value. At exactly `ttlMs` milliseconds the entry has expired.
+2. **Miss:** otherwise add 1 to `stats.misses`. If a load for this key is already running (it's in `inFlight`), return **that** promise instead of calling `load` again.
+3. Otherwise call `load(key)` and keep its promise in `inFlight`. When the value arrives, store `{ value, expiresAt: now() + ttlMs }` and return the value.
+4. Whether the load succeeds **or fails**, remove the key from `inFlight` afterwards. A failed load must not be cached: every waiting caller gets the error, and the next `get` tries again.
+5. `invalidate(key)` forgets the cached value (unknown keys are fine).
+
+<Hint>
+
+Wrap the loading part in an async function that you call straight away, and store the promise it returns:
+
+```js
+const promise = (async () => {
+  try {
+    const value = await load(key);
+    entries.set(key, { value, expiresAt: now() + ttlMs });
+    return value;
+  } finally {
+    inFlight.delete(key); // runs on success and on failure
+  }
+})();
+inFlight.set(key, promise);
+return promise;
+```
+
+Before that, check `inFlight.has(key)` and return `inFlight.get(key)` if it's there. `Map.prototype.delete` doesn't mind unknown keys.
+
+</Hint>
+
+<Solution>
+
+```js
+function createFakeClock() {
+  let time = 0;
+  return {
+    now: () => time,
+    advance(ms) {
+      time += ms;
+    },
+  };
+}
+
+function createCache({ load, ttlMs, now = Date.now }) {
+  const entries = new Map(); // key -> { value, expiresAt }
+  const inFlight = new Map(); // key -> promise of the value
+  const stats = { hits: 0, misses: 0 };
+
+  async function get(key) {
+    const entry = entries.get(key);
+    if (entry && now() < entry.expiresAt) {
+      stats.hits++;
+      return entry.value;
+    }
+    stats.misses++;
+    if (inFlight.has(key)) return inFlight.get(key);
+
+    const promise = (async () => {
+      try {
+        const value = await load(key);
+        entries.set(key, { value, expiresAt: now() + ttlMs });
+        return value;
+      } finally {
+        inFlight.delete(key);
+      }
+    })();
+    inFlight.set(key, promise);
+    return promise;
+  }
+
+  function invalidate(key) {
+    entries.delete(key);
+  }
+
+  return { get, invalidate, stats };
+}
+
+// ---- Try it ----
+const clock = createFakeClock();
+const prices = new Map([["tea", 3.5], ["cake", 4.25]]);
+let loads = 0;
+
+const cache = createCache({
+  ttlMs: 60_000,
+  now: clock.now,
+  load: async (item) => {
+    loads++;
+    await new Promise((r) => setTimeout(r, 20)); // slow query
+    return prices.get(item);
+  },
+});
+
+console.log(await cache.get("tea"), await cache.get("tea"));
+prices.set("tea", 4);
+clock.advance(30_000);
+console.log(await cache.get("tea")); // still fresh: 3.5
+clock.advance(30_000);
+console.log(await cache.get("tea")); // expired: 4
+
+const rush = Array.from({ length: 100 }, () => cache.get("cake"));
+const answers = await Promise.all(rush);
+console.log(answers.length, "answers,", loads, "loads");
+console.log(cache.stats);
+```
+
+</Solution>
+
+</Exercise>
+
+The 100 requests for `"cake"` all count as misses (none of them found a cached value), but they cause just **one** load. In a real app you'd track that with a third counter, because "misses vs loads" is exactly the number that tells you coalescing works.
+
+## Recap
+
+- Start with **functional** and **non-functional** requirements, plus what's **out of scope**. The non-functional ones drive the design.
+- **Back-of-the-envelope maths** finds the real problem: for PandaPoll it's spiky traffic and **fan-out**, not average load.
+- One Node process uses **one CPU core**: scale out with several processes or containers behind a **load balancer** with health checks.
+- Scaling out needs **stateless** servers: sessions, counters and caches that must be shared go into a shared store.
+- Cache in layers (browser, CDN, app). **Cache-aside** with a **TTL** plus invalidation on write; prevent **stampedes** with request coalescing and TTL jitter.
+- Databases: **indexes** first, then a bigger machine, **read replicas** (mind the lag), and **sharding** with consistent hashing as a last resort.
+- **Queues and workers** move slow work out of the request (202 Accepted) and absorb spikes; jobs must be safe to run twice.
+- **CAP**: during a partition, choose consistency or availability, per kind of data.

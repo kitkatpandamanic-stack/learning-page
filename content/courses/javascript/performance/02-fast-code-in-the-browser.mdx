@@ -1,0 +1,713 @@
+---
+title: Fast Code in the Browser
+description: Keep pages smooth with memoisation, debounce and throttle, layout-friendly DOM code, virtual lists, chunked work, Web Workers and React rendering done right.
+duration: 25
+xp: 25
+---
+
+A page feels fast when it **reacts** quickly: the button lights up as you tap it, the list scrolls without stuttering, typing never lags. All of that depends on one thing, the **main thread**. It runs your JavaScript, works out the layout, paints pixels and handles input, one job at a time. Every millisecond your code holds it is a millisecond the page can't respond. ⚡
+
+In this lesson you'll learn the techniques senior frontend developers use to keep the main thread free: doing less work, doing it less often, doing it in smaller pieces, or doing it somewhere else.
+
+## The budget: 16 ms per frame
+
+Screens usually refresh 60 times a second, so the browser has about **16 ms** per frame. In each frame it may have to run JavaScript (event handlers, timers), recalculate **styles**, compute the **layout** (sizes and positions of every box), **paint** the pixels and **composite** the layers onto the screen.
+
+```text
+ input → JavaScript → style → layout → paint → composite → 🖥️
+         └──────────── all of this in ~16 ms ─────────────┘
+```
+
+If your JavaScript takes 200 ms, the browser skips about 12 frames: animations stutter and clicks wait. Remember from the last lesson that a task over **50 ms** counts as a long task and hurts **INP**. The rest of this lesson is a toolbox for staying under those numbers.
+
+## Memoisation: don't compute the same thing twice
+
+You wrote `memoize` in [Closures and Higher-Order Functions](/learn/javascript/closures-and-higher-order-functions): remember a function's results, keyed by its arguments. A common real-world use is caching **expensive objects**. Creating an `Intl.NumberFormat` is surprisingly costly (it loads locale data), and code that creates one per price, per row, per render adds up fast:
+
+<CodeExample output={`£12.50
+£3.00
+£99.99
+£4.20
+$1,234.50
+formatters created: 2`}>
+
+```js
+function memoize(fn) {
+  const cache = new Map();
+  return (...args) => {
+    const key = args.join("|");
+    if (!cache.has(key)) cache.set(key, fn(...args));
+    return cache.get(key);
+  };
+}
+
+let created = 0;
+const formatterFor = memoize((locale, currency) => {
+  created++;
+  return new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency,
+  });
+});
+
+for (const price of [12.5, 3, 99.99, 4.2]) {
+  console.log(formatterFor("en-GB", "GBP").format(price));
+}
+console.log(formatterFor("en-US", "USD").format(1234.5));
+console.log("formatters created:", created);
+```
+
+</CodeExample>
+
+Memoisation trades **memory for time**, and that trade has rules:
+
+- Only memoise **pure** functions: same input, same output, no side effects. Memoising something that reads the clock or a database gives you stale answers.
+- It only helps if the same inputs **repeat** and the work is slower than building the key and looking it up. Memoising `a + b` makes it slower.
+- A cache keyed by user input **grows forever**. A search page that memoises every query a user ever typed is a memory leak with a nice name (see [Memory and Garbage Collection](/learn/javascript/memory-and-garbage-collection)). Give caches a **size limit** (evict the oldest or least recently used entry) or a time limit, or key them by objects in a `WeakMap`, so entries disappear with their objects.
+
+## Debounce vs throttle
+
+Some events fire **a lot**: `input` on every key press, `scroll` and `pointermove` dozens of times per second, `resize` continuously while a window is dragged. Running expensive work for every single one wastes the main thread. Two classic wrappers fix it:
+
+- **Debounce**: wait until the events **stop** for `ms`, then run once with the latest value. Perfect for a search box: search when the user pauses typing.
+- **Throttle**: run **at most once every `ms`** while the events keep coming. Perfect for scroll and resize handlers that must keep updating something (a progress bar, "load more when near the bottom") but not 60 times a second.
+
+Here's a scroll event every 50 ms for half a second, sent to both. Fake timers from Vitest make the timeline exact (you met them in [Mocks and Async Tests](/learn/javascript/mocks-and-async-tests)):
+
+<CodeExample output={`0 ms  throttle: y=0
+200 ms  throttle: y=200
+400 ms  throttle: y=400
+700 ms  debounce: y=500`}>
+
+```js
+import { vi } from "vitest";
+
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
+
+function throttle(fn, ms) {
+  let waiting = false;
+  return (...args) => {
+    if (waiting) return; // dropped
+    fn(...args);
+    waiting = true;
+    setTimeout(() => {
+      waiting = false;
+    }, ms);
+  };
+}
+
+vi.useFakeTimers();
+vi.setSystemTime(0);
+
+const log = (name) => (y) => {
+  console.log(`${Date.now()} ms  ${name}: y=${y}`);
+};
+const onScrollDebounced = debounce(log("debounce"), 200);
+const onScrollThrottled = throttle(log("throttle"), 200);
+
+// A scroll event every 50 ms for half a second
+for (let y = 0; y <= 500; y += 50) {
+  onScrollDebounced(y);
+  onScrollThrottled(y);
+  vi.advanceTimersByTime(50);
+}
+vi.advanceTimersByTime(500);
+vi.useRealTimers();
+```
+
+</CodeExample>
+
+The throttled handler runs straight away and then every 200 ms while scrolling continues. The debounced one stays silent the whole time and runs once, 200 ms after the last event.
+
+Look closely at the throttle, though: the last scroll position, `y=500`, **never arrives**. The user stopped scrolling at 500, but the page still thinks they're at 400. That's a real bug in simple throttles, and you'll fix it in the exercise.
+
+<Callout type="tip" title="For visual updates, use requestAnimationFrame">
+
+If the work updates the screen (moving an element with the pointer, a parallax effect), throttle to the display itself: `requestAnimationFrame(fn)` runs `fn` right before the next paint, once per frame. Remember the latest event and schedule one frame at a time, so you never do more work than the screen can show.
+
+</Callout>
+
+## Avoiding layout thrashing
+
+Changing the DOM is cheap at first: the browser just notes that the layout is **dirty** and recalculates it later, once per frame. But if you **read** a layout value (`offsetWidth`, `offsetHeight`, `getBoundingClientRect()`, `scrollTop`, `getComputedStyle`) after a **write**, the browser has to recalculate the layout **right now** to give you a correct answer. Doing that in a loop is called **layout thrashing**:
+
+```js
+// ❌ write, read, write, read... a full layout on every turn
+for (const box of boxes) {
+  box.style.width = container.offsetWidth / 2 + "px";
+}
+
+// ✅ read everything first, then write everything
+const half = container.offsetWidth / 2; // one layout
+for (const box of boxes) {
+  box.style.width = half + "px"; // writes are batched
+}
+```
+
+Try it. Each button resizes 400 boxes; the first interleaves reads and writes, the second batches them. Click each a few times and compare:
+
+<TryIt
+  html={`<style>
+  #boxes div { height: 4px; background: #7c5cff; margin: 1px 0; }
+  button { margin-right: 6px; }
+</style>
+<button id="thrash">Interleaved</button>
+<button id="batch">Batched</button>
+<p id="result">Click a button</p>
+<div id="boxes"></div>`}
+  code={`const container = document.querySelector("#boxes");
+for (let i = 0; i < 400; i++) {
+  container.append(document.createElement("div"));
+}
+const boxes = [...container.children];
+const result = document.querySelector("#result");
+
+function grow(box, width) {
+  box.style.width = (width % 300) + 10 + "px";
+}
+
+document.querySelector("#thrash").addEventListener("click", () => {
+  const start = performance.now();
+  for (const box of boxes) {
+    grow(box, box.offsetWidth + 7); // read after a write
+  }
+  const ms = performance.now() - start;
+  result.textContent = \`Interleaved: \${ms.toFixed(1)} ms\`;
+});
+
+document.querySelector("#batch").addEventListener("click", () => {
+  const start = performance.now();
+  const widths = boxes.map((box) => box.offsetWidth); // reads
+  boxes.forEach((box, i) => grow(box, widths[i] + 7)); // writes
+  const ms = performance.now() - start;
+  result.textContent = \`Batched: \${ms.toFixed(1)} ms\`;
+});`}
+/>
+
+On most computers the batched version is many times faster, and the gap grows with the size of the page. Related habits:
+
+- Do DOM **writes** inside `requestAnimationFrame`, and reads before them.
+- Animate with **`transform`** and **`opacity`**: they can skip layout and paint and only need the cheap composite step. Animating `width`, `top` or `margin` recalculates the layout every frame.
+- Build many elements in a `DocumentFragment` (or one `innerHTML` string from trusted data) and insert them **once**.
+- In the Performance panel, layout thrashing shows up as purple "Layout" blocks with a warning: **Forced reflow**.
+
+## Event delegation
+
+You met **event delegation** in [Events](/learn/javascript/events): one listener on a parent instead of one per child, using `event.target.closest(...)` to find out which child was clicked. It's also a performance tool. A table with 5,000 rows and three buttons per row means 15,000 listeners, each taking memory and setup time, and each needing removal when rows are re-rendered. One delegated listener does the same job, and keeps working for rows added later:
+
+```js
+table.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const row = button.closest("tr");
+  handle(button.dataset.action, row.dataset.id);
+});
+```
+
+## Rendering huge lists
+
+The fastest DOM node is the one you never create. A list of 50,000 rows means 50,000+ elements to create, style and lay out, and every layout afterwards gets slower too. Three options, from simplest to cleverest:
+
+1. **Pagination** or **"Load more"**: show 50 at a time. Simple, and often the best user experience anyway.
+2. **`content-visibility: auto`** in CSS: the browser skips layout and paint for off-screen sections. One line of CSS, a nice win for long pages of content.
+3. **Virtualisation** (or "windowing"): only render the rows that are **visible**, plus a few extra, inside a tall empty container that keeps the scrollbar the right size. As the user scrolls, swap which rows exist.
+
+The heart of virtualisation is a little arithmetic:
+
+<CodeExample output={`{ start: 0, end: 13, offsetY: 0 }
+{ start: 1297, end: 1313, offsetY: 51880 }
+{ start: 99987, end: 100000, offsetY: 3999480 }`}>
+
+```js
+function visibleRange({ scrollTop, height, rowHeight, total }) {
+  const overscan = 3; // extra rows above and below
+  const first = Math.floor(scrollTop / rowHeight);
+  const count = Math.ceil(height / rowHeight);
+  const start = Math.max(0, first - overscan);
+  const end = Math.min(total, first + count + overscan);
+  return { start, end, offsetY: start * rowHeight };
+}
+
+const list = { height: 400, rowHeight: 40, total: 100_000 };
+console.log(visibleRange({ ...list, scrollTop: 0 }));
+console.log(visibleRange({ ...list, scrollTop: 52_000 }));
+console.log(visibleRange({ ...list, scrollTop: 3_999_600 }));
+```
+
+</CodeExample>
+
+However far you scroll through 100,000 rows, only about 16 exist in the DOM. Scroll this one and watch the counter:
+
+<TryIt
+  html={`<style>
+  #viewport { height: 240px; overflow-y: auto; position: relative;
+    border: 1px solid #ffffff33; border-radius: 8px; }
+  #spacer { position: relative; }
+  .row { position: absolute; left: 0; right: 0; height: 30px;
+    line-height: 30px; padding: 0 10px; box-sizing: border-box;
+    border-bottom: 1px solid #ffffff14; }
+</style>
+<p id="info"></p>
+<div id="viewport"><div id="spacer"></div></div>`}
+  code={`const ROW = 30;
+const TOTAL = 100_000;
+const viewport = document.querySelector("#viewport");
+const spacer = document.querySelector("#spacer");
+const info = document.querySelector("#info");
+spacer.style.height = TOTAL * ROW + "px"; // full-size scrollbar
+
+function render() {
+  const first = Math.floor(viewport.scrollTop / ROW);
+  const count = Math.ceil(240 / ROW);
+  const start = Math.max(0, first - 3);
+  const end = Math.min(TOTAL, first + count + 3);
+
+  const rows = [];
+  for (let i = start; i < end; i++) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.top = i * ROW + "px";
+    row.textContent = \`Order #\${i + 1}\`;
+    rows.push(row);
+  }
+  spacer.replaceChildren(...rows);
+  info.textContent = \`\${TOTAL} orders, \${rows.length} rows in the DOM\`;
+}
+
+viewport.addEventListener("scroll", render);
+render();`}
+/>
+
+In real projects, use a tested library: **TanStack Virtual** or **react-window** for React, or your framework's equivalent. They handle variable row heights, keyboard focus and scroll restoration, which are fiddly. And don't virtualise lists of 100 items: it breaks the browser's find-in-page (Ctrl+F) and can confuse screen readers, so use it when the numbers really demand it.
+
+## Breaking up long tasks
+
+Sometimes you really do have a lot of work on the main thread: filtering 50,000 rows, parsing a big file the user dropped in. If it runs as one long task, every click waits until it's done. The fix is to split it into **chunks** and **yield** to the browser between them, so clicks, typing and rendering can slip in:
+
+<CodeExample output={`chunk done: 10000/30000
+👆 click handled
+chunk done: 20000/30000
+chunk done: 30000/30000
+sum: 449985000`}>
+
+```js
+const yieldToBrowser = () =>
+  new Promise((resolve) => setTimeout(resolve, 0));
+
+async function processInChunks(items, handle, chunkSize) {
+  for (let i = 0; i < items.length; i += chunkSize) {
+    for (const item of items.slice(i, i + chunkSize)) handle(item);
+    const done = Math.min(i + chunkSize, items.length);
+    console.log(`chunk done: ${done}/${items.length}`);
+    await yieldToBrowser(); // let waiting events run
+  }
+}
+
+// A click arrives while the work is running
+setTimeout(() => console.log("👆 click handled"), 0);
+
+const rows = Array.from({ length: 30_000 }, (_, i) => i);
+let sum = 0;
+await processInChunks(rows, (n) => { sum += n; }, 10_000);
+console.log("sum:", sum);
+```
+
+</CodeExample>
+
+The click is handled after the **first** chunk instead of after all of them. Without the `await`, it would wait for the whole job, just like the blocking loop in [Callbacks and the Event Loop](/learn/javascript/callbacks-and-the-event-loop). [The Event Loop in Depth](/learn/javascript/the-event-loop-in-depth) explains exactly when each queued task gets its turn.
+
+Real code usually yields based on **time** rather than item counts, because items differ in cost. Newer Chromium browsers also have **`scheduler.yield()`**, which yields but puts your task at the **front** of the queue, so your job doesn't fall behind unrelated timers:
+
+```js
+function yieldToMain() {
+  if (globalThis.scheduler?.yield) return scheduler.yield();
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function processAll(items, handle) {
+  let deadline = performance.now() + 50; // a 50 ms slice
+  for (const item of items) {
+    handle(item);
+    if (performance.now() > deadline) {
+      await yieldToMain();
+      deadline = performance.now() + 50;
+    }
+  }
+}
+```
+
+Two more tools: `requestIdleCallback(fn)` runs low-priority work (analytics, prefetching) when the browser is idle, and the simplest trick of all is to update the screen **first** ("Saving…") and do the heavy part afterwards.
+
+## Web Workers for heavy work
+
+Chunking still uses the main thread, just politely. For really heavy CPU work (image processing, parsing big CSV or JSON files, syntax highlighting, encryption, physics), move it **off** the main thread completely with a **Web Worker**. A worker is a separate thread with its own event loop and no access to the DOM. You talk to it with messages:
+
+```js
+// main.js
+const worker = new Worker(
+  new URL("./stats-worker.js", import.meta.url),
+  { type: "module" },
+);
+
+worker.addEventListener("message", (event) => {
+  showStats(event.data); // { rows: 250000, average: 42.1 }
+});
+
+fileInput.addEventListener("change", async () => {
+  const text = await fileInput.files[0].text();
+  worker.postMessage(text); // the page stays responsive
+});
+```
+
+```js
+// stats-worker.js
+self.addEventListener("message", (event) => {
+  const lines = event.data.split("\n").slice(1);
+  const values = lines.map((line) => Number(line.split(",")[2]));
+  const total = values.reduce((a, b) => a + b, 0);
+  self.postMessage({
+    rows: values.length,
+    average: total / values.length,
+  });
+});
+```
+
+Things to know:
+
+- Messages are **copied** with the structured clone algorithm. Sending 100 MB back and forth costs time too. Big binary data (an `ArrayBuffer`) can be **transferred** instead of copied: `worker.postMessage(buffer, [buffer])`.
+- Starting a worker takes a little time, so keep one around for repeated jobs instead of creating one per task.
+- The **Comlink** library wraps `postMessage` so you can call worker functions like normal async functions.
+- In Node.js, the same idea is **`worker_threads`**. (Fun fact: PandaDev runs your lesson code in a Web Worker, which is why an endless loop here doesn't freeze the site.)
+
+## React performance
+
+React's model, UI = f(state), is wonderfully simple, but it means React **re-renders** a lot. A component re-renders when:
+
+1. its own **state** changes;
+2. its **parent** re-renders (whether or not its props changed!);
+3. a **context** it uses changes.
+
+A re-render isn't automatically a problem: React compares the result with the previous one and only touches the DOM where something changed, and most components render in microseconds. It becomes a problem when an expensive component re-renders on every key press.
+
+The tools:
+
+- **`memo(Component)`** skips re-rendering when all props are the same as last time (compared with `Object.is`).
+- **`useMemo(() => value, [deps])`** remembers a computed **value** between renders.
+- **`useCallback(fn, [deps])`** remembers a **function**, so it stays the same object between renders.
+
+They only work together: `memo` compares props by identity, and an object or arrow function created during render is a **new** one every time. Type in the box and watch the console. Then replace `useCallback((item) => setPicked(item), [])` with a plain `(item) => setPicked(item)` and type again:
+
+<TryIt
+  language="react"
+  code={`import { useState, useCallback, memo } from "react";
+import { createRoot } from "react-dom/client";
+
+const ITEMS = Array.from({ length: 5 }, (_, i) => \`Item \${i + 1}\`);
+
+let listRenders = 0;
+const List = memo(function List({ items, onPick }) {
+  listRenders++;
+  console.log("List rendered, total:", listRenders);
+  return (
+    <ul>
+      {items.map((item) => (
+        <li key={item}>
+          <button onClick={() => onPick(item)}>{item}</button>
+        </li>
+      ))}
+    </ul>
+  );
+});
+
+function App() {
+  const [text, setText] = useState("");
+  const [picked, setPicked] = useState(null);
+  const handlePick = useCallback((item) => setPicked(item), []);
+
+  return (
+    <>
+      <input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Type here"
+      />
+      <p>Picked: {picked ?? "nothing"}</p>
+      <List items={ITEMS} onPick={handlePick} />
+    </>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);`}
+/>
+
+With `useCallback`, typing doesn't re-render `List` at all. With a plain arrow function, `memo` sees a "new" `onPick` on every key press and re-renders anyway, so `memo` was doing nothing but comparing props.
+
+### When it's not worth it
+
+Wrapping everything in `memo`, `useMemo` and `useCallback` is a common anti-pattern. Each one costs memory, a comparison on every render, and readability, and a single unstable prop silently cancels them out. Before reaching for them, try the cheaper fixes:
+
+- **Move state down**: if only the search box needs `text`, put that state in a small `SearchBox` component, so typing re-renders the box and nothing else.
+- **Lift content up**: pass expensive parts as `children`. Elements created by the parent aren't re-created when the child's state changes.
+- **Measure** with the React DevTools **Profiler** ("why did this render?" and how long it took) before and after.
+
+Use `useMemo` for genuinely expensive calculations (filtering and sorting thousands of rows), and `memo` + `useCallback` for big subtrees that re-render often for no reason. Newer projects can also enable the **React Compiler**, which adds this memoisation automatically at build time, so hand-written `useMemo` and `useCallback` are becoming rarer.
+
+### Keys matter for speed and correctness
+
+Keys tell React which item is which between renders. With a stable id, React moves the existing DOM node when you sort or insert. With the **array index** as the key, inserting at the top makes React think every item changed: it updates every row, and any state inside the rows (an input's text, an "expanded" flag) sticks to the wrong item.
+
+```jsx
+// ❌ index keys: inserting at the top reuses the wrong rows
+{todos.map((todo, i) => <TodoRow key={i} todo={todo} />)}
+
+// ✅ stable ids from the data
+{todos.map((todo) => <TodoRow key={todo.id} todo={todo} />)}
+```
+
+Index keys are fine only for lists that never reorder, insert or delete.
+
+<Callout type="warning" title="Fix the algorithm before the framework">
+
+Most "React is slow" bugs aren't about React at all: they're an O(n²) filter running on every render, a `fetch` in an effect with a missing dependency array, or 10,000 rows in the DOM. Profile first. Memo comes last.
+
+</Callout>
+
+<Quiz
+  question="A page shows search suggestions from the server as the user types, and a progress bar that follows the scroll position. Which wrappers fit best?"
+  options={[
+    "Throttle the search, debounce the progress bar",
+    "Debounce the search, throttle the progress bar (or update it with requestAnimationFrame)",
+    "Debounce both",
+    "Memoise both"
+  ]}
+  answer={1}
+  explanation="Search when the typing pauses (debounce), so you don't send a request per key press. The progress bar must keep moving while scrolling continues, just not 60 times per second, so throttle it, or sync it to frames with requestAnimationFrame."
+/>
+
+<Quiz
+  question="A parent renders <Chart data={rows} options={{ dark: true }} /> and Chart is wrapped in memo. Why does Chart still re-render every time the parent does?"
+  options={[
+    "memo only works on class components",
+    "rows is an array, and memo never compares arrays",
+    "The options object is created fresh on every render, so the props are never the same object",
+    "memo needs a key prop to work"
+  ]}
+  answer={2}
+  explanation="memo compares each prop with Object.is. An object literal written in JSX is a new object on every render, so the comparison always fails. Move the constant outside the component or wrap it in useMemo."
+/>
+
+<Exercise
+  title="A throttle that doesn't lose the last event"
+  starter={`import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+// TODO: remember the latest dropped call and run it
+// when the waiting time is over
+function throttle(fn, ms) {
+  let waiting = false;
+  return (...args) => {
+    if (waiting) return;
+    fn(...args);
+    waiting = true;
+    setTimeout(() => {
+      waiting = false;
+    }, ms);
+  };
+}
+
+describe("throttle", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("runs the first call straight away", () => {
+    const fn = vi.fn();
+    throttle(fn, 100)("a");
+    expect(fn).toHaveBeenCalledWith("a");
+  });
+
+  it("runs at most once per interval while calls keep coming", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    for (let i = 0; i < 10; i++) {
+      t(i);
+      vi.advanceTimersByTime(25);
+    }
+    // 250 ms of calls: at 0, 100 and 200 ms
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("runs once more at the end with the latest arguments", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    t(2);
+    t(3);
+    expect(fn).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(100);
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(fn).toHaveBeenLastCalledWith(3);
+  });
+
+  it("doesn't add an extra call when nothing was dropped", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    vi.advanceTimersByTime(500);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts a new interval after the trailing call", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    t(2); // runs at 100 ms
+    vi.advanceTimersByTime(120);
+    expect(fn).toHaveBeenCalledTimes(2);
+    t(3); // too soon after the trailing call: waits
+    expect(fn).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(80); // 200 ms
+    expect(fn).toHaveBeenCalledTimes(3);
+    expect(fn).toHaveBeenLastCalledWith(3);
+  });
+});
+`}
+  tests={[
+    { name: "All the tests pass (and you kept all 5)", check: `__vitest.failed === 0 && __vitest.passed >= 5` },
+    { name: "The first call runs straight away", check: `(() => { const calls = []; throttle((x) => calls.push(x), 40)("now"); return calls.join() === "now"; })()` },
+    { name: "With real timers: runs the first call, then the latest dropped one", check: `await new Promise((resolve) => { const calls = []; const t = throttle((x) => calls.push(x), 40); t(1); t(2); t(3); setTimeout(() => t(4), 10); setTimeout(() => resolve(calls.join()), 150); }) === "1,4"` },
+    { name: "No trailing call when nothing was dropped", check: `await new Promise((resolve) => { const calls = []; const t = throttle((x) => calls.push(x), 30); t("only"); setTimeout(() => resolve(calls.join()), 120); }) === "only"` },
+    { name: "Passes all arguments along", check: `await new Promise((resolve) => { const calls = []; const t = throttle((...a) => calls.push(a.join("+")), 30); t(1, 2); t(3, 4); setTimeout(() => resolve(calls.join()), 100); }) === "1+2,3+4"` },
+  ]}
+>
+
+The simple `throttle` from this lesson **drops** calls while it's waiting, so the last scroll position can get lost. Fix it, so it works like the throttle in Lodash:
+
+1. The first call runs **straight away**.
+2. Calls that arrive while waiting are not run, but the **latest** one's arguments are remembered.
+3. When the waiting time is over, if a call was dropped, run `fn` once with the **latest** arguments, and start a **new** waiting period (so calls can't sneak in right after it).
+4. If nothing was dropped, don't run anything extra; the next call runs straight away again.
+
+The Vitest tests describe exactly this behaviour with fake timers; the starter fails two of them. Make all five pass without changing the tests.
+
+<Hint>
+
+Keep two variables in the closure: `waiting` and `pendingArgs` (start with `null`). If `waiting`, store `pendingArgs = args` and return. Otherwise call `fn(...args)` and start the timer. Write the timer as a named function, e.g. `function done() { if (pendingArgs) { fn(...pendingArgs); pendingArgs = null; setTimeout(done, ms); } else { waiting = false; } }`, so the trailing call starts a new waiting period by scheduling `done` again.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+function throttle(fn, ms) {
+  let waiting = false;
+  let pendingArgs = null;
+
+  function done() {
+    if (pendingArgs) {
+      // A call was dropped: run the latest one now,
+      // and wait again before the next call
+      fn(...pendingArgs);
+      pendingArgs = null;
+      setTimeout(done, ms);
+    } else {
+      waiting = false;
+    }
+  }
+
+  return (...args) => {
+    if (waiting) {
+      pendingArgs = args; // remember only the latest
+      return;
+    }
+    fn(...args);
+    waiting = true;
+    setTimeout(done, ms);
+  };
+}
+
+describe("throttle", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("runs the first call straight away", () => {
+    const fn = vi.fn();
+    throttle(fn, 100)("a");
+    expect(fn).toHaveBeenCalledWith("a");
+  });
+
+  it("runs at most once per interval while calls keep coming", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    for (let i = 0; i < 10; i++) {
+      t(i);
+      vi.advanceTimersByTime(25);
+    }
+    // 250 ms of calls: at 0, 100 and 200 ms
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("runs once more at the end with the latest arguments", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    t(2);
+    t(3);
+    expect(fn).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(100);
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(fn).toHaveBeenLastCalledWith(3);
+  });
+
+  it("doesn't add an extra call when nothing was dropped", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    vi.advanceTimersByTime(500);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts a new interval after the trailing call", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    t(2); // runs at 100 ms
+    vi.advanceTimersByTime(120);
+    expect(fn).toHaveBeenCalledTimes(2);
+    t(3); // too soon after the trailing call: waits
+    expect(fn).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(80); // 200 ms
+    expect(fn).toHaveBeenCalledTimes(3);
+    expect(fn).toHaveBeenLastCalledWith(3);
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- The main thread does everything: JavaScript, style, layout, paint and input. Aim for **~16 ms per frame** and no tasks over **50 ms**.
+- **Memoise** pure, repeated, expensive work (like creating `Intl` formatters), and **bound** your caches so they don't leak.
+- **Debounce** waits for a pause (search boxes); **throttle** runs at most once per interval (scroll, resize), and a good throttle runs the **latest** dropped call at the end. For visual updates use `requestAnimationFrame`.
+- Avoid **layout thrashing**: read layout values first, then write; animate `transform` and `opacity`.
+- **Event delegation** replaces thousands of listeners with one.
+- Don't render what nobody sees: **paginate**, use `content-visibility: auto`, or **virtualise** long lists.
+- Split long tasks into **chunks** that yield (`setTimeout`, `scheduler.yield()`), and move heavy CPU work to a **Web Worker**.
+- React re-renders on state, parent and context changes. `memo` + `useCallback`/`useMemo` help only when props are stable and the work is real; first try moving state down, and **profile**. Use **stable keys**, never indexes for changing lists.

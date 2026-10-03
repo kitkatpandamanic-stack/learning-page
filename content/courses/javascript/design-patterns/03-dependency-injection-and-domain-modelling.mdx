@@ -1,0 +1,855 @@
+---
+title: Dependency Injection and Domain Modelling
+description: Inject clocks, fetch and loggers through constructors and factories, wire them in a composition root, and model the domain with value objects, entities, invariants, domain events and state machines.
+duration: 25
+xp: 30
+---
+
+A billing team once had a test suite that failed on the last day of every month, and only after 11 pm in London. Nobody could reproduce it in the morning, so it was "flaky" for a year. The cause: one function called `new Date()` directly, and the date arithmetic broke when "today" in UTC was already "tomorrow". The fix took ten minutes once someone made the clock **injectable** and wrote a test for that exact moment. ⏰
+
+This lesson has two halves that belong together. **Dependency injection** makes code testable and swappable by passing in the things that touch the outside world. **Domain modelling** makes the code that's left (your business rules) hard to misuse: values that can't be broken, objects that guard their own rules, events that announce what happened, and state machines that make impossible states impossible.
+
+## Hard-wired dependencies
+
+Here's typical code before anyone thought about testing it:
+
+```js
+// ❌ Hard-wired: reaches out for everything itself
+async function sendTrialReminders() {
+  const res = await fetch("https://api.example.com/users?trial=1");
+  const users = await res.json();
+  for (const user of users) {
+    const days = Math.ceil(
+      (new Date(user.trialEndsAt) - Date.now()) / 86_400_000,
+    );
+    if (days >= 0 && days <= 3) {
+      await fetch("https://mail.example.com/send", { /* ... */ });
+    }
+  }
+  console.log(`Reminders sent at ${new Date().toISOString()}`);
+}
+```
+
+To test it you'd need a real user API, a real mail server and a way to change the time. You can't check "3 days left" without waiting for a day when someone's trial really has 3 days left. The function decides **what** to do and **how** to talk to the world, and those two can't be separated.
+
+Not everything needs injecting. Pure helpers (a `formatPrice` function, lodash) are fine to import. Inject the things that are **slow, non-deterministic or side-effecting**:
+
+- **Time**: `Date.now()`, `new Date()`, timers.
+- **Randomness and ids**: `Math.random()`, `crypto.randomUUID()`.
+- **I/O**: `fetch`, databases, files, email, queues.
+- **Environment**: configuration, `process.env`, feature flags.
+- **Output you want to check**: loggers, metrics.
+
+## Constructor and factory injection
+
+**Dependency injection** (DI) just means: a piece of code **receives** its collaborators instead of creating or importing them. With a class, they arrive in the **constructor**; with a factory function, in its options object (you did this in the last lesson with `createLoyalty({ accounts, rewards })`). The code only depends on small **ports**: a clock is "anything with `now()`", a mailer is "anything with `send(to, text)`":
+
+<CodeExample output={`[ [ 'mei@pandadev.test', 'Your trial ends in 3 days' ] ]
+[ 'Sent 1 trial reminder(s)' ]`}>
+
+```js
+const DAY = 24 * 60 * 60 * 1000;
+
+class TrialReminders {
+  #users;
+  #clock;
+  #mailer;
+  #logger;
+
+  constructor({ users, clock, mailer, logger }) {
+    this.#users = users;
+    this.#clock = clock;
+    this.#mailer = mailer;
+    this.#logger = logger;
+  }
+
+  async run() {
+    const now = this.#clock.now();
+    let sent = 0;
+    for (const user of await this.#users.listTrials()) {
+      const days = Math.ceil((new Date(user.trialEndsAt) - now) / DAY);
+      if (days >= 0 && days <= 3) {
+        await this.#mailer.send(
+          user.email,
+          `Your trial ends in ${days} days`,
+        );
+        sent++;
+      }
+    }
+    this.#logger.info(`Sent ${sent} trial reminder(s)`);
+    return sent;
+  }
+}
+
+// In a test (or here): fakes for every port
+const outbox = [];
+const logs = [];
+const reminders = new TrialReminders({
+  users: {
+    listTrials: async () => [
+      { email: "mei@pandadev.test", trialEndsAt: "2026-03-03T12:00Z" },
+      { email: "bao@pandadev.test", trialEndsAt: "2026-03-10T12:00Z" },
+      { email: "zoe@pandadev.test", trialEndsAt: "2026-02-27T12:00Z" },
+    ],
+  },
+  clock: { now: () => new Date("2026-03-01T09:00Z") },
+  mailer: { send: async (to, text) => void outbox.push([to, text]) },
+  logger: { info: (message) => logs.push(message) },
+});
+
+await reminders.run();
+console.log(outbox);
+console.log(logs);
+```
+
+</CodeExample>
+
+The clock is frozen at 1 March 09:00, so "3 days left" is tested today, and so is the last-day-of-the-month-at-11-pm case. In production, `main.js` creates the class with the real things: `{ now: () => new Date() }`, a mailer that calls your email provider, and a real logger.
+
+A factory version is the same idea without `this`: `function createTrialReminders({ users, clock, mailer, logger }) { return { async run() { … } }; }`. Use whichever style your codebase uses; JavaScript projects lean towards factories, NestJS and Angular projects towards classes.
+
+<Callout type="warning" title="Careful with defaults">
+
+`function createTrialReminders({ clock = systemClock } = {})` is tempting: production code doesn't need to pass anything. But a test that forgets to pass a fake now silently uses the **real** clock (or the real mailer, which is worse). Keep dependencies **required** in the core and supply the real ones in one place, the composition root. A related browser gotcha: if you store the real `fetch` on an object and call it as `deps.fetch(url)`, Chrome throws `TypeError: Illegal invocation`, because `fetch` expects `this` to be `window`. Destructure it first (`const { fetch } = deps`) or pass `(...args) => fetch(...args)`.
+
+</Callout>
+
+## The composition root
+
+If every piece receives its dependencies, someone has to create them. That someone is the **composition root**: **one** place, usually `main.js` or `server.js`, where real implementations are built and plugged together. It's the only file that knows "we use PostgreSQL, SendGrid and Express". In Node on your machine it looks something like this:
+
+```js
+// src/main.js: the only file that knows the real implementations
+import pg from "pg";
+import { createPostgresAccounts } from "./loyalty/adapters/postgres-accounts.js";
+import { createLoyalty } from "./loyalty/use-cases/loyalty.js";
+import { createApp } from "./loyalty/adapters/http.js";
+import { createLogger } from "./shared/logger.js";
+
+const config = {
+  databaseUrl: process.env.DATABASE_URL,
+  port: Number(process.env.PORT ?? 3000),
+};
+
+const logger = createLogger({ level: "info" });
+const pool = new pg.Pool({ connectionString: config.databaseUrl });
+const clock = { now: () => new Date() };
+
+const loyalty = createLoyalty({
+  accounts: createPostgresAccounts(pool),
+  clock,
+  logger,
+});
+const app = createApp({ loyalty, logger });
+
+app.listen(config.port, () => logger.info(`Listening on ${config.port}`));
+```
+
+A neat habit is to put the wiring in a function that takes **overrides**, so tests and scripts can build the same graph with a few pieces swapped. Here the real version talks to PandaDev's built-in practice API (it works offline and always gives the same answers; real APIs work the same way), and the test version swaps in a fake weather source:
+
+<CodeExample output={`🧊 Reykjavik feels like -2°C, wrap up warm
+🌬️ Reykjavik: wind 45 km/h
+London: no alerts
+---
+🧊 Testville feels like -30°C, wrap up warm`}>
+
+```js
+// --- use case: knows nothing about HTTP ---
+function createWeatherAlerts({ weather, notify, coldBelow = 0 }) {
+  return {
+    async check(city) {
+      const now = await weather.current(city);
+      const alerts = [];
+      if (now.feelsLike < coldBelow) {
+        alerts.push(
+          `🧊 ${now.city} feels like ${now.feelsLike}°C, wrap up warm`,
+        );
+      }
+      if (now.windKph >= 40) {
+        alerts.push(`🌬️ ${now.city}: wind ${now.windKph} km/h`);
+      }
+      if (alerts.length === 0) alerts.push(`${now.city}: no alerts`);
+      alerts.forEach(notify);
+    },
+  };
+}
+
+// --- adapter: the practice API ---
+function createWeatherClient({ fetch, baseUrl }) {
+  return {
+    async current(city) {
+      const url = `${baseUrl}/weather?city=${encodeURIComponent(city)}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Weather failed: ${res.status}`);
+      return res.json();
+    },
+  };
+}
+
+// --- composition root: real pieces, overridable ---
+function buildServices(overrides = {}) {
+  const config = { apiUrl: "https://api.pandadev.test", coldBelow: 0 };
+  const weather =
+    overrides.weather ??
+    createWeatherClient({ fetch, baseUrl: config.apiUrl });
+  const notify = overrides.notify ?? ((text) => console.log(text));
+  return {
+    alerts: createWeatherAlerts({
+      weather,
+      notify,
+      coldBelow: config.coldBelow,
+    }),
+  };
+}
+
+const { alerts } = buildServices();
+await alerts.check("Reykjavik");
+await alerts.check("London");
+
+console.log("---");
+const test = buildServices({
+  weather: {
+    current: async () => ({ city: "Testville", feelsLike: -30, windKph: 5 }),
+  },
+});
+await test.alerts.check("anywhere");
+```
+
+</CodeExample>
+
+Read the composition root and you know the whole architecture: which adapters exist and who uses them. Everything else stays testable.
+
+## Do you need a DI container?
+
+In Java and C#, wiring is usually done by a **DI container**: you register classes, and the container works out the order and creates everything for you. JavaScript has containers too (InversifyJS, tsyringe, Awilix), and some frameworks have one built in: **NestJS** and **Angular** inject constructor parameters automatically. Here's Awilix in a Node project:
+
+```js
+import { createContainer, asFunction, asValue } from "awilix";
+
+const container = createContainer();
+container.register({
+  clock: asValue({ now: () => new Date() }),
+  accounts: asFunction(createPostgresAccounts).singleton(),
+  loyalty: asFunction(createLoyalty).singleton(),
+});
+
+// Awilix sees that createLoyalty wants { accounts, clock }
+const loyalty = container.resolve("loyalty");
+```
+
+Most JavaScript apps **don't need one**. Functions and object literals make hand-wiring short, and a 40-line `main.js` is explicit: "go to definition" works, and a missing dependency is an obvious `undefined`, not a container error at startup. Containers earn their place when your framework is built on one (NestJS, Angular), when the graph is huge, or when you need **lifetimes** like "one per request". Even then, per-request things (the current user, a database transaction) are often simpler as plain function arguments, or created in a middleware: `req.services = createRequestServices({ user: req.user })`.
+
+## Value objects
+
+Now the second half: modelling the domain so that the rules are hard to break. A **value object** is defined only by its value: two £5 notes are interchangeable, and "changing" one really means making a new one. Value objects are:
+
+- **Immutable**: `Object.freeze(this)`, and every operation returns a **new** object.
+- **Compared by value**, with an `equals` method (`===` compares references).
+- **Always valid**: the constructor rejects bad values, so if you have a `Money`, it's a good one.
+
+Money is the classic case, and also a classic bug: floating-point numbers can't store `0.1` exactly. Store money in whole **minor units** (pence, cents):
+
+<CodeExample output={`0.30000000000000004
+0.30 GBP
+false true
+TypeError
+Can't add GBP and EUR
+Money is stored in whole pence, got 9.5`}>
+
+```js
+class Money {
+  constructor(pence, currency) {
+    if (!Number.isInteger(pence)) {
+      throw new TypeError(`Money is stored in whole pence, got ${pence}`);
+    }
+    if (!/^[A-Z]{3}$/.test(currency)) {
+      throw new TypeError(`Unknown currency: ${currency}`);
+    }
+    this.pence = pence;
+    this.currency = currency;
+    Object.freeze(this); // nobody can change it later
+  }
+
+  static of(amount, currency) {
+    return new Money(Math.round(amount * 100), currency);
+  }
+
+  add(other) {
+    if (other.currency !== this.currency) {
+      throw new Error(`Can't add ${this.currency} and ${other.currency}`);
+    }
+    return new Money(this.pence + other.pence, this.currency);
+  }
+
+  times(factor) {
+    return new Money(Math.round(this.pence * factor), this.currency);
+  }
+
+  equals(other) {
+    return (
+      other instanceof Money &&
+      other.pence === this.pence &&
+      other.currency === this.currency
+    );
+  }
+
+  toString() {
+    return `${(this.pence / 100).toFixed(2)} ${this.currency}`;
+  }
+}
+
+console.log(0.1 + 0.2);
+const sum = Money.of(0.1, "GBP").add(Money.of(0.2, "GBP"));
+console.log(String(sum));
+console.log(sum === Money.of(0.3, "GBP"), sum.equals(Money.of(0.3, "GBP")));
+
+try {
+  sum.pence = 0; // strict mode: assigning to a frozen object throws
+} catch (error) {
+  console.log(error.name);
+}
+try {
+  sum.add(Money.of(1, "EUR"));
+} catch (error) {
+  console.log(error.message);
+}
+try {
+  new Money(9.5, "GBP");
+} catch (error) {
+  console.log(error.message);
+}
+```
+
+</CodeExample>
+
+Good value object candidates hide in every codebase as plain strings and numbers: email addresses (trimmed and lower-cased once, validated once), date ranges (start before end), quantities, coordinates, currency amounts. Replacing `price: 12.5` with a `Money` removes a whole category of bugs. Two notes: `Object.freeze` is **shallow** (freeze nested objects too, or keep value objects flat), and for display use `Intl.NumberFormat` rather than hand-made formatting.
+
+## Entities, invariants and domain events
+
+An **entity** is the opposite: it has an **identity** that stays the same while its data changes. Order `A-1001` is the same order before and after it's paid, and two orders with identical lines are still two different orders. Compare entities by **id**, not by their fields.
+
+Entities are where **invariants** live: rules that must **always** hold, like "an order's lines all have a positive quantity" or "a placed order can't be edited". Enforce each invariant in **one** place, the entity's methods, and give no other way in: private fields (`#lines`) and no setters. Then no route handler, script or teammate can put an order into a broken state, even by accident.
+
+When something meaningful happens, the entity can also record a **domain event** ("OrderPlaced"). The use case saves the entity and then publishes the events, so emails and stats react without the entity knowing they exist (the observer pattern from [lesson 1](/learn/javascript/solid-and-classic-patterns)):
+
+<CodeExample output={`9.50 GBP
+Quantity must be a whole number of at least 1
+Order A-1001 is placed and can't be changed
+1 OrderPlaced 9.50 GBP 2026-03-01T09:00:00.000Z
+[]
+[ 'A-1001' ]`}>
+
+```js
+class Money {
+  constructor(pence, currency) {
+    this.pence = pence;
+    this.currency = currency;
+    Object.freeze(this);
+  }
+  add(other) {
+    return new Money(this.pence + other.pence, this.currency);
+  }
+  times(n) {
+    return new Money(this.pence * n, this.currency);
+  }
+  toString() {
+    return `${(this.pence / 100).toFixed(2)} ${this.currency}`;
+  }
+}
+
+class DomainError extends Error {}
+
+class Order {
+  #lines = [];
+  #status = "draft";
+  #events = [];
+
+  constructor(id, currency) {
+    this.id = id;
+    this.currency = currency;
+  }
+
+  get status() {
+    return this.#status;
+  }
+
+  get total() {
+    return this.#lines.reduce(
+      (sum, line) => sum.add(line.price.times(line.qty)),
+      new Money(0, this.currency),
+    );
+  }
+
+  addLine(sku, qty, price) {
+    this.#mustBeDraft();
+    if (!Number.isInteger(qty) || qty < 1) {
+      throw new DomainError(
+        "Quantity must be a whole number of at least 1",
+      );
+    }
+    this.#lines.push({ sku, qty, price });
+  }
+
+  place(now) {
+    this.#mustBeDraft();
+    if (this.#lines.length === 0) {
+      throw new DomainError("Can't place an empty order");
+    }
+    this.#status = "placed";
+    this.#events.push({
+      type: "OrderPlaced",
+      orderId: this.id,
+      total: String(this.total),
+      at: now.toISOString(),
+    });
+  }
+
+  pullEvents() {
+    const events = this.#events;
+    this.#events = [];
+    return events;
+  }
+
+  #mustBeDraft() {
+    if (this.#status !== "draft") {
+      throw new DomainError(
+        `Order ${this.id} is ${this.#status} and can't be changed`,
+      );
+    }
+  }
+}
+
+const order = new Order("A-1001", "GBP");
+order.addLine("bamboo-tea", 2, new Money(350, "GBP"));
+order.addLine("panda-mug", 1, new Money(250, "GBP"));
+console.log(String(order.total));
+
+function attempt(action) {
+  try {
+    action();
+  } catch (error) {
+    console.log(error.message);
+  }
+}
+attempt(() => order.addLine("tea", 0, new Money(350, "GBP")));
+order.place(new Date("2026-03-01T09:00Z"));
+attempt(() => order.addLine("late", 1, new Money(100, "GBP")));
+
+// A use case would save the order, THEN publish its events:
+const published = [];
+const handlers = { OrderPlaced: (e) => published.push(e.orderId) };
+const events = order.pullEvents();
+const [placed] = events;
+console.log(events.length, placed.type, placed.total, placed.at);
+console.log(order.pullEvents()); // pulled once, so now empty
+for (const event of events) handlers[event.type]?.(event);
+console.log(published);
+```
+
+</CodeExample>
+
+Two details matter. `place` takes `now` as an argument instead of calling `new Date()`: the entity stays pure, and the use case passes `clock.now()`. And events are published **after** saving. If you send the "order confirmed" email first and the database write then fails, a customer gets an email for an order that doesn't exist. (Big systems make this reliable with an **outbox table**: the events are saved in the same transaction as the order, and a worker publishes them.)
+
+<Callout type="note" title="How much modelling do you need?">
+
+These ideas come from **Domain-Driven Design** (Eric Evans' book has a lot more: aggregates, bounded contexts, a shared "ubiquitous language" with the business). Take what helps. Value objects pay off almost everywhere; entities with private state pay off when rules are real; full DDD vocabulary pays off in big, rule-heavy domains like banking, insurance and logistics, and is overkill for a blog.
+
+</Callout>
+
+## Finite state machines
+
+Many objects move through a **workflow**: an order goes from pending to paid to shipped; a WebSocket connection goes from connecting to open, drops, reconnects. The usual first version is a pile of booleans: `isLoading`, `isConnected`, `hasError`, `isRetrying`. Four booleans allow 16 combinations, most of them nonsense ("connected **and** retrying **and** loading?"), and the bugs live in those combinations.
+
+A **finite state machine** (FSM) has exactly **one** current state, and a **transition table** that lists, for every state, which events are allowed and where they lead. Anything not in the table is rejected:
+
+<CodeExample output={`idle --CONNECT--> connecting
+connecting --OPENED--> open
+open --DROPPED--> reconnecting
+true false
+reconnecting --OPENED--> open
+Invalid event CONNECT in state open
+Invalid event toString in state open
+open --CLOSE--> closed
+[]`}>
+
+```js
+const connectionMachine = {
+  initial: "idle",
+  states: {
+    idle: { CONNECT: "connecting" },
+    connecting: {
+      OPENED: "open",
+      FAILED: "reconnecting",
+      CLOSE: "closed",
+    },
+    open: { DROPPED: "reconnecting", CLOSE: "closed" },
+    reconnecting: {
+      OPENED: "open",
+      GAVE_UP: "closed",
+      CLOSE: "closed",
+    },
+    closed: {},
+  },
+};
+
+function createMachine(definition, { onTransition = () => {} } = {}) {
+  let state = definition.initial;
+  const allowed = (event) =>
+    Object.hasOwn(definition.states[state], event); // not "toString"!
+
+  return {
+    get state() {
+      return state;
+    },
+    can: allowed,
+    send(event) {
+      if (!allowed(event)) {
+        throw new Error(`Invalid event ${event} in state ${state}`);
+      }
+      const from = state;
+      state = definition.states[state][event];
+      onTransition({ from, event, to: state });
+      return state;
+    },
+  };
+}
+
+const connection = createMachine(connectionMachine, {
+  onTransition: ({ from, event, to }) =>
+    console.log(`${from} --${event}--> ${to}`),
+});
+
+connection.send("CONNECT");
+connection.send("OPENED");
+connection.send("DROPPED");
+console.log(connection.can("OPENED"), connection.can("DROPPED"));
+connection.send("OPENED");
+for (const event of ["CONNECT", "toString"]) {
+  try {
+    connection.send(event);
+  } catch (error) {
+    console.log(error.message);
+  }
+}
+connection.send("CLOSE");
+console.log(Object.keys(connectionMachine.states[connection.state]));
+```
+
+</CodeExample>
+
+What you get from a few lines:
+
+- **Impossible states are impossible.** There's one `state` string, and it can only be one of five values.
+- **The workflow is data.** The table documents the whole lifecycle in one screen; a product manager can review it, and you can draw it as a diagram.
+- **Invalid actions fail loudly** instead of half-working: "ship a cancelled order" is an error, not a support ticket.
+- **One hook for side effects.** `onTransition` is the place to log, update the UI or schedule a reconnect.
+
+In React, a status string (`"idle" | "loading" | "success" | "error"`) in `useState` or a `useReducer` whose reducer is a transition table is the same idea. For complex workflows (nested states, timers, parallel states), the **XState** library is the standard tool:
+
+```js
+import { createMachine, createActor } from "xstate";
+
+const machine = createMachine({
+  initial: "idle",
+  states: {
+    idle: { on: { CONNECT: "connecting" } },
+    connecting: { on: { OPENED: "open", FAILED: "reconnecting" } },
+    // ...
+  },
+});
+const actor = createActor(machine).start();
+actor.send({ type: "CONNECT" });
+```
+
+<Quiz
+  question="Which of these is the best candidate for a value object rather than an entity?"
+  options={[
+    "A customer account that keeps its id while its address changes",
+    "An order that goes from pending to paid to shipped",
+    "A price of 12.50 GBP, where any two 12.50 GBP prices are interchangeable",
+    "A user session with a session id",
+  ]}
+  answer={2}
+  explanation="A price is defined only by its value, so it should be immutable and compared with equals. Accounts, orders and sessions have an identity that stays the same while their data changes, which makes them entities."
+/>
+
+<Quiz
+  question="A use case calls order.place(), then publishes the OrderPlaced event (which emails the customer), then saves the order. Why is that order of steps risky?"
+  options={[
+    "Events must be published before the entity is created",
+    "If saving fails, the customer has been emailed about an order that was never stored",
+    "Publishing events is slower than saving, so it should come last",
+    "There's no risk: the order of the steps doesn't matter",
+  ]}
+  answer={1}
+  explanation="Save first, then publish. Otherwise a failed write leaves the outside world believing something that isn't true. Large systems use an outbox table so the events are stored in the same transaction as the change."
+/>
+
+<Exercise
+  title="Untangle the order payment"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ---- BEFORE: tightly coupled. Read it, then replace it. ----
+// It charges cancelled orders, changes the order it was given,
+// and can't be tested without a real payment server.
+async function payOrder(order) {
+  const res = await fetch("https://pay.pandadev.test/charges", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ orderId: order.id, amount: order.total }),
+  });
+  if (!res.ok) throw new Error("Payment failed");
+  order.status = "paid";
+  order.paidAt = new Date(Date.now()).toISOString();
+  console.log("Order " + order.id + " paid");
+  return order;
+}
+
+// ---- AFTER ----
+const transitions = {
+  pending: { PAY: "paid", CANCEL: "cancelled" },
+  paid: { SHIP: "shipped", CANCEL: "cancelled" },
+  shipped: { DELIVER: "delivered" },
+  delivered: {},
+  cancelled: {},
+};
+
+// TODO 1: return the next status, or throw
+// Error("Can't <EVENT> an order that is <status>")
+// for any event that isn't in the table.
+function nextStatus(status, event) {
+  return transitions[status][event];
+}
+
+// TODO 2: no fetch, Date or console from outside: use the deps.
+//   pay(order): check the transition FIRST, then POST
+//     { orderId, amount } as JSON to paymentsUrl + "/charges";
+//     if !res.ok throw Error("Payment failed for order <id>");
+//     return a NEW order with status "paid" and
+//     paidAt: clock.now().toISOString(); log "Order <id> paid".
+//   cancel(order): return a NEW order with status "cancelled";
+//     log "Order <id> cancelled".
+function createOrderService({ fetch, clock, logger, paymentsUrl }) {
+  return {
+    async pay(order) {},
+    cancel(order) {},
+  };
+}
+
+// ---- tests (don't change them) ----
+function fakes({ ok = true } = {}) {
+  return {
+    fetch: vi.fn().mockResolvedValue({ ok, status: ok ? 201 : 402 }),
+    clock: { now: () => new Date("2026-05-01T10:00:00Z") },
+    logger: { info: vi.fn() },
+    paymentsUrl: "https://pay.test",
+  };
+}
+const order = { id: "A1", total: 3000, status: "pending" };
+
+describe("orders", () => {
+  it("allows only the transitions in the table", () => {
+    expect(nextStatus("pending", "PAY")).toBe("paid");
+    expect(nextStatus("paid", "SHIP")).toBe("shipped");
+    expect(() => nextStatus("shipped", "CANCEL")).toThrow(
+      "Can't CANCEL an order that is shipped",
+    );
+  });
+
+  it("pays: charges, stamps the time and logs", async () => {
+    const deps = fakes();
+    const paid = await createOrderService(deps).pay(order);
+    expect(paid).toEqual({
+      ...order,
+      status: "paid",
+      paidAt: "2026-05-01T10:00:00.000Z",
+    });
+    expect(order.status).toBe("pending");
+    expect(deps.fetch).toHaveBeenCalledWith(
+      "https://pay.test/charges",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(deps.logger.info).toHaveBeenCalledWith("Order A1 paid");
+  });
+
+  it("never charges a cancelled order", async () => {
+    const deps = fakes();
+    const cancelled = { ...order, status: "cancelled" };
+    await expect(createOrderService(deps).pay(cancelled)).rejects
+      .toThrow("Can't PAY an order that is cancelled");
+    expect(deps.fetch).not.toHaveBeenCalled();
+  });
+
+  it("a declined payment changes nothing", async () => {
+    const deps = fakes({ ok: false });
+    await expect(createOrderService(deps).pay(order)).rejects
+      .toThrow("Payment failed for order A1");
+    expect(deps.logger.info).not.toHaveBeenCalled();
+  });
+
+  it("cancels pending orders but not shipped ones", () => {
+    const service = createOrderService(fakes());
+    expect(service.cancel(order).status).toBe("cancelled");
+    expect(order.status).toBe("pending");
+    expect(() => service.cancel({ ...order, status: "shipped" }))
+      .toThrow("Can't CANCEL");
+  });
+});
+`}
+  tests={[
+    { name: "All the tests in the editor pass", check: `__vitest.failed === 0 && __vitest.passed >= 5` },
+    { name: "nextStatus follows the table and rejects everything else", check: `(() => { const bad = (s, e) => { try { nextStatus(s, e); return false; } catch (err) { return err.message === "Can't " + e + " an order that is " + s; } }; return nextStatus("pending", "CANCEL") === "cancelled" && nextStatus("shipped", "DELIVER") === "delivered" && bad("delivered", "PAY") && bad("pending", "SHIP") && bad("paid", "PAY") && bad("pending", "toString"); })()` },
+    { name: "pay sends the charge as JSON and returns a new paid order", check: `await (async () => { const calls = []; const logs = []; const svc = createOrderService({ fetch: async (url, options) => { calls.push([url, options]); return { ok: true, status: 201 }; }, clock: { now: () => new Date("2027-01-02T03:04:05Z") }, logger: { info: (m) => logs.push(m) }, paymentsUrl: "https://p.example" }); const o = { id: "Z9", total: 1250, status: "pending", note: "gift" }; const paid = await svc.pay(o); const [url, opts] = calls[0] ?? []; const body = JSON.parse(opts?.body ?? "{}"); const type = opts?.headers?.["Content-Type"] ?? opts?.headers?.["content-type"]; return calls.length === 1 && url === "https://p.example/charges" && opts.method === "POST" && /json/.test(type) && body.orderId === "Z9" && body.amount === 1250 && paid !== o && paid.status === "paid" && paid.note === "gift" && paid.paidAt === "2027-01-02T03:04:05.000Z" && o.status === "pending" && !("paidAt" in o) && logs.join() === "Order Z9 paid"; })()` },
+    { name: "pay checks the transition before charging anything", check: `await (async () => { let charged = 0; const svc = createOrderService({ fetch: async () => { charged++; return { ok: true }; }, clock: { now: () => new Date() }, logger: { info() {} }, paymentsUrl: "x" }); const results = []; for (const status of ["paid", "shipped", "cancelled"]) { try { await svc.pay({ id: "Q", total: 1, status }); results.push("no error"); } catch (e) { results.push(e.message); } } return charged === 0 && results.join("|") === "Can't PAY an order that is paid|Can't PAY an order that is shipped|Can't PAY an order that is cancelled"; })()` },
+    { name: "A declined payment rejects and logs nothing", check: `await (async () => { const logs = []; const svc = createOrderService({ fetch: async () => ({ ok: false, status: 402 }), clock: { now: () => new Date() }, logger: { info: (m) => logs.push(m) }, paymentsUrl: "x" }); const o = { id: "K7", total: 5, status: "pending" }; try { await svc.pay(o); return false; } catch (e) { return e.message === "Payment failed for order K7" && logs.length === 0 && o.status === "pending"; } })()` },
+    { name: "cancel returns a new order, logs, and respects the table", check: `await (async () => { const logs = []; const svc = createOrderService({ fetch: async () => ({ ok: true }), clock: { now: () => new Date() }, logger: { info: (m) => logs.push(m) }, paymentsUrl: "x" }); const p = { id: "C3", total: 5, status: "paid" }; const c = await svc.cancel(p); let refused = false; try { await svc.cancel({ id: "C4", total: 5, status: "delivered" }); } catch (e) { refused = e.message === "Can't CANCEL an order that is delivered"; } return c !== p && c.status === "cancelled" && p.status === "paid" && logs.join() === "Order C3 cancelled" && refused; })()` },
+    { name: "createOrderService uses only its injected dependencies", check: `!/Date\\.now|new Date|console\\./.test(createOrderService.toString())` },
+  ]}
+>
+
+Refactor the coupled `payOrder` into small, injected, testable pieces, guarded by a state machine. The transition table and the tests are ready:
+
+1. **`nextStatus(status, event)`** returns the next status from `transitions`, and throws `Error("Can't <EVENT> an order that is <status>")` for any event the table doesn't allow, including sneaky ones like `"toString"` (use `Object.hasOwn`, like the lesson's machine).
+2. **`createOrderService({ fetch, clock, logger, paymentsUrl })`** returns:
+   - `async pay(order)`: check the transition **before** charging anything, then `POST` `{ orderId, amount }` (the order's `id` and `total`) as JSON to `paymentsUrl + "/charges"` with a `Content-Type: application/json` header. If `!res.ok`, throw `Error("Payment failed for order <id>")`. Otherwise return a **new** order with `status: "paid"` and `paidAt: clock.now().toISOString()`, and call `logger.info("Order <id> paid")`.
+   - `cancel(order)`: return a **new** order with status `"cancelled"` (if the table allows it) and log `"Order <id> cancelled"`.
+
+Use only the injected `fetch`, `clock` and `logger`: no `Date`, no `console`. The given order objects must never be changed.
+
+<Hint>
+
+`nextStatus`: if `!Object.hasOwn(transitions[status], event)`, throw `new Error("Can't " + event + " an order that is " + status)`; otherwise return `transitions[status][event]`. In `pay`, call `const status = nextStatus(order.status, "PAY")` as the very first line, so an invalid order throws before `fetch` runs. Build the result with spread: `const paid = { ...order, status, paidAt: clock.now().toISOString() };`.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect, vi } from "vitest";
+
+const transitions = {
+  pending: { PAY: "paid", CANCEL: "cancelled" },
+  paid: { SHIP: "shipped", CANCEL: "cancelled" },
+  shipped: { DELIVER: "delivered" },
+  delivered: {},
+  cancelled: {},
+};
+
+function nextStatus(status, event) {
+  if (!Object.hasOwn(transitions[status] ?? {}, event)) {
+    throw new Error(`Can't ${event} an order that is ${status}`);
+  }
+  return transitions[status][event];
+}
+
+function createOrderService({ fetch, clock, logger, paymentsUrl }) {
+  return {
+    async pay(order) {
+      const status = nextStatus(order.status, "PAY"); // before charging
+      const res = await fetch(`${paymentsUrl}/charges`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId: order.id, amount: order.total }),
+      });
+      if (!res.ok) {
+        throw new Error(`Payment failed for order ${order.id}`);
+      }
+      const paid = {
+        ...order,
+        status,
+        paidAt: clock.now().toISOString(),
+      };
+      logger.info(`Order ${order.id} paid`);
+      return paid;
+    },
+
+    cancel(order) {
+      const status = nextStatus(order.status, "CANCEL");
+      logger.info(`Order ${order.id} cancelled`);
+      return { ...order, status };
+    },
+  };
+}
+
+// ---- tests (don't change them) ----
+function fakes({ ok = true } = {}) {
+  return {
+    fetch: vi.fn().mockResolvedValue({ ok, status: ok ? 201 : 402 }),
+    clock: { now: () => new Date("2026-05-01T10:00:00Z") },
+    logger: { info: vi.fn() },
+    paymentsUrl: "https://pay.test",
+  };
+}
+const order = { id: "A1", total: 3000, status: "pending" };
+
+describe("orders", () => {
+  it("allows only the transitions in the table", () => {
+    expect(nextStatus("pending", "PAY")).toBe("paid");
+    expect(nextStatus("paid", "SHIP")).toBe("shipped");
+    expect(() => nextStatus("shipped", "CANCEL")).toThrow(
+      "Can't CANCEL an order that is shipped",
+    );
+  });
+
+  it("pays: charges, stamps the time and logs", async () => {
+    const deps = fakes();
+    const paid = await createOrderService(deps).pay(order);
+    expect(paid).toEqual({
+      ...order,
+      status: "paid",
+      paidAt: "2026-05-01T10:00:00.000Z",
+    });
+    expect(order.status).toBe("pending");
+    expect(deps.fetch).toHaveBeenCalledWith(
+      "https://pay.test/charges",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(deps.logger.info).toHaveBeenCalledWith("Order A1 paid");
+  });
+
+  it("never charges a cancelled order", async () => {
+    const deps = fakes();
+    const cancelled = { ...order, status: "cancelled" };
+    await expect(createOrderService(deps).pay(cancelled)).rejects
+      .toThrow("Can't PAY an order that is cancelled");
+    expect(deps.fetch).not.toHaveBeenCalled();
+  });
+
+  it("a declined payment changes nothing", async () => {
+    const deps = fakes({ ok: false });
+    await expect(createOrderService(deps).pay(order)).rejects
+      .toThrow("Payment failed for order A1");
+    expect(deps.logger.info).not.toHaveBeenCalled();
+  });
+
+  it("cancels pending orders but not shipped ones", () => {
+    const service = createOrderService(fakes());
+    expect(service.cancel(order).status).toBe("cancelled");
+    expect(order.status).toBe("pending");
+    expect(() => service.cancel({ ...order, status: "shipped" }))
+      .toThrow("Can't CANCEL");
+  });
+});
+
+// In main.js, the composition root would wire the real things:
+// createOrderService({
+//   fetch: (...args) => fetch(...args),
+//   clock: { now: () => new Date() },
+//   logger: console,
+//   paymentsUrl: "https://pay.pandadev.test",
+// });
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Dependency injection**: code receives its collaborators (constructor or factory options) instead of reaching for them. Inject time, randomness, I/O, configuration and logging; plain helpers can be imported.
+- Keep dependencies **required** in the core, and build the real ones in the **composition root** (`main.js`), ideally as a function that accepts overrides for tests and scripts.
+- **DI containers** (Awilix, InversifyJS, NestJS) automate wiring. Most JavaScript apps are clearer wired by hand; use one when your framework expects it.
+- **Value objects** (`Money`, `Email`) are immutable (`Object.freeze`), compared with `equals`, and valid from the moment they're created. Store money in whole minor units.
+- **Entities** have an identity and guard their **invariants** in one place, with private fields and methods instead of setters.
+- **Domain events** record what happened; publish them **after** saving.
+- **Finite state machines** replace piles of booleans with one state and a transition table that rejects invalid events, for orders, connections and UI status alike.

@@ -1,0 +1,465 @@
+---
+title: Measuring Performance
+description: Measure before you optimise. Time code with performance.now, mark and measure, avoid benchmark traps, spot Big-O problems and understand Core Web Vitals.
+duration: 24
+xp: 25
+---
+
+A team once spent two weeks replacing their date library with a "faster" one because the dashboard felt slow. The dashboard was exactly as slow afterwards. When someone finally recorded a profile, the culprit took ten minutes to find: a `.find()` inside a `.map()`, comparing every order with every customer, 400 million times. The first rule of performance work is short: **measure, don't guess**. 🔍
+
+This module is about making JavaScript fast, in the browser and on the server. We start with the most important skill: finding out **where** the time actually goes, and **which** numbers matter to your users.
+
+## Measure, don't guess
+
+Your intuition about what's slow is usually wrong, and so is everybody else's. Programs spend most of their time in a few **hot spots**, often in places nobody suspects. So performance work always follows the same loop:
+
+1. **Pick a number that matters**: "the search results appear within 200 ms of typing", not "make it faster".
+2. **Reproduce** the slow case with realistic data on a realistic device (your laptop is not your users' phone).
+3. **Measure** to get a baseline.
+4. **Profile** to find the hot spot.
+5. **Fix** only that hot spot, then **measure again** to prove it helped, and run the tests to prove it still works.
+
+Step 5 matters more than it looks. Plenty of "optimisations" make code harder to read and no faster, because the engine was already doing something clever. If you can't show a before and after number, it's not an optimisation, it's a guess.
+
+## Timing code with performance.now
+
+You could time code with `Date.now()`, but it has two problems: it only counts whole milliseconds, and it follows the system clock, which can jump when the computer syncs its time. **`performance.now()`** is built for measuring: it returns milliseconds as a fraction (like `1234.5678`) since the page or worker started, and it only ever moves forward.
+
+Run this a few times and watch the numbers change:
+
+<TryIt code={`function timeIt(label, fn) {
+  const start = performance.now();
+  const result = fn();
+  const ms = performance.now() - start;
+  console.log(\`\${label}: \${ms.toFixed(3)} ms\`);
+  return result;
+}
+
+const numbers = Array.from({ length: 200_000 }, (_, i) => i);
+
+timeIt("for loop", () => {
+  let total = 0;
+  for (let i = 0; i < numbers.length; i++) total += numbers[i];
+  return total;
+});
+
+timeIt("reduce", () => numbers.reduce((a, b) => a + b, 0));
+
+timeIt("sort a copy", () => [...numbers].sort((a, b) => b - a));`}
+/>
+
+The numbers wobble from run to run, and the first run is often the slowest. Keep that in mind; we'll come back to why.
+
+<Callout type="note" title="Why the numbers look rounded">
+
+Browsers deliberately make `performance.now()` a little less precise (to 5 or 100 microseconds, depending on the page's security settings), because super-precise timers can be used for attacks like Spectre that read memory through timing. For timing your code that's plenty: anything worth optimising takes far longer than that.
+
+</Callout>
+
+### performance.mark and performance.measure
+
+For timing steps in a real app, the **User Timing API** is nicer than subtracting numbers by hand. `performance.mark(name)` drops a named timestamp, and `performance.measure(name, startMark, endMark)` records the time between two marks:
+
+<CodeExample output={`parse measure
+rows: 10000
+has a duration: true`}>
+
+```js
+const json = JSON.stringify(
+  Array.from({ length: 10_000 }, (_, i) => ({ id: i, ok: true })),
+);
+
+performance.mark("parse:start");
+const rows = JSON.parse(json);
+performance.mark("parse:end");
+
+performance.measure("parse", "parse:start", "parse:end");
+
+const [entry] = performance.getEntriesByName("parse");
+console.log(entry.name, entry.entryType);
+console.log("rows:", rows.length);
+console.log("has a duration:", entry.duration >= 0);
+```
+
+</CodeExample>
+
+The real win: marks and measures show up in the browser's **DevTools Performance panel** in a "Timings" track, right above the flame chart. So you can see your own named steps ("parse", "render list", "save draft") next to everything the browser did. Monitoring tools can collect them from real users too, as you'll see at the end of this lesson. (The same API exists in Node.js, via `performance` from `node:perf_hooks` or the global.)
+
+## Micro-benchmark traps
+
+A **micro-benchmark** times one tiny piece of code, like "is `for` faster than `forEach`?". They're useful, but they lie easily. The three classic traps:
+
+- **JIT warm-up.** As you saw in [How Engines Run Code](/learn/javascript/how-engines-run-code), JavaScript engines start by interpreting your code, watch which functions run a lot ("hot" functions), and then compile those into fast machine code. The first few hundred calls can be many times slower than later ones. Measure only the cold start and you're timing the interpreter, not your code.
+- **Dead-code elimination.** If a result is never used, the optimising compiler may skip the work entirely, and your benchmark proudly reports that sorting a million numbers takes 0.001 ms. Always **use** the result (add it to a variable you print at the end).
+- **Noise.** Other tabs, the garbage collector, CPU power saving and thermal throttling all slow down random runs. Never trust a single measurement: run many times and look at the **median**, not the average (one slow run drags the average around).
+
+Here's a small benchmark helper that deals with all three. Run it and compare an `Array.includes` lookup with a `Set.has` lookup:
+
+<TryIt code={`function bench(label, fn, { runs = 15, iterations = 200 } = {}) {
+  let sink = 0; // use every result, so nothing is skipped
+  for (let i = 0; i < iterations; i++) sink += fn(i); // warm-up
+
+  const perCall = [];
+  for (let r = 0; r < runs; r++) {
+    const start = performance.now();
+    for (let i = 0; i < iterations; i++) sink += fn(i);
+    perCall.push((performance.now() - start) / iterations);
+  }
+  perCall.sort((a, b) => a - b);
+  const median = perCall[Math.floor(runs / 2)];
+  console.log(\`\${label}: \${(median * 1000).toFixed(2)} µs per call\`);
+  return sink;
+}
+
+const ids = Array.from({ length: 10_000 }, (_, i) => i * 2);
+const idSet = new Set(ids);
+
+const last = 19_998; // near the end of the array
+const a = bench("array.includes", (i) => +ids.includes(last - i));
+const b = bench("set.has       ", (i) => +idSet.has(last - i));
+console.log("same answers:", a === b);`}
+/>
+
+`includes` has to walk through the array until it finds the value, so it gets slower as the array grows. A `Set` jumps straight to the answer. On most machines the gap here is a factor of hundreds.
+
+In real projects, use a benchmarking library rather than your own loop. They handle warm-up, statistics and outliers for you:
+
+```js
+// lookup.bench.js, run with: npx vitest bench
+import { bench, describe } from "vitest";
+
+const ids = Array.from({ length: 10_000 }, (_, i) => i);
+const idSet = new Set(ids);
+
+describe("lookup", () => {
+  bench("array.includes", () => {
+    ids.includes(9_999);
+  });
+  bench("set.has", () => {
+    idSet.has(9_999);
+  });
+});
+```
+
+Libraries like **tinybench** (which Vitest uses) and **mitata** do the same outside Vitest. And remember that a micro-benchmark answers a tiny question. Whether the change matters for **your app** is something only a profile of the whole app can tell you.
+
+## Big-O in practice
+
+A benchmark tells you how long something takes for **one** input size. **Big-O** tells you how the time **grows** as the input grows, and that's what decides whether your code survives production data. A function that takes 2 ms with 100 test rows might take 20 minutes with 100,000 real ones.
+
+| Big-O | Name | Typical JavaScript | 1,000 items → 100,000 items |
+| --- | --- | --- | --- |
+| O(1) | constant | `map.get(key)`, `set.has(x)`, `arr[i]`, `arr.push(x)` | same time |
+| O(log n) | logarithmic | binary search in a sorted array | a bit slower |
+| O(n) | linear | `arr.includes(x)`, `find`, `filter`, one loop | 100× slower |
+| O(n log n) | n log n | `arr.sort()` | ~170× slower |
+| O(n²) | quadratic | a loop inside a loop over the same data | 10,000× slower |
+
+The dangerous O(n²) code rarely looks like two `for` loops. It hides inside friendly array methods. Here's the classic: attaching a user to each post. Instead of timing it, we **count the steps**, which shows the growth exactly:
+
+<CodeExample output={`nested loops: 500500 steps
+Map lookups: 2000 steps`}>
+
+```js
+const users = Array.from({ length: 1000 }, (_, i) => ({
+  id: i,
+  name: `user${i}`,
+}));
+const posts = Array.from({ length: 1000 }, (_, i) => ({
+  id: i,
+  userId: 999 - i,
+}));
+
+// Like posts.map(p => users.find(u => u.id === p.userId))
+let steps = 0;
+for (const post of posts) {
+  for (const user of users) {
+    steps++;
+    if (user.id === post.userId) break;
+  }
+}
+console.log("nested loops:", steps, "steps");
+
+// Build an index once, then every lookup is one step
+steps = 0;
+const usersById = new Map();
+for (const user of users) {
+  steps++;
+  usersById.set(user.id, user);
+}
+for (const post of posts) {
+  steps++;
+  usersById.get(post.userId);
+}
+console.log("Map lookups:", steps, "steps");
+```
+
+</CodeExample>
+
+With 1,000 of each, the nested version does about 250 times more work. With 100,000 of each it would be 5 **billion** steps against 200,000. The fix is always the same idea: **build an index once** (a `Map` or a `Set`), then look things up in O(1).
+
+Watch out for these hidden loops inside loops:
+
+- `.find()`, `.filter()`, `.includes()`, `.indexOf()` or `.some()` called inside `.map()`, `.forEach()` or a `for` loop over another big array.
+- `arr.shift()` or `arr.splice(0, 1)` in a loop: removing the first item moves every other item along.
+- Copying in `reduce`: `items.reduce((acc, x) => ({ ...acc, [x.id]: x }), {})` copies the whole object on every step, so it's O(n²). Use `Object.fromEntries(items.map((x) => [x.id, x]))` or a `Map` instead.
+- `await` inside a loop for independent requests: not Big-O, but the same smell. It's N waits in a row instead of one `Promise.all`.
+
+<Callout type="tip" title="Big-O isn't everything">
+
+For 20 items, the "slow" O(n²) version is usually faster than building a `Map`, and much simpler to read. Big-O is about **growth**. If the data is small and will stay small (the 7 days of a week, the 3 tabs of a form), write the clearest code. If it comes from users or a database, assume it will grow.
+
+</Callout>
+
+## Finding the slow part: profilers
+
+Timing code by hand only works once you suspect a function. To find the hot spot in a whole app, use a **profiler**, which samples what the program is doing thousands of times per second.
+
+In Chrome (Edge and Firefox are similar), open DevTools → **Performance**:
+
+1. Click the gear and set **CPU: 4× slowdown** (and maybe a slow network). This roughly simulates an average phone. Users don't have your laptop.
+2. Click record, do the slow thing (type in the search, open the menu), stop.
+3. Read the **flame chart** on the Main track: each bar is a function call, its width is how long it took, and the bars below it are the functions it called. Look for wide bars.
+4. Tasks longer than 50 ms are **long tasks**, marked with a red corner. During a long task the page can't respond to clicks or typing.
+5. Switch to the **Bottom-Up** tab and sort by **Self Time** to see which functions burned the most time themselves, wherever they were called from.
+
+**Lighthouse** (also in DevTools) runs an automated audit of a page load and gives scores and concrete suggestions: "this image is too big", "this script blocks rendering". Use it as a checklist, not a goal: a perfect 100 on your fast office Wi-Fi says little about a user on a train.
+
+For Node.js servers, the same flame charts are available:
+
+```bash
+# Write a CPU profile while the server runs, then open the
+# .cpuprofile file in Chrome DevTools (Performance → Load profile)
+node --cpu-prof server.js
+
+# Or attach DevTools live: open chrome://inspect in Chrome
+node --inspect server.js
+```
+
+## Core Web Vitals
+
+What should you measure on a website? Google's **Core Web Vitals** are three numbers that capture what users actually feel. They're also used in search ranking, so business people care about them:
+
+| Metric | Question it answers | Good | Poor |
+| --- | --- | --- | --- |
+| **LCP**, Largest Contentful Paint | How long until the main content (the biggest image or text block) is visible? | ≤ 2.5 s | > 4 s |
+| **INP**, Interaction to Next Paint | When I click or type, how long until the screen reacts? (roughly the worst interaction of the visit) | ≤ 200 ms | > 500 ms |
+| **CLS**, Cumulative Layout Shift | Does stuff jump around while I'm reading? (a score, not a time) | ≤ 0.1 | > 0.25 |
+
+A page "passes" when at least **75%** of real visits are good for each metric (the 75th percentile). INP replaced an older metric, FID, in 2024, so older articles may still mention FID.
+
+### Common causes and fixes
+
+**Slow LCP** usually means the main content arrives late:
+- a slow server response (check **TTFB**, time to first byte): add caching, fix slow queries, use a CDN;
+- a huge hero image: compress it, serve modern formats (AVIF/WebP), give it `fetchpriority="high"`, and never `loading="lazy"` on it;
+- content that only appears after JavaScript downloads, runs and fetches data: render it on the server, or start the fetch earlier;
+- render-blocking CSS and fonts in the `<head>`.
+
+**Poor INP** means the main thread is busy when the user interacts:
+- long tasks from heavy JavaScript: split work into chunks, move it to a Web Worker, do less;
+- slow event handlers: do the visible update first, defer the rest;
+- re-rendering huge component trees or DOM lists on every key press.
+
+The next lesson is full of fixes for these.
+
+**High CLS** means things move after they appear:
+- images and videos without `width` and `height` (the browser doesn't know how much room to keep);
+- ads, banners and cookie notices pushed in above the content;
+- web fonts that swap in with different sizes;
+- content inserted above what the user is reading after a fetch.
+
+## Measuring real users
+
+Lighthouse and DevTools give you **lab data**: one device, one network, one run. Real users have slow phones, bad networks and full caches. **Field data**, also called **RUM** (real user monitoring), is collected from actual visits, and it's the truth.
+
+Why "the 75th percentile" and not the average? Because averages hide the users who suffer. Here are 12 LCP measurements from real visits:
+
+<CodeExample output={`average: 2596 ms
+median (p50): 1700 ms
+p75: 2600 ms
+p95: 7200 ms`}>
+
+```js
+function percentile(values, p) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, index)];
+}
+
+// LCP of 12 real page loads, in milliseconds
+const lcp = [1200, 1350, 1400, 1500, 1600, 1700,
+             1800, 2100, 2600, 3900, 4800, 7200];
+
+const average = lcp.reduce((a, b) => a + b, 0) / lcp.length;
+console.log("average:", Math.round(average), "ms");
+console.log("median (p50):", percentile(lcp, 50), "ms");
+console.log("p75:", percentile(lcp, 75), "ms");
+console.log("p95:", percentile(lcp, 95), "ms");
+```
+
+</CodeExample>
+
+The median says "1.7 s, great!", while one visitor in four waits more than 2.5 s and the slowest wait 7 seconds. The p75 just barely fails "good". Senior engineers talk about **percentiles** (p50, p75, p95, p99) for exactly this reason, for web pages and for API response times alike.
+
+In the browser, the **PerformanceObserver** API delivers performance entries as they happen. Google's small **web-vitals** library builds on it and computes LCP, INP and CLS correctly, which is surprisingly fiddly by hand:
+
+```js
+// npm i web-vitals
+import { onLCP, onINP, onCLS } from "web-vitals";
+
+function sendToAnalytics(metric) {
+  const body = JSON.stringify({
+    name: metric.name, // "LCP", "INP" or "CLS"
+    value: metric.value,
+    rating: metric.rating, // "good", "needs-improvement", "poor"
+    page: location.pathname,
+  });
+  // sendBeacon still delivers when the user is leaving the page
+  navigator.sendBeacon("/analytics", body);
+}
+
+onLCP(sendToAnalytics);
+onINP(sendToAnalytics);
+onCLS(sendToAnalytics);
+
+// Your own long tasks, straight from the browser
+new PerformanceObserver((list) => {
+  for (const entry of list.getEntries()) {
+    console.log("long task:", Math.round(entry.duration), "ms");
+  }
+}).observe({ type: "longtask", buffered: true });
+```
+
+Most teams send these to a monitoring service (Sentry, Datadog, Vercel Speed Insights and many others) and watch the p75 over time, so a release that makes things slower is caught within hours. Google's public **Chrome UX Report** (shown in PageSpeed Insights) also has field data for popular sites.
+
+<Callout type="warning" title="Set a budget, or it only gets slower">
+
+Performance decays one small feature at a time: nobody notices 30 ms, but twenty of them add up. Good teams write **performance budgets** down ("p75 LCP under 2.5 s", "under 200 KB of JavaScript on the home page") and check them in CI and dashboards, just like failing tests.
+
+</Callout>
+
+<Quiz
+  question="A benchmark computes JSON.parse(text) a million times in a loop and reports it takes almost no time, but the result is never stored or used. What is the most likely explanation?"
+  options={[
+    "JSON.parse is cached by the browser after the first call",
+    "The optimising compiler may have removed work whose result is never used, so the benchmark measures nothing",
+    "performance.now() stops counting inside loops",
+    "The loop runs in a separate thread"
+  ]}
+  answer={1}
+  explanation="That's dead-code elimination. Engines can skip work whose result is never used, so always use the result (for example, add it to a variable you print at the end). Also warm up and take the median of many runs."
+/>
+
+<Quiz
+  question="Users say the page freezes for a moment after they click Add to cart. Which Core Web Vital is this, and what is a likely cause?"
+  options={[
+    "LCP: the hero image is too big",
+    "CLS: the button moves when an ad loads",
+    "INP: a long task on the main thread delays the response to the click",
+    "TTFB: the CDN is too far away"
+  ]}
+  answer={2}
+  explanation="INP (Interaction to Next Paint) measures how long it takes for the screen to react to a click, tap or key press. Long tasks on the main thread are the usual cause: split them up, defer non-urgent work or move it to a worker."
+/>
+
+<Exercise
+  title="Speed up the order report"
+  starter={`function attachCustomers(orders, customers) {
+  // TODO: this is O(orders × customers). Make it O(n) with a Map.
+  return orders.map((order) => {
+    const customer = customers.find(
+      (c) => c.id === order.customerId,
+    );
+    return {
+      ...order,
+      customerName: customer ? customer.name : "Unknown",
+    };
+  });
+}
+
+const customers = [
+  { id: 1, name: "Mei" },
+  { id: 2, name: "Bao" },
+];
+const orders = [
+  { id: 101, customerId: 2, total: 30 },
+  { id: 102, customerId: 1, total: 12 },
+  { id: 103, customerId: 9, total: 5 },
+];
+
+for (const row of attachCustomers(orders, customers)) {
+  console.log(row.id, row.customerName, row.total);
+}
+`}
+  tests={[
+    { name: "Prints the report for the example", check: `__output.join("|") === "101 Bao 30|102 Mei 12|103 Unknown 5"` },
+    { name: "Keeps every order field and the order of the orders", check: `JSON.stringify(attachCustomers([{ id: 7, customerId: "b", total: 1, paid: true }, { id: 3, customerId: "a", total: 2 }], [{ id: "a", name: "Ann" }, { id: "b", name: "Ben" }])) === JSON.stringify([{ id: 7, customerId: "b", total: 1, paid: true, customerName: "Ben" }, { id: 3, customerId: "a", total: 2, customerName: "Ann" }])` },
+    { name: "Unknown customers and empty lists work", check: `attachCustomers([{ id: 1, customerId: 5 }], [])[0].customerName === "Unknown" && attachCustomers([], [{ id: 1, name: "X" }]).length === 0` },
+    { name: "Doesn't change the inputs", check: `(() => { const o = [{ id: 1, customerId: 1 }]; const c = [{ id: 1, name: "Z" }]; attachCustomers(o, c); return JSON.stringify(o) === '[{"id":1,"customerId":1}]' && JSON.stringify(c) === '[{"id":1,"name":"Z"}]'; })()` },
+    { name: "Looks at each customer's id at most twice (no search per order)", check: `(() => { let reads = 0; const cs = Array.from({ length: 2000 }, (_, i) => { const c = { name: "C" + i }; Object.defineProperty(c, "id", { enumerable: true, get() { reads++; return i; } }); return c; }); const os = Array.from({ length: 2000 }, (_, i) => ({ id: i, customerId: 1999 - i })); const out = attachCustomers(os, cs); return out[0].customerName === "C1999" && out[1999].customerName === "C0" && reads <= 2 * cs.length; })()` },
+    { name: "Handles 60,000 orders and 60,000 customers in under half a second", check: `(() => { const n = 60_000; const cs = Array.from({ length: n }, (_, i) => ({ id: i, name: "C" + i })); const os = Array.from({ length: n }, (_, i) => ({ id: i, customerId: (i * 7919) % n })); const start = performance.now(); const out = attachCustomers(os, cs); const ms = performance.now() - start; return ms < 500 && out[1].customerName === "C7919"; })()` },
+  ]}
+>
+
+The shop's daily report attaches each order's customer name. It worked fine in testing, but with tens of thousands of orders and customers it freezes for seconds, because it **searches the whole customer list for every order**.
+
+Rewrite `attachCustomers(orders, customers)` so it's **O(n)**:
+
+1. Build a `Map` from customer id to customer **once**, before going through the orders.
+2. For each order, return a **new** object with all the order's fields plus `customerName` (or `"Unknown"` if there's no such customer). Don't change the input arrays or objects.
+3. Keep the orders in the same order.
+
+The checks count how often your code reads a customer's `id`, and time a run with 60,000 of each. The slow version takes a few seconds on that check (that's the point), so be patient if you run the checks before fixing it.
+
+<Hint>
+
+Before the `map`, create the index: `const byId = new Map(customers.map((c) => [c.id, c]));` (that reads each `id` once). Then inside the `map`, replace the `find` with `byId.get(order.customerId)`. Everything else can stay the same.
+
+</Hint>
+
+<Solution>
+
+```js
+function attachCustomers(orders, customers) {
+  // Build the index once: O(customers)
+  const byId = new Map(customers.map((c) => [c.id, c]));
+
+  // One O(1) lookup per order: O(orders)
+  return orders.map((order) => {
+    const customer = byId.get(order.customerId);
+    return {
+      ...order,
+      customerName: customer ? customer.name : "Unknown",
+    };
+  });
+}
+
+const customers = [
+  { id: 1, name: "Mei" },
+  { id: 2, name: "Bao" },
+];
+const orders = [
+  { id: 101, customerId: 2, total: 30 },
+  { id: 102, customerId: 1, total: 12 },
+  { id: 103, customerId: 9, total: 5 },
+];
+
+for (const row of attachCustomers(orders, customers)) {
+  console.log(row.id, row.customerName, row.total);
+}
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Measure, don't guess**: pick a number that matters, reproduce with realistic data, measure, profile, fix the hot spot, measure again.
+- **`performance.now()`** is the right clock for timing code. **`performance.mark`/`measure`** name your steps, and they show up in the DevTools Performance panel.
+- Micro-benchmarks lie unless you **warm up**, **use the results** (dead-code elimination) and take the **median** of many runs. Prefer `vitest bench`, tinybench or mitata.
+- **Big-O** describes growth. Hidden O(n²) usually looks like `find`/`includes`/`filter` inside a loop; fix it by building a `Map` or `Set` index once.
+- Find hot spots with the **Performance panel** (4× CPU slowdown, flame chart, long tasks, Bottom-Up) and audit pages with **Lighthouse**; profile Node with `--cpu-prof` or `--inspect`.
+- **Core Web Vitals**: LCP ≤ 2.5 s (main content visible), INP ≤ 200 ms (responds to input), CLS ≤ 0.1 (nothing jumps), judged at the **75th percentile** of real visits.
+- Lab data finds problems; **field data** (PerformanceObserver, `web-vitals`, a monitoring service) tells you what real users feel. Watch percentiles, not averages, and set **performance budgets**.

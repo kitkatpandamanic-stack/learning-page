@@ -1,0 +1,971 @@
+---
+title: Real-Time Features and Resilience
+description: Push live updates with polling, Server-Sent Events or WebSockets, scale them across servers, and keep services standing with timeouts, retries, idempotency, circuit breakers and rate limits.
+duration: 25
+xp: 25
+---
+
+PandaPoll's big screen must show new votes within a second. HTTP, as you've used it so far, can't do that on its own: the browser asks, the server answers, and then the server has no way to talk to the browser until it asks again. In the first half of this lesson you'll compare the ways to get **live updates** and open your first **WebSocket**. In the second half you'll make the whole system **resilient**, because with thousands of open connections and several services, something is always failing somewhere. ⚡
+
+## Four ways to get live updates
+
+| Technique | How it works | Direction | Good for | Watch out for |
+| --- | --- | --- | --- | --- |
+| **Polling** | The client asks every few seconds | Client → server | Dashboards that can be 10–30 s old | Lots of empty answers; delay up to one interval |
+| **Long polling** | The server holds each request open until there's news (or ~30 s pass), then the client asks again | Server → client (sort of) | Old browsers and proxies, rare events | One request per event; fiddly to get right |
+| **Server-Sent Events (SSE)** | One long HTTP response that the server keeps writing events into | Server → client only | Live feeds, notifications, progress, streaming AI answers | Text only; the client still sends with normal requests |
+| **WebSockets** | The HTTP connection is upgraded into a two-way channel | Both ways | Chat, games, collaborative editing, live cursors | Stateful connections: harder to scale, load balance and deploy |
+
+Polling is a perfectly good answer more often than people think. It's plain HTTP, so caching, load balancers and auth all just work:
+
+```js
+// Polling: simple, robust, and up to 5 seconds behind
+const timer = setInterval(async () => {
+  const res = await fetch("/polls/7/results");
+  renderResults(await res.json());
+}, 5000);
+// clearInterval(timer) when the page is closed
+```
+
+**SSE** is the underrated middle ground. The browser has a built-in `EventSource` that even **reconnects automatically**, and the server is just Express writing to a response that never ends:
+
+```js
+// Server (Express): one response that stays open
+app.get("/polls/:id/live", (req, res) => {
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+  });
+  const send = (votes) =>
+    res.write(`data: ${JSON.stringify(votes)}\n\n`); // one event
+  pollEvents.on(req.params.id, send);
+  req.on("close", () => pollEvents.off(req.params.id, send));
+});
+
+// Browser
+const live = new EventSource("/polls/7/live");
+live.onmessage = (event) => renderResults(JSON.parse(event.data));
+```
+
+How to choose, in practice:
+
+- Updates every 10+ seconds are fine? **Polling**. Done.
+- The server pushes, the client mostly listens (results, notifications, progress bars, streamed text)? **SSE**.
+- Both sides talk often and fast (chat with typing indicators, multiplayer games, collaborative editors)? **WebSockets**.
+
+PandaPoll's big screen only *listens*, so SSE would do. But phones send votes and the presenter's remote sends "next question" and "close poll" all the time, and next we'll build a chat on the same foundation, so PandaPoll uses WebSockets. Being able to say why SSE was a real option is exactly what a design review wants to hear.
+
+## How a WebSocket connection starts
+
+A WebSocket starts life as an ordinary HTTP request with a few special headers, asking the server to **upgrade** the connection:
+
+```text
+GET /live?poll=7 HTTP/1.1
+Host: pandapoll.example
+Upgrade: websocket
+Connection: Upgrade
+Origin: https://pandapoll.example
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+After **101 Switching Protocols**, there's no more HTTP on that connection. Both sides send small **frames** whenever they like: text frames (usually JSON), binary frames, and control frames: **ping/pong** to check the other side is still there, and **close** with a code and a reason. The URL scheme is `ws://`, or `wss://` for the TLS-encrypted version, which is the only one you should use in production.
+
+Close codes you'll meet:
+
+| Code | Meaning |
+| --- | --- |
+| 1000 | Normal closure ("bye") |
+| 1001 | Going away (page closed, server shutting down) |
+| 1006 | Abnormal: the connection dropped without a close frame. Never sent, only reported |
+| 1008 / 1011 | Policy violation / unexpected server error |
+| 4000–4999 | Yours to define, e.g. 4001 "Unauthorized" |
+
+## Your first WebSocket server
+
+PandaDev runs WebSocket servers and clients on a built-in network, so the server and its clients can live in one file here. On your machine the server runs in Node and the client in the browser; the code is the same. Here's PandaPoll's live voting: the server sends the current results when someone connects, accepts votes, and **broadcasts** the new results to every connected screen:
+
+<CodeExample output={`screen got results { tabs: 0, spaces: 0 }
+phone  got results { tabs: 0, spaces: 0 }
+screen got results { tabs: 0, spaces: 1 }
+phone  got results { tabs: 0, spaces: 1 }
+phone  got error Messages must be JSON
+phone  got error Unknown option`}>
+
+```js
+import { WebSocketServer } from "ws";
+
+// ---- The server (server.js in Node) ----
+const wss = new WebSocketServer({ port: 8080 });
+const votes = { tabs: 0, spaces: 0 };
+
+function broadcast(message) {
+  const data = JSON.stringify(message);
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(data);
+  }
+}
+
+wss.on("connection", (socket) => {
+  socket.send(JSON.stringify({ type: "results", votes }));
+
+  socket.on("message", (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data);
+    } catch {
+      const error = "Messages must be JSON";
+      return socket.send(JSON.stringify({ type: "error", error }));
+    }
+    if (msg.type !== "vote" || !Object.hasOwn(votes, msg.option)) {
+      const error = "Unknown option";
+      return socket.send(JSON.stringify({ type: "error", error }));
+    }
+    votes[msg.option]++;
+    broadcast({ type: "results", votes });
+  });
+});
+
+// ---- Two clients (browser code) ----
+function connect(name) {
+  const ws = new WebSocket("ws://localhost:8080");
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    console.log(name, "got", msg.type, msg.votes ?? msg.error);
+  };
+  return new Promise((resolve) => (ws.onopen = () => resolve(ws)));
+}
+
+const screen = await connect("screen");
+const phone = await connect("phone ");
+phone.send(JSON.stringify({ type: "vote", option: "spaces" }));
+phone.send("tabs please");
+phone.send(JSON.stringify({ type: "vote", option: "toString" }));
+```
+
+</CodeExample>
+
+The two sides use slightly different APIs, and it's worth noticing which is which:
+
+- **Server** (`ws` package): `new WebSocketServer({ port })`, a `"connection"` event per client, and Node-style `socket.on("message", ...)`. `wss.clients` is a `Set` of every connected socket, which is what makes broadcasting a simple loop.
+- **Client** (the browser's built-in `WebSocket`): `onopen`, `onmessage` (the text is in `event.data`), `onclose`, `onerror`, or the same events with `addEventListener`. A new socket starts in the `CONNECTING` state; calling `send` before `open` throws.
+- **Never trust a message.** It's user input: parse it in a `try`/`catch`, check its shape, and answer with an error message instead of crashing. Note `Object.hasOwn`: with the `in` operator, `"toString" in votes` is `true` (inherited from `Object.prototype`), and a vote for `"toString"` would have been counted.
+
+To run it for real, put the server part in `server.js` and the client part in a page's `<script>`:
+
+```bash
+npm install ws
+node server.js          # listens on ws://localhost:8080
+```
+
+### Checking who connects, and testing it
+
+The handshake is a normal HTTP request, so you can authenticate it: read a token from the URL (or a cookie) and close with your own code if it's wrong. A WebSocket server is also just code, so you can test it with Vitest by opening clients and awaiting their messages. These two small helpers turn events into promises:
+
+<CodeExample output={`✓ poll server > sends the current results on connect
+✓ poll server > broadcasts each vote to every client
+✓ poll server > closes with 4001 when the token is wrong
+
+Tests  3 passed (3)`}>
+
+```js
+import { describe, it, expect, afterEach } from "vitest";
+import { WebSocketServer } from "ws";
+
+function createPollServer({ port, options }) {
+  const votes = Object.fromEntries(options.map((o) => [o, 0]));
+  const wss = new WebSocketServer({ port });
+
+  wss.on("connection", (socket, req) => {
+    const url = new URL(req.url, "ws://localhost");
+    if (url.searchParams.get("token") !== "secret") {
+      return socket.close(4001, "Unauthorized");
+    }
+    socket.send(JSON.stringify({ type: "results", votes }));
+    socket.on("message", (data) => {
+      const msg = JSON.parse(data);
+      if (Object.hasOwn(votes, msg.option)) votes[msg.option]++;
+      const update = JSON.stringify({ type: "results", votes });
+      for (const client of wss.clients) client.send(update);
+    });
+  });
+  return wss;
+}
+
+// Test helpers: resolve on the next message / on close
+const nextMessage = (ws) => new Promise((resolve) =>
+  ws.addEventListener("message", (e) => resolve(JSON.parse(e.data)),
+    { once: true }));
+const closed = (ws) => new Promise((resolve) =>
+  ws.addEventListener("close", resolve, { once: true }));
+
+describe("poll server", () => {
+  let wss;
+  afterEach(() => wss.close());
+
+  it("sends the current results on connect", async () => {
+    wss = createPollServer({ port: 9000, options: ["a", "b"] });
+    const ws = new WebSocket("ws://localhost:9000/?token=secret");
+    expect(await nextMessage(ws)).toEqual({
+      type: "results", votes: { a: 0, b: 0 },
+    });
+    ws.close();
+  });
+
+  it("broadcasts each vote to every client", async () => {
+    wss = createPollServer({ port: 9000, options: ["a", "b"] });
+    const one = new WebSocket("ws://localhost:9000/?token=secret");
+    const two = new WebSocket("ws://localhost:9000/?token=secret");
+    await Promise.all([nextMessage(one), nextMessage(two)]);
+
+    one.send(JSON.stringify({ type: "vote", option: "b" }));
+    const [a, b] = await Promise.all([nextMessage(one),
+      nextMessage(two)]);
+    expect(a.votes).toEqual({ a: 0, b: 1 });
+    expect(b).toEqual(a);
+    one.close();
+    two.close();
+  });
+
+  it("closes with 4001 when the token is wrong", async () => {
+    wss = createPollServer({ port: 9000, options: ["a"] });
+    const ws = new WebSocket("ws://localhost:9000/?token=nope");
+    const event = await closed(ws);
+    expect(event.code).toBe(4001);
+    expect(event.reason).toBe("Unauthorized");
+  });
+});
+```
+
+</CodeExample>
+
+`createPollServer` takes its port and options as parameters, so each test starts a fresh server, and `afterEach` closes it. You'll use exactly this style to build and test a full chat server in the capstone.
+
+<Callout type="warning" title="WebSockets skip some browser protections">
+
+CORS doesn't apply to WebSockets, and the browser sends cookies with the handshake. So a malicious page could open a socket to your server **as your logged-in user** (cross-site WebSocket hijacking). If you authenticate with cookies, check the `Origin` header against an allowlist during the handshake. Tokens in the URL end up in server logs, so prefer short-lived, single-use "connection tickets" over long-lived tokens there.
+
+</Callout>
+
+## Scaling WebSockets across servers
+
+Ordinary HTTP requests are short and any server can answer them. WebSocket connections are **long-lived and stateful**, which changes the rules:
+
+**Each server only knows its own sockets.** With three servers behind a load balancer, a vote that arrives on server A must also reach the screens connected to B and C. The usual fix is **pub/sub**: every server subscribes to a channel (in Redis, NATS or Kafka), and whichever server receives a vote publishes the new results there. Each server then forwards them to its **own** clients:
+
+```js
+import { createClient } from "redis";
+
+const pub = createClient({ url: process.env.REDIS_URL });
+const sub = pub.duplicate();
+await Promise.all([pub.connect(), sub.connect()]);
+
+// Every server: forward published results to MY clients
+await sub.subscribe("poll:7", (message) => {
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(message);
+  }
+});
+
+// Whichever server receives a vote: tell all servers
+const update = JSON.stringify({ type: "results", votes });
+await pub.publish("poll:7", update);
+```
+
+**The load balancer must allow upgrades** and long idle connections. In nginx that's a few lines; cloud load balancers usually support it out of the box:
+
+```nginx
+location /live {
+  proxy_pass http://pandapoll_app;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_read_timeout 1h;   # don't cut idle sockets after 60 s
+}
+```
+
+**Sticky sessions** (the LB sends a client to the same server every time, by cookie or IP) are needed for long polling and for libraries like Socket.IO that start with polling before upgrading. Plain WebSockets stay on one server for their whole life anyway, but a **reconnect** can land anywhere, so per-connection state must be rebuilt on reconnect or kept in a shared store.
+
+**Dead connections don't always say goodbye.** A phone that goes into a tunnel just stops answering, and the server keeps its socket (and memory) forever. The standard fix is a **heartbeat**: ping every client every 30 seconds and terminate those that didn't answer the previous ping. You'll build and test this in the capstone:
+
+```js
+wss.on("connection", (socket) => {
+  socket.isAlive = true;
+  socket.on("pong", () => (socket.isAlive = true));
+});
+
+const heartbeat = setInterval(() => {
+  for (const socket of wss.clients) {
+    if (!socket.isAlive) {
+      socket.terminate(); // didn't answer the last ping
+      continue;
+    }
+    socket.isAlive = false;
+    socket.ping();
+  }
+}, 30_000);
+wss.on("close", () => clearInterval(heartbeat));
+```
+
+**Deploys drop every connection.** When a server restarts, all its clients reconnect at the same moment. If they all retry instantly, they knock over the server that's just starting. That's the reconnect stampede, and the cure is the next section's backoff with jitter. Also count your connections: each open socket costs memory (often tens of KB), so one Node process typically holds thousands to tens of thousands of them, not millions.
+
+## When things fail
+
+In a system with load balancers, Redis, a database and a few services, something is **always** broken somewhere. You can't prevent that; what you control is whether a small failure stays small. The most dangerous failure isn't a crash, it's **slowness**: a crashed service fails fast, but a slow one holds on to connections, memory and the user's patience. When every request is stuck waiting on one slow dependency, healthy services stop answering too. Failures **cascade**.
+
+### Timeouts: never wait forever
+
+Every network call needs a **timeout**, chosen from what the **caller** can afford, not from how long the dependency usually takes. `fetch` has none by default, so pass a signal. The practice API's `/delay/1500` endpoint answers after 1.5 seconds, which is too slow for our homepage:
+
+<CodeExample output={`TimeoutError: falling back
+popular polls
+The Bamboo Heist`}>
+
+```js
+const API = "https://api.pandadev.test";
+
+async function getJSON(url, { timeoutMs = 2000 } = {}) {
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function recommendations() {
+  try {
+    // This service takes 1.5 s today; we can afford 300 ms
+    await getJSON(`${API}/delay/1500`, { timeoutMs: 300 });
+    return "personal picks";
+  } catch (error) {
+    console.log(`${error.name}: falling back`);
+    return "popular polls"; // a fallback, not an error page
+  }
+}
+
+console.log(await recommendations());
+const movie = await getJSON(`${API}/movies/1`, { timeoutMs: 300 });
+console.log(movie.title);
+```
+
+</CodeExample>
+
+`AbortSignal.timeout(ms)` aborts the request and rejects with a `TimeoutError`. Then the code **degrades gracefully**: the page shows popular polls instead of personal picks, rather than an error page. Database drivers, Redis clients and HTTP libraries all have their own timeout options; set every one of them.
+
+### Retries with exponential backoff and jitter
+
+Many failures are **transient**: a server restarting, a network blip, an overloaded service answering 503. Trying again often works, but *how* you retry matters. **Exponential backoff** waits longer after each failure, up to a **cap**:
+
+<CodeExample output={`[ 100, 200, 400, 800, 1600, 3200 ]
+5000 5000
+[ 50, 100, 200, 400 ]`}>
+
+```js
+// Exponential backoff with a cap, and "full jitter"
+function backoff(attempt, { baseMs = 100, capMs = 5000 } = {}) {
+  return Math.min(capMs, baseMs * 2 ** attempt);
+}
+
+function withJitter(attempt, random = Math.random) {
+  return Math.round(random() * backoff(attempt));
+}
+
+console.log([0, 1, 2, 3, 4, 5].map((n) => backoff(n)));
+console.log(backoff(6), backoff(30)); // capped
+console.log([0, 1, 2, 3].map((n) => withJitter(n, () => 0.5)));
+```
+
+</CodeExample>
+
+**Jitter** multiplies each wait by a random number. Without it, a thousand clients that failed at the same moment (say, when a deploy dropped their WebSockets) all retry at the same moment too, again and again. "Full jitter" waits a random time between 0 and the backoff, which spreads them out. A reconnecting WebSocket client uses exactly this schedule.
+
+Here's a retry helper. It retries only **transient** errors, and it takes `sleep` and `random` as parameters, so the example (and your tests) can record the waits instead of waiting. The practice API's `/flaky` endpoint fails twice with 503 and then works:
+
+<CodeExample output={`HTTP 503, retrying in 50 ms
+HTTP 503, retrying in 100 ms
+{ ok: true, attempt: 3 }
+waited: [ 50, 100 ]
+gave up at once: HTTP 404`}>
+
+```js
+const API = "https://api.pandadev.test";
+const RETRY_ON = new Set([429, 502, 503, 504]);
+
+async function getJSON(url) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+  if (!res.ok) {
+    const error = new Error(`HTTP ${res.status}`);
+    error.status = res.status;
+    throw error;
+  }
+  return res.json();
+}
+
+const isTransient = (error) =>
+  error.name === "TimeoutError" || RETRY_ON.has(error.status);
+
+async function retry(fn, { attempts = 4, baseMs = 100,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  random = Math.random } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (!isTransient(error) || attempt === attempts - 1) {
+        throw error;
+      }
+      const delay = Math.round(random() * baseMs * 2 ** attempt);
+      console.log(`${error.message}, retrying in ${delay} ms`);
+      await sleep(delay);
+    }
+  }
+}
+
+const waited = [];
+const options = {
+  sleep: async (ms) => waited.push(ms), // record, don't wait
+  random: () => 0.5,
+};
+
+console.log(await retry(() => getJSON(`${API}/flaky`), options));
+console.log("waited:", waited);
+
+try {
+  await retry(() => getJSON(`${API}/movies/999`), options);
+} catch (error) {
+  console.log("gave up at once:", error.message);
+}
+```
+
+</CodeExample>
+
+The 404 isn't retried: asking again for a poll that doesn't exist will never work. Retry timeouts, 502/503/504 and 429 (ideally waiting as long as its `Retry-After` header says); don't retry 400, 401, 403, 404 or 422.
+
+<Callout type="danger" title="Retries multiply">
+
+If the browser retries 3 times, the API it calls retries 3 times, and that API's database client retries 3 times, one click becomes 27 database queries, all during an outage. This **retry storm** has taken down very large sites. Retry at **one** layer, keep attempts low, and always use backoff with jitter.
+
+</Callout>
+
+### Idempotency keys: safe to repeat
+
+A request times out. Did it fail, or did only the **response** get lost? For a `GET` it doesn't matter. For "charge Mei £25" it matters a lot. An operation is **idempotent** if doing it twice has the same effect as doing it once. To make a `POST` safe to retry, the client creates a unique **idempotency key once per operation** (not per attempt) and sends it with every attempt; the server remembers keys it has handled and **replays** the stored response:
+
+<CodeExample output={`201 { chargeId: 1, user: 'mei', pence: 2500 }
+201 { chargeId: 1, user: 'mei', pence: 2500 }
+charges made: 1`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const charges = [];
+const done = new Map(); // idempotency key -> stored response
+
+const app = express();
+app.use(express.json());
+
+app.post("/charges", (req, res) => {
+  const key = req.get("Idempotency-Key");
+  if (!key) {
+    return res.status(400).json({ error: "Idempotency-Key needed" });
+  }
+  if (done.has(key)) {
+    const { status, body } = done.get(key);
+    return res.status(status).json(body); // replay, don't redo
+  }
+  charges.push(req.body);
+  const body = { chargeId: charges.length, ...req.body };
+  done.set(key, { status: 201, body });
+  res.status(201).json(body);
+});
+
+// The client makes the key ONCE per operation, then retries
+const key = crypto.randomUUID();
+const pay = () => request(app).post("/charges")
+  .set("Idempotency-Key", key)
+  .send({ user: "mei", pence: 2500 });
+
+const first = await pay();
+const retried = await pay(); // the first response got lost...
+console.log(first.status, first.body);
+console.log(retried.status, retried.body);
+console.log("charges made:", charges.length);
+```
+
+</CodeExample>
+
+Stripe's API works exactly like this. In production the keys live in the database with a **unique constraint** (so two retries arriving at the same instant can't both get through) and expire after a day or so. PandaPoll uses the same idea for votes: the phone sends a vote id, so a vote retried after a dropped connection is never counted twice. Queue workers too: a job that may run twice should carry an id that the worker checks.
+
+### Circuit breakers: stop calling a dead service
+
+Retries help with blips. But if the analytics service has been down for five minutes, every request still waits for its timeout, retries and fails, burning time and hammering a service that's trying to restart. A **circuit breaker** wraps calls to a dependency, notices repeated failures, and then **fails fast** for a while without calling it at all:
+
+```text
+            N failures in a row
+ CLOSED ────────────────────────▶ OPEN
+   ▲                               │ calls fail at once,
+   │ trial                         │ nothing is sent
+   │ succeeds                      │ reset timeout passes
+   │                               ▼
+   └──────────────────────── HALF-OPEN
+                                   │ trial fails
+                     OPEN ◀────────┘
+```
+
+| State | What happens to a call |
+| --- | --- |
+| **Closed** (normal) | It goes through. Failures in a row are counted; a success resets the count. |
+| **Open** | It's refused immediately with an error. The caller can use a fallback. |
+| **Half-open** (after a cool-down) | **One** trial call goes through. Success closes the circuit; failure opens it again for another cool-down. |
+
+You'll build one in the exercise. In real Node projects, **opossum** is the popular library, and service meshes (Envoy, Istio) can do it outside your code.
+
+### Rate limiting with a token bucket
+
+Resilience also means protecting **yourself** from too much traffic: a buggy client in a loop, a bot stuffing a poll, a sudden spike. A **token bucket** gives each client a bucket of `capacity` tokens that refills at `perSecond`. Each request takes a token; an empty bucket means **429 Too Many Requests**. The capacity allows short bursts, the refill rate sets the long-term average:
+
+<CodeExample output={`mei: [ 201, 201, 201, 429, 429 ]
+kai: [ 201, 201 ]
+mei, 2 s later: [ 201, 201, 429 ]
+mei, 1 min later: [ 201, 201, 201, 429 ]
+429 1 { error: 'Too many votes, slow down' }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+function rateLimit({ capacity, perSecond, now = Date.now }) {
+  const buckets = new Map(); // one bucket per client
+  return (req, res, next) => {
+    const id = req.get("X-Api-Key") ?? req.ip;
+    let bucket = buckets.get(id);
+    if (!bucket) {
+      bucket = createTokenBucket({ capacity, perSecond, now });
+      buckets.set(id, bucket);
+    }
+    if (bucket.take()) return next();
+    res.set("Retry-After", String(Math.ceil(1 / perSecond)));
+    res.status(429).json({ error: "Too many votes, slow down" });
+  };
+}
+
+let time = 0; // a fake clock: time only moves when we say so
+const app = express();
+app.use(rateLimit({ capacity: 3, perSecond: 1, now: () => time }));
+app.post("/votes", (req, res) => res.status(201).end());
+
+const vote = (key) =>
+  request(app).post("/votes").set("X-Api-Key", key);
+
+async function burst(key, n) {
+  const statuses = [];
+  for (let i = 0; i < n; i++) {
+    statuses.push((await vote(key)).status);
+  }
+  return statuses;
+}
+
+console.log("mei:", await burst("mei", 5));
+console.log("kai:", await burst("kai", 2));
+time += 2000;
+console.log("mei, 2 s later:", await burst("mei", 3));
+time += 60_000;
+console.log("mei, 1 min later:", await burst("mei", 4));
+const res = await vote("mei");
+console.log(res.status, res.headers["retry-after"], res.body);
+```
+
+</CodeExample>
+
+There's no timer refilling the buckets: each `take()` works out how many tokens were **earned** since the last call, which makes a bucket cheap enough to keep one per client. Two things for production: the `buckets` map grows forever (evict idle clients, or the rate limiter becomes a memory leak), and with several servers the counts must be shared, so they usually live in Redis. WebSocket messages need limiting too, per connection or per user; the capstone's chat does that.
+
+### Graceful degradation
+
+When a dependency fails, ask: "what's the **least bad** thing we can show?" Usually it's not an error page:
+
+- The WebSocket can't connect (some corporate proxies block it)? Fall back to **polling** every few seconds.
+- Redis pub/sub is down? Each server can still update its own clients, and the screen shows a small "live updates delayed" badge.
+- Recommendations are slow? Show popular polls (like the timeout example).
+- Under heavy load? **Shed** low-priority work first (exports, analytics) so voting keeps working.
+
+Decide these fallbacks with your product team **before** the incident, not during it.
+
+<Callout type="tip" title="How the patterns fit together">
+
+An outgoing call is wrapped from the inside out: a **timeout** on each attempt, a **circuit breaker** around the call, a few **retries** with backoff and jitter around that (only for idempotent or keyed requests), and a **fallback** when everything fails. Incoming traffic passes a **rate limiter** first.
+
+</Callout>
+
+<Quiz
+  question="A live sports score page only needs the server to push new scores to viewers, and viewers never send anything back. Which is the simplest good fit?"
+  options={[
+    "WebSockets, because they are the fastest",
+    "Server-Sent Events, because the updates only flow from server to client",
+    "Polling every 100 ms",
+    "Long polling, because it works with every proxy",
+  ]}
+  answer={1}
+  explanation="SSE is built for one-way server-to-client streams: it's plain HTTP, the browser's EventSource reconnects automatically, and it's simpler to scale than WebSockets. WebSockets earn their extra complexity when both sides talk often."
+/>
+
+<Quiz
+  question="A server restarts and 20,000 WebSocket clients notice at the same moment. Which reconnect strategy is kindest to the new server?"
+  options={[
+    "Reconnect immediately, then every 100 ms until it works",
+    "Reconnect after exactly 5 seconds",
+    "Exponential backoff with a cap, plus random jitter on every wait",
+    "Never reconnect; ask the user to refresh the page",
+  ]}
+  answer={2}
+  explanation="Backoff spaces out each client's attempts, and jitter spreads the 20,000 clients over time so they don't all arrive in the same instant. A fixed delay just moves the stampede 5 seconds later."
+/>
+
+<Exercise
+  title="A circuit breaker for PandaPoll"
+  starter={`import { describe, it, expect } from "vitest";
+
+class CircuitOpenError extends Error {
+  constructor() {
+    super("Circuit is open: not calling the service");
+    this.name = "CircuitOpenError";
+  }
+}
+
+function createCircuitBreaker({
+  failureThreshold,
+  resetTimeoutMs,
+  now = Date.now,
+}) {
+  let failures = 0;
+  let openedAt = null; // null means closed
+  let trialRunning = false;
+
+  function state() {
+    // TODO: "closed", "open" or "half-open"
+    return "closed";
+  }
+
+  async function call(fn) {
+    // TODO: refuse calls while open (and extra calls while a
+    // half-open trial is running), count failures in a row,
+    // open the circuit, close it again after a success
+    return fn();
+  }
+
+  return {
+    call,
+    get state() {
+      return state();
+    },
+  };
+}
+
+// ---- Tests (don't change them) ----
+function createFakeClock() {
+  let time = 0;
+  return { now: () => time, advance: (ms) => (time += ms) };
+}
+
+const fail = async () => {
+  throw new Error("no answer");
+};
+
+function setup() {
+  const clock = createFakeClock();
+  const breaker = createCircuitBreaker({
+    failureThreshold: 3,
+    resetTimeoutMs: 30_000,
+    now: clock.now,
+  });
+  return { clock, breaker };
+}
+
+async function failTimes(breaker, n) {
+  for (let i = 0; i < n; i++) {
+    await expect(breaker.call(fail)).rejects.toThrow("no answer");
+  }
+}
+
+describe("circuit breaker", () => {
+  it("passes results through while closed", async () => {
+    const { breaker } = setup();
+    expect(await breaker.call(async () => 42)).toBe(42);
+    expect(breaker.state).toBe("closed");
+  });
+
+  it("opens after 3 failures in a row", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 2);
+    expect(breaker.state).toBe("closed");
+    await failTimes(breaker, 1);
+    expect(breaker.state).toBe("open");
+  });
+
+  it("refuses calls while open, without calling fn", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 3);
+    let called = false;
+    const call = breaker.call(async () => (called = true));
+    await expect(call).rejects.toBeInstanceOf(CircuitOpenError);
+    expect(called).toBe(false);
+  });
+
+  it("resets the count after a success", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 2);
+    await breaker.call(async () => "ok");
+    await failTimes(breaker, 2);
+    expect(breaker.state).toBe("closed");
+  });
+
+  it("is half-open after the timeout; a good trial closes it",
+    async () => {
+      const { clock, breaker } = setup();
+      await failTimes(breaker, 3);
+      clock.advance(29_999);
+      expect(breaker.state).toBe("open");
+      clock.advance(1);
+      expect(breaker.state).toBe("half-open");
+      expect(await breaker.call(async () => "pong")).toBe("pong");
+      expect(breaker.state).toBe("closed");
+    });
+
+  it("opens again when the trial fails", async () => {
+    const { clock, breaker } = setup();
+    await failTimes(breaker, 3);
+    clock.advance(30_000);
+    await failTimes(breaker, 1);
+    expect(breaker.state).toBe("open");
+    clock.advance(29_999);
+    expect(breaker.state).toBe("open");
+  });
+
+  it("lets only one trial call through at a time", async () => {
+    const { clock, breaker } = setup();
+    await failTimes(breaker, 3);
+    clock.advance(30_000);
+    let finish;
+    const slow = new Promise((resolve) => (finish = resolve));
+    const trial = breaker.call(() => slow);
+    await expect(breaker.call(async () => "me too"))
+      .rejects.toBeInstanceOf(CircuitOpenError);
+    finish("done");
+    expect(await trial).toBe("done");
+    expect(breaker.state).toBe("closed");
+  });
+});
+`}
+  tests={[
+    { name: "All 7 tests in the file pass", check: `__vitest.failed === 0 && __vitest.passed === 7` },
+    { name: "Opens after failureThreshold failures (another threshold)", check: `await (async () => { let t = 0; const b = createCircuitBreaker({ failureThreshold: 2, resetTimeoutMs: 500, now: () => t }); const bad = async () => { throw new Error("x"); }; await b.call(bad).catch(() => {}); const s1 = b.state; await b.call(bad).catch(() => {}); return s1 === "closed" && b.state === "open"; })()` },
+    { name: "Rethrows the service's own error, then refuses with CircuitOpenError without calling fn", check: `await (async () => { let t = 0; const b = createCircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 500, now: () => t }); const boom = new Error("boom"); const e1 = await b.call(async () => { throw boom; }).catch((e) => e); let n = 0; t = 499; const e2 = await b.call(async () => n++).catch((e) => e); return e1 === boom && e2 instanceof CircuitOpenError && e2.name === "CircuitOpenError" && n === 0 && b.state === "open"; })()` },
+    { name: "Half-open exactly at resetTimeoutMs; a failed trial restarts the timer", check: `await (async () => { let t = 0; const b = createCircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 500, now: () => t }); await b.call(async () => { throw new Error("x"); }).catch(() => {}); t = 500; const s = b.state; await b.call(async () => { throw new Error("y"); }).catch(() => {}); const s2 = b.state; t = 999; const s3 = b.state; t = 1000; return s === "half-open" && s2 === "open" && s3 === "open" && b.state === "half-open" && (await b.call(async () => 7)) === 7 && b.state === "closed"; })()` },
+    { name: "Only one trial call at a time while half-open", check: `await (async () => { let t = 0; const b = createCircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 100, now: () => t }); await b.call(async () => { throw new Error("x"); }).catch(() => {}); t = 100; let release; const trial = b.call(() => new Promise((r) => (release = r))); const other = await b.call(async () => 1).catch((e) => e); release("ok"); const v = await trial; return other instanceof CircuitOpenError && v === "ok" && b.state === "closed" && (await b.call(async () => 2)) === 2; })()` },
+  ]}
+>
+
+PandaPoll calls an analytics service after every vote, and last week it went down for ten minutes. Finish `createCircuitBreaker` so the app stops waiting on it. The clock is injected (`now()` returns milliseconds), and the tests at the bottom use a fake one. Don't change the tests: make them pass.
+
+1. The `state` is `"closed"` while `openedAt` is `null`, `"half-open"` once at least `resetTimeoutMs` have passed since `openedAt`, and `"open"` otherwise.
+2. `call(fn)`: when the state is `"open"`, throw a `CircuitOpenError` **without** calling `fn`. Otherwise `await fn()`.
+3. On a **success**, reset the failure count, close the circuit (`openedAt = null`) and return the result.
+4. On a **failure**, count it and rethrow the original error. Open the circuit (`openedAt = now()`) when there have been `failureThreshold` failures in a row, or when the failed call was the half-open trial.
+5. While half-open, only **one** trial may run: if another call arrives while the trial is still running, refuse it with a `CircuitOpenError` too. (Async code makes this easy to forget: without the check, 500 waiting requests would all rush through the moment the cool-down ends.)
+
+<Hint>
+
+Read the state once at the start of `call`: `const current = state();`. If it's `"open"`, throw. If it's `"half-open"`, throw when `trialRunning` is already `true`, otherwise set it to `true`. Then use `try` / `catch` / `finally`: `try` awaits `fn()`, resets and returns; `catch` does `failures++`, opens the circuit when `current === "half-open" || failures >= failureThreshold`, and rethrows with `throw error`; `finally` sets `trialRunning = false` if this call was the trial.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect } from "vitest";
+
+class CircuitOpenError extends Error {
+  constructor() {
+    super("Circuit is open: not calling the service");
+    this.name = "CircuitOpenError";
+  }
+}
+
+function createCircuitBreaker({
+  failureThreshold,
+  resetTimeoutMs,
+  now = Date.now,
+}) {
+  let failures = 0;
+  let openedAt = null; // null means closed
+  let trialRunning = false;
+
+  function state() {
+    if (openedAt === null) return "closed";
+    if (now() - openedAt >= resetTimeoutMs) return "half-open";
+    return "open";
+  }
+
+  async function call(fn) {
+    const current = state();
+    if (current === "open") throw new CircuitOpenError();
+    if (current === "half-open") {
+      if (trialRunning) throw new CircuitOpenError();
+      trialRunning = true;
+    }
+    try {
+      const result = await fn();
+      failures = 0;
+      openedAt = null;
+      return result;
+    } catch (error) {
+      failures++;
+      if (current === "half-open" || failures >= failureThreshold) {
+        openedAt = now();
+      }
+      throw error;
+    } finally {
+      if (current === "half-open") trialRunning = false;
+    }
+  }
+
+  return {
+    call,
+    get state() {
+      return state();
+    },
+  };
+}
+
+// ---- Tests (don't change them) ----
+function createFakeClock() {
+  let time = 0;
+  return { now: () => time, advance: (ms) => (time += ms) };
+}
+
+const fail = async () => {
+  throw new Error("no answer");
+};
+
+function setup() {
+  const clock = createFakeClock();
+  const breaker = createCircuitBreaker({
+    failureThreshold: 3,
+    resetTimeoutMs: 30_000,
+    now: clock.now,
+  });
+  return { clock, breaker };
+}
+
+async function failTimes(breaker, n) {
+  for (let i = 0; i < n; i++) {
+    await expect(breaker.call(fail)).rejects.toThrow("no answer");
+  }
+}
+
+describe("circuit breaker", () => {
+  it("passes results through while closed", async () => {
+    const { breaker } = setup();
+    expect(await breaker.call(async () => 42)).toBe(42);
+    expect(breaker.state).toBe("closed");
+  });
+
+  it("opens after 3 failures in a row", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 2);
+    expect(breaker.state).toBe("closed");
+    await failTimes(breaker, 1);
+    expect(breaker.state).toBe("open");
+  });
+
+  it("refuses calls while open, without calling fn", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 3);
+    let called = false;
+    const call = breaker.call(async () => (called = true));
+    await expect(call).rejects.toBeInstanceOf(CircuitOpenError);
+    expect(called).toBe(false);
+  });
+
+  it("resets the count after a success", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 2);
+    await breaker.call(async () => "ok");
+    await failTimes(breaker, 2);
+    expect(breaker.state).toBe("closed");
+  });
+
+  it("is half-open after the timeout; a good trial closes it",
+    async () => {
+      const { clock, breaker } = setup();
+      await failTimes(breaker, 3);
+      clock.advance(29_999);
+      expect(breaker.state).toBe("open");
+      clock.advance(1);
+      expect(breaker.state).toBe("half-open");
+      expect(await breaker.call(async () => "pong")).toBe("pong");
+      expect(breaker.state).toBe("closed");
+    });
+
+  it("opens again when the trial fails", async () => {
+    const { clock, breaker } = setup();
+    await failTimes(breaker, 3);
+    clock.advance(30_000);
+    await failTimes(breaker, 1);
+    expect(breaker.state).toBe("open");
+    clock.advance(29_999);
+    expect(breaker.state).toBe("open");
+  });
+
+  it("lets only one trial call through at a time", async () => {
+    const { clock, breaker } = setup();
+    await failTimes(breaker, 3);
+    clock.advance(30_000);
+    let finish;
+    const slow = new Promise((resolve) => (finish = resolve));
+    const trial = breaker.call(() => slow);
+    await expect(breaker.call(async () => "me too"))
+      .rejects.toBeInstanceOf(CircuitOpenError);
+    finish("done");
+    expect(await trial).toBe("done");
+    expect(breaker.state).toBe("closed");
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Polling** is simple and often enough; **SSE** streams server-to-client over plain HTTP; **WebSockets** give a two-way channel for chat, games and collaboration, at the cost of stateful connections.
+- A WebSocket starts with an HTTP **Upgrade** handshake (101), then exchanges frames: messages, ping/pong and close with a code (1000, 1006, 4000–4999 for your app).
+- With `ws`: `new WebSocketServer`, `"connection"`, `socket.on("message")`, broadcast over `wss.clients`; validate every message; authenticate the handshake and check `Origin`.
+- Scaling WebSockets: **pub/sub** (Redis) between servers, load balancers that allow upgrades, **heartbeats** for dead connections, and jittered reconnects after deploys.
+- Give every call a **timeout**; **retry** only transient errors with **exponential backoff and jitter**, at one layer.
+- **Idempotency keys** make retried `POST`s and repeated jobs safe.
+- A **circuit breaker** fails fast while a dependency is down (closed → open → half-open, one trial at a time).
+- A **token bucket** rate limiter allows bursts but caps the average (429 + `Retry-After`).
+- **Degrade gracefully** and inject clocks, sleep and randomness so all of this is testable.

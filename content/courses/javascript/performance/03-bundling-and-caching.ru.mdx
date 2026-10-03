@@ -1,0 +1,692 @@
+---
+title: Сборка и кеширование
+description: Отправляйте меньше JavaScript с помощью сборщиков, tree shaking, разделения кода и сжатия, а потом делайте повторные визиты мгновенными с Cache-Control, ETag, CDN и stale-while-revalidate.
+duration: 25
+xp: 30
+---
+
+Самый быстрый запрос — тот, который не случился, а второй по скорости — маленький. Ваш код может работать быстро, когда уже запущен, но сначала ему нужно доехать по мобильной сети, пройти разбор и компиляцию — и только потом он стартует. На телефоне среднего уровня 1 МБ JavaScript может разбираться и компилироваться **секунды**. 📦
+
+Этот урок о двух половинах проблемы: как отправлять **меньше** кода (сборщики, tree shaking, разделение кода, сжатие) и как загружать его **реже** (HTTP-кеширование, ETag, CDN и service workers).
+
+## Что делают сборщики
+
+Вы пишете код как сотни маленьких модулей с `import` и `export` (см. [Модули](/learn/javascript/modules)), плюс npm-пакеты, TypeScript, JSX и CSS. Браузеры могли бы загружать все эти файлы по одному, но сотни запросов и непереведённый TypeScript быстрого сайта не дают. **Сборщик (bundler)** превращает ваши исходники в несколько оптимизированных файлов:
+
+1. **Разрешение (resolve)**: начиная с **точки входа (entry)** (`main.js`), пройти по каждому `import` и построить **граф модулей (module graph)**.
+2. **Преобразование (transform)**: превратить TypeScript, JSX и современный синтаксис в обычный JavaScript, понятный браузерам.
+3. **Сборка (bundle)**: объединить модули в несколько **чанков (chunks)**, выбросив неиспользуемый код (**tree shaking**).
+4. **Оптимизация (optimise)**: минифицировать код, добавить **хеши содержимого (content hashes)** в имена файлов (`app.3f9a1c.js`) и записать source maps для отладки.
+
+Инструменты, которые вы встретите: **Vite** (обычный выбор для новых проектов; использует esbuild и Rollup, а на смену им приходит более быстрый Rolldown), **esbuild** (очень быстрый, написан на Go), **Rollup** (отлично подходит для библиотек), **webpack** (старше, очень гибко настраивается, до сих пор во многих больших приложениях), **Turbopack** (Next.js) и **Parcel**. Они отличаются скоростью и настройкой, но все делают те же четыре шага.
+
+Вот первый шаг в миниатюре: обход графа модулей от точки входа. Настоящий сборщик делает ровно это, только с настоящими инструкциями `import`:
+
+<CodeExample output={`[ 'format.js', 'api.js', 'cart.js', 'main.js' ]
+[ 'api.js', 'charts.js', 'admin.js' ]`}>
+
+```js
+// Каждый модуль и модули, которые он импортирует
+const graph = {
+  "main.js": ["cart.js", "format.js"],
+  "cart.js": ["format.js", "api.js"],
+  "format.js": [],
+  "api.js": [],
+  "admin.js": ["api.js", "charts.js"],
+  "charts.js": [],
+};
+
+function bundle(entry) {
+  const seen = new Set();
+  const order = [];
+  function visit(file) {
+    if (seen.has(file)) return; // каждый модуль только один раз
+    seen.add(file);
+    for (const dep of graph[file]) visit(dep);
+    order.push(file); // зависимости идут первыми
+  }
+  visit(entry);
+  return order;
+}
+
+console.log(bundle("main.js"));
+console.log(bundle("admin.js"));
+```
+
+</CodeExample>
+
+Обратите внимание на три вещи, которые делает и настоящий сборщик. Модули, которые ничто не импортирует из `main.js` (`charts.js`, `admin.js`), никогда не попадают в основной бандл. Каждый модуль включается **один раз**, сколько бы файлов его ни импортировало. А `api.js` нужен **обеим** точкам входа, поэтому сборщик положил бы его в **общий чанк (shared chunk)**, который загружают обе страницы и который браузер кеширует один раз.
+
+## Tree shaking
+
+**Tree shaking** («встряхивание дерева») удаляет код, из которого вы ничего не импортируете, вплоть до отдельных функций. Это работает, потому что `import` и `export` в ES-модулях **статические**: сборщик видит, что именно используется, ничего не запуская.
+
+```js
+// utils.js
+export function formatPrice(cents) { /* ... */ }
+export function bigChartHelper() { /* 40 КБ кода */ }
+
+// main.js: в бандл попадёт только formatPrice
+import { formatPrice } from "./utils.js";
+```
+
+Что мешает tree shaking:
+
+- **CommonJS** (`require`, `module.exports`) динамический, поэтому сборщикам в основном приходится оставлять его целиком. Выбирайте пакеты, которые поставляются как ES-модули (`lodash-es` вместо `lodash`, а ещё лучше — маленький специализированный пакет).
+- **Импорт всего подряд**: если написать `import * as _ from "lodash-es"` и потом передавать `_` повсюду, сложно понять, что используется. Импортируйте нужные функции по имени.
+- **Побочные эффекты (side effects)**: если импорт модуля что-то **делает** (добавляет полифил, регистрирует глобальную переменную, вставляет CSS), сборщик не может его выбросить, даже если вы не используете ни один его экспорт. Библиотеки сообщают, что их можно безопасно выбрасывать, через `"sideEffects": false` в своём `package.json` (или список файлов, у которых побочные эффекты есть, например CSS):
+
+```json
+{
+  "name": "my-ui-library",
+  "type": "module",
+  "sideEffects": ["*.css"]
+}
+```
+
+## Разделение кода с динамическим import()
+
+Большинство покупателей вашего магазина никогда не открывают графики в админке или экспорт в PDF. Зачем всем загружать этот код? **Динамический импорт (dynamic import)**, `import("./charts.js")`, загружает модуль **в момент выполнения кода** и возвращает промис с его экспортами. Сборщики это видят и автоматически кладут такой модуль (и всё, что используется только им) в **отдельный чанк**:
+
+```js
+const button = document.querySelector("#show-chart");
+
+button.addEventListener("click", async () => {
+  // charts.js и его библиотека графиков на 200 КБ загрузятся при первом клике
+  const { drawChart } = await import("./charts.js");
+  drawChart(document.querySelector("#chart"), sales);
+});
+```
+
+В React то же самое для компонентов делает `lazy`, а `<Suspense>` показывает заглушку, пока чанк загружается:
+
+```jsx
+import { lazy, Suspense } from "react";
+
+const AdminPage = lazy(() => import("./AdminPage.jsx"));
+
+function App() {
+  return (
+    <Suspense fallback={<p>Загрузка…</p>}>
+      {isAdmin && <AdminPage />}
+    </Suspense>
+  );
+}
+```
+
+Разделение **по маршрутам (routes)** — каждая страница в своём чанке — самый эффективный старт, и фреймворки вроде Next.js делают это за вас. Минус ленивого кода — ожидание при первом использовании, поэтому частый приём — **начать загрузку заранее**: когда пользователь навёл курсор на кнопку или когда браузер простаивает. Как и `import()`, хороший загрузчик скачивает модуль только один раз, сколько бы его ни вызывали:
+
+<CodeExample output={`загружаем charts.js...
+тот же модуль: true
+📈 3 → 5 → 8`}>
+
+```js
+function lazy(load) {
+  let promise = null;
+  return () => (promise ??= load()); // запускаем один раз и делимся
+}
+
+// Как будто import("./charts.js"): 100 мс загрузки
+const loadCharts = lazy(() => {
+  console.log("загружаем charts.js...");
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve({ draw: (data) => `📈 ${data.join(" → ")}` });
+    }, 100);
+  });
+});
+
+// Наведение запускает загрузку, клик её использует
+const onHover = () => loadCharts();
+const onClick = async () => (await loadCharts()).draw([3, 5, 8]);
+
+const preloaded = onHover();
+const result = await onClick();
+console.log("тот же модуль:", (await preloaded) === (await loadCharts()));
+console.log(result);
+```
+
+</CodeExample>
+
+<Callout type="tip" title="Не дробите слишком мелко">
+
+Каждый чанк — это отдельный запрос со своими накладными расходами, а чанк, который всегда нужен сразу, — просто более медленный бандл. Отделяйте **большие** вещи, которые **многим** пользователям не нужны: маршруты, редакторы, графики, карты, библиотеки для PDF и таблиц.
+
+</Callout>
+
+## Минификация и сжатие
+
+**Минификация (minification)** переписывает код так, чтобы он стал меньше, не меняя его поведения: удаляет пробелы и комментарии, укорачивает имена локальных переменных, выбрасывает недостижимый код. Сборщики делают это в production-сборках (с помощью esbuild, Terser, SWC или oxc):
+
+```js
+// до: 137 символов
+function calculateTotal(items) {
+  // складываем цены
+  let total = 0;
+  for (const item of items) total += item.price;
+  return total;
+}
+
+// после: 72 символа
+function calculateTotal(t){let l=0;for(const o of t)l+=o.price;return l}
+```
+
+**Source maps** (файлы `.map`) связывают минифицированный код с вашими исходными файлами, поэтому трассировки стека и DevTools по-прежнему показывают ваш настоящий код и номера строк.
+
+Вдобавок серверы **сжимают** текстовые ответы (HTML, CSS, JavaScript, JSON, SVG) с помощью **gzip** или более нового **Brotli** (часто на 15–20% меньше, чем gzip). Браузер сообщает, что он понимает, в заголовке запроса `Accept-Encoding`, а сервер отвечает с `Content-Encoding: br`. Код очень однообразен, поэтому сжимается он превосходно. Запустите это и посмотрите, насколько gzip уменьшает немного JavaScript:
+
+<TryIt code={`const source = \`
+export function formatPrice(cents, currency = "GBP") {
+  return new Intl.NumberFormat("en-GB", {
+    style: "currency",
+    currency,
+  }).format(cents / 100);
+}
+export function formatDate(date) {
+  return new Intl.DateTimeFormat("en-GB").format(date);
+}
+\`.repeat(40);
+
+async function gzipSize(text) {
+  const stream = new Blob([text]).stream()
+    .pipeThrough(new CompressionStream("gzip"));
+  const buffer = await new Response(stream).arrayBuffer();
+  return buffer.byteLength;
+}
+
+const original = new TextEncoder().encode(source).length;
+const gzipped = await gzipSize(source);
+console.log("исходный размер:", original, "байт");
+console.log("после gzip:     ", gzipped, "байт");
+console.log(\`это \${(100 * gzipped / original).toFixed(1)}%\`);`}
+/>
+
+Этот пример необычно однообразен, но настоящие бандлы всё равно ужимаются примерно до четверти своего размера. Хостинги и CDN сжимают автоматически, так что обычно достаточно проверить, что сжатие включено (ищите `content-encoding` в панели Network).
+
+<Callout type="warning" title="Сжатие не делает разбор дешевле">
+
+Сжатие уменьшает **загрузку**, но браузеру всё равно нужно распаковать, разобрать и скомпилировать каждый байт исходного кода. 300 КБ JavaScript в gzip — это примерно 1 МБ кода для обработки. Вот почему удалять и разделять код лучше, чем сжимать его.
+
+</Callout>
+
+## Изображения и шрифты
+
+JavaScript — самый дорогой байт, но изображения обычно дают **больше всего** байтов. Самое важное:
+
+```html
+<!-- Главная картинка (LCP): современные форматы, размеры, ранняя загрузка -->
+<picture>
+  <source srcset="hero-800.avif 800w, hero-1600.avif 1600w"
+          type="image/avif" />
+  <img src="hero-800.jpg"
+       srcset="hero-800.jpg 800w, hero-1600.jpg 1600w"
+       sizes="(max-width: 800px) 100vw, 800px"
+       width="800" height="450" alt="Панды едят бамбук"
+       fetchpriority="high" />
+</picture>
+
+<!-- Ниже по странице: загружать, только когда до неё почти докрутили -->
+<img src="team.webp" width="400" height="300" alt="Наша команда"
+     loading="lazy" />
+```
+
+- Используйте **AVIF** или **WebP** вместо JPEG и PNG (часто вдвое меньше) и **SVG** для иконок и логотипов.
+- Отдавайте **адаптивные** размеры через `srcset` и `sizes`: телефону незачем скачивать картинку шириной 3000 пикселей.
+- Всегда задавайте **`width` и `height`** (или CSS `aspect-ratio`), чтобы браузер зарезервировал место и ничего не прыгало (CLS).
+- **`loading="lazy"`** — для картинок ниже первого экрана, но никогда для LCP-картинки; ей дайте `fetchpriority="high"`.
+- **Шрифты**: используйте **WOFF2**, только нужные начертания и символы (subsetting), `font-display: swap`, чтобы текст показывался сразу, и предзагружайте один-два шрифта, видимых на первом экране. Или используйте системные шрифты и не загружайте ничего.
+
+## Анализ бандла
+
+Нельзя уменьшить то, чего не видишь. **Анализатор бандла (bundle analyser)** рисует карту вашего бандла, где каждый модуль — прямоугольник размером с его байты, и почти каждая команда, которая смотрит на неё впервые, находит сюрприз: библиотеку дат со всеми локалями, две версии одного и того же пакета, целый набор иконок ради трёх иконок.
+
+```bash
+# Vite / Rollup: создаёт stats.html с картой (treemap) бандла
+npm i -D rollup-plugin-visualizer
+
+# Любой сборщик с source maps
+npx source-map-explorer dist/assets/*.js
+
+# Сколько стоит пакет ещё до установки?
+# Проверьте https://bundlephobia.com или https://pkg-size.dev
+
+# Валить CI, когда бандл вырос сверх бюджета
+npm i -D size-limit @size-limit/preset-app
+```
+
+Сделайте размер бандла частью код-ревью: пул-реквест, который добавляет 80 КБ ради выбора даты, заслуживает обсуждения.
+
+## HTTP-кеширование с Cache-Control
+
+Теперь вторая половина: не загружать одно и то же повторно. Каждый HTTP-ответ может указать, как его можно **кешировать**, с помощью заголовка (header) **`Cache-Control`**. Ему подчиняются браузеры, CDN и прокси. Директивы, которые вы будете использовать чаще всего:
+
+| Директива | Значение |
+| --- | --- |
+| `max-age=3600` | Свежий 3 600 секунд: использовать повторно, не спрашивая сервер |
+| `s-maxage=600` | То же, но только для общих кешей (CDN), там заменяет `max-age` |
+| `no-cache` | Хранить **можно**, но перед каждым повторным использованием нужно свериться с сервером |
+| `no-store` | Нигде не хранить (для чувствительных данных) |
+| `private` | Кешировать может только браузер пользователя, но не CDN (личные данные) |
+| `public` | Хранить может любой кеш |
+| `immutable` | Никогда не изменится: даже при перезагрузке не перепроверять |
+| `stale-while-revalidate=60` | После истечения срока можно ещё 60 секунд отдавать старую копию, пока в фоне загружается свежая |
+
+Названия сбивают с толку: **`no-cache` не значит «не кешировать»**. Он значит «всегда перепроверять». «Не хранить» — это `no-store`.
+
+Выигрышная стратегия для веб-приложений сочетает это с хешами содержимого от сборщика:
+
+- **Ассеты с хешем** (`app.3f9a1c.js`, `logo.8b2e.svg`): имя меняется при каждом изменении содержимого, поэтому содержимое по конкретному URL никогда не меняется. Кешируйте их **навсегда**: `public, max-age=31536000, immutable`.
+- **HTML** (`index.html`): он указывает на текущие файлы с хешами, поэтому его всегда нужно проверять: `no-cache`. Тогда деплой вступает в силу при следующей загрузке страницы.
+- **Ответы API**: зависит от ситуации. Публичные, редко меняющиеся данные могут получить короткий `max-age`; личные данные — `private, no-cache` или `no-store`.
+
+<CodeExample output={`/assets/app.3f9a1c.js → public, max-age=31536000, immutable
+/ → no-cache
+/api/me → private, no-store`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const app = express();
+
+// Имена файлов с хешем содержимого: содержимое никогда не меняется
+app.get("/assets/:file", (req, res) => {
+  res.set("Cache-Control", "public, max-age=31536000, immutable");
+  res.type("application/javascript").send("console.log('hi');");
+});
+
+// HTML говорит, какие файлы с хешем загружать: всегда проверяем его
+app.get("/", (req, res) => {
+  res.set("Cache-Control", "no-cache");
+  res.send('<script src="/assets/app.3f9a1c.js"></script>');
+});
+
+// Личные данные: нигде не храним
+app.get("/api/me", (req, res) => {
+  res.set("Cache-Control", "private, no-store");
+  res.json({ name: "Mei" });
+});
+
+for (const url of ["/assets/app.3f9a1c.js", "/", "/api/me"]) {
+  const res = await request(app).get(url);
+  console.log(url, "→", res.headers["cache-control"]);
+}
+```
+
+</CodeExample>
+
+В настоящем приложении на Express `express.static("dist", { immutable: true, maxAge: "1y" })` ставит эти заголовки для собранных ассетов, а большинство хостингов (Vercel, Netlify, Cloudflare Pages) делают это автоматически для файлов с хешем.
+
+## ETag и 304 Not Modified
+
+`no-cache` говорит «проверь перед повторным использованием». Но как браузеру проверить, не скачивая всё заново? С помощью **валидатора (validator)**. Сервер отправляет **`ETag`** (entity tag): короткий отпечаток содержимого, например хеш или номер версии. В следующий раз браузер отправляет его обратно в **`If-None-Match`**. Если содержимое не изменилось, сервер отвечает **`304 Not Modified`** с **пустым** телом, и браузер использует свою копию:
+
+```text
+GET /article                      →  200 OK
+                                     ETag: "v1"
+                                     Cache-Control: no-cache
+                                     { ...12 КБ JSON... }
+
+GET /article                      →  304 Not Modified
+If-None-Match: "v1"                  ETag: "v1"
+                                     (без тела: берите свою копию)
+
+GET /article   (после правки)     →  200 OK
+If-None-Match: "v1"                  ETag: "v2"
+                                     { ...новая версия... }
+```
+
+Запрос туда и обратно всё равно происходит, но ответ 304 крошечный, а сервер часто может пропустить и дорогую часть работы (рендер, сериализацию). Вот этот обмен, где ETag — номер версии статьи:
+
+<CodeExample output={`200 "v1" 35 байт
+304 "v1" 0 байт
+200 "v2" Caching 102`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const article = { version: 1, title: "Caching 101" };
+
+const app = express();
+app.get("/article", (req, res) => {
+  const etag = `"v${article.version}"`;
+  res.set("ETag", etag);
+  res.set("Cache-Control", "no-cache");
+  if (req.get("If-None-Match") === etag) {
+    return res.status(304).end(); // ваша копия ещё годится
+  }
+  res.json(article);
+});
+
+const first = await request(app).get("/article");
+console.log(first.status, first.headers.etag,
+  first.text.length, "байт");
+
+const second = await request(app)
+  .get("/article")
+  .set("If-None-Match", first.headers.etag);
+console.log(second.status, second.headers.etag,
+  second.text.length, "байт");
+
+article.version = 2;
+article.title = "Caching 102";
+const third = await request(app)
+  .get("/article")
+  .set("If-None-Match", first.headers.etag);
+console.log(third.status, third.headers.etag, third.body.title);
+```
+
+</CodeExample>
+
+На практике важны несколько деталей:
+
+- ETag — это **строки в кавычках**. **Слабый (weak)** ETag начинается с `W/` (`W/"v1"`) и означает «равноценное содержимое», а не побайтово идентичное. Для `If-None-Match` слабые и сильные теги сравниваются одинаково.
+- `If-None-Match` может содержать **несколько** тегов (`"v1", "v2"`) или `*`.
+- Настоящий Express уже добавляет слабый ETag к ответам `res.send` и `res.json` и сам отвечает 304. Свой ETag (номер версии, метка `updatedAt` или хеш) даёт вам контроль, и тот же подход работает на любом сервере.
+- Более старый валидатор — **`Last-Modified`** / **`If-Modified-Since`** с датой. ETag точнее.
+
+## CDN
+
+**CDN** (content delivery network — сеть доставки контента: Cloudflare, Fastly, Akamai, CloudFront или встроенная в ваш хостинг) — это набор кеширующих серверов по всему миру. Пользователь в Сиднее получает ваши файлы с сервера в Сиднее, а не с исходного сервера (origin) во Франкфурте, — это экономит сотни миллисекунд на каждом запросе, а ваш сервер обрабатывает только промахи кеша.
+
+CDN следуют `Cache-Control` (и `s-maxage` для сроков жизни только в CDN) и добавляют свои инструменты: **очистку (purging)** URL после деплоя или правки и правила кеширования для отдельных путей.
+
+Опасность — закешировать что-то **личное**. Типичный сценарий реального инцидента: команда «для скорости» добавляет `Cache-Control: public, max-age=60` к странице, страница показывает имя вошедшего пользователя, и в течение следующей минуты CDN отдаёт страницу аккаунта одного покупателя всем подряд. Практические правила:
+
+- Всё, что зависит от cookie или заголовка `Authorization`, получает `private` или `no-store`.
+- Если ответ зависит от заголовка запроса, скажите об этом через **`Vary`** (`Vary: Accept-Encoding`, `Vary: Accept-Language`), чтобы кеши хранили отдельную копию для каждого варианта.
+- Не ставьте `public` на ответы, которые устанавливают cookie.
+
+## Stale-while-revalidate
+
+Иногда «свежий» не обязательно значит «в эту секунду». Список товаров вполне может быть минутной давности; важно, чтобы он был **быстрым**. Стратегия **stale-while-revalidate** («отдавай устаревшее, пока перепроверяешь») говорит: когда закешированная копия только что устарела, всё равно верните её **сразу**, а свежую копию загрузите в фоне для следующего запроса. Заставлять пользователя ждать нужно, только когда копия устарела слишком сильно.
+
+Это директива `Cache-Control` для браузеров и CDN (`max-age=60, stale-while-revalidate=300`), а ещё отличный паттерн для вашего собственного кода: в честь него названы и на нём построены библиотеки загрузки данных вроде SWR и TanStack Query. Вот версия в памяти для сервера, с внедрёнными **часами (clock)**, чтобы её было легко тестировать, — как фейки в уроке [Моки и асинхронные тесты](/learn/javascript/mocks-and-async-tests):
+
+<CodeExample output={`t=0: загружаем цены (v1)
+t=0: v1
+t=30: v1
+t=90: загружаем цены (v2)
+t=90: v1
+t=95: v2
+t=500: загружаем цены (v3)
+t=500: v3`}>
+
+```js
+function createSwrCache({ load, maxAge, staleFor, clock }) {
+  const entries = new Map();
+
+  async function refresh(key) {
+    const value = await load(key);
+    entries.set(key, { value, storedAt: clock.now() });
+    return value;
+  }
+
+  return async function get(key) {
+    const entry = entries.get(key);
+    const age = entry ? clock.now() - entry.storedAt : Infinity;
+
+    if (age <= maxAge) return entry.value; // свежая
+    if (age <= maxAge + staleFor) {
+      // устаревшая: отвечаем сразу, обновляем в фоне (один раз)
+      entry.refreshing ??= refresh(key).catch(() => {
+        entry.refreshing = null; // попробуем в следующий раз
+      });
+      return entry.value;
+    }
+    return refresh(key); // нет копии или она слишком старая: ждём
+  };
+}
+
+const clock = { time: 0, now() { return this.time; } };
+let version = 0;
+const getPrices = createSwrCache({
+  maxAge: 60,
+  staleFor: 120,
+  clock,
+  load: async () => {
+    version++;
+    console.log(`t=${clock.time}: загружаем цены (v${version})`);
+    return `v${version}`;
+  },
+});
+
+for (const t of [0, 30, 90, 95, 500]) {
+  clock.time = t;
+  console.log(`t=${t}:`, await getPrices("all"));
+}
+```
+
+</CodeExample>
+
+В `t=90` копия устарела, но ещё пригодна, поэтому пользователь мгновенно получает `v1`, а `v2` загружается в фоне. В `t=500` копия слишком старая, чтобы её показывать, поэтому этот запрос ждёт `v3`. `??=` гарантирует, что множество запросов, пришедших во время обновления, используют **одну** фоновую загрузку, а не запускают каждый свою.
+
+## Service workers
+
+**Service worker** — это скрипт, который браузер запускает **между** вашей страницей и сетью. Он может отвечать на запросы из своего **Cache Storage**, благодаря чему страницы загружаются вообще без сети (офлайн-приложения и PWA):
+
+```js
+// sw.js
+const CACHE = "assets-v42";
+
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+  if (!url.pathname.startsWith("/assets/")) return; // сеть
+
+  // Сначала кеш: ассеты с хешем никогда не меняются
+  event.respondWith(
+    caches.open(CACHE).then(async (cache) => {
+      const cached = await cache.match(event.request);
+      if (cached) return cached;
+      const response = await fetch(event.request);
+      cache.put(event.request, response.clone());
+      return response;
+    }),
+  );
+});
+
+// main.js
+navigator.serviceWorker.register("/sw.js");
+```
+
+Типичные стратегии: **cache first** («сначала кеш») для ассетов с хешем, **network first** («сначала сеть», с откатом на кеш без сети) для HTML и вызовов API и **stale-while-revalidate** для вещей вроде аватаров. На практике используйте **Workbox**, где эти стратегии уже упакованы, потому что service workers мощные, и в них легко ошибиться: глючный service worker может отдавать пользователям старую версию сайта, пока его не заменят. Добавляйте его, когда вам нужна офлайн-работа, а не по умолчанию.
+
+<Quiz
+  question="Сборка выдаёт app.3f9a1c.js и index.html. Какие заголовки Cache-Control подходят лучше всего?"
+  options={[
+    "Обоим: no-store",
+    "app.3f9a1c.js: public, max-age=31536000, immutable. index.html: no-cache",
+    "app.3f9a1c.js: no-cache. index.html: public, max-age=31536000, immutable",
+    "Обоим: public, max-age=31536000"
+  ]}
+  answer={1}
+  explanation="Содержимое файла с хешем никогда не может измениться (новая сборка получает новое имя), поэтому его можно кешировать навсегда. index.html нужно всегда перепроверять, потому что именно он после деплоя направляет браузеры к новейшим файлам с хешем."
+/>
+
+<Quiz
+  question="Браузер отправляет If-None-Match с тем же ETag, который сервер отправил бы сейчас. Что должен ответить сервер?"
+  options={[
+    "200 OK снова с полным телом",
+    "304 Not Modified с пустым телом",
+    "204 No Content",
+    "412 Precondition Failed"
+  ]}
+  answer={1}
+  explanation="Совпадающий ETag означает, что копия браузера всё ещё актуальна, поэтому сервер отправляет 304 Not Modified без тела (но с ETag и заголовками кеширования), и браузер использует то, что у него уже есть."
+/>
+
+<Exercise
+  title="ETag для API товаров"
+  starter={`import express from "express";
+import request from "supertest";
+
+const products = new Map([
+  [1, { id: 1, name: "Bamboo mug", price: 12 }],
+  [2, { id: 2, name: "Panda socks", price: 8 }],
+]);
+
+// TODO: первые 16 шестнадцатеричных символов хеша SHA-256
+// от text, в двойных кавычках, например "2cf24dba5fb0a30e"
+async function etagFor(text) {
+  return "";
+}
+
+// TODO: отправить data как JSON с заголовками ETag и Cache-Control
+// или пустой ответ 304, если совпал If-None-Match
+async function sendCached(req, res, data) {
+  res.json(data);
+}
+
+const app = express();
+app.use(express.json());
+
+app.get("/api/products", async (req, res) => {
+  await sendCached(req, res, [...products.values()]);
+});
+
+app.get("/api/products/:id", async (req, res) => {
+  const product = products.get(Number(req.params.id));
+  if (!product) {
+    return res.status(404).json({ error: "Product not found" });
+  }
+  await sendCached(req, res, product);
+});
+
+app.patch("/api/products/:id", (req, res) => {
+  const product = products.get(Number(req.params.id));
+  if (!product) {
+    return res.status(404).json({ error: "Product not found" });
+  }
+  if (typeof req.body.price === "number") {
+    product.price = req.body.price;
+  }
+  res.json(product);
+});
+
+// Попробуйте: второй запрос отправляет ETag обратно
+const first = await request(app).get("/api/products/1");
+console.log(first.status, first.headers.etag);
+
+const second = await request(app)
+  .get("/api/products/1")
+  .set("If-None-Match", first.headers.etag ?? "");
+console.log(second.status, JSON.stringify(second.text));
+`}
+  tests={[
+    { name: "etagFor возвращает 16-символьный префикс SHA-256 в кавычках", check: `(await etagFor("hello")) === '"2cf24dba5fb0a30e"' && (await etagFor("hello!")) !== (await etagFor("hello"))` },
+    { name: "У ответов есть подходящий ETag и Cache-Control: no-cache", check: `await (async () => { const res = await require("supertest")(app).get("/api/products/2"); return res.status === 200 && res.body.name === "Panda socks" && /^"[0-9a-f]{16}"$/.test(res.headers.etag ?? "") && res.headers.etag === (await etagFor(res.text)) && res.headers["cache-control"] === "no-cache"; })()` },
+    { name: "Совпавший If-None-Match получает пустой 304 с ETag", check: `await (async () => { const api = require("supertest")(app); const a = await api.get("/api/products"); const b = await api.get("/api/products").set("If-None-Match", a.headers.etag); return a.status === 200 && b.status === 304 && b.text === "" && b.headers.etag === a.headers.etag && b.headers["cache-control"] === "no-cache"; })()` },
+    { name: "Другой ETag получает полный ответ", check: `await (async () => { const res = await require("supertest")(app).get("/api/products/1").set("If-None-Match", '"0000000000000000"'); return res.status === 200 && res.body.name === "Bamboo mug"; })()` },
+    { name: "Обрабатывает списки, слабые теги и *", check: `await (async () => { const api = require("supertest")(app); const tag = (await api.get("/api/products/1")).headers.etag; const list = await api.get("/api/products/1").set("If-None-Match", '"abc", ' + tag); const weak = await api.get("/api/products/1").set("If-None-Match", "W/" + tag); const star = await api.get("/api/products/1").set("If-None-Match", "*"); return list.status === 304 && weak.status === 304 && star.status === 304; })()` },
+    { name: "Изменённый товар получает новый ETag, а старый больше не совпадает", check: `await (async () => { const api = require("supertest")(app); const before = await api.get("/api/products/2"); await api.patch("/api/products/2").send({ price: 99 }); const after = await api.get("/api/products/2").set("If-None-Match", before.headers.etag); return after.status === 200 && after.body.price === 99 && after.headers.etag !== before.headers.etag; })()` },
+    { name: "Для несуществующих товаров по-прежнему 404", check: `await (async () => (await require("supertest")(app).get("/api/products/42")).status === 404)()` },
+  ]}
+>
+
+Фронтенд магазина опрашивает API товаров каждые несколько секунд, и чаще всего ничего не меняется. Научите API отправлять **ETag**, чтобы неизменившиеся ответы превращались в крошечные `304`:
+
+1. **`etagFor(text)`**: вычислите хеш `text` по SHA-256 с помощью `crypto.subtle.digest`, превратите первые **8 байт** в **16 шестнадцатеричных символов в нижнем регистре** и верните их **в двойных кавычках**. `etagFor("hello")` даёт `"2cf24dba5fb0a30e"` (вместе с кавычками).
+2. **`sendCached(req, res, data)`**: превратите `data` в JSON-строку, вычислите её ETag и установите заголовок `ETag` и `Cache-Control: no-cache`. Затем прочитайте `If-None-Match`: если он совпадает, ответьте **`304`** с пустым телом; иначе отправьте JSON с кодом ответа 200 (`res.type("json").send(body)`).
+3. `If-None-Match` совпадает, если он равен `*` или если любой из его тегов, разделённых запятыми, после удаления пробелов по краям и префикса `W/` равен ETag.
+
+Маршруты уже вызывают `sendCached`, поэтому изменение цены через `PATCH` меняет JSON, а значит, и ETag.
+
+<Hint>
+
+Для хеша: `const bytes = new TextEncoder().encode(text); const hash = await crypto.subtle.digest("SHA-256", bytes);`, затем `[...new Uint8Array(hash)].slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("")`. Для сравнения: `const header = req.get("If-None-Match") ?? "";`, затем `header.trim() === "*" || header.split(",").map((t) => t.trim().replace(/^W\//, "")).includes(etag)`. Установите оба заголовка **до** проверки на 304, чтобы ответ 304 тоже их содержал.
+
+</Hint>
+
+<Solution>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const products = new Map([
+  [1, { id: 1, name: "Bamboo mug", price: 12 }],
+  [2, { id: 2, name: "Panda socks", price: 8 }],
+]);
+
+async function etagFor(text) {
+  const bytes = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = [...new Uint8Array(hash)]
+    .slice(0, 8)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `"${hex}"`;
+}
+
+function matches(header, etag) {
+  if (!header) return false;
+  if (header.trim() === "*") return true;
+  return header
+    .split(",")
+    .map((tag) => tag.trim().replace(/^W\//, ""))
+    .includes(etag);
+}
+
+async function sendCached(req, res, data) {
+  const body = JSON.stringify(data);
+  const etag = await etagFor(body);
+  res.set("ETag", etag);
+  res.set("Cache-Control", "no-cache");
+  if (matches(req.get("If-None-Match"), etag)) {
+    return res.status(304).end();
+  }
+  res.type("json").send(body);
+}
+
+const app = express();
+app.use(express.json());
+
+app.get("/api/products", async (req, res) => {
+  await sendCached(req, res, [...products.values()]);
+});
+
+app.get("/api/products/:id", async (req, res) => {
+  const product = products.get(Number(req.params.id));
+  if (!product) {
+    return res.status(404).json({ error: "Product not found" });
+  }
+  await sendCached(req, res, product);
+});
+
+app.patch("/api/products/:id", (req, res) => {
+  const product = products.get(Number(req.params.id));
+  if (!product) {
+    return res.status(404).json({ error: "Product not found" });
+  }
+  if (typeof req.body.price === "number") {
+    product.price = req.body.price;
+  }
+  res.json(product);
+});
+
+// Попробуйте: второй запрос отправляет ETag обратно
+const first = await request(app).get("/api/products/1");
+console.log(first.status, first.headers.etag);
+
+const second = await request(app)
+  .get("/api/products/1")
+  .set("If-None-Match", first.headers.etag ?? "");
+console.log(second.status, JSON.stringify(second.text));
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Сборщики** (Vite, esbuild, Rollup, webpack) проходят по графу модулей от точки входа, преобразуют TypeScript/JSX, объединяют модули в чанки и добавляют хеши содержимого.
+- **Tree shaking** выбрасывает неиспользуемые экспорты. Для этого нужны ES-модули и код без **побочных эффектов** при импорте (`"sideEffects"` в `package.json`).
+- **Разделение кода** через `import()` и `lazy` из React загружает маршруты и тяжёлые функции по требованию; предзагрузка при наведении скрывает ожидание.
+- **Минифицируйте** и **сжимайте** (gzip/Brotli), но помните, что браузер всё равно разбирает каждый байт. Оптимизируйте изображения (AVIF/WebP, `srcset`, `width`/`height`, lazy ниже первого экрана) и шрифты (WOFF2, подмножества символов, `font-display: swap`).
+- Изучайте бандл **анализатором** и охраняйте его **бюджетом размера** в CI.
+- **`Cache-Control`**: ассеты с хешем — `public, max-age=31536000, immutable`; HTML — `no-cache` (= всегда перепроверять); личные данные — `private` или `no-store` (= никогда не хранить).
+- **ETag** + `If-None-Match` превращают неизменившиеся ответы в пустые **304 Not Modified**.
+- **CDN** кешируют контент рядом с пользователями; никогда не кешируйте личные ответы публично и используйте `Vary` для вариантов.
+- **Stale-while-revalidate** мгновенно отдаёт слегка устаревшую копию и обновляет её в фоне; **service workers** (с Workbox) добавляют офлайн-кеширование, когда оно действительно нужно.

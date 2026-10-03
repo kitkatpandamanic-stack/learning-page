@@ -1,0 +1,1662 @@
+---
+title: "Part 2: The realtime server"
+description: Put the chat core behind a WebSocket server that authenticates connections, validates messages, broadcasts to rooms, tracks presence and sweeps dead sockets, tested with in-memory clients.
+duration: 25
+xp: 30
+---
+
+In Part 1 you built PandaChat's core: rooms, presence, rate limits and history, all plain JavaScript and fully tested. But nobody can talk to it yet. In this part the core meets the network. 🌐
+
+The new code is an **adapter**, exactly as the [Clean Architecture](/learn/javascript/clean-architecture) lesson promised: it translates protocol messages into calls to the service, and the service's events into protocol messages. The core doesn't change by a single line. We'll build `createChatServer({ port, service, authenticate })` with the `ws` package from the [Real-time and Resilience](/learn/javascript/real-time-and-resilience) lesson, and it will:
+
+- **authenticate** every connection when it opens, and close the ones that can't prove who they are,
+- **validate** every message, answering bad input with an error instead of crashing,
+- **route** `join`, `leave`, `message`, `typing` and `history` to the service,
+- **broadcast** events only to the sockets in that room, with presence when people come and go,
+- find and drop **dead connections** with a heartbeat, and **shut down** politely.
+
+```text
+ browsers                 createChatServer                 chat service
+ ────────   JSON text     ─────────────────   calls        ────────────
+ Mei  ◀──▶  socket  ──▶   handle → route   ─────────────▶  join, post…
+ Bo   ◀──▶  socket  ◀──   broadcast to room ◀── events ──  subscribe()
+```
+
+PandaDev runs WebSocket servers and clients on a built-in network, so the server and its clients can live in one file here. On your machine the server runs in Node and the client in the browser; the code is the same:
+
+```bash
+npm install ws
+node server.js            # the chat server, listening on port 8080
+```
+
+## Who's there? Authenticating the connection
+
+A WebSocket starts life as an ordinary HTTP request (the **handshake**), and that's the moment to check who is connecting. Afterwards every message on the socket comes from the same user, so we authenticate **once**, attach the user to the socket and never trust a user id in a message again.
+
+There's a catch: the browser's `new WebSocket(url)` can't set headers, so there's no `Authorization: Bearer …` like in the [Authentication and Sessions](/learn/javascript/authentication-and-sessions) lesson. The usual options:
+
+| Option | How | Watch out for |
+| --- | --- | --- |
+| Session cookie | the browser sends cookies with the handshake automatically | other sites can open sockets with your cookies too: check the `Origin` header against an allow-list |
+| Token in the URL | `wss://chat.example/?token=…` | URLs end up in logs and proxies: use a **short-lived, single-use ticket**, never a long-lived token |
+| First message | connect, then send `{ type: "auth", token }` | the server must ignore everything else until then, and time out silent sockets |
+
+We use a **ticket in the URL**. Before connecting, the page asks the normal HTTP API for a ticket (the session cookie proves who it is), and the ticket works once, for 30 seconds. The server gets `authenticate` **injected**, so tests can pass a simple lookup while production checks real tickets:
+
+```js
+// In the Express app (Node), next to the chat server
+const tickets = new Map(); // ticket -> { user, expires }
+
+app.post("/api/chat-ticket", requireLogin, (req, res) => {
+  const ticket = crypto.randomUUID();
+  tickets.set(ticket, { user: req.user, expires: Date.now() + 30_000 });
+  res.json({ ticket });
+});
+
+function consumeTicket(ticket) {
+  const entry = tickets.get(ticket);
+  tickets.delete(ticket); // single use, even if it has expired
+  if (!entry || entry.expires < Date.now()) return null;
+  return entry.user;
+}
+```
+
+On the chat server, the connection handler reads the token from `req.url` and refuses strangers with a **close code**:
+
+<CodeExample output={`server: handshake for ?token=mei-token
+server: handshake for ?token=constructor
+mei-token got {"type":"welcome","user":{"id":"u1","name":"Mei"}}
+constructor closed: 4001 Unauthorized`}>
+
+```js
+import { WebSocketServer } from "ws";
+
+// Tests and this demo use a Map; production checks a real ticket
+const TOKENS = new Map([["mei-token", { id: "u1", name: "Mei" }]]);
+const authenticate = (token) => TOKENS.get(token) ?? null;
+
+const wss = new WebSocketServer({ port: 4000 });
+wss.on("connection", (socket, req) => {
+  const url = new URL(req.url, "http://localhost");
+  console.log("server: handshake for", url.search);
+  const user = authenticate(url.searchParams.get("token"));
+  if (!user) {
+    socket.close(4001, "Unauthorized");
+    return;
+  }
+  socket.user = user;
+  socket.send(JSON.stringify({ type: "welcome", user }));
+});
+
+// ---- browser code ----
+function open(token) {
+  const ws = new WebSocket(`ws://localhost:4000/?token=${token}`);
+  ws.onmessage = (event) => console.log(token, "got", event.data);
+  ws.onclose = (event) => {
+    console.log(token, "closed:", event.code, event.reason);
+  };
+}
+open("mei-token");
+open("constructor"); // TOKENS["constructor"] would be a function!
+```
+
+</CodeExample>
+
+The `"constructor"` line is there on purpose. If `TOKENS` were a plain object, `TOKENS["constructor"]` would be `Object`, a truthy value, and a stranger would be let in with a very strange "user". A `Map` only knows the keys you put in it, a cheap defence against the prototype tricks from the [XSS and Injection](/learn/javascript/xss-and-injection) lesson.
+
+Close codes are part of the protocol, so the client can react properly:
+
+| Code | Meaning | Client should |
+| --- | --- | --- |
+| 1000 | normal close | stay closed |
+| 1001 | going away (server restarting, tab closing) | reconnect, after a short wait |
+| 1006 | the connection just died (never sent by anyone: the browser reports it) | reconnect with backoff |
+| 1008 / 1009 | policy violation / message too big | not retry the same thing |
+| 4000–4999 | yours to define; we use **4001** for "unauthorized" | ask the user to sign in again, **not** retry |
+
+## Never trust a message
+
+Every message is user input, whatever the client app is supposed to send. An attacker (or just a buggy old version of your app) can send broken JSON, `null`, a number, an object with the wrong `type` or a missing `room`. In Node, an exception thrown in a socket's `"message"` handler can crash the whole process, disconnecting **every** user. So `handle` is a firewall with two layers: a `try`/`catch` around `JSON.parse`, and one around the routing, which turns errors into **error replies**:
+
+<CodeExample output={`Unexpected: Cannot read properties of undefined (reading 'length')
+got {"type":"error","code":"bad_json","message":"Messages must be JSON"}
+got {"type":"error","code":"unknown_type","message":"Unknown message type: undefined"}
+got {"type":"error","code":"unknown_type","message":"Unknown message type: dance"}
+got {"type":"error","code":"internal","message":"Something went wrong"}
+got {"type":"pong"}`}>
+
+```js
+import { WebSocketServer } from "ws";
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+function send(socket, message) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function handle(socket, data) {
+  let msg;
+  try {
+    msg = JSON.parse(String(data));
+  } catch {
+    send(socket, {
+      type: "error",
+      code: "bad_json",
+      message: "Messages must be JSON",
+    });
+    return;
+  }
+  try {
+    route(socket, msg);
+  } catch (error) {
+    const known = error instanceof ChatError;
+    if (!known) console.error("Unexpected:", error.message);
+    send(socket, {
+      type: "error",
+      code: known ? error.code : "internal",
+      message: known ? error.message : "Something went wrong",
+    });
+  }
+}
+
+function route(socket, msg) {
+  switch (msg?.type) {
+    case "ping":
+      send(socket, { type: "pong" });
+      break;
+    case "count": // a bug: trusts that msg.items exists
+      send(socket, { type: "count", total: msg.items.length });
+      break;
+    default:
+      throw new ChatError(
+        "unknown_type",
+        `Unknown message type: ${msg?.type}`,
+      );
+  }
+}
+
+const wss = new WebSocketServer({ port: 4000 });
+wss.on("connection", (socket) => {
+  socket.on("message", (data) => handle(socket, data));
+});
+
+// ---- a misbehaving client ----
+const ws = new WebSocket("ws://localhost:4000");
+ws.onmessage = (event) => console.log("got", event.data);
+ws.onopen = () => {
+  for (const text of [
+    "hello",
+    "null",
+    '{ "type": "dance" }',
+    '{ "type": "count" }',
+    '{ "type": "ping" }',
+  ]) {
+    ws.send(text);
+  }
+};
+```
+
+</CodeExample>
+
+Read the output carefully:
+
+- **Five bad messages, five answers, and the connection survives**: the `ping` at the end still gets its `pong`. One misbehaving client can't hurt anyone else.
+- **`msg?.type`** copes with `null` and numbers: `JSON.parse("null")` is perfectly valid JSON, and `null.type` would throw.
+- **Known errors** (`ChatError`, from the service or the router) are expected: their `code` and `message` go straight to the client.
+- **Unknown errors are bugs.** The client gets a bland `internal` error, never the error's text or stack (they can leak file paths and library versions), and the details go to **our** logs. That's the `Unexpected: …` line, printed first because the server handled all five messages before the client read any reply.
+
+Two limits stop abuse before our code even runs: `new WebSocketServer({ port, maxPayload: 16 * 1024 })` makes `ws` refuse frames over 16 KB (close code 1009), and the service's rate limiter stops floods. Without `maxPayload`, `ws` accepts messages of up to 100 MB by default, and a few of those can exhaust the server's memory.
+
+## Rooms and broadcasting
+
+Each socket gets a `Set` of the rooms it joined. The server subscribes to the service **once**, and forwards each event to the sockets that are in its room:
+
+```js
+const unsubscribe = service.subscribe((event) => {
+  for (const socket of wss.clients) {
+    if (!socket.rooms?.has(event.room)) continue;
+    const own = socket.user.id === event.user?.id;
+    if (event.type === "typing" && own) continue;
+    send(socket, event);
+  }
+});
+```
+
+- **Events, not return values, drive delivery.** `route` just calls `service.postMessage(...)`; it doesn't send anything itself. The message reaches the room (sender included, as the protocol's echo) because the service emits it. One path for every delivery means one place to get it right, and in Part 3 it's the place where messages from **other servers** come in too.
+- **Order matters in `join`.** `route` calls `service.join` first and only then adds the room to `socket.rooms`, so the joiner gets one `joined` reply with the full member list instead of also receiving their own `presence` event. In `leave` it's the other way round: forget the room first, then tell the service.
+- **`send` checks `readyState`.** A socket can be closing while an event is delivered; sending on it would be wasted work.
+- **`socket.rooms?.`**: a socket that failed authentication is closing and has no `rooms`.
+
+A loop over all clients for every event is `O(connections)`. With 20,000 sockets on one server and 333 messages a second, that's millions of checks a second: fine for a start, but a busy server would keep a `Map` from room name to its sockets instead. Measure first (the [Measuring Performance](/learn/javascript/measuring-performance) lesson), then optimise.
+
+When a socket **closes** for any reason (the user left, the network died, the heartbeat gave up), its `close` handler calls `service.leaveAll(user.id)`, and the presence events tell everyone. That's the beauty of the event design: "disconnecting" needs no special broadcasting code.
+
+## Heartbeats: finding dead connections
+
+A phone that drives into a tunnel doesn't say goodbye. Its socket on the server stays "open", holding memory and showing a user as online who isn't there. TCP may take many minutes to notice. The fix is a **heartbeat**: every 30 seconds the server **pings** every socket, and the other side answers with a **pong** automatically (browsers do it for you; you never see it in JavaScript). A socket that didn't answer since the last round is **terminated**:
+
+<CodeExample output={`after a ping and a pong: 1 client
+client: closed 1006
+after a silent round: 0 clients`}>
+
+```js
+import { WebSocketServer } from "ws";
+
+const wss = new WebSocketServer({ port: 4000 });
+wss.on("connection", (socket) => {
+  socket.isAlive = true;
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
+});
+
+function sweep() {
+  for (const socket of wss.clients) {
+    if (!socket.isAlive) {
+      socket.terminate(); // no pong since the last sweep
+      continue;
+    }
+    socket.isAlive = false;
+    socket.ping(); // the client answers with a pong by itself
+  }
+}
+
+const ws = new WebSocket("ws://localhost:4000");
+ws.onclose = (event) => console.log("client: closed", event.code);
+await new Promise((resolve) => (ws.onopen = resolve));
+const pause = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+sweep();
+await pause(); // time for the pong
+sweep();
+console.log("after a ping and a pong:", wss.clients.size, "client");
+
+sweep(); // no pong arrived since the last sweep...
+await pause();
+console.log("after a silent round:", wss.clients.size, "clients");
+```
+
+</CodeExample>
+
+`terminate()` closes immediately, without the polite closing handshake (there's nobody to shake hands with), and the client sees code **1006**. Notice how the timing is **not** inside `sweep`: something else calls it on a schedule. That keeps the server free of timers, so tests can call `chat.sweep()` directly (no fake timers, no waiting 30 seconds), and production wires it up in one line:
+
+```js
+// server.js on your machine
+const chat = createChatServer({ port: 8080, service,
+  authenticate: consumeTicket });
+const heartbeat = setInterval(chat.sweep, 30_000);
+```
+
+Clients need a heartbeat of their own too: if a phone hears nothing from the server for a while, the connection may be dead in a way the browser hasn't noticed yet. Our protocol has no regular server messages, so in Part 3 the client simply reconnects whenever the browser reports a close.
+
+## Closing politely
+
+A deploy restarts the server. Instead of letting every connection die with 1006, `close()` stops listening to the service, closes each socket with **1001 "going away"** (so clients know to reconnect, ideally to another server), and stops the `WebSocketServer`. In Part 3 you'll call it when the platform sends **SIGTERM**.
+
+## Testing a WebSocket server
+
+The server is tested like any other code: start it in `beforeEach`, connect real (in-memory) clients, send JSON, `await` the answers, and `close()` it in `afterEach`. Two details make WebSocket tests reliable:
+
+1. **Queue what arrives.** A message can arrive **before** the test starts waiting for it. A one-shot `addEventListener("message", ..., { once: true })` would miss it, so the test client pushes every message into an `inbox` and `next()` takes from the queue.
+2. **Never wait forever.** If a broken server never answers, a plain `await` hangs. `next()` and `closed()` give up after 200 ms with a clear error ("No message within 200 ms"), so a bug fails one test instead of freezing the run.
+
+```js
+it("welcomes a user with a valid token", async () => {
+  const ws = connect("mei-token");
+  expect(await ws.next()).toEqual({ type: "welcome", user: mei });
+});
+```
+
+Testing that something **doesn't** happen is harder: "Bo didn't receive Mei's message" can't be awaited. The trick is a **barrier**: after the thing that must not reach Bo, do something that **must** reach him, and check that it's the next message he gets. If the forbidden message had arrived, it would be first in his queue.
+
+<Quiz
+  question="A user's phone loses signal in a tunnel. What makes the server notice and announce that they left?"
+  options={[
+    "The browser sends a close frame when the signal is lost",
+    "The heartbeat: the phone can't answer the next ping, so the following sweep terminates the socket, and its close handler calls service.leaveAll",
+    "The token expires after 30 seconds",
+    "TCP closes the connection instantly",
+  ]}
+  answer={1}
+  explanation="A connection that dies silently sends nothing. The server only finds out by asking: each sweep pings every socket, and one that hasn't answered since the previous sweep is terminated. Closing it runs the same close handler as any disconnect, which tells the service, which tells the room."
+/>
+
+<Quiz
+  question="Why does handle() send the client a bland 'internal' error for unexpected exceptions, instead of the error's message?"
+  options={[
+    "Because error messages can't be turned into JSON",
+    "Because unexpected errors are bugs: their details (stack traces, file paths, library versions) help attackers and confuse users, so they go to the server's logs instead",
+    "Because the WebSocket protocol forbids long messages",
+    "Because ChatError and Error have different names",
+  ]}
+  answer={1}
+  explanation="Expected errors (a ChatError with a code) are part of the protocol and safe to show. Anything else is a bug, and its text may reveal internals. The client learns that something went wrong; the team learns what from the logs."
+/>
+
+<Exercise
+  title="Build it: The realtime server"
+  starter={`import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import WebSocket, { WebSocketServer } from "ws";
+
+// ---------- errors ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- time ----------
+
+/** A clock for tests: time only moves when a test says so. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- the chat service ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // characters per message
+  keep: 200, // messages kept per room
+  burst: 5, // messages in a quick burst...
+  perSecond: 1, // ...then one per second
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // name -> { members, messages }
+  const buckets = new Map(); // user id -> token bucket
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "Room names use a-z, 0-9 and -, up to 30 characters",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", \`Join \${name} first\`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) return false;
+    room.members.delete(userId);
+    emit({
+      type: "presence",
+      room: name,
+      action: "leave",
+      user,
+      members: members(name),
+    });
+    return true;
+  }
+
+  function leaveAll(userId) {
+    const left = [];
+    for (const name of rooms.keys()) {
+      if (leave(name, userId)) left.push(name);
+    }
+    return left;
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", \`Join \${name} first\`);
+    }
+    const clean = typeof text === "string" ? text.trim() : "";
+    if (clean.length < 1 || clean.length > config.maxLength) {
+      throw new ChatError(
+        "invalid_text",
+        \`Messages have 1 to \${config.maxLength} characters\`,
+      );
+    }
+    if (!bucketFor(userId).take()) {
+      throw new ChatError("rate_limited", "Slow down a little");
+    }
+    const message = {
+      id: newId(),
+      room: name,
+      user,
+      text: clean,
+      at: clock(),
+    };
+    room.messages.push(message);
+    if (room.messages.length > config.keep) room.messages.shift();
+    emit({ type: "message", room: name, message });
+    return message;
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    const messages = rooms.get(name)?.messages ?? [];
+    const size = Number.isInteger(limit)
+      ? Math.min(Math.max(limit, 1), 100)
+      : 50;
+    let end = messages.length;
+    if (before !== undefined) {
+      end = messages.findIndex((m) => m.id === before);
+      if (end === -1) return []; // unknown, or too old to keep
+    }
+    return messages.slice(Math.max(0, end - size), end);
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- the realtime server ----------
+
+function send(socket, message) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function createChatServer({ port, service, authenticate }) {
+  // maxPayload: refuse frames bigger than 16 KB (a chat message
+  // is at most 500 characters, so anything bigger is abuse)
+  const wss = new WebSocketServer({ port, maxPayload: 16 * 1024 });
+
+  // Every event from the service goes to the sockets in its room.
+  const unsubscribe = service.subscribe((event) => {
+    for (const socket of wss.clients) {
+      if (!socket.rooms?.has(event.room)) continue;
+      const own = socket.user.id === event.user?.id;
+      if (event.type === "typing" && own) continue;
+      send(socket, event);
+    }
+  });
+
+  wss.on("connection", (socket, req) => {
+    // TODO 1: read the token from req.url ("/?token=..."), and
+    // close the socket with 4001 "Unauthorized" unless
+    // authenticate(token) returns a user
+    const user = { id: "nobody", name: "Nobody" };
+    socket.user = user;
+    socket.rooms = new Set();
+    socket.isAlive = true;
+    socket.on("pong", () => {
+      socket.isAlive = true;
+    });
+    socket.on("message", (data) => handle(socket, data));
+    socket.on("close", () => {
+      // TODO 4: forget the socket's rooms and take the user out of
+      // every room, so the others see them leave
+    });
+    send(socket, { type: "welcome", user });
+  });
+
+  function handle(socket, data) {
+    // TODO 2: parse the JSON safely (bad_json), then call route();
+    // turn a ChatError into { type: "error", code, message } and
+    // any other error into the code "internal"
+    route(socket, JSON.parse(String(data)));
+  }
+
+  function route(socket, msg) {
+    const { user, rooms } = socket;
+    switch (msg?.type) {
+      case "join": {
+        const joined = service.join(msg.room, user);
+        rooms.add(msg.room);
+        send(socket, { type: "joined", ...joined });
+        break;
+      }
+      // TODO 3: leave, message, typing and history, and a
+      // default that throws ChatError("unknown_type", ...)
+    }
+  }
+
+  // A real interval calls this every 30 s (see the lesson).
+  function sweep() {
+    // TODO 5: terminate sockets that didn't answer the last ping;
+    // mark the others as not alive and ping them
+  }
+
+  function close() {
+    unsubscribe();
+    for (const socket of wss.clients) {
+      socket.close(1001, "Server shutting down");
+    }
+    wss.close();
+  }
+
+  return { wss, sweep, close };
+}
+
+// ---------- tests: the core (Part 1) ----------
+
+const mei = { id: "u1", name: "Mei" };
+const bo = { id: "u2", name: "Bo" };
+
+describe("chat service", () => {
+  let clock, chat, events;
+
+  beforeEach(() => {
+    clock = fakeClock(1_000_000);
+    let n = 0;
+    chat = createChatService({
+      clock,
+      newId: () => \`m\${++n}\`,
+      limits: { burst: 3, perSecond: 1 },
+    });
+    events = [];
+    chat.subscribe((event) => events.push(event));
+  });
+
+  it("join adds members and announces them once", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    chat.join("general", bo);
+    expect(chat.members("general")).toEqual([mei, bo]);
+    expect(events.map((e) => \`\${e.action} \${e.user.name}\`))
+      .toEqual(["join Mei", "join Bo"]);
+  });
+
+  it.each(["", "General", "no spaces", "a".repeat(31), 42])(
+    'refuses the room name "%s"',
+    (name) => {
+      expect(() => chat.join(name, mei)).toThrow("Room names");
+    },
+  );
+
+  it("posts a trimmed message and tells listeners", () => {
+    chat.join("general", mei);
+    const message = chat.postMessage("general", "u1", "  Hi!  ");
+    expect(message).toEqual({
+      id: "m1", room: "general", user: mei, text: "Hi!",
+      at: 1_000_000,
+    });
+    expect(events.at(-1)).toEqual({
+      type: "message", room: "general", message,
+    });
+  });
+
+  it("refuses messages from people who haven't joined", () => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+    expect(() => chat.postMessage("random", "u1", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+  });
+
+  it.each([
+    ["empty", ""],
+    ["only spaces", "   "],
+    ["too long", "x".repeat(501)],
+    ["not text", 42],
+  ])("refuses a message that is %s", (_label, text) => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u1", text))
+      .toThrow(expect.objectContaining({ code: "invalid_text" }));
+  });
+
+  it("leave announces it, and leavers can't post", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    expect(chat.leave("general", "u2")).toBe(true);
+    expect(chat.leave("general", "u2")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      action: "leave", user: bo, members: [mei],
+    });
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow("Join general first");
+  });
+
+  it("history pages backwards with a cursor", () => {
+    chat.join("general", mei);
+    for (const text of ["a", "b", "c"]) {
+      chat.postMessage("general", "u1", text);
+      clock.advance(1000);
+    }
+    const texts = (list) => list.map((m) => m.text).join("");
+    expect(texts(chat.history("general"))).toBe("abc");
+    expect(texts(chat.history("general", { limit: 2 }))).toBe("bc");
+    expect(texts(chat.history("general", { before: "m2" }))).toBe("a");
+    expect(chat.history("nowhere")).toEqual([]);
+  });
+
+  it("lets a user send a burst, then refuses", () => {
+    chat.join("general", mei);
+    for (let i = 0; i < 3; i++) {
+      chat.postMessage("general", "u1", \`hi \${i}\`);
+    }
+    expect(() => chat.postMessage("general", "u1", "one more"))
+      .toThrow(expect.objectContaining({ code: "rate_limited" }));
+  });
+
+  it("refills one message per second", () => {
+    chat.join("general", mei);
+    for (let i = 0; i < 3; i++) chat.postMessage("general", "u1", "hi");
+    clock.advance(999);
+    expect(() => chat.postMessage("general", "u1", "hi")).toThrow();
+    clock.advance(1);
+    expect(chat.postMessage("general", "u1", "hi").text).toBe("hi");
+  });
+
+  it("never saves up more than the burst", () => {
+    chat.join("general", mei);
+    chat.postMessage("general", "u1", "hi");
+    clock.advance(60_000);
+    for (let i = 0; i < 3; i++) chat.postMessage("general", "u1", "hi");
+    expect(() => chat.postMessage("general", "u1", "hi")).toThrow();
+  });
+});
+
+// ---------- tests: the server (Part 2) ----------
+
+const PORT = 4000;
+const kai = { id: "u3", name: "Kai" };
+const TOKENS = new Map([
+  ["mei-token", mei],
+  ["bo-token", bo],
+  ["kai-token", kai],
+]);
+const authenticate = (token) => TOKENS.get(token) ?? null;
+
+/**
+ * A test client. It queues what it receives, so no message is
+ * missed, and gives up after 200 ms, so a broken server fails a
+ * test instead of hanging it.
+ */
+function connect(token) {
+  const ws = new WebSocket(\`ws://localhost:\${PORT}/?token=\${token}\`);
+  const inbox = [];
+  let closeCode;
+  let wake = () => {};
+  ws.addEventListener("message", (event) => {
+    inbox.push(JSON.parse(event.data));
+    wake();
+  });
+  ws.addEventListener("close", (event) => {
+    closeCode = event.code;
+    wake();
+  });
+  // Resolves with the first value get() returns, or rejects.
+  const waitFor = (get, what) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        wake = () => {};
+        reject(new Error(\`No \${what} within 200 ms\`));
+      }, 200);
+      wake = () => {
+        const value = get();
+        if (value === undefined) return;
+        clearTimeout(timer);
+        wake = () => {};
+        resolve(value);
+      };
+      wake();
+    });
+  ws.next = () => waitFor(() => inbox.shift(), "message");
+  ws.closed = () => waitFor(() => closeCode, "close");
+  ws.sendJson = (message) => ws.send(JSON.stringify(message));
+  return ws;
+}
+
+/** Connects and joins a room; resolves with the client. */
+async function joined(token, room) {
+  const ws = connect(token);
+  await ws.next(); // welcome
+  ws.sendJson({ type: "join", room });
+  await ws.next(); // joined
+  return ws;
+}
+
+describe("chat server", () => {
+  let service, chat;
+
+  beforeEach(() => {
+    let n = 0;
+    service = createChatService({
+      clock: fakeClock(1_000_000),
+      newId: () => \`m\${++n}\`,
+      limits: { burst: 3 },
+    });
+    chat = createChatServer({ port: PORT, service, authenticate });
+  });
+
+  afterEach(() => chat.close());
+
+  it("closes connections without a valid token with 4001", async () => {
+    expect(await connect("nope").closed()).toBe(4001);
+    expect(await connect("").closed()).toBe(4001);
+  });
+
+  it("welcomes a user with a valid token", async () => {
+    const ws = connect("mei-token");
+    expect(await ws.next()).toEqual({ type: "welcome", user: mei });
+  });
+
+  it("answers bad input with errors and keeps going", async () => {
+    const ws = connect("mei-token");
+    await ws.next();
+    ws.send("{ not json");
+    expect(await ws.next()).toMatchObject({ code: "bad_json" });
+    ws.sendJson({ type: "dance" });
+    expect(await ws.next()).toMatchObject({ code: "unknown_type" });
+    ws.send("null");
+    expect(await ws.next()).toMatchObject({ code: "unknown_type" });
+    ws.sendJson({ type: "join", room: "Bad Room!" });
+    expect(await ws.next()).toMatchObject({ code: "invalid_room" });
+  });
+
+  it("join replies with members and history, and tells the room", async () => {
+    const meiWs = await joined("mei-token", "general");
+    meiWs.sendJson({ type: "message", room: "general", text: "Hi" });
+    await meiWs.next();
+    const boWs = connect("bo-token");
+    await boWs.next();
+    boWs.sendJson({ type: "join", room: "general" });
+    const reply = await boWs.next();
+    expect(reply).toMatchObject({
+      type: "joined", room: "general", members: [mei, bo],
+    });
+    expect(reply.history.map((m) => m.text)).toEqual(["Hi"]);
+    expect(await meiWs.next()).toMatchObject({
+      type: "presence", action: "join", user: bo,
+    });
+  });
+
+  it("sends messages to everyone in the room, sender too", async () => {
+    const meiWs = await joined("mei-token", "general");
+    const boWs = await joined("bo-token", "general");
+    await meiWs.next(); // Bo joined
+    meiWs.sendJson({ type: "message", room: "general", text: " Hi! " });
+    for (const ws of [meiWs, boWs]) {
+      expect(await ws.next()).toMatchObject({
+        type: "message",
+        message: { id: "m1", text: "Hi!", user: mei },
+      });
+    }
+  });
+
+  it("turns service errors into error replies", async () => {
+    const ws = await joined("mei-token", "general");
+    ws.sendJson({ type: "message", room: "random", text: "Hi" });
+    expect(await ws.next()).toMatchObject({ code: "not_member" });
+    ws.sendJson({ type: "message", room: "general", text: "  " });
+    expect(await ws.next()).toMatchObject({ code: "invalid_text" });
+    for (let i = 0; i < 4; i++) {
+      ws.sendJson({ type: "message", room: "general", text: "spam" });
+    }
+    const replies = [];
+    for (let i = 0; i < 4; i++) replies.push(await ws.next());
+    expect(replies.map((r) => r.type).join()).toBe(
+      "message,message,message,error",
+    );
+    expect(replies[3].code).toBe("rate_limited");
+  });
+
+  it("typing goes to the others, not back to the typist", async () => {
+    const meiWs = await joined("mei-token", "general");
+    const boWs = await joined("bo-token", "general");
+    await meiWs.next(); // Bo joined
+    meiWs.sendJson({ type: "typing", room: "general" });
+    meiWs.sendJson({ type: "message", room: "general", text: "Hi" });
+    expect(await boWs.next()).toMatchObject({
+      type: "typing", user: mei,
+    });
+    expect(await meiWs.next()).toMatchObject({ type: "message" });
+  });
+
+  it("history pages backwards for members only", async () => {
+    const ws = await joined("mei-token", "general");
+    for (const text of ["a", "b", "c"]) {
+      ws.sendJson({ type: "message", room: "general", text });
+      await ws.next();
+    }
+    ws.sendJson({ type: "history", room: "general", before: "m3" });
+    const page = await ws.next();
+    expect(page.messages.map((m) => m.text)).toEqual(["a", "b"]);
+    ws.sendJson({ type: "history", room: "random" });
+    expect(await ws.next()).toMatchObject({ code: "not_member" });
+  });
+
+  it("announces when someone leaves or disconnects", async () => {
+    const meiWs = await joined("mei-token", "general");
+    const boWs = await joined("bo-token", "general");
+    const kaiWs = await joined("kai-token", "general");
+    await meiWs.next(); // Bo joined
+    await meiWs.next(); // Kai joined
+    await boWs.next(); // Kai joined
+    boWs.sendJson({ type: "leave", room: "general" });
+    expect(await boWs.next()).toEqual({ type: "left", room: "general" });
+    expect(await meiWs.next()).toMatchObject({
+      action: "leave", user: bo, members: [mei, kai],
+    });
+    kaiWs.close();
+    expect(await meiWs.next()).toMatchObject({
+      action: "leave", user: kai, members: [mei],
+    });
+    expect(service.members("general")).toEqual([mei]);
+  });
+
+  // TODO 6: it("keeps messages inside their room", ...)
+
+  it("sweep() keeps live sockets and drops silent ones", async () => {
+    const ws = await joined("mei-token", "general");
+    chat.sweep(); // ping...
+    await new Promise((resolve) => setTimeout(resolve, 20)); // ...pong
+    chat.sweep();
+    expect(chat.wss.clients.size).toBe(1);
+    chat.sweep(); // no time for a pong this time
+    expect(await ws.closed()).toBe(1006);
+    expect(service.members("general")).toEqual([]);
+  });
+
+  it("close() says goodbye with 1001", async () => {
+    const ws = connect("mei-token");
+    await ws.next();
+    chat.close();
+    expect(await ws.closed()).toBe(1001);
+  });
+});`}
+  tests={[
+    { name: "All the tests pass: Part 1's, Part 2's and your new one", check: `__vitest.failed === 0 && __vitest.passed >= 29` },
+    { name: "Your room test catches a server that sends every event to everyone", check: `(await __retest([["if (!socket.rooms?.has(event.room)) continue;", ""]])).failed > __vitest.failed` },
+    { name: "Only valid tokens get in: others are closed with 4001", check: `await (async () => { const service = createChatService({ clock: fakeClock(0), newId: (() => { let n = 0; return () => 'id' + ++n; })(), limits: { burst: 2, perSecond: 1 } }); const server = createChatServer({ port: 4000, service, authenticate: (t) => ({ 'k-token': { id: 'k', name: 'Kim' }, 'l-token': { id: 'l', name: 'Lou' } })[t] ?? null }); const json = (ws, m) => ws.send(JSON.stringify(m)); try { const bad = connect('k-token-x'); const none = new WebSocket('ws://localhost:4000/'); let why = ''; none.addEventListener('close', (e) => (why = e.code + ' ' + e.reason)); const good = connect('k-token'); const hi = await good.next(); return (await bad.closed()) === 4001 && why === '4001 Unauthorized' && hi.type === 'welcome' && hi.user.name === 'Kim' && server.wss.clients.size === 1; } finally { server.close(); } })()` },
+    { name: "Bad input gets error replies, and the connection keeps working", check: `await (async () => { const service = createChatService({ clock: fakeClock(0), newId: (() => { let n = 0; return () => 'id' + ++n; })(), limits: { burst: 2, perSecond: 1 } }); const server = createChatServer({ port: 4000, service, authenticate: (t) => ({ 'k-token': { id: 'k', name: 'Kim' }, 'l-token': { id: 'l', name: 'Lou' } })[t] ?? null }); const json = (ws, m) => ws.send(JSON.stringify(m)); try { const ws = connect('k-token'); await ws.next(); ws.send('{ oops'); const a = await ws.next(); json(ws, [1, 2]); const b = await ws.next(); ws.send('42'); const c = await ws.next(); json(ws, { type: 'fly', room: 'x' }); const d = await ws.next(); json(ws, { type: 'join', room: 'zoo' }); const e = await ws.next(); return a.type === 'error' && a.code === 'bad_json' && typeof a.message === 'string' && [b, c, d].every((r) => r.type === 'error' && r.code === 'unknown_type') && e.type === 'joined' && e.room === 'zoo'; } finally { server.close(); } })()` },
+    { name: "Service errors become error replies with their codes", check: `await (async () => { const service = createChatService({ clock: fakeClock(0), newId: (() => { let n = 0; return () => 'id' + ++n; })(), limits: { burst: 2, perSecond: 1 } }); const server = createChatServer({ port: 4000, service, authenticate: (t) => ({ 'k-token': { id: 'k', name: 'Kim' }, 'l-token': { id: 'l', name: 'Lou' } })[t] ?? null }); const json = (ws, m) => ws.send(JSON.stringify(m)); try { const ws = connect('k-token'); await ws.next(); json(ws, { type: 'join', room: 'No Way' }); const a = await ws.next(); json(ws, { type: 'message', room: 'zoo', text: 'hi' }); const b = await ws.next(); json(ws, { type: 'typing', room: 'zoo' }); const c = await ws.next(); json(ws, { type: 'join', room: 'zoo' }); await ws.next(); json(ws, { type: 'message', room: 'zoo', text: 'x'.repeat(501) }); const d = await ws.next(); for (let i = 0; i < 3; i++) json(ws, { type: 'message', room: 'zoo', text: 'hey' }); const got = [await ws.next(), await ws.next(), await ws.next()]; return [a, b, c, d].map((r) => r.type + ':' + r.code).join() === 'error:invalid_room,error:not_member,error:not_member,error:invalid_text' && got.map((r) => r.type).join() === 'message,message,error' && got[2].code === 'rate_limited' && got[2].message === 'Slow down a little'; } finally { server.close(); } })()` },
+    { name: "message, typing, leave and history follow the protocol", check: `await (async () => { const service = createChatService({ clock: fakeClock(0), newId: (() => { let n = 0; return () => 'id' + ++n; })(), limits: { burst: 2, perSecond: 1 } }); const server = createChatServer({ port: 4000, service, authenticate: (t) => ({ 'k-token': { id: 'k', name: 'Kim' }, 'l-token': { id: 'l', name: 'Lou' } })[t] ?? null }); const json = (ws, m) => ws.send(JSON.stringify(m)); try { const kim = connect('k-token'); const lou = connect('l-token'); await kim.next(); await lou.next(); json(kim, { type: 'join', room: 'zoo' }); await kim.next(); json(lou, { type: 'join', room: 'zoo' }); const lj = await lou.next(); const p = await kim.next(); json(lou, { type: 'typing', room: 'zoo' }); json(lou, { type: 'message', room: 'zoo', text: ' hi Kim ' }); const t = await kim.next(); const m1 = await kim.next(); const m2 = await lou.next(); json(kim, { type: 'history', room: 'zoo', before: 'id1' }); const h1 = await kim.next(); json(kim, { type: 'history', room: 'zoo', limit: 1 }); const h2 = await kim.next(); json(lou, { type: 'leave', room: 'zoo' }); const left = await lou.next(); const pl = await kim.next(); json(lou, { type: 'history', room: 'zoo' }); const h3 = await lou.next(); return lj.type === 'joined' && lj.members.length === 2 && p.type === 'presence' && p.action === 'join' && p.user.name === 'Lou' && t.type === 'typing' && t.user.name === 'Lou' && m1.type === 'message' && m1.room === 'zoo' && m1.message.text === 'hi Kim' && m1.message.user.name === 'Lou' && m2.message.id === m1.message.id && h1.type === 'history' && h1.room === 'zoo' && h1.messages.length === 0 && h2.messages.length === 1 && h2.messages[0].id === 'id1' && left.type === 'left' && left.room === 'zoo' && pl.action === 'leave' && pl.user.name === 'Lou' && pl.members.length === 1 && h3.code === 'not_member'; } finally { server.close(); } })()` },
+    { name: "Disconnecting takes the user out of all their rooms", check: `await (async () => { const service = createChatService({ clock: fakeClock(0), newId: (() => { let n = 0; return () => 'id' + ++n; })(), limits: { burst: 2, perSecond: 1 } }); const server = createChatServer({ port: 4000, service, authenticate: (t) => ({ 'k-token': { id: 'k', name: 'Kim' }, 'l-token': { id: 'l', name: 'Lou' } })[t] ?? null }); const json = (ws, m) => ws.send(JSON.stringify(m)); try { const kim = connect('k-token'); const lou = connect('l-token'); await kim.next(); await lou.next(); for (const room of ['zoo', 'park']) { json(kim, { type: 'join', room }); await kim.next(); json(lou, { type: 'join', room }); await lou.next(); await kim.next(); } lou.close(); const a = await kim.next(); const b = await kim.next(); return [a, b].every((e) => e.type === 'presence' && e.action === 'leave' && e.user.name === 'Lou') && a.room !== b.room && service.members('zoo').length === 1 && service.members('park').length === 1; } finally { server.close(); } })()` },
+    { name: "sweep() pings, keeps sockets that answer and terminates silent ones", check: `await (async () => { const service = createChatService({ clock: fakeClock(0), newId: (() => { let n = 0; return () => 'id' + ++n; })(), limits: { burst: 2, perSecond: 1 } }); const server = createChatServer({ port: 4000, service, authenticate: (t) => ({ 'k-token': { id: 'k', name: 'Kim' }, 'l-token': { id: 'l', name: 'Lou' } })[t] ?? null }); const json = (ws, m) => ws.send(JSON.stringify(m)); try { const kim = connect('k-token'); const lou = connect('l-token'); await kim.next(); await lou.next(); json(kim, { type: 'join', room: 'zoo' }); await kim.next(); server.sweep(); const pinged = [...server.wss.clients].every((s) => s.isAlive === false); await new Promise((r) => setTimeout(r, 30)); const answered = [...server.wss.clients].every((s) => s.isAlive === true); server.sweep(); const kept = server.wss.clients.size === 2; server.sweep(); const codes = await Promise.all([kim.closed(), lou.closed()]); return pinged && answered && kept && codes.join() === '1006,1006' && server.wss.clients.size === 0 && service.members('zoo').length === 0; } finally { server.close(); } })()` },
+  ]}
+>
+
+The starter is your finished Part 1 (core and tests) plus the server, with six TODOs. `send`, the broadcasting `subscribe`, `join` in `route`, `close()` and all the server tests except one are ready. Make every test pass:
+
+1. **Authenticate** in the `connection` handler: read the `token` from `req.url` (use `new URL(req.url, "http://localhost").searchParams`) and close the socket with `4001`, `"Unauthorized"` (and return) unless `authenticate(token)` returns a user.
+2. **`handle(socket, data)`**: parse `String(data)` as JSON; if that fails, send `{ type: "error", code: "bad_json", message: "Messages must be JSON" }`. Otherwise call `route`, and turn a thrown `ChatError` into `{ type: "error", code, message }` and any other error into code `"internal"` (log it with `console.error`).
+3. **`route`**: `leave` (forget the room on the socket, tell the service, reply `{ type: "left", room }`), `message` and `typing` (just call the service: its events do the delivery), `history` (only for rooms the socket is in, otherwise `ChatError("not_member", …)`; reply `{ type: "history", room, messages }` using the message's `before` and `limit`), and a `default` that throws `ChatError("unknown_type", …)`.
+4. **The `close` handler**: clear the socket's rooms and call `service.leaveAll(user.id)`.
+5. **`sweep()`**: for each client, terminate it if `isAlive` is false; otherwise set it to `false` and `ping()` it.
+6. **Write the test `"keeps messages inside their room"`**: Mei joins `general` and Bo joins `random`; Mei posts in `general`, then Bo posts in `random`, and Bo's next message must be his own (the barrier). The checks will make the server send every event to everyone to see if your test notices.
+
+<Hint>
+
+For TODO 1, copy the authentication lines from the lesson's first example. TODO 2 is the lesson's `handle` function, unchanged. In `route`, each `case` ends with `break` (or is a block `{ ... }` when it declares a `const`). For your test, use the `joined(token, room)` helper, `sendJson(...)`, and `await meiWs.next()` after Mei's post so it has been handled before Bo posts; then `expect(await boWs.next()).toMatchObject({ message: { text: ... } })`.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import WebSocket, { WebSocketServer } from "ws";
+
+// ---------- errors ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- time ----------
+
+/** A clock for tests: time only moves when a test says so. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- the chat service ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // characters per message
+  keep: 200, // messages kept per room
+  burst: 5, // messages in a quick burst...
+  perSecond: 1, // ...then one per second
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // name -> { members, messages }
+  const buckets = new Map(); // user id -> token bucket
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "Room names use a-z, 0-9 and -, up to 30 characters",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Join ${name} first`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) return false;
+    room.members.delete(userId);
+    emit({
+      type: "presence",
+      room: name,
+      action: "leave",
+      user,
+      members: members(name),
+    });
+    return true;
+  }
+
+  function leaveAll(userId) {
+    const left = [];
+    for (const name of rooms.keys()) {
+      if (leave(name, userId)) left.push(name);
+    }
+    return left;
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Join ${name} first`);
+    }
+    const clean = typeof text === "string" ? text.trim() : "";
+    if (clean.length < 1 || clean.length > config.maxLength) {
+      throw new ChatError(
+        "invalid_text",
+        `Messages have 1 to ${config.maxLength} characters`,
+      );
+    }
+    if (!bucketFor(userId).take()) {
+      throw new ChatError("rate_limited", "Slow down a little");
+    }
+    const message = {
+      id: newId(),
+      room: name,
+      user,
+      text: clean,
+      at: clock(),
+    };
+    room.messages.push(message);
+    if (room.messages.length > config.keep) room.messages.shift();
+    emit({ type: "message", room: name, message });
+    return message;
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    const messages = rooms.get(name)?.messages ?? [];
+    const size = Number.isInteger(limit)
+      ? Math.min(Math.max(limit, 1), 100)
+      : 50;
+    let end = messages.length;
+    if (before !== undefined) {
+      end = messages.findIndex((m) => m.id === before);
+      if (end === -1) return []; // unknown, or too old to keep
+    }
+    return messages.slice(Math.max(0, end - size), end);
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- the realtime server ----------
+
+function send(socket, message) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function createChatServer({ port, service, authenticate }) {
+  // maxPayload: refuse frames bigger than 16 KB (a chat message
+  // is at most 500 characters, so anything bigger is abuse)
+  const wss = new WebSocketServer({ port, maxPayload: 16 * 1024 });
+
+  // Every event from the service goes to the sockets in its room.
+  const unsubscribe = service.subscribe((event) => {
+    for (const socket of wss.clients) {
+      if (!socket.rooms?.has(event.room)) continue;
+      const own = socket.user.id === event.user?.id;
+      if (event.type === "typing" && own) continue;
+      send(socket, event);
+    }
+  });
+
+  wss.on("connection", (socket, req) => {
+    const url = new URL(req.url, "http://localhost");
+    const user = authenticate(url.searchParams.get("token"));
+    if (!user) {
+      socket.close(4001, "Unauthorized");
+      return;
+    }
+    socket.user = user;
+    socket.rooms = new Set();
+    socket.isAlive = true;
+    socket.on("pong", () => {
+      socket.isAlive = true;
+    });
+    socket.on("message", (data) => handle(socket, data));
+    socket.on("close", () => {
+      socket.rooms.clear();
+      service.leaveAll(user.id);
+    });
+    send(socket, { type: "welcome", user });
+  });
+
+  function handle(socket, data) {
+    let msg;
+    try {
+      msg = JSON.parse(String(data));
+    } catch {
+      send(socket, {
+        type: "error",
+        code: "bad_json",
+        message: "Messages must be JSON",
+      });
+      return;
+    }
+    try {
+      route(socket, msg);
+    } catch (error) {
+      const known = error instanceof ChatError;
+      if (!known) console.error("Unexpected:", error.message);
+      send(socket, {
+        type: "error",
+        code: known ? error.code : "internal",
+        message: known ? error.message : "Something went wrong",
+      });
+    }
+  }
+
+  function route(socket, msg) {
+    const { user, rooms } = socket;
+    switch (msg?.type) {
+      case "join": {
+        const joined = service.join(msg.room, user);
+        rooms.add(msg.room);
+        send(socket, { type: "joined", ...joined });
+        break;
+      }
+      case "leave":
+        rooms.delete(msg.room);
+        service.leave(msg.room, user.id);
+        send(socket, { type: "left", room: msg.room });
+        break;
+      case "message":
+        service.postMessage(msg.room, user.id, msg.text);
+        break;
+      case "typing":
+        service.typing(msg.room, user.id);
+        break;
+      case "history": {
+        if (!rooms.has(msg.room)) {
+          throw new ChatError("not_member", `Join ${msg.room} first`);
+        }
+        const messages = service.history(msg.room, {
+          before: msg.before,
+          limit: msg.limit,
+        });
+        send(socket, { type: "history", room: msg.room, messages });
+        break;
+      }
+      default:
+        throw new ChatError(
+          "unknown_type",
+          `Unknown message type: ${msg?.type}`,
+        );
+    }
+  }
+
+  // A real interval calls this every 30 s (see the lesson).
+  function sweep() {
+    for (const socket of wss.clients) {
+      if (!socket.isAlive) {
+        socket.terminate();
+        continue;
+      }
+      socket.isAlive = false;
+      socket.ping();
+    }
+  }
+
+  function close() {
+    unsubscribe();
+    for (const socket of wss.clients) {
+      socket.close(1001, "Server shutting down");
+    }
+    wss.close();
+  }
+
+  return { wss, sweep, close };
+}
+
+// ---------- tests: the core (Part 1) ----------
+
+const mei = { id: "u1", name: "Mei" };
+const bo = { id: "u2", name: "Bo" };
+
+describe("chat service", () => {
+  let clock, chat, events;
+
+  beforeEach(() => {
+    clock = fakeClock(1_000_000);
+    let n = 0;
+    chat = createChatService({
+      clock,
+      newId: () => `m${++n}`,
+      limits: { burst: 3, perSecond: 1 },
+    });
+    events = [];
+    chat.subscribe((event) => events.push(event));
+  });
+
+  it("join adds members and announces them once", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    chat.join("general", bo);
+    expect(chat.members("general")).toEqual([mei, bo]);
+    expect(events.map((e) => `${e.action} ${e.user.name}`))
+      .toEqual(["join Mei", "join Bo"]);
+  });
+
+  it.each(["", "General", "no spaces", "a".repeat(31), 42])(
+    'refuses the room name "%s"',
+    (name) => {
+      expect(() => chat.join(name, mei)).toThrow("Room names");
+    },
+  );
+
+  it("posts a trimmed message and tells listeners", () => {
+    chat.join("general", mei);
+    const message = chat.postMessage("general", "u1", "  Hi!  ");
+    expect(message).toEqual({
+      id: "m1", room: "general", user: mei, text: "Hi!",
+      at: 1_000_000,
+    });
+    expect(events.at(-1)).toEqual({
+      type: "message", room: "general", message,
+    });
+  });
+
+  it("refuses messages from people who haven't joined", () => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+    expect(() => chat.postMessage("random", "u1", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+  });
+
+  it.each([
+    ["empty", ""],
+    ["only spaces", "   "],
+    ["too long", "x".repeat(501)],
+    ["not text", 42],
+  ])("refuses a message that is %s", (_label, text) => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u1", text))
+      .toThrow(expect.objectContaining({ code: "invalid_text" }));
+  });
+
+  it("leave announces it, and leavers can't post", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    expect(chat.leave("general", "u2")).toBe(true);
+    expect(chat.leave("general", "u2")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      action: "leave", user: bo, members: [mei],
+    });
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow("Join general first");
+  });
+
+  it("history pages backwards with a cursor", () => {
+    chat.join("general", mei);
+    for (const text of ["a", "b", "c"]) {
+      chat.postMessage("general", "u1", text);
+      clock.advance(1000);
+    }
+    const texts = (list) => list.map((m) => m.text).join("");
+    expect(texts(chat.history("general"))).toBe("abc");
+    expect(texts(chat.history("general", { limit: 2 }))).toBe("bc");
+    expect(texts(chat.history("general", { before: "m2" }))).toBe("a");
+    expect(chat.history("nowhere")).toEqual([]);
+  });
+
+  it("lets a user send a burst, then refuses", () => {
+    chat.join("general", mei);
+    for (let i = 0; i < 3; i++) {
+      chat.postMessage("general", "u1", `hi ${i}`);
+    }
+    expect(() => chat.postMessage("general", "u1", "one more"))
+      .toThrow(expect.objectContaining({ code: "rate_limited" }));
+  });
+
+  it("refills one message per second", () => {
+    chat.join("general", mei);
+    for (let i = 0; i < 3; i++) chat.postMessage("general", "u1", "hi");
+    clock.advance(999);
+    expect(() => chat.postMessage("general", "u1", "hi")).toThrow();
+    clock.advance(1);
+    expect(chat.postMessage("general", "u1", "hi").text).toBe("hi");
+  });
+
+  it("never saves up more than the burst", () => {
+    chat.join("general", mei);
+    chat.postMessage("general", "u1", "hi");
+    clock.advance(60_000);
+    for (let i = 0; i < 3; i++) chat.postMessage("general", "u1", "hi");
+    expect(() => chat.postMessage("general", "u1", "hi")).toThrow();
+  });
+});
+
+// ---------- tests: the server (Part 2) ----------
+
+const PORT = 4000;
+const kai = { id: "u3", name: "Kai" };
+const TOKENS = new Map([
+  ["mei-token", mei],
+  ["bo-token", bo],
+  ["kai-token", kai],
+]);
+const authenticate = (token) => TOKENS.get(token) ?? null;
+
+/**
+ * A test client. It queues what it receives, so no message is
+ * missed, and gives up after 200 ms, so a broken server fails a
+ * test instead of hanging it.
+ */
+function connect(token) {
+  const ws = new WebSocket(`ws://localhost:${PORT}/?token=${token}`);
+  const inbox = [];
+  let closeCode;
+  let wake = () => {};
+  ws.addEventListener("message", (event) => {
+    inbox.push(JSON.parse(event.data));
+    wake();
+  });
+  ws.addEventListener("close", (event) => {
+    closeCode = event.code;
+    wake();
+  });
+  // Resolves with the first value get() returns, or rejects.
+  const waitFor = (get, what) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        wake = () => {};
+        reject(new Error(`No ${what} within 200 ms`));
+      }, 200);
+      wake = () => {
+        const value = get();
+        if (value === undefined) return;
+        clearTimeout(timer);
+        wake = () => {};
+        resolve(value);
+      };
+      wake();
+    });
+  ws.next = () => waitFor(() => inbox.shift(), "message");
+  ws.closed = () => waitFor(() => closeCode, "close");
+  ws.sendJson = (message) => ws.send(JSON.stringify(message));
+  return ws;
+}
+
+/** Connects and joins a room; resolves with the client. */
+async function joined(token, room) {
+  const ws = connect(token);
+  await ws.next(); // welcome
+  ws.sendJson({ type: "join", room });
+  await ws.next(); // joined
+  return ws;
+}
+
+describe("chat server", () => {
+  let service, chat;
+
+  beforeEach(() => {
+    let n = 0;
+    service = createChatService({
+      clock: fakeClock(1_000_000),
+      newId: () => `m${++n}`,
+      limits: { burst: 3 },
+    });
+    chat = createChatServer({ port: PORT, service, authenticate });
+  });
+
+  afterEach(() => chat.close());
+
+  it("closes connections without a valid token with 4001", async () => {
+    expect(await connect("nope").closed()).toBe(4001);
+    expect(await connect("").closed()).toBe(4001);
+  });
+
+  it("welcomes a user with a valid token", async () => {
+    const ws = connect("mei-token");
+    expect(await ws.next()).toEqual({ type: "welcome", user: mei });
+  });
+
+  it("answers bad input with errors and keeps going", async () => {
+    const ws = connect("mei-token");
+    await ws.next();
+    ws.send("{ not json");
+    expect(await ws.next()).toMatchObject({ code: "bad_json" });
+    ws.sendJson({ type: "dance" });
+    expect(await ws.next()).toMatchObject({ code: "unknown_type" });
+    ws.send("null");
+    expect(await ws.next()).toMatchObject({ code: "unknown_type" });
+    ws.sendJson({ type: "join", room: "Bad Room!" });
+    expect(await ws.next()).toMatchObject({ code: "invalid_room" });
+  });
+
+  it("join replies with members and history, and tells the room", async () => {
+    const meiWs = await joined("mei-token", "general");
+    meiWs.sendJson({ type: "message", room: "general", text: "Hi" });
+    await meiWs.next();
+    const boWs = connect("bo-token");
+    await boWs.next();
+    boWs.sendJson({ type: "join", room: "general" });
+    const reply = await boWs.next();
+    expect(reply).toMatchObject({
+      type: "joined", room: "general", members: [mei, bo],
+    });
+    expect(reply.history.map((m) => m.text)).toEqual(["Hi"]);
+    expect(await meiWs.next()).toMatchObject({
+      type: "presence", action: "join", user: bo,
+    });
+  });
+
+  it("sends messages to everyone in the room, sender too", async () => {
+    const meiWs = await joined("mei-token", "general");
+    const boWs = await joined("bo-token", "general");
+    await meiWs.next(); // Bo joined
+    meiWs.sendJson({ type: "message", room: "general", text: " Hi! " });
+    for (const ws of [meiWs, boWs]) {
+      expect(await ws.next()).toMatchObject({
+        type: "message",
+        message: { id: "m1", text: "Hi!", user: mei },
+      });
+    }
+  });
+
+  it("turns service errors into error replies", async () => {
+    const ws = await joined("mei-token", "general");
+    ws.sendJson({ type: "message", room: "random", text: "Hi" });
+    expect(await ws.next()).toMatchObject({ code: "not_member" });
+    ws.sendJson({ type: "message", room: "general", text: "  " });
+    expect(await ws.next()).toMatchObject({ code: "invalid_text" });
+    for (let i = 0; i < 4; i++) {
+      ws.sendJson({ type: "message", room: "general", text: "spam" });
+    }
+    const replies = [];
+    for (let i = 0; i < 4; i++) replies.push(await ws.next());
+    expect(replies.map((r) => r.type).join()).toBe(
+      "message,message,message,error",
+    );
+    expect(replies[3].code).toBe("rate_limited");
+  });
+
+  it("typing goes to the others, not back to the typist", async () => {
+    const meiWs = await joined("mei-token", "general");
+    const boWs = await joined("bo-token", "general");
+    await meiWs.next(); // Bo joined
+    meiWs.sendJson({ type: "typing", room: "general" });
+    meiWs.sendJson({ type: "message", room: "general", text: "Hi" });
+    expect(await boWs.next()).toMatchObject({
+      type: "typing", user: mei,
+    });
+    expect(await meiWs.next()).toMatchObject({ type: "message" });
+  });
+
+  it("history pages backwards for members only", async () => {
+    const ws = await joined("mei-token", "general");
+    for (const text of ["a", "b", "c"]) {
+      ws.sendJson({ type: "message", room: "general", text });
+      await ws.next();
+    }
+    ws.sendJson({ type: "history", room: "general", before: "m3" });
+    const page = await ws.next();
+    expect(page.messages.map((m) => m.text)).toEqual(["a", "b"]);
+    ws.sendJson({ type: "history", room: "random" });
+    expect(await ws.next()).toMatchObject({ code: "not_member" });
+  });
+
+  it("announces when someone leaves or disconnects", async () => {
+    const meiWs = await joined("mei-token", "general");
+    const boWs = await joined("bo-token", "general");
+    const kaiWs = await joined("kai-token", "general");
+    await meiWs.next(); // Bo joined
+    await meiWs.next(); // Kai joined
+    await boWs.next(); // Kai joined
+    boWs.sendJson({ type: "leave", room: "general" });
+    expect(await boWs.next()).toEqual({ type: "left", room: "general" });
+    expect(await meiWs.next()).toMatchObject({
+      action: "leave", user: bo, members: [mei, kai],
+    });
+    kaiWs.close();
+    expect(await meiWs.next()).toMatchObject({
+      action: "leave", user: kai, members: [mei],
+    });
+    expect(service.members("general")).toEqual([mei]);
+  });
+
+  it("keeps messages inside their room", async () => {
+    const meiWs = await joined("mei-token", "general");
+    const boWs = await joined("bo-token", "random");
+    meiWs.sendJson({ type: "message", room: "general", text: "Hi" });
+    await meiWs.next();
+    boWs.sendJson({ type: "message", room: "random", text: "Yo" });
+    expect(await boWs.next()).toMatchObject({
+      message: { text: "Yo" },
+    });
+  });
+
+  it("sweep() keeps live sockets and drops silent ones", async () => {
+    const ws = await joined("mei-token", "general");
+    chat.sweep(); // ping...
+    await new Promise((resolve) => setTimeout(resolve, 20)); // ...pong
+    chat.sweep();
+    expect(chat.wss.clients.size).toBe(1);
+    chat.sweep(); // no time for a pong this time
+    expect(await ws.closed()).toBe(1006);
+    expect(service.members("general")).toEqual([]);
+  });
+
+  it("close() says goodbye with 1001", async () => {
+    const ws = connect("mei-token");
+    await ws.next();
+    chat.close();
+    expect(await ws.closed()).toBe(1001);
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- **`createChatServer`**, a thin adapter between the protocol and the core: it authenticates each connection once (close code **4001** for strangers), attaches the user to the socket and never trusts ids in messages.
+- A **message firewall**: safe JSON parsing, `maxPayload`, routing with a `switch`, `ChatError` codes passed to clients, and bland `internal` errors (with a log line) for bugs. Bad input never takes the server down.
+- **Room broadcasting** driven by the service's events, with presence on join, leave and disconnect, and typing that isn't echoed back.
+- A **heartbeat** `sweep()` that pings and terminates silent sockets, with the timer kept outside so it's trivial to test, and a polite **`close()`** with 1001.
+- A **test client** that queues messages and times out instead of hanging, and the **barrier** trick for testing what must not happen.
+
+PandaChat now works end to end, in tests. In **Part 3** we give it a face: a React client that shows who's online and who's typing, and that **reconnects** by itself. Then we plan how to run it on many servers and ship it. 🚀

@@ -1,0 +1,943 @@
+---
+title: Аутентификация и сессии
+description: Храните пароли безопасно, впускайте пользователей через защищённые cookie сессий, разберитесь в подписанных токенах и JWT изнутри и защищайте маршруты ролями и лимитами.
+duration: 25
+xp: 25
+---
+
+Любое приложение с аккаунтами на каждом запросе должно ответить на два вопроса: **кто это?** и **можно ли ему это сделать?** Ошибка в любом из них — и вот он, настоящий взлом: утёкшая база с быстрыми хешами паролей, взломанными за полдня, сессия, которая никогда не истекает, API, который проверяет, что вы вошли, но не проверяет, что удаляемый заказ — ваш. В этом уроке вы соберёте каждую часть на Web Crypto API и Express, чтобы увидеть, что никакой магии тут нет, и узнаете, за какой проверенной в бою библиотекой тянуться в продакшене. 🔐
+
+## Аутентификация и авторизация
+
+Эти два слова звучат похоже, поэтому их часто сокращают до **authn** и **authz**:
+
+- **Аутентификация (authentication, authn)**: *кто вы?* Подтверждение личности паролем, ключом доступа (passkey), токеном или кнопкой «Войти через Google».
+- **Авторизация (authorisation, authz)**: *что вам можно?* Проверка, что эта личность может выполнить это действие с этой конкретной вещью.
+
+У каждой неудачи свой код ответа (status code), и правильный код помогает клиенту правильно отреагировать:
+
+| Код | Означает | Клиент должен |
+| --- | --- | --- |
+| **401** Unauthorized | «Я не знаю, кто вы»: учётных данных нет, они неверны или истекли | войти (заново) |
+| **403** Forbidden | «Я знаю, кто вы, и вам это нельзя» | показать «нет доступа», а не повторять запрос |
+| **404** Not Found | используется ещё и для того, чтобы **скрыть** существующее, но чужое | считать, что этого нет |
+
+Да, 401 почему-то называется «Unauthorized», хотя речь в нём об аутентификации. Вините историю.
+
+## Хранение паролей
+
+Правило номер один: **никогда не храните пароли**. Храните то, что позволяет **проверить** пароль, но не позволяет его восстановить. Когда (а не «если») ваша база утечёт, именно это отличает «смените пароль на всякий случай» от захвата почтовых ящиков всех пользователей — ведь люди повторяют пароли.
+
+### Почему простого хеша мало
+
+**Хеш (hash)** вроде SHA-256 превращает любой ввод в «отпечаток» фиксированного размера, и обратить его нельзя. Так почему бы не хранить `sha256(password)`? Посмотрите на двух пользователей с одинаковым паролем:
+
+<CodeExample output={`ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f
+true`}>
+
+```js
+const encoder = new TextEncoder();
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256", encoder.encode(text)
+  );
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+const mei = await sha256Hex("password123");
+const po = await sha256Hex("password123");
+console.log(mei);
+console.log(mei === po);
+```
+
+</CodeExample>
+
+Две проблемы:
+
+- **Одинаковый пароль — одинаковый хеш.** У атакующих есть заранее вычисленные таблицы хешей миллиардов популярных паролей, так что `ef92b778…` находится мгновенно. И все пользователи с этим хешем попадаются разом.
+- **Он быстрый.** SHA-256 (а также MD5 и SHA-1) специально сделаны быстрыми. Одна игровая видеокарта считает **миллиарды** хешей SHA-256 в секунду, так что перебором находятся даже необычные пароли.
+
+### Медленные хеши с солью
+
+Исправление состоит из двух частей:
+
+- **Соль (salt)**: случайные байты, свои для каждого пользователя, которые подмешиваются в хеш и хранятся рядом с ним. Теперь одинаковые пароли дают разные хеши, а заранее вычисленные таблицы бесполезны.
+- **Медленная** функция, которая нарочно много раз повторяет свою работу. Проверка входа за 100 мс для пользователя незаметна, а вот перебор миллиардов паролей становится неподъёмно дорогим.
+
+**PBKDF2** — медленный хеш с солью, встроенный в каждый браузер и Node через `crypto.subtle`. Всё, что понадобится для проверки пароля позже, мы храним в одной строке: алгоритм, число итераций, соль и хеш.
+
+<CodeExample output={`[ 13, 4, 22, 43 ]
+true false
+16`}>
+
+```js
+const encoder = new TextEncoder();
+// Мало, чтобы пример шёл мгновенно. В реальности: 600_000+!
+const ITERATIONS = 1_000;
+
+const toBase64Url = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+
+const fromBase64Url = (text) =>
+  Uint8Array.from(
+    atob(text.replaceAll("-", "+").replaceAll("_", "/")),
+    (char) => char.charCodeAt(0)
+  );
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations },
+    key,
+    256 // бит = 32 байта
+  );
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt, ITERATIONS);
+  return ["pbkdf2-sha256", ITERATIONS,
+    toBase64Url(salt), toBase64Url(hash)].join("$");
+}
+
+const mei = await hashPassword("password123");
+const po = await hashPassword("password123");
+console.log(mei.split("$").map((part) => String(part).length));
+console.log(mei.startsWith("pbkdf2-sha256$1000$"), mei === po);
+console.log(fromBase64Url(mei.split("$")[2]).length);
+```
+
+</CodeExample>
+
+Сохранённая строка выглядит как `pbkdf2-sha256$1000$<salt>$<hash>`, и теперь один и тот же пароль даёт у Mei и Po **разный** результат. (Мы печатаем длины, а не сами значения, потому что соль случайна: при вашем запуске байты будут другими — в этом весь смысл.) Алгоритм и число итераций хранятся **внутри** строки, поэтому стоимость можно повысить позже: старые хеши по-прежнему проверяются, а при следующем входе каждого пользователя вы перехешируете пароль с новыми настройками.
+
+### Проверка за постоянное время
+
+Чтобы проверить вход, разбейте сохранённую строку, снова запустите PBKDF2 с **той же солью и тем же числом итераций** и сравните результат с сохранённым хешем:
+
+<CodeExample output={`true
+false
+false`}>
+
+```js
+const encoder = new TextEncoder();
+const ITERATIONS = 1_000; // в реальных приложениях: 600_000+
+
+const toBase64Url = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+const fromBase64Url = (text) =>
+  Uint8Array.from(
+    atob(text.replaceAll("-", "+").replaceAll("_", "/")),
+    (char) => char.charCodeAt(0)
+  );
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256
+  );
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt, ITERATIONS);
+  return ["pbkdf2-sha256", ITERATIONS,
+    toBase64Url(salt), toBase64Url(hash)].join("$");
+}
+
+// Смотрит на каждый байт, даже найдя различие
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
+}
+
+async function verifyPassword(password, stored) {
+  const [scheme, iterations, salt, hash] = stored.split("$");
+  if (scheme !== "pbkdf2-sha256") return false;
+  const actual = await pbkdf2(
+    password, fromBase64Url(salt), Number(iterations)
+  );
+  return timingSafeEqual(actual, fromBase64Url(hash));
+}
+
+const phrase = "correct horse battery staple";
+const stored = await hashPassword(phrase);
+console.log(await verifyPassword(phrase, stored));
+console.log(await verifyPassword(phrase.toUpperCase(), stored));
+console.log(await verifyPassword("anything", "md5$5f4dcc3b5aa7"));
+```
+
+</CodeExample>
+
+Почему бы просто не сравнить через `===`? Обычное сравнение строк или байтов **останавливается на первом различии**, поэтому неверная догадка, которая начинается с правильных байтов, отклоняется чуть-чуть дольше. За множество запросов атакующий может это измерить и восстановить секрет (API-ключ, подпись токена) байт за байтом. Это **атака по времени (timing attack)**. `timingSafeEqual` всегда проходит по всем байтам, так что время не зависит от того, где различие. В Node используйте встроенный `crypto.timingSafeEqual(bufferA, bufferB)`, а для HMAC-подписей это сделает за вас `crypto.subtle.verify` — вы увидите это ниже.
+
+### В продакшене: Argon2id или bcrypt
+
+PBKDF2 вполне годится (его требуют многие государственные стандарты), но его слабость в том, что видеокарты отлично его считают. **Argon2id** и **scrypt** ещё и **требовательны к памяти (memory-hard)**: каждой догадке нужно много оперативной памяти, а дёшево распараллелить это видеокарты не могут. Текущие минимальные требования OWASP: Argon2id с 19 МиБ памяти и 2 итерациями, scrypt с N = 2^17, bcrypt со стоимостью 10 или PBKDF2-SHA256 с **600 000** итераций. На вашем компьютере:
+
+```bash
+npm install argon2   # или: npm install bcrypt
+```
+
+```js
+import argon2 from "argon2";
+
+// Argon2id с разумными настройками по умолчанию; соль и параметры
+// хранятся внутри строки результата, как у нас выше
+const hash = await argon2.hash(password);
+const ok = await argon2.verify(hash, password);
+
+// bcrypt: стоимость 12 — хорошее начало
+// (он учитывает только первые 72 байта)
+import bcrypt from "bcrypt";
+const hash2 = await bcrypt.hash(password, 12);
+const ok2 = await bcrypt.compare(password, hash2);
+```
+
+Если устанавливать нативные пакеты нельзя, в Node есть встроенный `crypto.scrypt`. Что бы вы ни выбрали, **подберите стоимость** так, чтобы один хеш занимал на вашем сервере примерно 100–500 мс, и никогда не пишите собственный алгоритм.
+
+## Сессии на cookie
+
+После успешного входа браузеру нужно что-то, что он будет отправлять со всеми следующими запросами, чтобы пользователь не вводил пароль каждый раз. Классический ответ — **сессия (session)**:
+
+1. Сервер создаёт длинный, случайный, неугадываемый **идентификатор сессии (session id)** и запоминает, что он означает (`id → пользователь`), в **хранилище сессий (session store)**.
+2. Он отправляет id браузеру в **cookie** через заголовок `Set-Cookie`.
+3. Браузер автоматически возвращает cookie с каждым запросом к этому сайту, а сервер находит по нему сессию.
+
+В Express `res.cookie()` устанавливает cookie, а middleware `cookie-parser` читает входящие cookie в `req.cookies`. `request.agent(app)` из Supertest сохраняет cookie между запросами — совсем как браузер:
+
+<CodeExample output={`[ 'Max-Age=3600', 'Path=/', 'HttpOnly', 'Secure', 'SameSite=Lax' ]
+{ username: 'mei' }
+401
+0`}>
+
+```js
+import express from "express";
+import cookieParser from "cookie-parser";
+import request from "supertest";
+
+// Хранилище сессий: id -> данные. В реальности: Redis или БД.
+const sessions = new Map();
+const HOUR = 60 * 60 * 1000;
+
+const app = express();
+app.use(express.json());
+app.use(cookieParser());
+
+app.post("/login", (req, res) => {
+  // (проверку пароля здесь пропускаем: см. раздел выше)
+  const oldId = req.cookies.sid;
+  if (oldId) sessions.delete(oldId); // ротация: id не повторяем
+
+  const id = crypto.randomUUID(); // неугадываемый
+  sessions.set(id, { username: req.body.username });
+  res.cookie("sid", id, {
+    httpOnly: true,   // JavaScript не может его прочитать
+    secure: true,     // отправляется только по HTTPS
+    sameSite: "lax",  // не отправляется с межсайтовыми POST
+    maxAge: HOUR,     // истекает в браузере через час
+  });
+  res.json({ ok: true });
+});
+
+app.get("/me", (req, res) => {
+  const session = sessions.get(req.cookies.sid);
+  if (!session) {
+    return res.status(401).json({ error: "Not logged in" });
+  }
+  res.json({ username: session.username });
+});
+
+app.post("/logout", (req, res) => {
+  sessions.delete(req.cookies.sid); // удаляем и на сервере
+  res.clearCookie("sid");
+  res.sendStatus(204);
+});
+
+// request.agent сохраняет cookie между запросами, как браузер
+const browser = request.agent(app);
+const login = await browser.post("/login").send({ username: "mei" });
+const [cookie] = login.headers["set-cookie"];
+const hidden = /^(sid|Expires)=/; // случайный id и дата
+console.log(cookie.split("; ").filter((p) => !hidden.test(p)));
+
+console.log((await browser.get("/me")).body);
+await browser.post("/logout");
+console.log((await browser.get("/me")).status);
+console.log(sessions.size);
+```
+
+</CodeExample>
+
+Первая строка показывает **атрибуты** cookie (случайный id и дату мы скрыли). Каждый из них закрывает свою дверь:
+
+| Атрибут | Что делает | Защищает от |
+| --- | --- | --- |
+| `HttpOnly` | `document.cookie` его не видит | кражи сессии через XSS |
+| `Secure` | отправляется только по HTTPS | перехвата в публичном Wi-Fi |
+| `SameSite=Lax` | не отправляется с межсайтовыми POST, в iframe и с `fetch` | CSRF (следующий урок) |
+| `Max-Age` / `Expires` | браузер удалит его по истечении времени | забытых сессий, живущих вечно |
+| `Path` / `Domain` | какие URL получают cookie | утечки на другие пути и поддомены |
+
+Ещё три важные привычки:
+
+- **Меняйте id сессии при входе** (и при изменении прав). Иначе атакующий, который до входа подсунул в браузер жертвы известный ему id сессии (**фиксация сессии, session fixation**), после входа оказался бы залогинен как жертва.
+- **Завершайте сессии и на сервере.** `Max-Age` — лишь указание браузеру; украденная cookie работает, пока **сервер** не забудет сессию. Храните с каждой сессией время истечения (например, 30 минут бездействия и 12 часов максимум) и проверяйте его.
+- **Выход удаляет сессию на сервере**, а не только cookie. В этом большое преимущество сессий: любую можно завершить мгновенно, а после смены пароля — сразу все сессии пользователя.
+
+В настоящем приложении на Express обычно используют `express-session` с хранилищем вроде Redis, а не `Map`, которая исчезает при перезапуске и не делится между серверами. Если назвать cookie `__Host-sid`, браузер ещё и потребует `Secure`, `Path=/` и отсутствие `Domain`, так что поддомен не сможет её перезаписать:
+
+```js
+import session from "express-session";
+import { RedisStore } from "connect-redis";
+
+app.use(session({
+  name: "__Host-sid",
+  secret: process.env.SESSION_SECRET,
+  store: new RedisStore({ client: redisClient }),
+  resave: false,
+  saveUninitialized: false,
+  cookie: { httpOnly: true, secure: true, sameSite: "lax",
+            maxAge: 12 * 60 * 60 * 1000 },
+}));
+
+// после проверки пароля:
+req.session.regenerate((err) => {      // меняем id
+  if (err) return next(err);
+  req.session.userId = user.id;
+  res.json({ ok: true });
+});
+```
+
+## Подписанные токены и JWT
+
+Сессиям на каждом запросе нужен поиск в общем хранилище. Другое большое семейство, **подписанные токены (signed tokens)**, кладёт данные **в сам токен** и добавляет подпись, так что любой сервер, у которого есть ключ, может проверить токен без поиска. Формат, которым пользуются все, — **JWT** (JSON Web Token): три части в base64url через точку, `header.payload.signature`, с подписью **HMAC-SHA256**. Вот токен, собранный через `crypto.subtle`, чтобы вы видели каждый шаг:
+
+<CodeExample output={`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+{ sub: 'mei', role: 'user' }
+43`}>
+
+```js
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const toBase64Url = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+const fromBase64Url = (text) =>
+  Uint8Array.from(
+    atob(text.replaceAll("-", "+").replaceAll("_", "/")),
+    (char) => char.charCodeAt(0)
+  );
+const encodeJson = (value) =>
+  toBase64Url(encoder.encode(JSON.stringify(value)));
+
+async function hmacKey(secret) {
+  return crypto.subtle.importKey(
+    "raw", encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]
+  );
+}
+
+async function signToken(claims, key) {
+  const header = encodeJson({ alg: "HS256", typ: "JWT" });
+  const payload = encodeJson(claims);
+  const data = encoder.encode(`${header}.${payload}`);
+  const mac = await crypto.subtle.sign("HMAC", key, data);
+  const signature = toBase64Url(new Uint8Array(mac));
+  return `${header}.${payload}.${signature}`;
+}
+
+const key = await hmacKey("dev-only-secret"); // в жизни — из окружения
+const token = await signToken({ sub: "mei", role: "user" }, key);
+
+const [header, payload, signature] = token.split(".");
+console.log(header);
+console.log(JSON.parse(decoder.decode(fromBase64Url(payload))));
+console.log(signature.length);
+```
+
+</CodeExample>
+
+Первая строка, `eyJhbGciOi…`, — так начинается почти любой JWT, который вы когда-либо увидите: это просто `{"alg":"HS256","typ":"JWT"}` в base64url. А вторая строка доказывает самый непонятый факт о JWT: **полезную нагрузку (payload) может прочитать кто угодно**, без ключа. Base64 — это кодировка, а не шифрование. JWT **подписан, но не секретен**, поэтому никогда не кладите в него пароли или личные данные.
+
+Поля полезной нагрузки называются **утверждениями (claims)**. Стандартные короткие имена: `sub` (subject — о ком токен), `exp` (expiry — время истечения в **секундах** с 1970 года, а не в миллисекундах), `iat` (issued at — когда выдан), `iss` (issuer — кто выдал) и `aud` (audience — для кого).
+
+### Проверка токена
+
+Проверка — важнейшая половина: **сначала** проверьте подпись (через `crypto.subtle.verify`, который сравнивает за постоянное время), только потом доверяйте полезной нагрузке, и проверьте срок действия. Время `now` — это параметр, поэтому истечение легко протестировать без ожидания:
+
+<CodeExample output={`{ sub: 'mei', role: 'user', exp: 1700000900 }
+подделан -> bad signature
+чужой ключ -> bad signature
+истёк -> token expired
+мусор -> malformed token`}>
+
+```js
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const toBase64Url = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+const fromBase64Url = (text) =>
+  Uint8Array.from(
+    atob(text.replaceAll("-", "+").replaceAll("_", "/")),
+    (char) => char.charCodeAt(0)
+  );
+const encodeJson = (value) =>
+  toBase64Url(encoder.encode(JSON.stringify(value)));
+const decodeJson = (text) =>
+  JSON.parse(decoder.decode(fromBase64Url(text)));
+
+async function hmacKey(secret) {
+  return crypto.subtle.importKey(
+    "raw", encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]
+  );
+}
+
+async function signToken(claims, key) {
+  const header = encodeJson({ alg: "HS256", typ: "JWT" });
+  const payload = encodeJson(claims);
+  const data = encoder.encode(`${header}.${payload}`);
+  const mac = await crypto.subtle.sign("HMAC", key, data);
+  const signature = toBase64Url(new Uint8Array(mac));
+  return `${header}.${payload}.${signature}`;
+}
+
+class InvalidToken extends Error {}
+
+async function verifyToken(token, key, now) {
+  const parts = String(token).split(".");
+  if (parts.length !== 3) throw new InvalidToken("malformed token");
+  const [header, payload, signature] = parts;
+  let valid;
+  try {
+    valid = await crypto.subtle.verify(  // проверка за постоянное время
+      "HMAC", key, fromBase64Url(signature),
+      encoder.encode(`${header}.${payload}`)
+    );
+  } catch {
+    throw new InvalidToken("malformed token");
+  }
+  if (!valid) throw new InvalidToken("bad signature");
+  const claims = decodeJson(payload); // только теперь доверяем данным
+  if (now >= claims.exp) throw new InvalidToken("token expired");
+  return claims;
+}
+
+const key = await hmacKey("dev-only-secret");
+const issuedAt = 1_700_000_000; // секунды, как в exp у JWT
+const token = await signToken(
+  { sub: "mei", role: "user", exp: issuedAt + 15 * 60 }, key
+);
+console.log(await verifyToken(token, key, issuedAt + 60));
+
+const [header, , signature] = token.split(".");
+const evil = encodeJson({ sub: "mei", role: "admin", exp: 2e9 });
+const attempts = [
+  ["подделан", `${header}.${evil}.${signature}`, key],
+  ["чужой ключ", token, await hmacKey("guessed-secret")],
+  ["истёк", token, key],
+  ["мусор", "not-a-token", key],
+];
+for (const [name, candidate, candidateKey] of attempts) {
+  try {
+    await verifyToken(candidate, candidateKey, issuedAt + 901);
+  } catch (error) {
+    console.log(name, "->", error.message);
+  }
+}
+```
+
+</CodeExample>
+
+Mei попыталась повысить себя до `admin`, отредактировав полезную нагрузку, но без секрета сервера она не может создать подходящую подпись. В этом и состоит вся безопасность JWT: **в секретном ключе**. Делайте его длинным и случайным (не меньше 32 случайных байтов), загружайте из окружения и помните: тот, у кого он есть, может выпустить токен для любого пользователя.
+
+Заметьте, что `verifyToken` **игнорирует `alg` из заголовка** и всегда проверяет HMAC-SHA256. В настоящих JWT-библиотеках были знаменитые баги: атакующий ставил `"alg": "none"`, и сервер вообще пропускал проверку подписи.
+
+### В продакшене: используйте библиотеку
+
+Код токенов вручную мы писали ради понимания. В реальных проектах берите поддерживаемую библиотеку, например **`jose`**: она работает в Node, браузерах, Deno, Bun и edge-средах и сама разбирается со стандартными утверждениями, расхождением часов и типами ключей:
+
+```js
+// npm install jose
+import { SignJWT, jwtVerify } from "jose";
+
+const secret = new TextEncoder().encode(process.env.JWT_SECRET);
+
+const token = await new SignJWT({ role: "user" })
+  .setProtectedHeader({ alg: "HS256" })
+  .setSubject(String(user.id))
+  .setIssuedAt()
+  .setExpirationTime("15m")
+  .sign(secret);
+
+// Бросает ошибку, если подпись, алгоритм или срок действия не те
+const { payload } = await jwtVerify(token, secret, {
+  algorithms: ["HS256"],  // всегда фиксируйте допустимые алгоритмы
+});
+```
+
+<Callout type="warning" title="Подводные камни JWT, на которых спотыкаются настоящие команды">
+
+- **JWT нелегко отозвать.** Выход из аккаунта или бан пользователя не останавливают токен, который ещё действителен. Делайте токены доступа короткоживущими (5–15 минут) и дополняйте их **токеном обновления (refresh token)**, который хранится на сервере и который *можно* отозвать. В этот момент вы, по сути, заново изобрели сессии — поэтому для веб-сайта сессии по-прежнему более простой выбор по умолчанию.
+- **Фиксируйте алгоритм** при проверке и проверяйте `exp` (библиотеки делают и то и другое, если передать нужные опции).
+- **Подписан, но не зашифрован**: всё в полезной нагрузке можно прочитать.
+- Используйте **асимметричные ключи** (RS256, ES256, EdDSA), когда ваши токены проверяют другие сервисы: они получают только открытый ключ и не могут выпускать токены.
+
+</Callout>
+
+## Где браузеру хранить токен?
+
+Если ваш фронтенд получает токен, то место его хранения решает, что атакующий сможет сделать с XSS-уязвимостью (из [прошлого урока](/learn/javascript/xss-and-injection)):
+
+| Хранилище | XSS может украсть? | Отправляется автоматически? | Заметки |
+| --- | --- | --- | --- |
+| Cookie с `HttpOnly` | **нет** (но XSS всё равно может слать запросы, пока страница открыта) | да, поэтому подумайте о CSRF | лучший вариант по умолчанию для своего сайта |
+| `localStorage` | **да**, и он переживает закрытие вкладки | нет, заголовок добавляете вы | просто, но одна XSS = украденный аккаунт |
+| Память JS (переменная) | да, пока страница открыта | нет | теряется при перезагрузке; дополните cookie обновления |
+
+Обычная рекомендация для браузерного приложения, которое общается со **своим** бэкендом: сессия (или токен) в **cookie с `HttpOnly`, `Secure` и `SameSite`**, плюс защита от CSRF там, где она нужна. Bearer-токены в заголовке `Authorization` хороши для мобильных приложений, CLI и вызовов между сервисами, где нет браузерного хранилища cookie.
+
+## Middleware авторизации с ролями
+
+Как только вы знаете, **кто** обращается, каждый защищённый маршрут должен проверить, **что** ему можно. В Express это middleware: `requireLogin` находит пользователя, а **фабрика** middleware `requireRole(...roles)` возвращает middleware для ролей, нужных маршруту:
+
+<CodeExample output={`/admin/stats nobody 401 { error: 'Not logged in' }
+/admin/stats sess-mei 403 { error: 'Forbidden' }
+/admin/stats sess-boss 200 { notes: 2 }
+/notes/1 sess-mei 200 { owner: 'mei', text: 'Buy bamboo' }
+/notes/2 sess-mei 404 { error: 'Note not found' }`}>
+
+```js
+import express from "express";
+import cookieParser from "cookie-parser";
+import request from "supertest";
+
+// Представим, что эти сессии создал /login
+const sessions = new Map([
+  ["sess-mei", { username: "mei", role: "user" }],
+  ["sess-boss", { username: "boss", role: "admin" }],
+]);
+const notes = new Map([
+  ["1", { owner: "mei", text: "Buy bamboo" }],
+  ["2", { owner: "boss", text: "Raise prices" }],
+]);
+
+function requireLogin(req, res, next) {
+  const user = sessions.get(req.cookies.sid);
+  if (!user) {
+    return res.status(401).json({ error: "Not logged in" });
+  }
+  req.user = user;
+  next();
+}
+
+// Фабрика middleware: каждый маршрут говорит, какие роли ему нужны
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    next();
+  };
+}
+
+const app = express();
+app.use(cookieParser());
+
+app.get("/admin/stats", requireLogin, requireRole("admin"),
+  (req, res) => res.json({ notes: notes.size }));
+
+app.get("/notes/:id", requireLogin, (req, res) => {
+  const note = notes.get(req.params.id);
+  // владение: чужая заметка выглядит точно так же, как несуществующая
+  if (!note || note.owner !== req.user.username) {
+    return res.status(404).json({ error: "Note not found" });
+  }
+  res.json(note);
+});
+
+const as = (sid) => ["Cookie", `sid=${sid}`];
+const checks = [
+  ["/admin/stats", "nobody"],
+  ["/admin/stats", "sess-mei"],
+  ["/admin/stats", "sess-boss"],
+  ["/notes/1", "sess-mei"],
+  ["/notes/2", "sess-mei"],
+];
+for (const [url, sid] of checks) {
+  const res = await request(app).get(url).set(...as(sid));
+  console.log(url, sid, res.status, res.body);
+}
+```
+
+</CodeExample>
+
+Последняя строка — это проверка, которую забывают чаще всего: **владение**. Mei вошла, и заметка 2 существует, но она не её. Если об этом забыть, получится **IDOR** (Insecure Direct Object Reference, небезопасная прямая ссылка на объект), или «Broken Object Level Authorization» в списке OWASP для API, где это риск номер один: поменяйте `/notes/1` на `/notes/2` в URL — и читайте чужие данные. Ответ 404 вместо 403 к тому же не подтверждает, что заметка 2 существует.
+
+<Callout type="tip" title="Запрещено по умолчанию">
+
+Сделайте «защищённый» поведением по умолчанию, а не тем, о чём должен помнить каждый маршрут: подключайте `requireLogin` к целым роутерам (`apiRouter.use(requireLogin)`), а немногие публичные маршруты (вход, регистрация, `/health`) держите в отдельном роутере. Затем добавьте один тест, который вызывает каждый маршрут без cookie и ожидает 401: он поймает эндпоинт, про который кто-то забыл. Когда приложение растёт, роли превращаются в **права доступа (permissions)** (`notes:read`, `billing:write`), но шаблон остаётся тем же.
+
+</Callout>
+
+## Замедляем подбор паролей
+
+Даже идеальное хеширование не мешает атакующему просто **пробовать** пароли через вашу форму входа: много паролей для одного аккаунта (**перебор, brute force**) или утёкшие с других сайтов пары логин/пароль (**подстановка учётных данных, credential stuffing**). Считайте неудачи по аккаунту и по IP-адресу и после слишком многих блокируйте вход на время. Как всегда, внедряйте часы как зависимость, чтобы это можно было протестировать:
+
+<CodeExample output={`после 3 неудач: true
+другой пользователь: false
+через 15 минут: false`}>
+
+```js
+function createLoginThrottle({ maxFailures, windowMs, now }) {
+  const failures = new Map(); // ключ -> время неудачных попыток
+
+  const recent = (key) =>
+    (failures.get(key) ?? []).filter((t) => now() - t < windowMs);
+
+  return {
+    isLocked: (key) => recent(key).length >= maxFailures,
+    fail: (key) => failures.set(key, [...recent(key), now()]),
+    succeed: (key) => failures.delete(key),
+  };
+}
+
+let time = 0; // фейковые часы: тесты двигают время вручную
+const throttle = createLoginThrottle({
+  maxFailures: 3, windowMs: 15 * 60_000, now: () => time,
+});
+
+const key = "mei|203.0.113.7"; // имя пользователя + IP-адрес
+for (let i = 0; i < 3; i++) {
+  throttle.fail(key);
+  time += 1000;
+}
+console.log("после 3 неудач:", throttle.isLocked(key));
+console.log("другой пользователь:", throttle.isLocked("po|203.0.113.7"));
+time += 15 * 60_000;
+console.log("через 15 минут:", throttle.isLocked(key));
+```
+
+</CodeExample>
+
+Маршрут входа сначала проверяет `isLocked` и отвечает **429 Too Many Requests**, при неверном пароле вызывает `fail`, а при верном — `succeed`. В продакшене:
+
+- Храните счётчики в **общем хранилище** (Redis), чтобы их видел каждый сервер, или используйте `express-rate-limit` с хранилищем в Redis для простых лимитов по IP на `/login`, `/signup` и `/forgot-password`.
+- Отвечайте **одной и той же** ошибкой на «нет такого пользователя» и «неверный пароль» (`Invalid username or password`), чтобы атакующие не могли выяснить, у каких адресов почты есть аккаунты.
+- Блокируйте с **растущими задержками**, а не навсегда, иначе атакующие смогут нарочно блокировать настоящих пользователей.
+- Предложите **многофакторную аутентификацию (MFA)** и **ключи доступа (passkeys, WebAuthn)**: тогда одного украденного пароля мало. Помогает и проверка новых паролей по базам утёкших (например, через range API сервиса Have I Been Pwned).
+
+```js
+// npm install express-rate-limit
+import { rateLimit } from "express-rate-limit";
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,              // 10 попыток с одного IP за 15 минут
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+});
+app.post("/login", loginLimiter, loginHandler);
+```
+
+<Quiz
+  question="Ваша таблица пользователей утекла. Какое сохранённое значение сильнее всего усложнит атакующему восстановление исходных паролей?"
+  options={["sha256(password)", "md5(password + секретный «перец», общий для всех пользователей)", "argon2id со случайной солью для каждого пользователя, настроенный примерно на 200 мс на хеш", "Пароль, зашифрованный AES, с ключом в той же базе данных"]}
+  answer={2}
+  explanation="Медленный, требовательный к памяти хеш с уникальной солью для каждого пользователя делает дорогой каждую отдельную догадку и обесценивает заранее вычисленные таблицы. Быстрые хеши (SHA-256, MD5) можно перебирать миллиарды раз в секунду, а шифрование обратит любой, кто найдёт ключ."
+/>
+
+<Quiz
+  question="Пользователь меняет в полезной нагрузке своего HS256 JWT роль user на admin и отправляет токен обратно. Что произойдёт при правильной проверке и почему?"
+  options={["Сработает, ведь полезная нагрузка — просто base64, и изменить её может кто угодно", "Будет отклонён: подпись вычислена по исходным заголовку и полезной нагрузке с секретом сервера, поэтому больше не совпадает", "Будет отклонён, потому что полезная нагрузка JWT зашифрована", "Будет работать, пока токен не истечёт, ведь сервер проверяет только exp"]}
+  answer={1}
+  explanation="Прочитать и изменить полезную нагрузку может кто угодно, но подпись — это HMAC заголовка и полезной нагрузки на ключе, который есть только у сервера. Если пересчитать его по изменённой нагрузке, получится другое значение, поэтому проверка не проходит."
+/>
+
+<Exercise
+  title="Войти, остаться, выйти"
+  starter={`import express from "express";
+import cookieParser from "cookie-parser";
+import request from "supertest";
+
+// ---------- функции для паролей из урока (готовы) ----------
+const encoder = new TextEncoder();
+const toB64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const fromB64 = (text) =>
+  Uint8Array.from(atob(text), (char) => char.charCodeAt(0));
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256
+  );
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password, iterations = 1_000) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt, iterations);
+  return \`pbkdf2$\${iterations}$\${toB64(salt)}$\${toB64(hash)}\`;
+}
+
+async function verifyPassword(password, stored) {
+  const [, iterations, salt, hash] = stored.split("$");
+  const actual = await pbkdf2(
+    password, fromB64(salt), Number(iterations)
+  );
+  const expected = fromB64(hash);
+  let diff = actual.length ^ expected.length;
+  for (let i = 0; i < actual.length; i++) {
+    diff |= actual[i] ^ expected[i];
+  }
+  return diff === 0;
+}
+// --------------------------------------------------------------
+
+const HOUR = 60 * 60 * 1000;
+
+async function createApp() {
+  const users = new Map([
+    ["mei", { role: "user", hash: await hashPassword("bamboo") }],
+    ["boss", { role: "admin", hash: await hashPassword("s3cret") }],
+  ]);
+  const sessions = new Map(); // id сессии -> имя пользователя
+
+  const app = express();
+  app.use(express.json());
+  app.use(cookieParser());
+
+  app.post("/login", async (req, res) => {
+    const { username, password } = req.body ?? {};
+    // TODO 1: 400 { error: "Invalid input" }, если оба не строки
+    // TODO 2: 401 { error: "Invalid username or password" } для
+    //         неизвестного пользователя ИЛИ неверного пароля (verifyPassword)
+    // TODO 3: удалите старую сессию (req.cookies.sid), создайте новый
+    //         id через crypto.randomUUID(), сохраните его в sessions и
+    //         установите cookie "sid": httpOnly, secure, sameSite "lax",
+    //         maxAge HOUR. Ответьте { username, role }.
+    res.status(501).json({ error: "Not implemented" });
+  });
+
+  function requireLogin(req, res, next) {
+    // TODO 4: найдите req.cookies.sid в sessions; если сессии
+    //         нет — 401 { error: "Not logged in" }. Иначе
+    //         запишите req.user = { username, role } и вызовите next()
+    next();
+  }
+
+  function requireRole(role) {
+    // TODO 5: 403 { error: "Forbidden" }, если req.user.role
+    //         не равна нужной роли
+    return (req, res, next) => next();
+  }
+
+  app.get("/me", requireLogin, (req, res) => {
+    res.json(req.user);
+  });
+
+  app.get("/admin/stats", requireLogin, requireRole("admin"),
+    (req, res) => res.json({ users: users.size }));
+
+  app.post("/logout", (req, res) => {
+    // TODO 6: удалите сессию, очистите cookie "sid", ответьте 204
+    res.sendStatus(501);
+  });
+
+  return app;
+}
+
+const browser = request.agent(await createApp());
+const login = await browser
+  .post("/login")
+  .send({ username: "mei", password: "bamboo" });
+console.log("login", login.status, login.body);
+console.log("me", (await browser.get("/me")).body);
+console.log("logout", (await browser.post("/logout")).status);
+console.log("me", (await browser.get("/me")).status);
+`}
+  tests={[
+    { name: "Верный вход устанавливает cookie sid с HttpOnly, Secure, SameSite=Lax на час", check: `await (async () => { const r = await require('supertest')(await createApp()).post('/login').send({ username: 'mei', password: 'bamboo' }); const c = (r.headers['set-cookie'] ?? [])[0] ?? ''; return r.status === 200 && r.body.username === 'mei' && r.body.role === 'user' && /^sid=[^;]{20,}/.test(c) && ['HttpOnly', 'Secure', 'SameSite=Lax', 'Max-Age=3600'].every((f) => c.split('; ').includes(f)); })()` },
+    { name: "Неверный пароль и неизвестный пользователь получают одинаковый 401 и никакой cookie", check: `await (async () => { const api = require('supertest')(await createApp()); const a = await api.post('/login').send({ username: 'mei', password: 'Bamboo' }); const b = await api.post('/login').send({ username: 'nobody', password: 'bamboo' }); return a.status === 401 && b.status === 401 && a.body.error === 'Invalid username or password' && b.body.error === a.body.error && !a.headers['set-cookie'] && !b.headers['set-cookie']; })()` },
+    { name: "Имена пользователей и пароли не строкой получают 400 Invalid input", check: `await (async () => { const api = require('supertest')(await createApp()); const a = await api.post('/login').send({ username: 'mei', password: { $ne: '' } }); const b = await api.post('/login'); const c = await api.post('/login').send({ username: ['boss'], password: 's3cret' }); return [a, b, c].every((r) => r.status === 400 && r.body.error === 'Invalid input' && !r.headers['set-cookie']); })()` },
+    { name: "requireLogin отвечает 401 без действующей сессии и заполняет req.user, если она есть", check: `await (async () => { const app = await createApp(); const api = require('supertest')(app); const anon = await api.get('/me'); const forged = await api.get('/me').set('Cookie', 'sid=boss'); const agent = require('supertest').agent(app); await agent.post('/login').send({ username: 'boss', password: 's3cret' }); const me = await agent.get('/me'); return anon.status === 401 && anon.body.error === 'Not logged in' && forged.status === 401 && me.status === 200 && JSON.stringify(me.body) === JSON.stringify({ username: 'boss', role: 'admin' }); })()` },
+    { name: "Выход отвечает 204, очищает cookie и завершает сессию на сервере", check: `await (async () => { const app = await createApp(); const agent = require('supertest').agent(app); const login = await agent.post('/login').send({ username: 'mei', password: 'bamboo' }); const sid = /sid=([^;]*)/.exec(login.headers['set-cookie'][0])[1]; const out = await agent.post('/logout'); const after = await agent.get('/me'); const replay = await require('supertest')(app).get('/me').set('Cookie', 'sid=' + sid); return out.status === 204 && /^sid=;/.test((out.headers['set-cookie'] ?? [])[0] ?? '') && after.status === 401 && replay.status === 401; })()` },
+    { name: "Повторный вход меняет id сессии, и старый id перестаёт работать", check: `await (async () => { const app = await createApp(); const agent = require('supertest').agent(app); const sidOf = (r) => /sid=([^;]*)/.exec(r.headers['set-cookie'][0])[1]; const first = sidOf(await agent.post('/login').send({ username: 'mei', password: 'bamboo' })); const second = sidOf(await agent.post('/login').send({ username: 'mei', password: 'bamboo' })); const api = require('supertest')(app); const old = await api.get('/me').set('Cookie', 'sid=' + first); const cur = await api.get('/me').set('Cookie', 'sid=' + second); return first !== second && old.status === 401 && cur.status === 200; })()` },
+    { name: "requireRole пускает администраторов, отвечает 403 пользователям и 401 посторонним", check: `await (async () => { const app = await createApp(); const st = require('supertest'); const mei = st.agent(app); await mei.post('/login').send({ username: 'mei', password: 'bamboo' }); const boss = st.agent(app); await boss.post('/login').send({ username: 'boss', password: 's3cret' }); const a = await mei.get('/admin/stats'); const b = await boss.get('/admin/stats'); const c = await st(app).get('/admin/stats'); return a.status === 403 && a.body.error === 'Forbidden' && b.status === 200 && b.body.users === 2 && c.status === 401; })()` },
+  ]}
+>
+
+Соберите систему входа для небольшого приложения на Express. Функции для паролей из урока уже готовы вверху, а пользователи `mei` (пароль `bamboo`, роль `user`) и `boss` (пароль `s3cret`, роль `admin`) хранятся как хеши PBKDF2 с солью. Нажмите **«Запустить»**, чтобы увидеть, как демонстрация внизу не работает, а затем:
+
+1. **`POST /login`**: отвечайте **400** `{ error: "Invalid input" }`, если `username` и `password` не являются строками (никаких фокусов с `{ "$ne": "" }`).
+2. Для неизвестного пользователя **или** неверного пароля (`await verifyPassword(password, user.hash)`) отвечайте **401** с одинаковым `{ error: "Invalid username or password" }`.
+3. При успехе **смените** сессию: удалите старую (`req.cookies.sid`), создайте новый id через `crypto.randomUUID()`, сохраните `id → username` в `sessions` и установите cookie `sid` с `httpOnly: true`, `secure: true`, `sameSite: "lax"` и `maxAge: HOUR`. Ответьте `{ username, role }`.
+4. **`requireLogin`**: найдите cookie в `sessions`. Нет сессии — **401** `{ error: "Not logged in" }`. Иначе запишите `req.user = { username, role }` и вызовите `next()`.
+5. **`requireRole(role)`** возвращает middleware, который отвечает **403** `{ error: "Forbidden" }`, если `req.user.role !== role`.
+6. **`POST /logout`**: удалите сессию на сервере, вызовите `res.clearCookie("sid")` и ответьте **204**.
+
+Проверки входят через `request.agent`, повторно отправляют старые cookie после выхода и после второго входа и пробуют маршрут администратора от имени каждого пользователя.
+
+<Hint>
+
+В `/login` сначала проверьте типы, затем `const user = users.get(username);` и `if (!user || !(await verifyPassword(password, user.hash)))`. Обратите внимание на скобки вокруг `await`: `!await ...` тоже сработает, но это легко неправильно прочитать. `sessions.delete(undefined)` ничего не ломает, поэтому `req.cookies.sid` можно удалять всегда, перед созданием нового id. В `requireLogin` вызов `sessions.get(req.cookies.sid)` даёт имя пользователя, а роль берётся из `users.get(username).role`.
+
+</Hint>
+
+<Solution>
+
+```js
+import express from "express";
+import cookieParser from "cookie-parser";
+import request from "supertest";
+
+// ---------- функции для паролей из урока (готовы) ----------
+const encoder = new TextEncoder();
+const toB64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const fromB64 = (text) =>
+  Uint8Array.from(atob(text), (char) => char.charCodeAt(0));
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256
+  );
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password, iterations = 1_000) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt, iterations);
+  return `pbkdf2$${iterations}$${toB64(salt)}$${toB64(hash)}`;
+}
+
+async function verifyPassword(password, stored) {
+  const [, iterations, salt, hash] = stored.split("$");
+  const actual = await pbkdf2(
+    password, fromB64(salt), Number(iterations)
+  );
+  const expected = fromB64(hash);
+  let diff = actual.length ^ expected.length;
+  for (let i = 0; i < actual.length; i++) {
+    diff |= actual[i] ^ expected[i];
+  }
+  return diff === 0;
+}
+// --------------------------------------------------------------
+
+const HOUR = 60 * 60 * 1000;
+
+async function createApp() {
+  const users = new Map([
+    ["mei", { role: "user", hash: await hashPassword("bamboo") }],
+    ["boss", { role: "admin", hash: await hashPassword("s3cret") }],
+  ]);
+  const sessions = new Map(); // id сессии -> имя пользователя
+
+  const app = express();
+  app.use(express.json());
+  app.use(cookieParser());
+
+  app.post("/login", async (req, res) => {
+    const { username, password } = req.body ?? {};
+    if (typeof username !== "string" ||
+        typeof password !== "string") {
+      return res.status(400).json({ error: "Invalid input" });
+    }
+    const user = users.get(username);
+    if (!user || !(await verifyPassword(password, user.hash))) {
+      return res
+        .status(401)
+        .json({ error: "Invalid username or password" });
+    }
+    sessions.delete(req.cookies.sid); // меняем id сессии
+    const id = crypto.randomUUID();
+    sessions.set(id, username);
+    res.cookie("sid", id, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      maxAge: HOUR,
+    });
+    res.json({ username, role: user.role });
+  });
+
+  function requireLogin(req, res, next) {
+    const username = sessions.get(req.cookies.sid);
+    if (!username) {
+      return res.status(401).json({ error: "Not logged in" });
+    }
+    req.user = { username, role: users.get(username).role };
+    next();
+  }
+
+  function requireRole(role) {
+    return (req, res, next) => {
+      if (req.user.role !== role) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+      next();
+    };
+  }
+
+  app.get("/me", requireLogin, (req, res) => {
+    res.json(req.user);
+  });
+
+  app.get("/admin/stats", requireLogin, requireRole("admin"),
+    (req, res) => res.json({ users: users.size }));
+
+  app.post("/logout", (req, res) => {
+    sessions.delete(req.cookies.sid);
+    res.clearCookie("sid");
+    res.sendStatus(204);
+  });
+
+  return app;
+}
+
+const browser = request.agent(await createApp());
+const login = await browser
+  .post("/login")
+  .send({ username: "mei", password: "bamboo" });
+console.log("login", login.status, login.body);
+console.log("me", (await browser.get("/me")).body);
+console.log("logout", (await browser.post("/logout")).status);
+console.log("me", (await browser.get("/me")).status);
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Аутентификация** — это *кто вы* (неудача — **401**); **авторизация** — это *что вам можно* (неудача — **403** или **404**, чтобы скрыть чужое).
+- Никогда не храните пароли или их быстрые хеши. Используйте **медленный хеш с солью**: Argon2id или bcrypt в продакшене либо PBKDF2 с 600 000+ итераций (`crypto.subtle` это умеет). Храните алгоритм, стоимость, соль и хеш вместе.
+- Сравнивайте секреты **за постоянное время** (`crypto.timingSafeEqual`, `crypto.subtle.verify`), чтобы избежать атак по времени.
+- **Сессии**: случайный id в cookie с `HttpOnly`, `Secure`, `SameSite` и сроком действия; меняйте id при входе, завершайте сессии на сервере и удаляйте их при выходе. `cookie-parser` читает `req.cookies`; `request.agent` тестирует это как браузер.
+- **JWT** — это `header.payload.signature`: **подписан, но не зашифрован**. Проверяйте подпись, прежде чем чему-либо доверять, фиксируйте алгоритм, проверяйте `exp`, делайте токены короткоживущими и используйте библиотеку вроде `jose`.
+- В браузерных приложениях храните токены в cookie с `HttpOnly`, а не в `localStorage`: XSS может прочитать `localStorage`.
+- Защищайте маршруты через **middleware**: `requireLogin`, `requireRole(...roles)` — и всегда проверяйте **владение** (IDOR). Запрещено по умолчанию.
+- Замедляйте подбор **лимитами по аккаунту и по IP**, одинаковыми сообщениями об ошибках и MFA или ключами доступа.

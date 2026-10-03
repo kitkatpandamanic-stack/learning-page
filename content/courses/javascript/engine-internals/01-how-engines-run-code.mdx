@@ -1,0 +1,642 @@
+---
+title: How JavaScript Engines Run Your Code
+description: Follow your code through the parser, the bytecode interpreter and the optimising JIT, keep object shapes fast, read the call stack, and master hoisting and this.
+duration: 24
+xp: 25
+---
+
+You can build a tested Express API and a React app that talks to it. That's real engineering. But sooner or later you'll meet a bug that only makes sense if you know what the **engine** is doing: a method that "forgets" its object when you pass it as a callback, a variable that exists but can't be read, a function that's fast in a benchmark and slow in production. In this module we open the hood. This first lesson follows your code from text to machine code and explains the rules the engine uses on the way. 🔧
+
+## Engines: the programs that run JavaScript
+
+JavaScript is a language defined by a specification called **ECMAScript**, written by a committee called **TC39**. A new edition comes out every year (ES2024, ES2025...). The spec says what code must *do*, not how to make it fast. That's the job of an **engine**:
+
+| Engine | Made by | Runs in |
+| --- | --- | --- |
+| **V8** | Google | Chrome, Edge, Node.js, Deno, Electron |
+| **SpiderMonkey** | Mozilla | Firefox |
+| **JavaScriptCore** | Apple | Safari, every browser on iOS, Bun |
+
+The engine is only half the story. It knows nothing about pages, timers or files. Those come from the **host**: the browser adds `document`, `fetch` and `setTimeout`; Node.js adds `fs`, `process` and `http`. That's why the same `Array.prototype.map` works everywhere, but `document` doesn't exist in Node.
+
+## From source code to machine code
+
+Modern engines all follow the same broad pipeline. Here it is with V8's names for each part:
+
+```text
+ source code (text)
+       │  parser
+       ▼
+ AST (abstract syntax tree: the structure of your code)
+       │  bytecode generator
+       ▼
+ bytecode ──────▶ Ignition interpreter: starts running straight away,
+       │          and records "type feedback" (what it actually saw)
+       │  this function is hot (runs a lot)?
+       ▼
+ Sparkplug / Maglev / TurboFan: optimising JIT compilers
+ build fast machine code that ASSUMES the types it saw before
+       │  an assumption breaks (a string where it saw numbers)?
+       ▼
+ deoptimise: throw that machine code away, back to bytecode
+```
+
+Step by step:
+
+1. **Parsing.** The parser reads the whole script and builds an **AST**. If there's a syntax error anywhere, nothing runs, not even line 1. (Engines parse function bodies **lazily**: they only check them quickly at first and build the full structure when the function is first called. That makes pages start faster.)
+2. **Bytecode.** The AST becomes **bytecode**, compact instructions for a virtual machine. An **interpreter** runs it immediately. Starting quickly matters more than running fast for code that only runs once.
+3. **JIT compilation.** While interpreting, the engine watches. When a function gets **hot**, an optimising **just-in-time (JIT) compiler** turns it into machine code, using what it observed: "`add` has only ever been called with small integers, so compile an integer addition".
+4. **Deoptimisation.** If an assumption turns out wrong (now `add` gets a string), the engine **deoptimises**: it throws the machine code away and carries on in the interpreter. Your program is still correct; it's just slower until the engine re-optimises.
+
+You can see the parse-first rule for yourself. `new Function(source)` parses code without running it:
+
+<CodeExample output={`SyntaxError
+Nothing ran, not even line 1`}>
+
+```js
+const source = `
+  console.log("line 1 ran");
+  let total = ;
+`;
+
+try {
+  new Function(source); // parse only
+} catch (error) {
+  console.log(error.name);
+  console.log("Nothing ran, not even line 1");
+}
+```
+
+</CodeExample>
+
+On your machine, Node.js can show the JIT at work. Here `add` is optimised, then hit by a string:
+
+```js title="deopt.js"
+function add(a, b) {
+  return a + b;
+}
+for (let i = 0; i < 100_000; i++) add(i, 1); // hot: optimise it
+add("panda", 1); // surprise!
+```
+
+```bash
+node --trace-opt --trace-deopt deopt.js
+# [marking <JSFunction add> for optimization to MAGLEV,
+#    reason: hot and stable]
+# [bailout (kind: deopt-eager, reason: not a Smi):
+#    deoptimizing <JSFunction add>]
+```
+
+"Smi" means *small integer*, V8's fast number format. The optimised code had bet on integers and lost. One deopt is harmless. A function that deoptimises again and again, because it's fed a different type every time, never gets fast.
+
+<Callout type="tip" title="What this means for everyday code">
+
+You don't write code *for* the JIT. You write **boring, consistent** code and the JIT rewards you: functions that get the same types of arguments, arrays that hold one kind of value, objects that keep the same shape. Code like `function process(x)` that accepts a number, a string, an array *or* an object is hard for humans to read and hard for the engine to optimise.
+
+</Callout>
+
+## Hidden classes and inline caches
+
+JavaScript objects look like flexible dictionaries: add a property whenever you like. A naive engine would store every object as a hash table and look up `point.x` by name every time. That's slow, so engines secretly give objects a **shape** (V8 calls it a *hidden class* or *map*). The shape records which properties the object has, **in which order**, and where each one sits in memory:
+
+```text
+const a = { x: 1, y: 2 };     shape S1: x at slot 0, y at slot 1
+const b = { x: 5, y: 9 };     shape S1 again (same keys, same order)
+const c = { y: 2, x: 1 };     shape S2: y at slot 0, x at slot 1
+```
+
+Objects with the same shape share it, so the shape costs almost nothing per object. Now the clever part: an **inline cache**. The first time a line like `total += point.x` runs, the engine looks `x` up properly and remembers: "for shape S1, `x` is in slot 0". Next time it sees an S1 object there, it skips the lookup entirely. A property access site that only ever sees one shape is **monomorphic** (fast). A few shapes make it **polymorphic** (a bit slower). Many shapes make it **megamorphic**: the engine gives up caching and does the slow lookup every time.
+
+Property **order** is part of the shape, and objects really do remember it:
+
+<CodeExample output={`[ 'x', 'y' ] [ 'y', 'x' ]
+User { id: 1, name: 'Mei', email: undefined }
+[ 'id', 'name', 'email' ]`}>
+
+```js
+const a = { x: 1, y: 2 };
+const b = { y: 2, x: 1 };
+console.log(Object.keys(a), Object.keys(b)); // two shapes
+
+class User {
+  constructor(id, name, email) {
+    // Every field, every time, same order: one shape
+    this.id = id;
+    this.name = name;
+    this.email = email; // even when it's undefined
+  }
+}
+const mei = new User(1, "Mei");
+console.log(mei);
+console.log(Object.keys(mei));
+```
+
+</CodeExample>
+
+Habits that keep shapes stable:
+
+- **Initialise every field in the constructor** (or as class fields), in the same order, even if the value is `null` or `undefined` for now. Don't add properties later in random places.
+- **Don't `delete` properties** from objects you keep using. In V8, `delete` often turns the object into slow "dictionary mode". Set the property to `undefined`, or build a new object without it: `const { password, ...safeUser } = user;`.
+- If an object really is a dictionary (keys come from data, added and removed all the time), use a **`Map`**. That's what it's built for.
+
+On your machine you can ask V8 directly with a debugging flag (these `%` functions are not real JavaScript, they only work with the flag):
+
+```js title="shapes.js"
+class Point {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
+  }
+}
+const a = new Point(1, 2);
+const b = new Point(3, 4);
+const c = { y: 4, x: 3 };
+const d = new Point(5, 6);
+d.z = 7;
+const e = new Point(1, 2);
+delete e.y;
+
+console.log(%HaveSameMap(a, b)); // true
+console.log(%HaveSameMap(a, c)); // false: other order
+console.log(%HaveSameMap(a, d)); // false: extra property
+console.log(%HasFastProperties(e)); // false: dictionary mode
+```
+
+```bash
+node --allow-natives-syntax shapes.js
+```
+
+How much does it matter? Run this benchmark yourself. It sums the same numbers from objects with one shape and from objects with 30 different shapes. On a typical laptop the many-shapes version is around **3 times slower**, but the exact numbers depend on your machine and browser, so don't trust anybody's numbers (including ours) without measuring:
+
+<TryIt code={`// Same data, two ways of building the objects
+function makeSame(i) {
+  return { id: i, x: i, y: i };
+}
+function makeMixed(i) {
+  const point = {};
+  point["tag" + (i % 30)] = true; // 30 different shapes
+  point.x = i;
+  point.y = i;
+  return point;
+}
+
+// Two identical functions, so each one learns its own shapes
+function sumSame(points) {
+  let total = 0;
+  for (let i = 0; i < points.length; i++) total += points[i].x;
+  return total;
+}
+function sumMixed(points) {
+  let total = 0;
+  for (let i = 0; i < points.length; i++) total += points[i].x;
+  return total;
+}
+
+const N = 300_000;
+const same = Array.from({ length: N }, (_, i) => makeSame(i));
+const mixed = Array.from({ length: N }, (_, i) => makeMixed(i));
+
+function bench(fn, data) {
+  for (let i = 0; i < 5; i++) fn(data); // warm up the JIT
+  const start = performance.now();
+  for (let i = 0; i < 50; i++) fn(data);
+  return performance.now() - start;
+}
+
+const tSame = bench(sumSame, same);
+const tMixed = bench(sumMixed, mixed);
+console.log(\`same shape: \${tSame.toFixed(1)} ms\`);
+console.log(\`30 shapes:  \${tMixed.toFixed(1)} ms\`);
+console.log(\`\${(tMixed / tSame).toFixed(1)}x slower\`);
+`}
+/>
+
+Keep this in proportion. A 3× difference in a loop that takes 2 milliseconds is irrelevant; it matters in hot paths that process hundreds of thousands of objects (rendering, parsing, games, data pipelines). Consistent shapes are a free win because they also make code easier to read. Measuring properly is the topic of the performance module.
+
+## Execution contexts and the call stack
+
+Every time a function is called, the engine creates an **execution context** for it: its parameters and local variables, a link to the scope it was defined in (that's how [closures](/learn/javascript/closures-and-higher-order-functions) work), and its value of `this`. The contexts are kept on the **call stack**: calling a function **pushes** a context, returning **pops** it. The engine always runs whatever is on top.
+
+<CodeExample output={`global: calling greet
+  greet: calling shout
+    shout: I'm on top of the stack
+  greet: shout returned
+global: HELLO, MEI!`}>
+
+```js
+function shout(text) {
+  console.log("    shout: I'm on top of the stack");
+  return text.toUpperCase() + "!";
+}
+
+function greet(name) {
+  console.log("  greet: calling shout");
+  const message = shout(`hello, ${name}`);
+  console.log("  greet: shout returned");
+  return message;
+}
+
+console.log("global: calling greet");
+console.log("global:", greet("mei"));
+```
+
+</CodeExample>
+
+At the deepest point the stack holds three contexts: the global code, `greet` and `shout`. A **stack trace** is a snapshot of the call stack at the moment an error was created. Read it from the top: the first line is where it broke, each line below is "who called that":
+
+```text
+TypeError: Cannot read properties of undefined (reading 'toUpperCase')
+    at shout (app.js:2:15)
+    at greet (app.js:7:19)
+    at app.js:13:29
+```
+
+The stack has a fixed size (around ten thousand frames in Chrome and Node, more in Firefox). Recursion without a working base case fills it up:
+
+<CodeExample output={`1000
+RangeError
+Too deep: use a loop or an explicit stack instead`}>
+
+```js
+// Counts how many calls deep it goes
+function depth(n) {
+  if (n === 0) return 0;
+  return 1 + depth(n - 1);
+}
+
+console.log(depth(1_000));
+
+try {
+  depth(1_000_000);
+} catch (error) {
+  console.log(error.name);
+  console.log("Too deep: use a loop or an explicit stack instead");
+}
+```
+
+</CodeExample>
+
+Chrome, Node and Safari throw `RangeError: Maximum call stack size exceeded`; Firefox calls it `InternalError: too much recursion`. Recursion is perfect for tree-shaped data of reasonable depth (menus, comment threads, a JSON document). When the depth comes from **user data** (a linked list of 100,000 items, a deeply nested payload someone sent your API), use a loop. Attackers know that "send something 100,000 levels deep" crashes naive recursive parsers.
+
+## Hoisting and the temporal dead zone
+
+Before the engine runs a function (or a script), it scans it and creates all the variables declared in it. This is called **hoisting**, and each kind of declaration is set up differently:
+
+| Declaration | Created at the start of its scope as... | Using it before the line |
+| --- | --- | --- |
+| `function greet() {}` | the complete function | works |
+| `var count` | `undefined` | gives `undefined`, silently |
+| `let`, `const`, `class` | **uninitialised** | `ReferenceError` |
+
+The time between the start of the scope and the declaration line, during which a `let`/`const`/`class` exists but can't be touched, is called the **temporal dead zone** (TDZ):
+
+<CodeExample output={`function
+undefined
+ReferenceError`}>
+
+```js
+console.log(typeof helper); // hoisted completely
+console.log(count); // hoisted, but the value isn't
+var count = 5;
+
+function helper() {
+  return "I can be called before my line";
+}
+
+try {
+  console.log(total); // in the temporal dead zone
+  const total = 10;
+} catch (error) {
+  console.log(error.name);
+}
+```
+
+</CodeExample>
+
+The TDZ is a feature, not a bug: reading a variable before it has its value is almost always a mistake, and `let`/`const` turn it into a loud error instead of a silent `undefined`. It also catches a sneaky bug with **shadowing**:
+
+<CodeExample output={`ReferenceError
+12`}>
+
+```js
+const price = 10;
+
+function withTax() {
+  // This `price` is the NEW one declared below, still in its TDZ
+  const price = price * 1.2;
+  return price;
+}
+
+try {
+  withTax();
+} catch (error) {
+  console.log(error.name);
+}
+
+function withTaxFixed() {
+  const total = price * 1.2; // a different name: no shadowing
+  return total;
+}
+console.log(withTaxFixed());
+```
+
+</CodeExample>
+
+Because function declarations are hoisted completely, many codebases put the main logic at the top of a file and the helper functions below it. Classes are not: `new Panda()` above `class Panda {}` throws.
+
+## How this is decided
+
+`this` trips up even experienced developers, because it's **not** decided where a function is written. For normal functions it's decided **at call time**, by **how** the function is called. The engine checks these rules in order:
+
+| How it's called | `this` is |
+| --- | --- |
+| `new Thing()` | the brand-new object |
+| `fn.call(obj, ...)`, `fn.apply(obj, [...])`, or a function from `fn.bind(obj)` | `obj` |
+| `obj.fn()` (a **method call**: there's a dot or `[]` right before the call) | `obj` |
+| `fn()` (a **plain call**) | `undefined` in strict mode (modules, classes, this runner); the global object in old sloppy scripts |
+| an **arrow function**, however it's called | the `this` of the code around it, fixed when the arrow is created |
+
+<CodeExample output={`Mei
+nobody (undefined)
+Bao
+Bao
+Bao
+nobody (undefined)`}>
+
+```js
+function whoAmI() {
+  return this === undefined ? "nobody (undefined)" : this.name;
+}
+
+const mei = { name: "Mei", whoAmI };
+const bao = { name: "Bao" };
+
+console.log(mei.whoAmI()); // method call: this = mei
+console.log(whoAmI()); // plain call: undefined
+console.log(whoAmI.call(bao)); // explicit: this = bao
+
+const boundToBao = whoAmI.bind(bao);
+console.log(boundToBao()); // bound for good
+console.log(boundToBao.call(mei)); // bind wins over call
+
+const detached = mei.whoAmI; // just the function, no object
+console.log(detached()); // plain call again!
+```
+
+</CodeExample>
+
+The last line is the key insight: `mei.whoAmI` is just a **reference to a function**. The function doesn't belong to `mei`. The only thing that made `this` equal `mei` was the `mei.` in front of the call, and once you store the function somewhere else, that's gone.
+
+### Arrow functions borrow this
+
+Arrow functions don't have their own `this`. They use the `this` of the surrounding code, which is exactly what you want for callbacks inside methods:
+
+<CodeExample output={`[ 'Mei of the Pandas', 'Bao of the Pandas' ]
+[ 'Mei of the undefined', 'Bao of the undefined' ]`}>
+
+```js
+const team = {
+  name: "Pandas",
+  members: ["Mei", "Bao"],
+  arrowList() {
+    // The arrow uses the method's this: team
+    return this.members.map((m) => `${m} of the ${this.name}`);
+  },
+  functionList() {
+    // map calls this function plainly: its own this is undefined
+    return this.members.map(function (m) {
+      return `${m} of the ${this?.name}`;
+    });
+  },
+};
+
+console.log(team.arrowList());
+console.log(team.functionList());
+```
+
+</CodeExample>
+
+The flip side: **don't** use an arrow function as an object method (`{ name: "Mei", hi: () => this.name }`). It borrows `this` from outside the object, not the object itself.
+
+### The lost-this callback bug
+
+This is the classic. You pass a method as a callback, and whoever calls it later calls it **plainly**:
+
+<CodeExample output={`TypeError
+1
+2
+3`}>
+
+```js
+class Stopwatch {
+  seconds = 0;
+
+  tick() {
+    this.seconds++;
+  }
+}
+
+const watch = new Stopwatch();
+const tick = watch.tick; // same as setInterval(watch.tick, 1000)
+
+try {
+  tick(); // this is undefined: this.seconds blows up
+} catch (error) {
+  console.log(error.name);
+}
+
+// Fix 1: wrap it in an arrow, so it's a method call again
+const viaArrow = () => watch.tick();
+viaArrow();
+console.log(watch.seconds);
+
+// Fix 2: bind it
+const bound = watch.tick.bind(watch);
+bound();
+console.log(watch.seconds);
+
+// Fix 3: an arrow function stored in a class field
+class SafeStopwatch {
+  seconds = 0;
+  tick = () => {
+    this.seconds++; // `this` is the instance, always
+  };
+}
+const safe = new SafeStopwatch();
+const safeTick = safe.tick;
+safeTick();
+safeTick();
+safeTick();
+console.log(safe.seconds);
+```
+
+</CodeExample>
+
+You'll see this bug as `setTimeout(this.save, 1000)`, `button.addEventListener("click", this.open)` (where `this` becomes the **button**, not your object), `promise.then(this.handle)` or destructuring `const { tick } = watch`. Which fix?
+
+- An **arrow wrapper** at the call site is the most explicit and the most common.
+- **Arrow class fields** make a method safe to pass anywhere. The cost: every instance gets its own copy of the function (not shared on the prototype), and subclasses can't call it with `super.tick()`. Great for event handlers, wasteful for a class with a million instances.
+- **`bind`** in the constructor (`this.tick = this.tick.bind(this)`) does the same job; you'll see it in older React class components.
+
+<Callout type="warning" title="this inside event handlers">
+
+With `element.addEventListener("click", function () { ... })`, the browser calls your function with `this` set to the element. Some old code relies on that. In new code, use `event.currentTarget` instead: it's explicit, and it works the same in arrow functions.
+
+</Callout>
+
+<Quiz
+  question="function getName() { return this.name; } const user = { name: 'Mei', getName }; const fn = user.getName; What happens when you call fn() in a module?"
+  options={[
+    "It returns 'Mei'",
+    "It returns undefined",
+    "It throws a TypeError, because this is undefined",
+    "It returns the name of the global object",
+  ]}
+  answer={2}
+  explanation="fn() is a plain call, so this is decided by how the function is called, not where it came from. Modules are strict mode, so this is undefined, and reading undefined.name throws a TypeError."
+/>
+
+<Quiz
+  question="An object built with a = {} and then a.y = 1; a.x = 2 is used in a hot loop together with objects created as { x: 2, y: 1 }. Why can this be slower than necessary?"
+  options={[
+    "Objects with properties added later can't be garbage collected",
+    "The objects have different shapes (different property order), so the property access is no longer monomorphic",
+    "Property order changes the values the loop reads",
+    "The JIT never optimises functions that use object literals",
+  ]}
+  answer={1}
+  explanation="The shape includes the order in which properties were added. Two shapes at one property access make it polymorphic, and with many shapes the inline cache gives up. Creating every object the same way, with all fields in the same order, keeps it monomorphic."
+/>
+
+<Exercise
+  title="Fix the lost this"
+  starter={`// A tiny event bus: it calls handlers as PLAIN functions.
+// (Don't change the bus.)
+const bus = {
+  handlers: {},
+  on(event, handler) {
+    (this.handlers[event] ??= []).push(handler);
+  },
+  emit(event, ...args) {
+    for (const handler of this.handlers[event] ?? []) {
+      handler(...args);
+    }
+  },
+};
+
+// Fix this class so its methods work when they're passed around
+class LikeCounter {
+  constructor(label) {
+    this.label = label;
+    this.likes = 0;
+  }
+
+  like(amount = 1) {
+    this.likes += amount;
+  }
+
+  reset() {
+    this.likes = 0;
+  }
+
+  report() {
+    console.log(\`\${this.label}: \${this.likes} likes\`);
+  }
+}
+
+// Don't change the code below
+const counter = new LikeCounter("Bamboo photo");
+bus.on("like", counter.like);
+bus.on("reset", counter.reset);
+bus.on("report", counter.report);
+
+bus.emit("like");
+bus.emit("like", 2);
+bus.emit("report");
+bus.emit("reset");
+bus.emit("report");
+`}
+  tests={[
+    { name: "Prints the two reports", check: `__output.join("|") === "Bamboo photo: 3 likes|Bamboo photo: 0 likes"` },
+    { name: "like works after destructuring it from an instance", check: `(() => { const c = new LikeCounter("x"); const { like } = c; like(5); like(); return c.likes === 6; })()` },
+    { name: "reset and report work when passed around", check: `(() => { const c = new LikeCounter("Test"); c.likes = 4; const r = c.report; const z = c.reset; r(); z(); r(); return c.likes === 0 && __output.slice(-2).join("|") === "Test: 4 likes|Test: 0 likes"; })()` },
+    { name: "Each counter keeps its own likes", check: `(() => { const a = new LikeCounter("a"); const b = new LikeCounter("b"); const likeA = a.like; const likeB = b.like; likeA(); likeA(); likeB(); return a.likes === 2 && b.likes === 1; })()` },
+    { name: "like still defaults to 1", check: `(() => { const c = new LikeCounter("d"); const f = c.like; f(); return c.likes === 1; })()` },
+    { name: "The bus is unchanged", check: `bus.emit.toString().includes("handler(...args)") && bus.on.toString().includes("push(handler)")` },
+  ]}
+>
+
+A tiny **event bus** calls every handler as a plain function, so the `LikeCounter`'s methods lose their `this` and the program crashes. Fix the **class** (not the bus and not the code at the bottom), so that:
+
+1. The program prints `Bamboo photo: 3 likes` and then `Bamboo photo: 0 likes`.
+2. `like`, `reset` and `report` work even when they're taken off an instance, e.g. `const { like } = counter; like(5);`.
+3. Each counter still keeps its own `likes`, and `like()` still adds 1 by default.
+
+<Hint>
+
+Turn the three methods into **arrow functions stored in class fields**: `like = (amount = 1) => { this.likes += amount; };`. An arrow function takes `this` from where it's created, and class field initialisers run with `this` set to the new instance. (Binding them in the constructor, `this.like = this.like.bind(this);`, works too.)
+
+</Hint>
+
+<Solution>
+
+```js
+// A tiny event bus: it calls handlers as PLAIN functions.
+// (Don't change the bus.)
+const bus = {
+  handlers: {},
+  on(event, handler) {
+    (this.handlers[event] ??= []).push(handler);
+  },
+  emit(event, ...args) {
+    for (const handler of this.handlers[event] ?? []) {
+      handler(...args);
+    }
+  },
+};
+
+// Fix this class so its methods work when they're passed around
+class LikeCounter {
+  constructor(label) {
+    this.label = label;
+    this.likes = 0;
+  }
+
+  like = (amount = 1) => {
+    this.likes += amount;
+  };
+
+  reset = () => {
+    this.likes = 0;
+  };
+
+  report = () => {
+    console.log(`${this.label}: ${this.likes} likes`);
+  };
+}
+
+// Don't change the code below
+const counter = new LikeCounter("Bamboo photo");
+bus.on("like", counter.like);
+bus.on("reset", counter.reset);
+bus.on("report", counter.report);
+
+bus.emit("like");
+bus.emit("like", 2);
+bus.emit("report");
+bus.emit("reset");
+bus.emit("report");
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- JavaScript is specified by **ECMAScript**; **engines** (V8, SpiderMonkey, JavaScriptCore) run it, and the **host** (browser, Node.js) adds APIs like `document`, `fetch` and `fs`.
+- Code is **parsed** into an AST (a syntax error anywhere stops everything), turned into **bytecode** for an interpreter, and hot functions are **JIT-compiled** using observed types. When an assumption breaks, the engine **deoptimises**.
+- Objects get hidden **shapes**; **inline caches** make property access fast when a site sees one shape. Initialise all fields in the constructor in the same order, avoid `delete`, use `Map` for real dictionaries.
+- Each call pushes an **execution context** on the **call stack**; stack traces read top-down; runaway recursion throws `RangeError` (`InternalError` in Firefox), so use loops for data-driven depth.
+- **Hoisting**: function declarations are ready at once, `var` starts as `undefined`, and `let`/`const`/`class` sit in the **temporal dead zone** until their line.
+- `this` is decided **by the call**: `new`, then `call`/`apply`/`bind`, then `obj.method()`, else `undefined` in strict mode. **Arrow functions** borrow `this` from around them. Passing `obj.method` as a callback loses `this`: fix it with an arrow wrapper, `bind` or arrow class fields.

@@ -1,0 +1,974 @@
+---
+title: Функции реального времени и отказоустойчивость
+description: Обновления вживую через polling, SSE или WebSocket, их масштабирование на несколько серверов, а также тайм-ауты, повторы, идемпотентность, circuit breaker и лимиты.
+duration: 25
+xp: 25
+---
+
+Большой экран PandaPoll должен показывать новые голоса в течение секунды. HTTP в том виде, в каком вы им пользовались до сих пор, сам по себе на это не способен: браузер спрашивает, сервер отвечает, и после этого у сервера нет способа что-то сказать браузеру, пока тот не спросит снова. В первой половине урока вы сравните способы получать **обновления вживую (live updates)** и откроете свой первый **WebSocket**. Во второй половине вы сделаете всю систему **отказоустойчивой (resilient)**, ведь когда открыты тысячи соединений и работает несколько сервисов, что-то где-то ломается всегда. ⚡
+
+## Четыре способа получать обновления вживую
+
+| Техника | Как работает | Направление | Подходит для | Подводные камни |
+| --- | --- | --- | --- | --- |
+| **Polling** (опрос) | Клиент спрашивает каждые несколько секунд | Клиент → сервер | Дашбордов, которые могут отставать на 10–30 с | Много пустых ответов; задержка до одного интервала |
+| **Long polling** (долгий опрос) | Сервер держит каждый запрос открытым, пока не появятся новости (или не пройдёт ~30 с), потом клиент спрашивает снова | Сервер → клиент (почти) | Старых браузеров и прокси, редких событий | Один запрос на событие; легко ошибиться в деталях |
+| **Server-Sent Events (SSE)** | Один долгий HTTP-ответ, в который сервер продолжает дописывать события | Только сервер → клиент | Лент новостей, уведомлений, прогресса, потоковых ответов ИИ | Только текст; клиент по-прежнему отправляет данные обычными запросами |
+| **WebSocket** | HTTP-соединение «повышается» (upgrade) до двустороннего канала | В обе стороны | Чатов, игр, совместного редактирования, живых курсоров | Соединения с состоянием: сложнее масштабировать, балансировать и деплоить |
+
+Polling — вполне хороший ответ гораздо чаще, чем принято думать. Это обычный HTTP, поэтому кэширование, балансировщики нагрузки и аутентификация просто работают:
+
+```js
+// Polling: просто, надёжно и с отставанием до 5 секунд
+const timer = setInterval(async () => {
+  const res = await fetch("/polls/7/results");
+  renderResults(await res.json());
+}, 5000);
+// clearInterval(timer), когда страницу закрывают
+```
+
+**SSE** — недооценённая золотая середина. В браузере есть встроенный `EventSource`, который даже **сам переподключается**, а сервер — это просто Express, который пишет в ответ, который никогда не заканчивается:
+
+```js
+// Сервер (Express): один ответ, который остаётся открытым
+app.get("/polls/:id/live", (req, res) => {
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+  });
+  const send = (votes) =>
+    res.write(`data: ${JSON.stringify(votes)}\n\n`); // одно событие
+  pollEvents.on(req.params.id, send);
+  req.on("close", () => pollEvents.off(req.params.id, send));
+});
+
+// Браузер
+const live = new EventSource("/polls/7/live");
+live.onmessage = (event) => renderResults(JSON.parse(event.data));
+```
+
+Как выбирать на практике:
+
+- Обновлений раз в 10+ секунд достаточно? **Polling**. Готово.
+- Сервер отправляет, а клиент в основном слушает (результаты, уведомления, индикаторы прогресса, потоковый текст)? **SSE**.
+- Обе стороны общаются часто и быстро (чат с индикатором «печатает…», многопользовательские игры, совместные редакторы)? **WebSocket**.
+
+Большой экран PandaPoll только *слушает*, так что SSE бы подошёл. Но телефоны отправляют голоса, пульт ведущего постоянно шлёт «следующий вопрос» и «закрыть опрос», а дальше мы построим на той же основе чат, поэтому PandaPoll использует WebSocket. Умение объяснить, почему SSE был реальным вариантом, — ровно то, что хотят услышать на обсуждении архитектуры (design review).
+
+## Как начинается WebSocket-соединение
+
+WebSocket начинает жизнь как обычный HTTP-запрос с несколькими особыми заголовками, который просит сервер **повысить (upgrade)** соединение:
+
+```text
+GET /live?poll=7 HTTP/1.1
+Host: pandapoll.example
+Upgrade: websocket
+Connection: Upgrade
+Origin: https://pandapoll.example
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+После **101 Switching Protocols** в этом соединении больше нет HTTP. Обе стороны отправляют небольшие **фреймы (frames)**, когда захотят: текстовые (обычно с JSON), бинарные и управляющие — **ping/pong**, чтобы проверить, что другая сторона ещё на месте, и **close** с кодом и причиной. Схема URL — `ws://` или `wss://` для версии с шифрованием TLS; в продакшене используйте только её.
+
+Коды закрытия, которые вам встретятся:
+
+| Код | Значение |
+| --- | --- |
+| 1000 | Нормальное закрытие («пока») |
+| 1001 | Уход (страницу закрыли, сервер выключается) |
+| 1006 | Аварийное: соединение оборвалось без фрейма close. Никогда не отправляется, только сообщается |
+| 1008 / 1011 | Нарушение политики / неожиданная ошибка сервера |
+| 4000–4999 | Определяете вы сами, например 4001 "Unauthorized" |
+
+## Ваш первый WebSocket-сервер
+
+PandaDev запускает WebSocket-серверы и клиенты во встроенной сети, поэтому здесь сервер и его клиенты могут жить в одном файле. На вашей машине сервер работает в Node, а клиент — в браузере; код тот же. Вот голосование PandaPoll вживую: сервер отправляет текущие результаты, когда кто-то подключается, принимает голоса и **рассылает (broadcast)** новые результаты на каждый подключённый экран:
+
+<CodeExample output={`экран   получил results { tabs: 0, spaces: 0 }
+телефон получил results { tabs: 0, spaces: 0 }
+экран   получил results { tabs: 0, spaces: 1 }
+телефон получил results { tabs: 0, spaces: 1 }
+телефон получил error Сообщения должны быть в формате JSON
+телефон получил error Неизвестный вариант`}>
+
+```js
+import { WebSocketServer } from "ws";
+
+// ---- Сервер (server.js в Node) ----
+const wss = new WebSocketServer({ port: 8080 });
+const votes = { tabs: 0, spaces: 0 };
+
+function broadcast(message) {
+  const data = JSON.stringify(message);
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(data);
+  }
+}
+
+wss.on("connection", (socket) => {
+  socket.send(JSON.stringify({ type: "results", votes }));
+
+  socket.on("message", (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data);
+    } catch {
+      const error = "Сообщения должны быть в формате JSON";
+      return socket.send(JSON.stringify({ type: "error", error }));
+    }
+    if (msg.type !== "vote" || !Object.hasOwn(votes, msg.option)) {
+      const error = "Неизвестный вариант";
+      return socket.send(JSON.stringify({ type: "error", error }));
+    }
+    votes[msg.option]++;
+    broadcast({ type: "results", votes });
+  });
+});
+
+// ---- Два клиента (код для браузера) ----
+function connect(name) {
+  const ws = new WebSocket("ws://localhost:8080");
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    console.log(name, "получил", msg.type, msg.votes ?? msg.error);
+  };
+  return new Promise((resolve) => (ws.onopen = () => resolve(ws)));
+}
+
+const screen = await connect("экран  ");
+const phone = await connect("телефон");
+phone.send(JSON.stringify({ type: "vote", option: "spaces" }));
+phone.send("за табы, пожалуйста");
+phone.send(JSON.stringify({ type: "vote", option: "toString" }));
+```
+
+</CodeExample>
+
+У двух сторон немного разные API, и стоит заметить, где какое:
+
+- **Сервер** (пакет `ws`): `new WebSocketServer({ port })`, событие `"connection"` на каждого клиента и `socket.on("message", ...)` в стиле Node. `wss.clients` — это `Set` всех подключённых сокетов, поэтому рассылка сводится к простому циклу.
+- **Клиент** (встроенный в браузер `WebSocket`): `onopen`, `onmessage` (текст лежит в `event.data`), `onclose`, `onerror` или те же события через `addEventListener`. Новый сокет начинает в состоянии `CONNECTING`; вызов `send` до `open` выбрасывает исключение.
+- **Никогда не доверяйте сообщению.** Это пользовательский ввод: разбирайте его в `try`/`catch`, проверяйте его форму и отвечайте сообщением об ошибке, а не падайте. Обратите внимание на `Object.hasOwn`: с оператором `in` выражение `"toString" in votes` равно `true` (свойство унаследовано от `Object.prototype`), и голос за `"toString"` был бы засчитан.
+
+Чтобы запустить это по-настоящему, положите серверную часть в `server.js`, а клиентскую — в `<script>` на странице:
+
+```bash
+npm install ws
+node server.js          # слушает ws://localhost:8080
+```
+
+### Проверяем, кто подключается, и тестируем
+
+Рукопожатие (handshake) — это обычный HTTP-запрос, поэтому его можно аутентифицировать: прочитать токен из URL (или cookie) и закрыть соединение своим кодом, если токен неверный. А WebSocket-сервер — это просто код, поэтому его можно тестировать с Vitest: открывать клиенты и ждать их сообщений. Две маленькие вспомогательные функции превращают события в промисы:
+
+<CodeExample output={`✓ сервер опросов > при подключении отправляет текущие результаты
+✓ сервер опросов > рассылает каждый голос всем клиентам
+✓ сервер опросов > закрывает соединение с кодом 4001 при неверном токене
+
+Tests  3 passed (3)`}>
+
+```js
+import { describe, it, expect, afterEach } from "vitest";
+import { WebSocketServer } from "ws";
+
+function createPollServer({ port, options }) {
+  const votes = Object.fromEntries(options.map((o) => [o, 0]));
+  const wss = new WebSocketServer({ port });
+
+  wss.on("connection", (socket, req) => {
+    const url = new URL(req.url, "ws://localhost");
+    if (url.searchParams.get("token") !== "secret") {
+      return socket.close(4001, "Unauthorized");
+    }
+    socket.send(JSON.stringify({ type: "results", votes }));
+    socket.on("message", (data) => {
+      const msg = JSON.parse(data);
+      if (Object.hasOwn(votes, msg.option)) votes[msg.option]++;
+      const update = JSON.stringify({ type: "results", votes });
+      for (const client of wss.clients) client.send(update);
+    });
+  });
+  return wss;
+}
+
+// Помощники для тестов: дождаться следующего сообщения / закрытия
+const nextMessage = (ws) => new Promise((resolve) =>
+  ws.addEventListener("message", (e) => resolve(JSON.parse(e.data)),
+    { once: true }));
+const closed = (ws) => new Promise((resolve) =>
+  ws.addEventListener("close", resolve, { once: true }));
+
+describe("сервер опросов", () => {
+  let wss;
+  afterEach(() => wss.close());
+
+  it("при подключении отправляет текущие результаты", async () => {
+    wss = createPollServer({ port: 9000, options: ["a", "b"] });
+    const ws = new WebSocket("ws://localhost:9000/?token=secret");
+    expect(await nextMessage(ws)).toEqual({
+      type: "results", votes: { a: 0, b: 0 },
+    });
+    ws.close();
+  });
+
+  it("рассылает каждый голос всем клиентам", async () => {
+    wss = createPollServer({ port: 9000, options: ["a", "b"] });
+    const one = new WebSocket("ws://localhost:9000/?token=secret");
+    const two = new WebSocket("ws://localhost:9000/?token=secret");
+    await Promise.all([nextMessage(one), nextMessage(two)]);
+
+    one.send(JSON.stringify({ type: "vote", option: "b" }));
+    const [a, b] = await Promise.all([nextMessage(one),
+      nextMessage(two)]);
+    expect(a.votes).toEqual({ a: 0, b: 1 });
+    expect(b).toEqual(a);
+    one.close();
+    two.close();
+  });
+
+  it("закрывает соединение с кодом 4001 при неверном токене",
+    async () => {
+      wss = createPollServer({ port: 9000, options: ["a"] });
+      const ws = new WebSocket("ws://localhost:9000/?token=nope");
+      const event = await closed(ws);
+      expect(event.code).toBe(4001);
+      expect(event.reason).toBe("Unauthorized");
+    });
+});
+```
+
+</CodeExample>
+
+`createPollServer` получает порт и варианты ответа как параметры, поэтому каждый тест запускает свежий сервер, а `afterEach` его закрывает. Именно в таком стиле вы построите и протестируете полноценный чат-сервер в итоговом проекте.
+
+<Callout type="warning" title="WebSocket обходит некоторые защиты браузера">
+
+CORS к WebSocket не применяется, а cookie браузер отправляет вместе с рукопожатием. Значит, вредоносная страница может открыть сокет к вашему серверу **от имени вашего залогиненного пользователя** (cross-site WebSocket hijacking — межсайтовый перехват WebSocket). Если вы аутентифицируете по cookie, во время рукопожатия сверяйте заголовок `Origin` со списком разрешённых. Токены в URL попадают в логи сервера, поэтому вместо долгоживущих токенов передавайте там короткоживущие одноразовые «билеты на подключение».
+
+</Callout>
+
+## Масштабирование WebSocket на несколько серверов
+
+Обычные HTTP-запросы короткие, и ответить на них может любой сервер. WebSocket-соединения **долгоживущие и с состоянием**, и это меняет правила:
+
+**Каждый сервер знает только свои сокеты.** Если за балансировщиком стоят три сервера, голос, который пришёл на сервер A, должен дойти и до экранов, подключённых к B и C. Обычное решение — **pub/sub** (публикация/подписка): каждый сервер подписывается на канал (в Redis, NATS или Kafka), и сервер, получивший голос, публикует туда новые результаты. Затем каждый сервер пересылает их **своим** клиентам:
+
+```js
+import { createClient } from "redis";
+
+const pub = createClient({ url: process.env.REDIS_URL });
+const sub = pub.duplicate();
+await Promise.all([pub.connect(), sub.connect()]);
+
+// Каждый сервер: пересылаем опубликованные результаты МОИМ клиентам
+await sub.subscribe("poll:7", (message) => {
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(message);
+  }
+});
+
+// Сервер, который получил голос: сообщаем всем серверам
+const update = JSON.stringify({ type: "results", votes });
+await pub.publish("poll:7", update);
+```
+
+**Балансировщик должен разрешать upgrade** и долгие простаивающие соединения. В nginx это несколько строк; облачные балансировщики обычно поддерживают это из коробки:
+
+```nginx
+location /live {
+  proxy_pass http://pandapoll_app;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_read_timeout 1h;   # не обрывать простаивающие сокеты через 60 с
+}
+```
+
+**Липкие сессии (sticky sessions)** — когда балансировщик каждый раз отправляет клиента на один и тот же сервер по cookie или IP — нужны для long polling и для библиотек вроде Socket.IO, которые начинают с polling и только потом переходят на WebSocket. Обычный WebSocket и так всю жизнь остаётся на одном сервере, но **переподключение** может попасть куда угодно, поэтому состояние соединения нужно восстанавливать при переподключении или хранить в общем хранилище.
+
+**Мёртвые соединения не всегда прощаются.** Телефон, который заехал в тоннель, просто перестаёт отвечать, а сервер хранит его сокет (и память) вечно. Стандартное решение — **heartbeat** («сердцебиение»): каждые 30 секунд отправлять ping каждому клиенту и обрывать соединение с теми, кто не ответил на предыдущий ping. Вы построите и протестируете это в итоговом проекте:
+
+```js
+wss.on("connection", (socket) => {
+  socket.isAlive = true;
+  socket.on("pong", () => (socket.isAlive = true));
+});
+
+const heartbeat = setInterval(() => {
+  for (const socket of wss.clients) {
+    if (!socket.isAlive) {
+      socket.terminate(); // не ответил на прошлый ping
+      continue;
+    }
+    socket.isAlive = false;
+    socket.ping();
+  }
+}, 30_000);
+wss.on("close", () => clearInterval(heartbeat));
+```
+
+**Деплой обрывает все соединения.** Когда сервер перезапускается, все его клиенты переподключаются в один и тот же момент. Если все они повторяют попытку мгновенно, то кладут только что запустившийся сервер. Это лавина переподключений (reconnect stampede), а лекарство от неё — экспоненциальная задержка с разбросом из следующего раздела. И считайте свои соединения: каждый открытый сокет стоит памяти (часто десятки КБ), поэтому один процесс Node обычно держит от тысяч до десятков тысяч сокетов, но не миллионы.
+
+## Когда всё ломается
+
+В системе с балансировщиками, Redis, базой данных и несколькими сервисами что-то где-то сломано **всегда**. Предотвратить это нельзя; в ваших силах — сделать так, чтобы маленький сбой остался маленьким. Самый опасный сбой — не падение, а **медлительность**: упавший сервис отказывает быстро, а медленный держит соединения, память и терпение пользователя. Когда каждый запрос застревает в ожидании одной медленной зависимости, перестают отвечать и здоровые сервисы. Сбои распространяются **каскадом** (cascading failures).
+
+### Тайм-ауты: никогда не ждите вечно
+
+Каждому сетевому вызову нужен **тайм-аут (timeout)**, и выбирать его нужно исходя из того, сколько может позволить себе **вызывающая сторона**, а не из того, сколько обычно отвечает зависимость. У `fetch` по умолчанию тайм-аута нет, поэтому передайте сигнал. Эндпоинт `/delay/1500` учебного API отвечает через 1,5 секунды — это слишком медленно для нашей главной страницы:
+
+<CodeExample output={`TimeoutError: переключаемся на запасной вариант
+популярные опросы
+The Bamboo Heist`}>
+
+```js
+const API = "https://api.pandadev.test";
+
+async function getJSON(url, { timeoutMs = 2000 } = {}) {
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function recommendations() {
+  try {
+    // Сегодня этот сервис отвечает 1,5 с; мы можем ждать 300 мс
+    await getJSON(`${API}/delay/1500`, { timeoutMs: 300 });
+    return "личные подборки";
+  } catch (error) {
+    console.log(`${error.name}: переключаемся на запасной вариант`);
+    return "популярные опросы"; // запасной вариант, а не ошибка
+  }
+}
+
+console.log(await recommendations());
+const movie = await getJSON(`${API}/movies/1`, { timeoutMs: 300 });
+console.log(movie.title);
+```
+
+</CodeExample>
+
+`AbortSignal.timeout(ms)` прерывает запрос и отклоняет промис с ошибкой `TimeoutError`. Дальше код **плавно деградирует (degrades gracefully)**: вместо страницы с ошибкой страница показывает популярные опросы вместо личных подборок. У драйверов баз данных, клиентов Redis и HTTP-библиотек есть свои настройки тайм-аутов; задайте каждую из них.
+
+### Повторы с экспоненциальной задержкой и разбросом
+
+Многие сбои **временные (transient)**: сервер перезапускается, сеть на мгновение моргнула, перегруженный сервис отвечает 503. Повторная попытка часто помогает, но важно, *как* вы повторяете. **Экспоненциальная задержка (exponential backoff)** после каждой неудачи ждёт всё дольше, вплоть до **потолка (cap)**:
+
+<CodeExample output={`[ 100, 200, 400, 800, 1600, 3200 ]
+5000 5000
+[ 50, 100, 200, 400 ]`}>
+
+```js
+// Экспоненциальная задержка с потолком и «полным разбросом»
+function backoff(attempt, { baseMs = 100, capMs = 5000 } = {}) {
+  return Math.min(capMs, baseMs * 2 ** attempt);
+}
+
+function withJitter(attempt, random = Math.random) {
+  return Math.round(random() * backoff(attempt));
+}
+
+console.log([0, 1, 2, 3, 4, 5].map((n) => backoff(n)));
+console.log(backoff(6), backoff(30)); // упёрлись в потолок
+console.log([0, 1, 2, 3].map((n) => withJitter(n, () => 0.5)));
+```
+
+</CodeExample>
+
+**Разброс (jitter)** умножает каждое ожидание на случайное число. Без него тысяча клиентов, у которых сбой случился в один момент (скажем, деплой оборвал их WebSocket), и повторять будут в один момент — снова и снова. «Полный разброс» (full jitter) ждёт случайное время от 0 до значения задержки, и клиенты распределяются во времени. Переподключающийся WebSocket-клиент использует ровно такое расписание.
+
+Вот вспомогательная функция для повторов. Она повторяет только **временные** ошибки и принимает `sleep` и `random` как параметры, поэтому пример (и ваши тесты) может записывать ожидания, а не ждать по-настоящему. Эндпоинт `/flaky` учебного API дважды отвечает ошибкой 503, а потом работает:
+
+<CodeExample output={`HTTP 503, повтор через 50 мс
+HTTP 503, повтор через 100 мс
+{ ok: true, attempt: 3 }
+ждали: [ 50, 100 ]
+сразу сдались: HTTP 404`}>
+
+```js
+const API = "https://api.pandadev.test";
+const RETRY_ON = new Set([429, 502, 503, 504]);
+
+async function getJSON(url) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+  if (!res.ok) {
+    const error = new Error(`HTTP ${res.status}`);
+    error.status = res.status;
+    throw error;
+  }
+  return res.json();
+}
+
+const isTransient = (error) =>
+  error.name === "TimeoutError" || RETRY_ON.has(error.status);
+
+async function retry(fn, { attempts = 4, baseMs = 100,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  random = Math.random } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (!isTransient(error) || attempt === attempts - 1) {
+        throw error;
+      }
+      const delay = Math.round(random() * baseMs * 2 ** attempt);
+      console.log(`${error.message}, повтор через ${delay} мс`);
+      await sleep(delay);
+    }
+  }
+}
+
+const waited = [];
+const options = {
+  sleep: async (ms) => waited.push(ms), // записываем, а не ждём
+  random: () => 0.5,
+};
+
+console.log(await retry(() => getJSON(`${API}/flaky`), options));
+console.log("ждали:", waited);
+
+try {
+  await retry(() => getJSON(`${API}/movies/999`), options);
+} catch (error) {
+  console.log("сразу сдались:", error.message);
+}
+```
+
+</CodeExample>
+
+404 не повторяется: сколько ни спрашивай про опрос, которого нет, ответ не изменится. Повторяйте тайм-ауты, 502/503/504 и 429 (в идеале выждав столько, сколько указано в заголовке `Retry-After`); не повторяйте 400, 401, 403, 404 и 422.
+
+<Callout type="danger" title="Повторы перемножаются">
+
+Если браузер повторяет 3 раза, API, которое он вызывает, повторяет 3 раза, и клиент базы данных этого API тоже повторяет 3 раза, то один клик превращается в 27 запросов к базе — и всё это во время сбоя. Такой **шторм повторов (retry storm)** уже не раз ронял очень крупные сайты. Повторяйте на **одном** уровне, делайте мало попыток и всегда используйте задержку с разбросом.
+
+</Callout>
+
+### Ключи идемпотентности: повторять безопасно
+
+Запрос завершился по тайм-ауту. Он не выполнился — или потерялся только **ответ**? Для `GET` это не важно. Для «списать с Мэй 25 £» — очень важно. Операция **идемпотентна (idempotent)**, если выполнить её дважды — то же самое, что выполнить один раз. Чтобы `POST` можно было безопасно повторять, клиент создаёт уникальный **ключ идемпотентности (idempotency key) один раз на операцию** (а не на попытку) и отправляет его с каждой попыткой; сервер запоминает уже обработанные ключи и **повторно отдаёт (replay)** сохранённый ответ:
+
+<CodeExample output={`201 { chargeId: 1, user: 'mei', pence: 2500 }
+201 { chargeId: 1, user: 'mei', pence: 2500 }
+сделано списаний: 1`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const charges = [];
+const done = new Map(); // ключ идемпотентности -> сохранённый ответ
+
+const app = express();
+app.use(express.json());
+
+app.post("/charges", (req, res) => {
+  const key = req.get("Idempotency-Key");
+  if (!key) {
+    return res.status(400).json({ error: "Idempotency-Key needed" });
+  }
+  if (done.has(key)) {
+    const { status, body } = done.get(key);
+    return res.status(status).json(body); // повторяем ответ, а не работу
+  }
+  charges.push(req.body);
+  const body = { chargeId: charges.length, ...req.body };
+  done.set(key, { status: 201, body });
+  res.status(201).json(body);
+});
+
+// Клиент создаёт ключ ОДИН раз на операцию, потом повторяет
+const key = crypto.randomUUID();
+const pay = () => request(app).post("/charges")
+  .set("Idempotency-Key", key)
+  .send({ user: "mei", pence: 2500 });
+
+const first = await pay();
+const retried = await pay(); // первый ответ потерялся...
+console.log(first.status, first.body);
+console.log(retried.status, retried.body);
+console.log("сделано списаний:", charges.length);
+```
+
+</CodeExample>
+
+Ровно так работает API Stripe. В продакшене ключи хранятся в базе данных с **ограничением уникальности (unique constraint)** — чтобы два повтора, пришедшие в одно и то же мгновение, не прошли оба, — и истекают примерно через сутки. PandaPoll использует ту же идею для голосов: телефон отправляет id голоса, поэтому голос, повторённый после обрыва соединения, никогда не засчитывается дважды. То же касается воркеров очереди: задача, которая может выполниться дважды, должна нести id, который воркер проверяет.
+
+### Circuit breaker: перестаньте вызывать мёртвый сервис
+
+Повторы помогают при кратковременных сбоях. Но если сервис аналитики лежит уже пять минут, каждый запрос всё равно ждёт свой тайм-аут, повторяет и падает — тратит время и долбит сервис, который пытается перезапуститься. **Circuit breaker** («автоматический выключатель») оборачивает вызовы зависимости, замечает повторяющиеся сбои и после этого какое-то время **сразу отказывает (fails fast)**, вообще не вызывая её:
+
+```text
+            N неудач подряд
+ CLOSED ────────────────────────▶ OPEN
+   ▲                               │ вызовы сразу отклоняются,
+   │ пробный                       │ ничего не отправляется
+   │ вызов                         │ прошёл тайм-аут сброса
+   │ успешен                       ▼
+   └──────────────────────── HALF-OPEN
+                                   │ пробный вызов неудачен
+                     OPEN ◀────────┘
+```
+
+| Состояние | Что происходит с вызовом |
+| --- | --- |
+| **Closed** (замкнут, обычный режим) | Вызов проходит. Неудачи подряд подсчитываются; успех сбрасывает счётчик. |
+| **Open** (разомкнут) | Вызов сразу отклоняется с ошибкой. Вызывающая сторона может использовать запасной вариант. |
+| **Half-open** (полуоткрыт, после паузы) | Проходит **один** пробный вызов. Успех замыкает цепь; неудача снова размыкает её на следующую паузу. |
+
+Вы построите такой выключатель в упражнении. В реальных проектах на Node популярна библиотека **opossum**, а сервисные сетки (service mesh — Envoy, Istio) умеют делать это вне вашего кода.
+
+### Ограничение частоты запросов с token bucket
+
+Отказоустойчивость — это ещё и защита **себя** от слишком большого трафика: от клиента с багом, который зациклился, от бота, накручивающего голоса, от внезапного всплеска. **Token bucket** («ведро с жетонами») даёт каждому клиенту ведро на `capacity` жетонов, которое пополняется со скоростью `perSecond`. Каждый запрос забирает жетон; пустое ведро означает **429 Too Many Requests**. Ёмкость разрешает короткие всплески, а скорость пополнения задаёт среднее значение на длинной дистанции:
+
+<CodeExample output={`mei: [ 201, 201, 201, 429, 429 ]
+kai: [ 201, 201 ]
+mei через 2 с: [ 201, 201, 429 ]
+mei через минуту: [ 201, 201, 201, 429 ]
+429 1 { error: 'Слишком много голосов, помедленнее' }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+function rateLimit({ capacity, perSecond, now = Date.now }) {
+  const buckets = new Map(); // по ведру на каждого клиента
+  return (req, res, next) => {
+    const id = req.get("X-Api-Key") ?? req.ip;
+    let bucket = buckets.get(id);
+    if (!bucket) {
+      bucket = createTokenBucket({ capacity, perSecond, now });
+      buckets.set(id, bucket);
+    }
+    if (bucket.take()) return next();
+    res.set("Retry-After", String(Math.ceil(1 / perSecond)));
+    res.status(429).json({ error: "Слишком много голосов, помедленнее" });
+  };
+}
+
+let time = 0; // фейковые часы: время идёт, только когда мы скажем
+const app = express();
+app.use(rateLimit({ capacity: 3, perSecond: 1, now: () => time }));
+app.post("/votes", (req, res) => res.status(201).end());
+
+const vote = (key) =>
+  request(app).post("/votes").set("X-Api-Key", key);
+
+async function burst(key, n) {
+  const statuses = [];
+  for (let i = 0; i < n; i++) {
+    statuses.push((await vote(key)).status);
+  }
+  return statuses;
+}
+
+console.log("mei:", await burst("mei", 5));
+console.log("kai:", await burst("kai", 2));
+time += 2000;
+console.log("mei через 2 с:", await burst("mei", 3));
+time += 60_000;
+console.log("mei через минуту:", await burst("mei", 4));
+const res = await vote("mei");
+console.log(res.status, res.headers["retry-after"], res.body);
+```
+
+</CodeExample>
+
+Никакой таймер вёдра не пополняет: каждый `take()` вычисляет, сколько жетонов **накопилось** с прошлого вызова, поэтому ведро настолько дёшево, что его можно держать по одному на каждого клиента. Две вещи для продакшена: словарь `buckets` растёт бесконечно (удаляйте неактивных клиентов, иначе ограничитель частоты станет утечкой памяти), а при нескольких серверах счётчики должны быть общими, поэтому обычно они живут в Redis. Сообщения WebSocket тоже нужно ограничивать — на соединение или на пользователя; чат в итоговом проекте так и делает.
+
+### Плавная деградация
+
+Когда зависимость отказывает, спросите себя: «Что **наименее плохое** мы можем показать?» Обычно это не страница с ошибкой:
+
+- WebSocket не подключается (некоторые корпоративные прокси его блокируют)? Переходите на **polling** раз в несколько секунд.
+- Упал pub/sub в Redis? Каждый сервер всё ещё может обновлять своих клиентов, а экран показывает маленький значок «обновления задерживаются».
+- Рекомендации тормозят? Покажите популярные опросы (как в примере с тайм-аутом).
+- Сильная нагрузка? Сначала **сбрасывайте (shed)** низкоприоритетную работу (выгрузки, аналитику), чтобы голосование продолжало работать.
+
+Договоритесь об этих запасных вариантах с продуктовой командой **до** инцидента, а не во время него.
+
+<Callout type="tip" title="Как шаблоны сочетаются друг с другом">
+
+Исходящий вызов оборачивается изнутри наружу: **тайм-аут** на каждую попытку, вокруг вызова — **circuit breaker**, вокруг него — несколько **повторов** с экспоненциальной задержкой и разбросом (только для идемпотентных запросов или запросов с ключом) и **запасной вариант (fallback)**, когда не помогло ничего. Входящий трафик сначала проходит через **ограничитель частоты (rate limiter)**.
+
+</Callout>
+
+<Quiz
+  question="Странице со счётом спортивного матча вживую нужно только, чтобы сервер отправлял зрителям новый счёт, а зрители ничего не отправляют в ответ. Что подходит лучше всего и проще всего?"
+  options={[
+    "WebSocket, потому что это самое быстрое",
+    "Server-Sent Events, потому что обновления идут только от сервера к клиенту",
+    "Polling каждые 100 мс",
+    "Long polling, потому что он работает с любым прокси",
+  ]}
+  answer={1}
+  explanation="SSE создан для односторонних потоков от сервера к клиенту: это обычный HTTP, EventSource в браузере сам переподключается, и масштабировать его проще, чем WebSocket. WebSocket оправдывает свою дополнительную сложность, когда обе стороны общаются часто."
+/>
+
+<Quiz
+  question="Сервер перезапускается, и 20 000 WebSocket-клиентов замечают это в один и тот же момент. Какая стратегия переподключения бережнее всего к новому серверу?"
+  options={[
+    "Переподключиться сразу, а потом каждые 100 мс, пока не получится",
+    "Переподключиться ровно через 5 секунд",
+    "Экспоненциальная задержка с потолком плюс случайный разброс для каждого ожидания",
+    "Никогда не переподключаться; попросить пользователя обновить страницу",
+  ]}
+  answer={2}
+  explanation="Задержка разносит попытки каждого клиента, а разброс распределяет 20 000 клиентов во времени, чтобы они не пришли все в одно мгновение. Фиксированная задержка просто сдвигает лавину на 5 секунд позже."
+/>
+
+<Exercise
+  title="Circuit breaker для PandaPoll"
+  starter={`import { describe, it, expect } from "vitest";
+
+class CircuitOpenError extends Error {
+  constructor() {
+    super("Цепь разомкнута: сервис не вызываем");
+    this.name = "CircuitOpenError";
+  }
+}
+
+function createCircuitBreaker({
+  failureThreshold,
+  resetTimeoutMs,
+  now = Date.now,
+}) {
+  let failures = 0;
+  let openedAt = null; // null означает «замкнут»
+  let trialRunning = false;
+
+  function state() {
+    // TODO: "closed", "open" или "half-open"
+    return "closed";
+  }
+
+  async function call(fn) {
+    // TODO: отклонять вызовы, пока цепь разомкнута (и лишние
+    // вызовы, пока идёт пробный вызов в half-open), считать
+    // неудачи подряд, размыкать цепь, замыкать её после успеха
+    return fn();
+  }
+
+  return {
+    call,
+    get state() {
+      return state();
+    },
+  };
+}
+
+// ---- Тесты (не меняйте их) ----
+function createFakeClock() {
+  let time = 0;
+  return { now: () => time, advance: (ms) => (time += ms) };
+}
+
+const fail = async () => {
+  throw new Error("нет ответа");
+};
+
+function setup() {
+  const clock = createFakeClock();
+  const breaker = createCircuitBreaker({
+    failureThreshold: 3,
+    resetTimeoutMs: 30_000,
+    now: clock.now,
+  });
+  return { clock, breaker };
+}
+
+async function failTimes(breaker, n) {
+  for (let i = 0; i < n; i++) {
+    await expect(breaker.call(fail)).rejects.toThrow("нет ответа");
+  }
+}
+
+describe("circuit breaker", () => {
+  it("пропускает результаты, пока цепь замкнута", async () => {
+    const { breaker } = setup();
+    expect(await breaker.call(async () => 42)).toBe(42);
+    expect(breaker.state).toBe("closed");
+  });
+
+  it("размыкается после 3 неудач подряд", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 2);
+    expect(breaker.state).toBe("closed");
+    await failTimes(breaker, 1);
+    expect(breaker.state).toBe("open");
+  });
+
+  it("в разомкнутом состоянии отклоняет вызовы, не вызывая fn",
+    async () => {
+      const { breaker } = setup();
+      await failTimes(breaker, 3);
+      let called = false;
+      const call = breaker.call(async () => (called = true));
+      await expect(call).rejects.toBeInstanceOf(CircuitOpenError);
+      expect(called).toBe(false);
+    });
+
+  it("сбрасывает счётчик после успеха", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 2);
+    await breaker.call(async () => "ok");
+    await failTimes(breaker, 2);
+    expect(breaker.state).toBe("closed");
+  });
+
+  it("после тайм-аута полуоткрыт; удачная проба замыкает цепь",
+    async () => {
+      const { clock, breaker } = setup();
+      await failTimes(breaker, 3);
+      clock.advance(29_999);
+      expect(breaker.state).toBe("open");
+      clock.advance(1);
+      expect(breaker.state).toBe("half-open");
+      expect(await breaker.call(async () => "pong")).toBe("pong");
+      expect(breaker.state).toBe("closed");
+    });
+
+  it("снова размыкается, если проба неудачна", async () => {
+    const { clock, breaker } = setup();
+    await failTimes(breaker, 3);
+    clock.advance(30_000);
+    await failTimes(breaker, 1);
+    expect(breaker.state).toBe("open");
+    clock.advance(29_999);
+    expect(breaker.state).toBe("open");
+  });
+
+  it("пропускает только один пробный вызов за раз", async () => {
+    const { clock, breaker } = setup();
+    await failTimes(breaker, 3);
+    clock.advance(30_000);
+    let finish;
+    const slow = new Promise((resolve) => (finish = resolve));
+    const trial = breaker.call(() => slow);
+    await expect(breaker.call(async () => "я тоже"))
+      .rejects.toBeInstanceOf(CircuitOpenError);
+    finish("готово");
+    expect(await trial).toBe("готово");
+    expect(breaker.state).toBe("closed");
+  });
+});
+`}
+  tests={[
+    { name: "Все 7 тестов в файле проходят", check: `__vitest.failed === 0 && __vitest.passed === 7` },
+    { name: "Размыкается после failureThreshold неудач (другой порог)", check: `await (async () => { let t = 0; const b = createCircuitBreaker({ failureThreshold: 2, resetTimeoutMs: 500, now: () => t }); const bad = async () => { throw new Error("x"); }; await b.call(bad).catch(() => {}); const s1 = b.state; await b.call(bad).catch(() => {}); return s1 === "closed" && b.state === "open"; })()` },
+    { name: "Пробрасывает собственную ошибку сервиса, затем отклоняет с CircuitOpenError, не вызывая fn", check: `await (async () => { let t = 0; const b = createCircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 500, now: () => t }); const boom = new Error("boom"); const e1 = await b.call(async () => { throw boom; }).catch((e) => e); let n = 0; t = 499; const e2 = await b.call(async () => n++).catch((e) => e); return e1 === boom && e2 instanceof CircuitOpenError && e2.name === "CircuitOpenError" && n === 0 && b.state === "open"; })()` },
+    { name: "Полуоткрыт ровно через resetTimeoutMs; неудачная проба перезапускает таймер", check: `await (async () => { let t = 0; const b = createCircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 500, now: () => t }); await b.call(async () => { throw new Error("x"); }).catch(() => {}); t = 500; const s = b.state; await b.call(async () => { throw new Error("y"); }).catch(() => {}); const s2 = b.state; t = 999; const s3 = b.state; t = 1000; return s === "half-open" && s2 === "open" && s3 === "open" && b.state === "half-open" && (await b.call(async () => 7)) === 7 && b.state === "closed"; })()` },
+    { name: "В half-open одновременно идёт только один пробный вызов", check: `await (async () => { let t = 0; const b = createCircuitBreaker({ failureThreshold: 1, resetTimeoutMs: 100, now: () => t }); await b.call(async () => { throw new Error("x"); }).catch(() => {}); t = 100; let release; const trial = b.call(() => new Promise((r) => (release = r))); const other = await b.call(async () => 1).catch((e) => e); release("ok"); const v = await trial; return other instanceof CircuitOpenError && v === "ok" && b.state === "closed" && (await b.call(async () => 2)) === 2; })()` },
+  ]}
+>
+
+PandaPoll после каждого голоса вызывает сервис аналитики, а на прошлой неделе он лежал десять минут. Допишите `createCircuitBreaker`, чтобы приложение перестало его ждать. Часы внедряются снаружи (`now()` возвращает миллисекунды), а тесты внизу используют фейковые. Не меняйте тесты — сделайте так, чтобы они прошли.
+
+1. Состояние `state` — `"closed"`, пока `openedAt` равно `null`; `"half-open"`, когда с момента `openedAt` прошло хотя бы `resetTimeoutMs`; иначе `"open"`.
+2. `call(fn)`: если состояние `"open"`, выбросьте `CircuitOpenError`, **не** вызывая `fn`. Иначе выполните `await fn()`.
+3. При **успехе** сбросьте счётчик неудач, замкните цепь (`openedAt = null`) и верните результат.
+4. При **неудаче** посчитайте её и пробросьте исходную ошибку дальше. Разомкните цепь (`openedAt = now()`), если неудач подряд набралось `failureThreshold` или если неудачным оказался пробный вызов в half-open.
+5. В состоянии half-open может выполняться только **один** пробный вызов: если, пока он ещё идёт, приходит другой вызов, тоже отклоните его с `CircuitOpenError`. (В асинхронном коде об этом легко забыть: без такой проверки 500 ожидающих запросов ринулись бы в сервис в тот же миг, как закончится пауза.)
+
+<Hint>
+
+Прочитайте состояние один раз в начале `call`: `const current = state();`. Если оно `"open"` — выбросьте ошибку. Если `"half-open"` — выбросьте ошибку, когда `trialRunning` уже `true`, а иначе установите его в `true`. Затем используйте `try` / `catch` / `finally`: в `try` выполните `await fn()`, сбросьте состояние и верните результат; в `catch` сделайте `failures++`, разомкните цепь, когда `current === "half-open" || failures >= failureThreshold`, и пробросьте ошибку через `throw error`; в `finally` установите `trialRunning = false`, если этот вызов был пробным.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect } from "vitest";
+
+class CircuitOpenError extends Error {
+  constructor() {
+    super("Цепь разомкнута: сервис не вызываем");
+    this.name = "CircuitOpenError";
+  }
+}
+
+function createCircuitBreaker({
+  failureThreshold,
+  resetTimeoutMs,
+  now = Date.now,
+}) {
+  let failures = 0;
+  let openedAt = null; // null означает «замкнут»
+  let trialRunning = false;
+
+  function state() {
+    if (openedAt === null) return "closed";
+    if (now() - openedAt >= resetTimeoutMs) return "half-open";
+    return "open";
+  }
+
+  async function call(fn) {
+    const current = state();
+    if (current === "open") throw new CircuitOpenError();
+    if (current === "half-open") {
+      if (trialRunning) throw new CircuitOpenError();
+      trialRunning = true;
+    }
+    try {
+      const result = await fn();
+      failures = 0;
+      openedAt = null;
+      return result;
+    } catch (error) {
+      failures++;
+      if (current === "half-open" || failures >= failureThreshold) {
+        openedAt = now();
+      }
+      throw error;
+    } finally {
+      if (current === "half-open") trialRunning = false;
+    }
+  }
+
+  return {
+    call,
+    get state() {
+      return state();
+    },
+  };
+}
+
+// ---- Тесты (не меняйте их) ----
+function createFakeClock() {
+  let time = 0;
+  return { now: () => time, advance: (ms) => (time += ms) };
+}
+
+const fail = async () => {
+  throw new Error("нет ответа");
+};
+
+function setup() {
+  const clock = createFakeClock();
+  const breaker = createCircuitBreaker({
+    failureThreshold: 3,
+    resetTimeoutMs: 30_000,
+    now: clock.now,
+  });
+  return { clock, breaker };
+}
+
+async function failTimes(breaker, n) {
+  for (let i = 0; i < n; i++) {
+    await expect(breaker.call(fail)).rejects.toThrow("нет ответа");
+  }
+}
+
+describe("circuit breaker", () => {
+  it("пропускает результаты, пока цепь замкнута", async () => {
+    const { breaker } = setup();
+    expect(await breaker.call(async () => 42)).toBe(42);
+    expect(breaker.state).toBe("closed");
+  });
+
+  it("размыкается после 3 неудач подряд", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 2);
+    expect(breaker.state).toBe("closed");
+    await failTimes(breaker, 1);
+    expect(breaker.state).toBe("open");
+  });
+
+  it("в разомкнутом состоянии отклоняет вызовы, не вызывая fn",
+    async () => {
+      const { breaker } = setup();
+      await failTimes(breaker, 3);
+      let called = false;
+      const call = breaker.call(async () => (called = true));
+      await expect(call).rejects.toBeInstanceOf(CircuitOpenError);
+      expect(called).toBe(false);
+    });
+
+  it("сбрасывает счётчик после успеха", async () => {
+    const { breaker } = setup();
+    await failTimes(breaker, 2);
+    await breaker.call(async () => "ok");
+    await failTimes(breaker, 2);
+    expect(breaker.state).toBe("closed");
+  });
+
+  it("после тайм-аута полуоткрыт; удачная проба замыкает цепь",
+    async () => {
+      const { clock, breaker } = setup();
+      await failTimes(breaker, 3);
+      clock.advance(29_999);
+      expect(breaker.state).toBe("open");
+      clock.advance(1);
+      expect(breaker.state).toBe("half-open");
+      expect(await breaker.call(async () => "pong")).toBe("pong");
+      expect(breaker.state).toBe("closed");
+    });
+
+  it("снова размыкается, если проба неудачна", async () => {
+    const { clock, breaker } = setup();
+    await failTimes(breaker, 3);
+    clock.advance(30_000);
+    await failTimes(breaker, 1);
+    expect(breaker.state).toBe("open");
+    clock.advance(29_999);
+    expect(breaker.state).toBe("open");
+  });
+
+  it("пропускает только один пробный вызов за раз", async () => {
+    const { clock, breaker } = setup();
+    await failTimes(breaker, 3);
+    clock.advance(30_000);
+    let finish;
+    const slow = new Promise((resolve) => (finish = resolve));
+    const trial = breaker.call(() => slow);
+    await expect(breaker.call(async () => "я тоже"))
+      .rejects.toBeInstanceOf(CircuitOpenError);
+    finish("готово");
+    expect(await trial).toBe("готово");
+    expect(breaker.state).toBe("closed");
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Polling** прост и часто его достаточно; **SSE** передаёт поток от сервера к клиенту по обычному HTTP; **WebSocket** даёт двусторонний канал для чатов, игр и совместной работы — ценой соединений с состоянием.
+- WebSocket начинается с HTTP-рукопожатия **Upgrade** (101), а затем стороны обмениваются фреймами: сообщениями, ping/pong и close с кодом (1000, 1006, 4000–4999 для вашего приложения).
+- С `ws`: `new WebSocketServer`, `"connection"`, `socket.on("message")`, рассылка по `wss.clients`; проверяйте каждое сообщение; аутентифицируйте рукопожатие и проверяйте `Origin`.
+- Масштабирование WebSocket: **pub/sub** (Redis) между серверами, балансировщики, которые разрешают upgrade, **heartbeat** против мёртвых соединений и переподключение с разбросом после деплоя.
+- Давайте каждому вызову **тайм-аут**; **повторяйте** только временные ошибки, с **экспоненциальной задержкой и разбросом** и на одном уровне.
+- **Ключи идемпотентности** делают безопасными повторные `POST` и повторный запуск задач.
+- **Circuit breaker** сразу отказывает, пока зависимость лежит (closed → open → half-open, один пробный вызов за раз).
+- Ограничитель частоты на основе **token bucket** разрешает всплески, но ограничивает среднее (429 + `Retry-After`).
+- **Деградируйте плавно** и внедряйте часы, sleep и случайность, чтобы всё это можно было протестировать.

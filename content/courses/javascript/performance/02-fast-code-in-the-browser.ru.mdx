@@ -1,0 +1,713 @@
+---
+title: Быстрый код в браузере
+description: Сохраняйте плавность страниц с помощью мемоизации, debounce и throttle, бережной работы с DOM, виртуальных списков, разбиения работы, Web Workers и правильного рендера в React.
+duration: 25
+xp: 25
+---
+
+Страница кажется быстрой, когда она быстро **реагирует**: кнопка подсвечивается, как только вы её нажали, список прокручивается без рывков, ввод никогда не отстаёт. Всё это зависит от одной вещи — **основного потока (main thread)**. Он выполняет ваш JavaScript, рассчитывает раскладку, рисует пиксели и обрабатывает ввод — по одной задаче за раз. Каждая миллисекунда, на которую ваш код его занимает, — это миллисекунда, когда страница не может ответить. ⚡
+
+В этом уроке вы освоите приёмы, которыми senior-фронтендеры держат основной поток свободным: делать меньше работы, делать её реже, делать её небольшими кусками или делать её где-то в другом месте.
+
+## Бюджет: 16 мс на кадр
+
+Экраны обычно обновляются 60 раз в секунду, поэтому у браузера есть примерно **16 мс** на кадр (frame). За каждый кадр ему может понадобиться выполнить JavaScript (обработчики событий, таймеры), пересчитать **стили (style)**, вычислить **раскладку (layout)** — размеры и положение каждого блока, — **отрисовать (paint)** пиксели и **скомпоновать (composite)** слои на экране.
+
+```text
+ ввод → JavaScript → style → layout → paint → composite → 🖥️
+        └────────────── всё это за ~16 мс ───────────────┘
+```
+
+Если ваш JavaScript работает 200 мс, браузер пропускает около 12 кадров: анимации дёргаются, а клики ждут. Помните из прошлого урока: задача дольше **50 мс** считается длинной и портит **INP**. Остальная часть урока — набор инструментов, чтобы укладываться в эти цифры.
+
+## Мемоизация: не считайте одно и то же дважды
+
+Вы писали `memoize` в уроке [Замыкания и функции высшего порядка](/learn/javascript/closures-and-higher-order-functions): функция запоминает свои результаты по аргументам. Частое применение в реальной жизни — кеширование **дорогих объектов**. Создать `Intl.NumberFormat` на удивление затратно (он загружает данные локали), и код, который создаёт его для каждой цены, каждой строки и каждого рендера, быстро накапливает задержки:
+
+<CodeExample output={`£12.50
+£3.00
+£99.99
+£4.20
+$1,234.50
+создано форматтеров: 2`}>
+
+```js
+function memoize(fn) {
+  const cache = new Map();
+  return (...args) => {
+    const key = args.join("|");
+    if (!cache.has(key)) cache.set(key, fn(...args));
+    return cache.get(key);
+  };
+}
+
+let created = 0;
+const formatterFor = memoize((locale, currency) => {
+  created++;
+  return new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency,
+  });
+});
+
+for (const price of [12.5, 3, 99.99, 4.2]) {
+  console.log(formatterFor("en-GB", "GBP").format(price));
+}
+console.log(formatterFor("en-US", "USD").format(1234.5));
+console.log("создано форматтеров:", created);
+```
+
+</CodeExample>
+
+Мемоизация (memoisation) меняет **память на время**, и у этого обмена есть правила:
+
+- Мемоизируйте только **чистые (pure)** функции: тот же ввод — тот же результат, без побочных эффектов. Если мемоизировать что-то, что читает часы или базу данных, вы получите устаревшие ответы.
+- Она помогает, только если одни и те же входные данные **повторяются**, а работа медленнее, чем построить ключ и найти его. Мемоизация `a + b` сделает код медленнее.
+- Кеш, ключи которого — пользовательский ввод, **растёт бесконечно**. Страница поиска, которая мемоизирует каждый запрос, когда-либо введённый пользователем, — это утечка памяти под красивым названием (см. [Память и сборка мусора](/learn/javascript/memory-and-garbage-collection)). Задайте кешу **ограничение по размеру** (вытесняйте самую старую или давно не использованную запись) или по времени, либо храните ключи-объекты в `WeakMap`, чтобы записи исчезали вместе с объектами.
+
+## Debounce и throttle
+
+Некоторые события срабатывают **очень часто**: `input` — при каждом нажатии клавиши, `scroll` и `pointermove` — десятки раз в секунду, `resize` — непрерывно, пока окно тянут мышью. Запускать дорогую работу на каждое из них — пустая трата основного потока. Это исправляют две классические обёртки:
+
+- **Debounce**: подождать, пока события **прекратятся** на `ms`, и выполнить один раз с последним значением. Идеально для поля поиска: искать, когда пользователь сделал паузу в наборе.
+- **Throttle**: выполнять **не чаще раза в `ms`**, пока события продолжают приходить. Идеально для обработчиков прокрутки и изменения размера, которые должны что-то обновлять (полосу прогресса, «загрузить ещё у самого низа»), но не 60 раз в секунду.
+
+Вот событие прокрутки каждые 50 мс в течение полсекунды, отправленное в обе обёртки. Фейковые таймеры (fake timers) из Vitest делают временную шкалу точной (вы познакомились с ними в уроке [Моки и асинхронные тесты](/learn/javascript/mocks-and-async-tests)):
+
+<CodeExample output={`0 мс  throttle: y=0
+200 мс  throttle: y=200
+400 мс  throttle: y=400
+700 мс  debounce: y=500`}>
+
+```js
+import { vi } from "vitest";
+
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
+
+function throttle(fn, ms) {
+  let waiting = false;
+  return (...args) => {
+    if (waiting) return; // отброшен
+    fn(...args);
+    waiting = true;
+    setTimeout(() => {
+      waiting = false;
+    }, ms);
+  };
+}
+
+vi.useFakeTimers();
+vi.setSystemTime(0);
+
+const log = (name) => (y) => {
+  console.log(`${Date.now()} мс  ${name}: y=${y}`);
+};
+const onScrollDebounced = debounce(log("debounce"), 200);
+const onScrollThrottled = throttle(log("throttle"), 200);
+
+// Событие прокрутки каждые 50 мс в течение полсекунды
+for (let y = 0; y <= 500; y += 50) {
+  onScrollDebounced(y);
+  onScrollThrottled(y);
+  vi.advanceTimersByTime(50);
+}
+vi.advanceTimersByTime(500);
+vi.useRealTimers();
+```
+
+</CodeExample>
+
+Обработчик с throttle срабатывает сразу, а затем каждые 200 мс, пока продолжается прокрутка. Обработчик с debounce молчит всё это время и срабатывает один раз — через 200 мс после последнего события.
+
+Но присмотритесь к throttle: последняя позиция прокрутки, `y=500`, **так и не приходит**. Пользователь остановился на 500, а страница всё ещё думает, что он на 400. Это настоящий баг простых реализаций throttle, и вы исправите его в упражнении.
+
+<Callout type="tip" title="Для визуальных обновлений используйте requestAnimationFrame">
+
+Если работа обновляет экран (перемещение элемента вслед за указателем, эффект параллакса), привяжите частоту к самому дисплею: `requestAnimationFrame(fn)` запускает `fn` прямо перед следующей отрисовкой, один раз за кадр. Запоминайте последнее событие и планируйте по одному кадру за раз — тогда вы никогда не сделаете больше работы, чем экран способен показать.
+
+</Callout>
+
+## Избегаем layout thrashing
+
+Изменять DOM поначалу дёшево: браузер просто отмечает, что раскладка **устарела (dirty)**, и пересчитывает её позже, один раз за кадр. Но если вы **читаете** значение раскладки (`offsetWidth`, `offsetHeight`, `getBoundingClientRect()`, `scrollTop`, `getComputedStyle`) после **записи**, браузеру приходится пересчитать раскладку **прямо сейчас**, чтобы дать правильный ответ. Если делать так в цикле, получится **layout thrashing** («пробуксовка раскладки»):
+
+```js
+// ❌ запись, чтение, запись, чтение... полный пересчёт раскладки на каждом шаге
+for (const box of boxes) {
+  box.style.width = container.offsetWidth / 2 + "px";
+}
+
+// ✅ сначала всё прочитать, потом всё записать
+const half = container.offsetWidth / 2; // один пересчёт раскладки
+for (const box of boxes) {
+  box.style.width = half + "px"; // записи собираются в пакет
+}
+```
+
+Попробуйте. Каждая кнопка меняет размер 400 блоков; первая чередует чтения и записи, вторая собирает их в пакеты. Нажмите каждую несколько раз и сравните:
+
+<TryIt
+  html={`<style>
+  #boxes div { height: 4px; background: #7c5cff; margin: 1px 0; }
+  button { margin-right: 6px; }
+</style>
+<button id="thrash">Вперемешку</button>
+<button id="batch">Пакетом</button>
+<p id="result">Нажмите кнопку</p>
+<div id="boxes"></div>`}
+  code={`const container = document.querySelector("#boxes");
+for (let i = 0; i < 400; i++) {
+  container.append(document.createElement("div"));
+}
+const boxes = [...container.children];
+const result = document.querySelector("#result");
+
+function grow(box, width) {
+  box.style.width = (width % 300) + 10 + "px";
+}
+
+document.querySelector("#thrash").addEventListener("click", () => {
+  const start = performance.now();
+  for (const box of boxes) {
+    grow(box, box.offsetWidth + 7); // чтение после записи
+  }
+  const ms = performance.now() - start;
+  result.textContent = \`Вперемешку: \${ms.toFixed(1)} мс\`;
+});
+
+document.querySelector("#batch").addEventListener("click", () => {
+  const start = performance.now();
+  const widths = boxes.map((box) => box.offsetWidth); // чтения
+  boxes.forEach((box, i) => grow(box, widths[i] + 7)); // записи
+  const ms = performance.now() - start;
+  result.textContent = \`Пакетом: \${ms.toFixed(1)} мс\`;
+});`}
+/>
+
+На большинстве компьютеров пакетная версия во много раз быстрее, и разрыв растёт вместе с размером страницы. Полезные привычки рядом:
+
+- Делайте **записи** в DOM внутри `requestAnimationFrame`, а чтения — до них.
+- Анимируйте **`transform`** и **`opacity`**: они могут пропустить layout и paint, и им нужен только дешёвый шаг composite. Анимация `width`, `top` или `margin` пересчитывает раскладку на каждом кадре.
+- Создавайте много элементов в `DocumentFragment` (или одной строкой `innerHTML` из доверенных данных) и вставляйте их **один раз**.
+- В панели Performance layout thrashing выглядит как фиолетовые блоки «Layout» с предупреждением **Forced reflow**.
+
+## Делегирование событий
+
+Вы познакомились с **делегированием событий (event delegation)** в уроке [События](/learn/javascript/events): один обработчик на родителе вместо отдельного на каждом потомке, а `event.target.closest(...)` подсказывает, по какому потомку кликнули. Это ещё и инструмент производительности. Таблица на 5 000 строк с тремя кнопками в каждой — это 15 000 обработчиков, каждый из которых занимает память и время на настройку, и каждый нужно снимать при повторном рендере строк. Один делегированный обработчик делает ту же работу и продолжает работать для строк, добавленных позже:
+
+```js
+table.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const row = button.closest("tr");
+  handle(button.dataset.action, row.dataset.id);
+});
+```
+
+## Рендер огромных списков
+
+Самый быстрый DOM-узел — тот, который вы так и не создали. Список из 50 000 строк — это больше 50 000 элементов, которые нужно создать, стилизовать и разложить, и каждый следующий пересчёт раскладки тоже становится медленнее. Три варианта, от самого простого к самому хитрому:
+
+1. **Пагинация (pagination)** или кнопка **«Загрузить ещё»**: показывайте по 50 штук. Просто, и часто это и так лучший пользовательский опыт.
+2. **`content-visibility: auto`** в CSS: браузер пропускает layout и paint для разделов за пределами экрана. Одна строка CSS — и приятный выигрыш для длинных страниц с контентом.
+3. **Виртуализация (virtualisation)**, или «windowing»: отрисовывайте только **видимые** строки плюс несколько лишних внутри высокого пустого контейнера, который сохраняет правильный размер полосы прокрутки. Когда пользователь прокручивает, меняйте набор существующих строк.
+
+Сердце виртуализации — немного арифметики:
+
+<CodeExample output={`{ start: 0, end: 13, offsetY: 0 }
+{ start: 1297, end: 1313, offsetY: 51880 }
+{ start: 99987, end: 100000, offsetY: 3999480 }`}>
+
+```js
+function visibleRange({ scrollTop, height, rowHeight, total }) {
+  const overscan = 3; // лишние строки сверху и снизу
+  const first = Math.floor(scrollTop / rowHeight);
+  const count = Math.ceil(height / rowHeight);
+  const start = Math.max(0, first - overscan);
+  const end = Math.min(total, first + count + overscan);
+  return { start, end, offsetY: start * rowHeight };
+}
+
+const list = { height: 400, rowHeight: 40, total: 100_000 };
+console.log(visibleRange({ ...list, scrollTop: 0 }));
+console.log(visibleRange({ ...list, scrollTop: 52_000 }));
+console.log(visibleRange({ ...list, scrollTop: 3_999_600 }));
+```
+
+</CodeExample>
+
+Как далеко ни прокручивай 100 000 строк, в DOM существует всего около 16. Прокрутите этот список и следите за счётчиком:
+
+<TryIt
+  html={`<style>
+  #viewport { height: 240px; overflow-y: auto; position: relative;
+    border: 1px solid #ffffff33; border-radius: 8px; }
+  #spacer { position: relative; }
+  .row { position: absolute; left: 0; right: 0; height: 30px;
+    line-height: 30px; padding: 0 10px; box-sizing: border-box;
+    border-bottom: 1px solid #ffffff14; }
+</style>
+<p id="info"></p>
+<div id="viewport"><div id="spacer"></div></div>`}
+  code={`const ROW = 30;
+const TOTAL = 100_000;
+const viewport = document.querySelector("#viewport");
+const spacer = document.querySelector("#spacer");
+const info = document.querySelector("#info");
+spacer.style.height = TOTAL * ROW + "px"; // полосе прокрутки — полный размер
+
+function render() {
+  const first = Math.floor(viewport.scrollTop / ROW);
+  const count = Math.ceil(240 / ROW);
+  const start = Math.max(0, first - 3);
+  const end = Math.min(TOTAL, first + count + 3);
+
+  const rows = [];
+  for (let i = start; i < end; i++) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.top = i * ROW + "px";
+    row.textContent = \`Заказ №\${i + 1}\`;
+    rows.push(row);
+  }
+  spacer.replaceChildren(...rows);
+  info.textContent = \`Заказов: \${TOTAL}, строк в DOM: \${rows.length}\`;
+}
+
+viewport.addEventListener("scroll", render);
+render();`}
+/>
+
+В реальных проектах используйте проверенную библиотеку: **TanStack Virtual** или **react-window** для React либо аналог для вашего фреймворка. Они учитывают строки разной высоты, фокус клавиатуры и восстановление прокрутки — а это кропотливые вещи. И не виртуализируйте списки из 100 элементов: это ломает встроенный поиск по странице (Ctrl+F) и может запутать экранные дикторы, поэтому применяйте виртуализацию, только когда цифры действительно этого требуют.
+
+## Разбиваем длинные задачи
+
+Иногда в основном потоке действительно много работы: отфильтровать 50 000 строк, разобрать большой файл, который перетащил пользователь. Если всё это выполняется одной длинной задачей, каждый клик ждёт её окончания. Решение — разбить работу на **порции (chunks)** и **уступать (yield)** браузеру между ними, чтобы клики, ввод и отрисовка могли проскочить в промежутках:
+
+<CodeExample output={`порция готова: 10000/30000
+👆 клик обработан
+порция готова: 20000/30000
+порция готова: 30000/30000
+сумма: 449985000`}>
+
+```js
+const yieldToBrowser = () =>
+  new Promise((resolve) => setTimeout(resolve, 0));
+
+async function processInChunks(items, handle, chunkSize) {
+  for (let i = 0; i < items.length; i += chunkSize) {
+    for (const item of items.slice(i, i + chunkSize)) handle(item);
+    const done = Math.min(i + chunkSize, items.length);
+    console.log(`порция готова: ${done}/${items.length}`);
+    await yieldToBrowser(); // пропускаем ожидающие события
+  }
+}
+
+// Пока идёт работа, приходит клик
+setTimeout(() => console.log("👆 клик обработан"), 0);
+
+const rows = Array.from({ length: 30_000 }, (_, i) => i);
+let sum = 0;
+await processInChunks(rows, (n) => { sum += n; }, 10_000);
+console.log("сумма:", sum);
+```
+
+</CodeExample>
+
+Клик обрабатывается после **первой** порции, а не после всех. Без `await` он ждал бы окончания всей работы — как блокирующий цикл в уроке [Колбэки и цикл событий](/learn/javascript/callbacks-and-the-event-loop). В уроке [Цикл событий в деталях](/learn/javascript/the-event-loop-in-depth) подробно объясняется, когда именно каждая задача из очереди получает свою очередь.
+
+В реальном коде обычно уступают браузеру по **времени**, а не по количеству элементов, потому что элементы обрабатываются с разной скоростью. В новых браузерах на Chromium есть ещё **`scheduler.yield()`**: он уступает браузеру, но ставит вашу задачу в **начало** очереди, чтобы ваша работа не отставала от посторонних таймеров:
+
+```js
+function yieldToMain() {
+  if (globalThis.scheduler?.yield) return scheduler.yield();
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function processAll(items, handle) {
+  let deadline = performance.now() + 50; // отрезок в 50 мс
+  for (const item of items) {
+    handle(item);
+    if (performance.now() > deadline) {
+      await yieldToMain();
+      deadline = performance.now() + 50;
+    }
+  }
+}
+```
+
+Ещё два инструмента: `requestIdleCallback(fn)` запускает низкоприоритетную работу (аналитику, предзагрузку), когда браузер простаивает, а самый простой трюк из всех — **сначала** обновить экран («Сохраняем…»), а тяжёлую часть сделать потом.
+
+## Web Workers для тяжёлой работы
+
+Разбиение на порции всё равно использует основной поток, просто вежливо. Для действительно тяжёлой работы процессора (обработка изображений, разбор больших CSV- или JSON-файлов, подсветка синтаксиса, шифрование, физика) полностью уберите её **из** основного потока с помощью **Web Worker**. Воркер — это отдельный поток со своим циклом событий (event loop) и без доступа к DOM. Общаться с ним нужно сообщениями:
+
+```js
+// main.js
+const worker = new Worker(
+  new URL("./stats-worker.js", import.meta.url),
+  { type: "module" },
+);
+
+worker.addEventListener("message", (event) => {
+  showStats(event.data); // { rows: 250000, average: 42.1 }
+});
+
+fileInput.addEventListener("change", async () => {
+  const text = await fileInput.files[0].text();
+  worker.postMessage(text); // страница остаётся отзывчивой
+});
+```
+
+```js
+// stats-worker.js
+self.addEventListener("message", (event) => {
+  const lines = event.data.split("\n").slice(1);
+  const values = lines.map((line) => Number(line.split(",")[2]));
+  const total = values.reduce((a, b) => a + b, 0);
+  self.postMessage({
+    rows: values.length,
+    average: total / values.length,
+  });
+});
+```
+
+Что нужно знать:
+
+- Сообщения **копируются** алгоритмом структурного клонирования (structured clone). Пересылка 100 МБ туда и обратно тоже стоит времени. Большие двоичные данные (`ArrayBuffer`) можно **передать (transfer)**, а не копировать: `worker.postMessage(buffer, [buffer])`.
+- Запуск воркера занимает немного времени, поэтому для повторяющихся задач держите один воркер, а не создавайте новый на каждую задачу.
+- Библиотека **Comlink** оборачивает `postMessage`, и функции воркера можно вызывать как обычные асинхронные функции.
+- В Node.js та же идея называется **`worker_threads`**. (Забавный факт: PandaDev запускает код ваших уроков в Web Worker, поэтому бесконечный цикл здесь не подвешивает сайт.)
+
+## Производительность React
+
+Модель React, UI = f(state), восхитительно проста, но из-за неё React много **перерендеривает**. Компонент (component) рендерится заново, когда:
+
+1. меняется его собственное **состояние (state)**;
+2. рендерится заново его **родитель** (неважно, изменились ли пропсы!);
+3. меняется **контекст**, который он использует.
+
+Повторный рендер сам по себе не проблема: React сравнивает результат с предыдущим и трогает DOM только там, где что-то изменилось, а большинство компонентов рендерятся за микросекунды. Проблема появляется, когда дорогой компонент перерендеривается при каждом нажатии клавиши.
+
+Инструменты:
+
+- **`memo(Component)`** пропускает повторный рендер, если все пропсы те же, что и в прошлый раз (сравнение через `Object.is`).
+- **`useMemo(() => value, [deps])`** запоминает вычисленное **значение** между рендерами.
+- **`useCallback(fn, [deps])`** запоминает **функцию**, чтобы между рендерами это был тот же самый объект.
+
+Работают они только вместе: `memo` сравнивает пропсы по ссылке, а объект или стрелочная функция, созданные во время рендера, каждый раз **новые**. Печатайте в поле и следите за консолью. Потом замените `useCallback((item) => setPicked(item), [])` на обычную `(item) => setPicked(item)` и попечатайте снова:
+
+<TryIt
+  language="react"
+  code={`import { useState, useCallback, memo } from "react";
+import { createRoot } from "react-dom/client";
+
+const ITEMS = Array.from({ length: 5 }, (_, i) => \`Пункт \${i + 1}\`);
+
+let listRenders = 0;
+const List = memo(function List({ items, onPick }) {
+  listRenders++;
+  console.log("List отрисован, всего раз:", listRenders);
+  return (
+    <ul>
+      {items.map((item) => (
+        <li key={item}>
+          <button onClick={() => onPick(item)}>{item}</button>
+        </li>
+      ))}
+    </ul>
+  );
+});
+
+function App() {
+  const [text, setText] = useState("");
+  const [picked, setPicked] = useState(null);
+  const handlePick = useCallback((item) => setPicked(item), []);
+
+  return (
+    <>
+      <input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Печатайте здесь"
+      />
+      <p>Выбрано: {picked ?? "ничего"}</p>
+      <List items={ITEMS} onPick={handlePick} />
+    </>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);`}
+/>
+
+С `useCallback` ввод текста вообще не перерендеривает `List`. С обычной стрелочной функцией `memo` при каждом нажатии клавиши видит «новый» `onPick` и всё равно перерендеривает список — то есть `memo` только зря сравнивал пропсы.
+
+### Когда это того не стоит
+
+Оборачивать всё подряд в `memo`, `useMemo` и `useCallback` — распространённый антипаттерн. Каждая обёртка стоит памяти, сравнения при каждом рендере и читаемости, а одного нестабильного пропа достаточно, чтобы незаметно свести их на нет. Прежде чем браться за них, попробуйте более дешёвые исправления:
+
+- **Опустите состояние ниже**: если `text` нужен только полю поиска, вынесите это состояние в маленький компонент `SearchBox` — тогда ввод перерендерит только поле и больше ничего.
+- **Поднимите содержимое выше**: передавайте дорогие части через `children`. Элементы, созданные родителем, не пересоздаются, когда меняется состояние потомка.
+- **Измеряйте** с помощью **Profiler** в React DevTools («почему это отрендерилось?» и сколько это заняло) до и после.
+
+Используйте `useMemo` для действительно дорогих вычислений (фильтрация и сортировка тысяч строк), а `memo` + `useCallback` — для больших поддеревьев, которые часто перерендериваются без причины. В новых проектах можно также включить **React Compiler**, который добавляет такую мемоизацию автоматически при сборке, поэтому рукописные `useMemo` и `useCallback` встречаются всё реже.
+
+### Ключи важны и для скорости, и для корректности
+
+Ключи (keys) подсказывают React, какой элемент какой между рендерами. Со стабильным id React при сортировке или вставке перемещает существующий DOM-узел. С **индексом массива** в качестве ключа вставка в начало заставляет React думать, что изменился каждый элемент: он обновляет каждую строку, а любое состояние внутри строк (текст в поле ввода, флаг «развёрнуто») прилипает не к тому элементу.
+
+```jsx
+// ❌ ключи-индексы: вставка в начало переиспользует не те строки
+{todos.map((todo, i) => <TodoRow key={i} todo={todo} />)}
+
+// ✅ стабильные id из данных
+{todos.map((todo) => <TodoRow key={todo.id} todo={todo} />)}
+```
+
+Ключи-индексы годятся только для списков, которые никогда не переупорядочиваются, не вставляют и не удаляют элементы.
+
+<Callout type="warning" title="Сначала исправьте алгоритм, потом фреймворк">
+
+Большинство багов «React тормозит» вообще не про React: это фильтр O(n²), который запускается при каждом рендере, `fetch` в эффекте без массива зависимостей или 10 000 строк в DOM. Сначала профилируйте. Memo — в самую последнюю очередь.
+
+</Callout>
+
+<Quiz
+  question="Страница показывает подсказки поиска с сервера, пока пользователь печатает, и полосу прогресса, которая следует за позицией прокрутки. Какие обёртки подходят лучше всего?"
+  options={[
+    "Throttle для поиска, debounce для полосы прогресса",
+    "Debounce для поиска, throttle для полосы прогресса (или обновление через requestAnimationFrame)",
+    "Debounce для обоих",
+    "Мемоизация для обоих"
+  ]}
+  answer={1}
+  explanation="Ищите, когда пользователь делает паузу в наборе (debounce), чтобы не отправлять запрос на каждое нажатие клавиши. Полоса прогресса должна двигаться, пока продолжается прокрутка, просто не 60 раз в секунду, поэтому для неё нужен throttle или синхронизация с кадрами через requestAnimationFrame."
+/>
+
+<Quiz
+  question="Родитель рендерит <Chart data={rows} options={{ dark: true }} />, а Chart обёрнут в memo. Почему Chart всё равно перерендеривается каждый раз вместе с родителем?"
+  options={[
+    "memo работает только с классовыми компонентами",
+    "rows — это массив, а memo никогда не сравнивает массивы",
+    "Объект options создаётся заново при каждом рендере, поэтому пропсы никогда не являются тем же объектом",
+    "memo нужен проп key, чтобы работать"
+  ]}
+  answer={2}
+  explanation="memo сравнивает каждый проп через Object.is. Объектный литерал, написанный в JSX, — это новый объект при каждом рендере, поэтому сравнение всегда проваливается. Вынесите константу за пределы компонента или оберните её в useMemo."
+/>
+
+<Exercise
+  title="Throttle, который не теряет последнее событие"
+  starter={`import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+// TODO: запоминайте последний отброшенный вызов и выполняйте его,
+// когда время ожидания закончится
+function throttle(fn, ms) {
+  let waiting = false;
+  return (...args) => {
+    if (waiting) return;
+    fn(...args);
+    waiting = true;
+    setTimeout(() => {
+      waiting = false;
+    }, ms);
+  };
+}
+
+describe("throttle", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("сразу выполняет первый вызов", () => {
+    const fn = vi.fn();
+    throttle(fn, 100)("a");
+    expect(fn).toHaveBeenCalledWith("a");
+  });
+
+  it("выполняет не чаще раза за интервал, пока идут вызовы", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    for (let i = 0; i < 10; i++) {
+      t(i);
+      vi.advanceTimersByTime(25);
+    }
+    // 250 мс вызовов: в 0, 100 и 200 мс
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("в конце выполняет ещё раз с последними аргументами", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    t(2);
+    t(3);
+    expect(fn).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(100);
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(fn).toHaveBeenLastCalledWith(3);
+  });
+
+  it("не добавляет лишний вызов, если ничего не было отброшено", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    vi.advanceTimersByTime(500);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("после завершающего вызова начинает новый интервал", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    t(2); // выполнится в 100 мс
+    vi.advanceTimersByTime(120);
+    expect(fn).toHaveBeenCalledTimes(2);
+    t(3); // слишком скоро после завершающего вызова: ждёт
+    expect(fn).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(80); // 200 мс
+    expect(fn).toHaveBeenCalledTimes(3);
+    expect(fn).toHaveBeenLastCalledWith(3);
+  });
+});
+`}
+  tests={[
+    { name: "Все тесты проходят (и все 5 на месте)", check: `__vitest.failed === 0 && __vitest.passed >= 5` },
+    { name: "Первый вызов выполняется сразу", check: `(() => { const calls = []; throttle((x) => calls.push(x), 40)("now"); return calls.join() === "now"; })()` },
+    { name: "С настоящими таймерами: выполняет первый вызов, затем последний отброшенный", check: `await new Promise((resolve) => { const calls = []; const t = throttle((x) => calls.push(x), 40); t(1); t(2); t(3); setTimeout(() => t(4), 10); setTimeout(() => resolve(calls.join()), 150); }) === "1,4"` },
+    { name: "Нет завершающего вызова, если ничего не было отброшено", check: `await new Promise((resolve) => { const calls = []; const t = throttle((x) => calls.push(x), 30); t("only"); setTimeout(() => resolve(calls.join()), 120); }) === "only"` },
+    { name: "Передаёт все аргументы", check: `await new Promise((resolve) => { const calls = []; const t = throttle((...a) => calls.push(a.join("+")), 30); t(1, 2); t(3, 4); setTimeout(() => resolve(calls.join()), 100); }) === "1+2,3+4"` },
+  ]}
+>
+
+Простой `throttle` из этого урока **отбрасывает** вызовы, пока ждёт, поэтому последняя позиция прокрутки может потеряться. Исправьте его, чтобы он работал как throttle из Lodash:
+
+1. Первый вызов выполняется **сразу**.
+2. Вызовы, которые приходят во время ожидания, не выполняются, но аргументы **последнего** из них запоминаются.
+3. Когда время ожидания закончилось и какой-то вызов был отброшен, выполните `fn` один раз с **последними** аргументами и начните **новый** период ожидания (чтобы вызовы не проскочили сразу после него).
+4. Если ничего не было отброшено, ничего лишнего не выполняйте; следующий вызов снова выполнится сразу.
+
+Тесты Vitest описывают ровно это поведение с фейковыми таймерами; стартовый код проваливает два из них. Сделайте так, чтобы прошли все пять, не меняя тесты.
+
+<Hint>
+
+Храните в замыкании две переменные: `waiting` и `pendingArgs` (сначала `null`). Если `waiting`, сохраните `pendingArgs = args` и выйдите. Иначе вызовите `fn(...args)` и запустите таймер. Напишите обработчик таймера как именованную функцию, например `function done() { if (pendingArgs) { fn(...pendingArgs); pendingArgs = null; setTimeout(done, ms); } else { waiting = false; } }` — тогда завершающий вызов начнёт новый период ожидания, снова запланировав `done`.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+function throttle(fn, ms) {
+  let waiting = false;
+  let pendingArgs = null;
+
+  function done() {
+    if (pendingArgs) {
+      // Вызов был отброшен: выполняем последний сейчас
+      // и снова ждём перед следующим вызовом
+      fn(...pendingArgs);
+      pendingArgs = null;
+      setTimeout(done, ms);
+    } else {
+      waiting = false;
+    }
+  }
+
+  return (...args) => {
+    if (waiting) {
+      pendingArgs = args; // запоминаем только последний
+      return;
+    }
+    fn(...args);
+    waiting = true;
+    setTimeout(done, ms);
+  };
+}
+
+describe("throttle", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("сразу выполняет первый вызов", () => {
+    const fn = vi.fn();
+    throttle(fn, 100)("a");
+    expect(fn).toHaveBeenCalledWith("a");
+  });
+
+  it("выполняет не чаще раза за интервал, пока идут вызовы", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    for (let i = 0; i < 10; i++) {
+      t(i);
+      vi.advanceTimersByTime(25);
+    }
+    // 250 мс вызовов: в 0, 100 и 200 мс
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("в конце выполняет ещё раз с последними аргументами", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    t(2);
+    t(3);
+    expect(fn).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(100);
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(fn).toHaveBeenLastCalledWith(3);
+  });
+
+  it("не добавляет лишний вызов, если ничего не было отброшено", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    vi.advanceTimersByTime(500);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("после завершающего вызова начинает новый интервал", () => {
+    const fn = vi.fn();
+    const t = throttle(fn, 100);
+    t(1);
+    t(2); // выполнится в 100 мс
+    vi.advanceTimersByTime(120);
+    expect(fn).toHaveBeenCalledTimes(2);
+    t(3); // слишком скоро после завершающего вызова: ждёт
+    expect(fn).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(80); // 200 мс
+    expect(fn).toHaveBeenCalledTimes(3);
+    expect(fn).toHaveBeenLastCalledWith(3);
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Основной поток делает всё: JavaScript, стили, раскладку, отрисовку и обработку ввода. Стремитесь к **~16 мс на кадр** и к отсутствию задач дольше **50 мс**.
+- **Мемоизируйте** чистую, повторяющуюся и дорогую работу (например, создание форматтеров `Intl`) и **ограничивайте** кеши, чтобы они не текли.
+- **Debounce** ждёт паузы (поля поиска); **throttle** выполняет не чаще раза за интервал (прокрутка, изменение размера), а хороший throttle в конце выполняет **последний** отброшенный вызов. Для визуальных обновлений используйте `requestAnimationFrame`.
+- Избегайте **layout thrashing**: сначала читайте значения раскладки, потом записывайте; анимируйте `transform` и `opacity`.
+- **Делегирование событий** заменяет тысячи обработчиков одним.
+- Не рендерите то, чего никто не видит: используйте **пагинацию**, `content-visibility: auto` или **виртуализацию** длинных списков.
+- Разбивайте длинные задачи на **порции**, которые уступают браузеру (`setTimeout`, `scheduler.yield()`), а тяжёлую работу процессора переносите в **Web Worker**.
+- React перерендеривает компонент при изменении состояния, родителя и контекста. `memo` + `useCallback`/`useMemo` помогают, только когда пропсы стабильны, а работа действительно дорогая; сначала попробуйте опустить состояние ниже и **профилируйте**. Используйте **стабильные ключи**, а не индексы, для изменяющихся списков.

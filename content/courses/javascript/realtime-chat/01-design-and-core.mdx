@@ -1,0 +1,1048 @@
+---
+title: "Part 1: Design and core"
+description: Write a design doc for a real-time chat platform, with its message protocol, data model and estimates, then build and test its core with rooms, presence, rate limits and history.
+duration: 25
+xp: 30
+---
+
+Welcome to the **Level 3 capstone**, the final project of the whole JavaScript course! 🎓 Over three parts you'll design, build and ship **PandaChat**, a real-time chat platform: people join rooms like `#general`, see who's online, watch "Bo is typing…" appear, and get every message the moment it's sent, without reloading anything. When the Wi-Fi drops for a few seconds, the app quietly reconnects and catches up.
+
+Chat is a favourite system design interview question for a good reason. The features fit on a sticky note, but doing them **well** touches nearly everything a senior engineer cares about: long-lived connections, fan-out, abuse, flaky networks, and state that is spread over many servers. You'll use the whole of Level 3:
+
+| Part | What we build | Lessons it uses |
+| --- | --- | --- |
+| 1 | The design doc and the chat core, fully tested | [Designing Systems](/learn/javascript/designing-systems), [Clean Architecture](/learn/javascript/clean-architecture), [DI and Domain Modelling](/learn/javascript/dependency-injection-and-domain-modelling) |
+| 2 | The WebSocket server: auth, validation, rooms, presence, heartbeats | [Real-time and Resilience](/learn/javascript/real-time-and-resilience), [Authentication and Sessions](/learn/javascript/authentication-and-sessions), [XSS and Injection](/learn/javascript/xss-and-injection) |
+| 3 | The React client that reconnects, then scaling and shipping it all | [Effects and Data](/learn/javascript/effects-and-data), [Fast Code in the Browser](/learn/javascript/fast-code-in-the-browser), [Real-time and Resilience](/learn/javascript/real-time-and-resilience) |
+
+As in the Level 2 capstone, the code grows from part to part: each part's exercise starts with the finished code of the part before, so the names stay the same all the way through.
+
+## Start with a design doc
+
+Seniors don't start with code, they start with a **design doc**: a page or two that says what we're building, what we're *not* building, and which trade-offs we chose and why. It takes an hour to write and saves weeks of building the wrong thing. It's also how you get useful feedback early: it's much cheaper to hear "what happens when a user has two tabs open?" in a document than in a code review.
+
+### Requirements
+
+| Kind | Requirement |
+| --- | --- |
+| Functional | Users sign in and join **rooms** by name (`general`, `pandas-fan-club`) |
+| Functional | A message sent to a room reaches everyone in it **live**; new joiners see the recent history |
+| Functional | Everyone sees who is in the room (**presence**) and who is typing |
+| Functional | Older messages can be loaded page by page ("load more") |
+| Non-functional | A message reaches the others in under 200 ms (p99) |
+| Non-functional | Nobody can flood a room: each user may send a short burst, then about one message per second |
+| Non-functional | A dropped connection recovers on its own and catches up on what it missed |
+| Non-functional | Bad input (broken JSON, huge messages, unknown commands) never crashes the server |
+
+**Out of scope for v1:** private messages, editing and deleting messages, files and images, read receipts, push notifications, search. Writing these down stops the project from quietly growing, and gives everyone a list to argue about for v2.
+
+### Why WebSockets?
+
+There are four classic ways to get updates from a server to a browser, and choosing between them is the first big decision:
+
+| Technique | How it works | Good for | Cost |
+| --- | --- | --- | --- |
+| Polling | ask "anything new?" every few seconds | dashboards that can be a bit stale | slow updates, lots of empty requests |
+| Long polling | the server holds the request open until there is news | old browsers and proxies | a new request after every message |
+| Server-Sent Events | one long HTTP response that streams events | live feeds, notifications | server to client only; sending needs normal requests |
+| WebSockets | one long-lived, two-way connection | chat, games, collaboration | stateful servers, harder to scale |
+
+A chat sends many small messages in **both** directions (messages, typing, joins), so **WebSockets** fit best. Server-Sent Events plus a `POST` per message would honestly work too, and would be easier to put behind ordinary HTTP infrastructure. "We picked X" is half a decision; "we picked X over Y because Z" is the half that helps the next engineer.
+
+## The message protocol
+
+A WebSocket only carries text (or bytes). What the text **means** is up to us, so the protocol is the most important part of the design: the server and every client must agree on it, and it's hard to change once apps are installed on people's phones. Our rule is simple: every message is a **JSON object with a `type`**.
+
+What the client can send:
+
+| `type` | Other fields | Does |
+| --- | --- | --- |
+| `join` | `room` | joins a room |
+| `leave` | `room` | leaves it |
+| `message` | `room`, `text` | posts a message |
+| `typing` | `room` | "I'm typing" (clients send it at most once a second) |
+| `history` | `room`, `before`, `limit` | asks for older messages |
+
+What the server sends:
+
+| `type` | Other fields | When |
+| --- | --- | --- |
+| `welcome` | `user` | right after connecting |
+| `joined` | `room`, `members`, `history` | the answer to `join` |
+| `left` | `room` | the answer to `leave` |
+| `message` | `room`, `message` | someone (maybe you) posted |
+| `presence` | `room`, `action`, `user`, `members` | someone joined or left |
+| `typing` | `room`, `user` | someone else is typing |
+| `history` | `room`, `messages` | the answer to `history` |
+| `error` | `code`, `message` | something went wrong |
+
+Here is a short conversation, client lines marked `→`, server lines `←`:
+
+```text
+→ { "type": "join", "room": "general" }
+← { "type": "joined", "room": "general",
+    "members": [{ "id": "u1", "name": "Mei" }], "history": [] }
+→ { "type": "message", "room": "general", "text": "Hi! 🐼" }
+← { "type": "message", "room": "general",
+    "message": { "id": "m1", "room": "general", "text": "Hi! 🐼",
+                 "user": { "id": "u1", "name": "Mei" }, "at": 1767268800000 } }
+→ { "type": "message", "room": "general", "text": "" }
+← { "type": "error", "code": "invalid_text",
+    "message": "Messages have 1 to 500 characters" }
+```
+
+A few decisions hide in there:
+
+- **The client never says who it is.** There's no `user` field in what clients send: the server knows the user from the connection, which was authenticated once when it opened. A field the client controls is a field an attacker controls.
+- **Errors have a `code` for programs and a `message` for people.** The client can react to `rate_limited` without parsing English, and we can reword messages without breaking anyone.
+- **The sender gets its own message back.** That echo is the confirmation that the server accepted and stored it, with the server's `id` and time. Until it arrives, a client can show the message as "sending…".
+
+### The data model
+
+Messages are the only thing we must keep. In production they go into a table like this one (in Part 1 we keep them in memory):
+
+```sql
+CREATE TABLE messages (
+  id         TEXT PRIMARY KEY,      -- time-sortable, e.g. a UUIDv7
+  room       TEXT NOT NULL,
+  user_id    TEXT NOT NULL REFERENCES users (id),
+  text       TEXT NOT NULL CHECK (length(text) BETWEEN 1 AND 500),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX messages_by_room ON messages (room, id);
+```
+
+The index matches our one important query, "the latest 50 messages in this room before message X". **Presence** (who is online right now) is not in the database at all: it belongs to live connections, it changes every second, and it's gone when a server restarts, which is exactly right, because so are the connections.
+
+## Back-of-the-envelope numbers
+
+How big does this have to be? Let's estimate for a healthy community: 100,000 people a day, a fifth of them online at the busy hour, each sending about one message a minute while they're online, in rooms of about 25 people:
+
+<CodeExample output={`Open connections at peak: 20,000
+Messages in: 333/s, out: 8,333/s
+Messages per day: 3,000,000
+Storage per year: 329 GB
+Memory for connections: 1 GB`}>
+
+```js
+const fmt = (n) => Math.round(n).toLocaleString("en-US");
+
+const dailyUsers = 100_000;
+const onlineAtPeak = 0.2;         // share of users online at once
+const messagesPerMinute = 1;      // per online user
+const roomSize = 25;              // people who receive each message
+
+const connections = dailyUsers * onlineAtPeak;
+const incoming = (connections * messagesPerMinute) / 60;
+const outgoing = incoming * roomSize;
+console.log(`Open connections at peak: ${fmt(connections)}`);
+console.log(`Messages in: ${fmt(incoming)}/s, out: ${fmt(outgoing)}/s`);
+
+const messagesPerDay = dailyUsers * 30;
+const bytesPerMessage = 300;      // text, ids, room, timestamp
+const gbPerYear = (messagesPerDay * bytesPerMessage * 365) / 1e9;
+console.log(`Messages per day: ${fmt(messagesPerDay)}`);
+console.log(`Storage per year: ${fmt(gbPerYear)} GB`);
+
+const kbPerConnection = 50;       // socket buffers + our objects
+const memoryGb = (connections * kbPerConnection) / 1e6;
+console.log(`Memory for connections: ${memoryGb} GB`);
+```
+
+</CodeExample>
+
+What the numbers tell us:
+
+- **20,000 open connections** is fine for Node: one process can hold tens of thousands of mostly idle WebSockets. But we'll want several servers anyway, for safety and deploys, and that brings the hardest problem of real-time systems (Part 3): a message sent to server A must also reach the people connected to server B.
+- **333 messages in, 8,333 out per second.** Chat is a **fan-out** system: every message is written once and delivered 25 times. The delivery side is what we must make cheap.
+- **329 GB a year** fits one PostgreSQL server for years. No exotic database needed.
+- **1 GB of memory** for connections: plan the servers' RAM for it, and don't keep big objects per connection.
+
+### Trade-offs we chose
+
+| Decision | We chose | Because | The price |
+| --- | --- | --- | --- |
+| Transport | WebSockets | two-way, low latency, little overhead per message | stateful servers, special load-balancer setup |
+| Delivery | live messages + history on (re)join | simple; a reconnecting client catches up from history | a message during a long outage is only in history |
+| Order | the server timestamps and orders messages per room | one source of truth for "what came first" | clients' clocks don't matter, but there's one writer per room |
+| Pages of history | a **cursor** (`before` a message id) | stable while new messages arrive | can't jump to "page 7" |
+| Flooding | a token bucket per user | allows quick bursts, limits sustained spam | counters must be shared between servers later |
+| Presence | in memory, per server | fast, and it disappears with the connections | needs pub/sub across servers (Part 3) |
+
+<Callout type="tip" title="Exactly once is (almost) a myth">
+
+Networks lose things. A message can be delivered and the connection drop before the "got it" comes back, so the client can't know whether to resend. Real systems pick **at most once** (never resend; might lose), or **at least once** (resend; might duplicate) plus de-duplication by id. We start with at most once for live messages, and history on rejoin fills the gaps. Saying this out loud in the design doc avoids promises the system can't keep.
+
+</Callout>
+
+## Pages that don't move
+
+The trade-offs table says history uses a **cursor**, not page numbers. Here's why. Imagine you opened a room, read the newest 3 messages, and two new messages arrived while you scrolled up to "load more":
+
+<CodeExample output={`first screen: m5 m6 m7
+page 2:       m4 m5 m6
+before m5:    m2 m3 m4`}>
+
+```js
+const messages = [];
+const post = (id) => messages.push({ id, text: `message ${id}` });
+["m1", "m2", "m3", "m4", "m5", "m6", "m7"].forEach(post);
+const ids = (list) => list.map((m) => m.id).join(" ");
+
+// Page numbers: page 1 is the newest `size` messages.
+function pageByNumber(list, page, size) {
+  const end = list.length - (page - 1) * size;
+  return list.slice(Math.max(0, end - size), end);
+}
+
+// A cursor: the `size` messages just before a known message.
+function pageBefore(list, before, size) {
+  const end = list.findIndex((m) => m.id === before);
+  return list.slice(Math.max(0, end - size), end);
+}
+
+const first = pageByNumber(messages, 1, 3);
+console.log("first screen:", ids(first));
+
+post("m8"); // new messages arrive while we read...
+post("m9");
+
+console.log("page 2:      ", ids(pageByNumber(messages, 2, 3)));
+console.log("before m5:   ", ids(pageBefore(messages, "m5", 3)));
+```
+
+</CodeExample>
+
+With page numbers, "page 2" is counted from the newest message, so when two new messages arrive it shifts: you'd see `m5` and `m6` **twice**. A cursor says "the 3 messages before `m5`", which means the same thing no matter what arrives later. In SQL that's `WHERE room = $1 AND id < $2 ORDER BY id DESC LIMIT 50`, which is why time-sortable ids and the `(room, id)` index matter. Every feed you've used (Slack, X, GitHub's API) pages this way.
+
+## Time, under our control
+
+Rate limiting is about time, and code that reads `Date.now()` directly is slow and flaky to test. As in the [DI and Domain Modelling](/learn/javascript/dependency-injection-and-domain-modelling) lesson, the core takes a **clock** as a parameter: a function that returns the time in milliseconds. Production passes `Date.now`; tests pass a **fake clock** that only moves when the test says so.
+
+The rate limiter is the **token bucket** from the [Real-time and Resilience](/learn/javascript/real-time-and-resilience) lesson, unchanged (its clock parameter is called `now`): each user has a bucket of `capacity` tokens; a message costs one; tokens are earned back at `perSecond`, but never above `capacity`. That allows a quick burst ("hi!", "how are you?", "🐼") but not a flood:
+
+<CodeExample output={`burst: [ true, true, true, false ]
+1.5 s later: true false
+a minute later: [ true, true, true, false ]
+clock: 61500`}>
+
+```js
+/** A clock for tests: time only moves when a test says so. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+const clock = fakeClock();
+const bucket = createTokenBucket({
+  capacity: 3,
+  perSecond: 1,
+  now: clock,
+});
+const burst = () => Array.from({ length: 4 }, () => bucket.take());
+
+console.log("burst:", burst());
+clock.advance(1500);
+console.log("1.5 s later:", bucket.take(), bucket.take());
+clock.advance(60_000);
+console.log("a minute later:", burst());
+console.log("clock:", clock());
+```
+
+</CodeExample>
+
+A minute of silence earns back only three tokens, not sixty: the `Math.min` is what stops a user from saving up a flood. And the whole test took zero real milliseconds, because `clock.advance(60_000)` just changes a number. A function with properties (`clock()` and `clock.advance()`) is a neat JavaScript trick: one value that is both the clock and its remote control.
+
+## The chat service
+
+The **core** of PandaChat knows nothing about WebSockets, React or databases. It's the use-case layer from the [Clean Architecture](/learn/javascript/clean-architecture) lesson: plain functions that enforce the rules. We build it with a **factory function**, `createChatService({ clock, newId, limits })`, which keeps its state in closures (`rooms`, `buckets`, `listeners`) that nobody outside can touch, and returns an object of methods.
+
+How do other parts find out that something happened? The service is an **observer** (an event emitter, as in the [SOLID and Classic Patterns](/learn/javascript/solid-and-classic-patterns) lesson): `subscribe(listener)` registers a function, the service calls it with every event, and `subscribe` returns a function that unsubscribes. In Part 2 the WebSocket server subscribes and forwards events to the right sockets. Here's the start of the service, with `join`:
+
+<CodeExample output={`general: Mei joined
+general: Bo joined
+[ 'Mei', 'Bo' ]
+ChatError invalid_room Bad room name`}>
+
+```js
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService() {
+  const rooms = new Map(); // name -> { members, messages }
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError("invalid_room", "Bad room name");
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({ type: "presence", room: name, action: "join", user });
+    }
+    return { room: name, members: members(name) };
+  }
+
+  return { subscribe, join, members };
+}
+
+const chat = createChatService();
+const stop = chat.subscribe((event) => {
+  console.log(`${event.room}: ${event.user.name} ${event.action}ed`);
+});
+
+chat.join("general", { id: "u1", name: "Mei" });
+const reply = chat.join("general", { id: "u2", name: "Bo" });
+chat.join("general", { id: "u2", name: "Bo" }); // again: no event
+console.log(reply.members.map((user) => user.name));
+
+stop();
+chat.join("random", { id: "u1", name: "Mei" }); // nobody listening
+try {
+  chat.join("Party Room!", { id: "u1", name: "Mei" });
+} catch (error) {
+  console.log(error.name, error.code, error.message);
+}
+```
+
+</CodeExample>
+
+Notice the details:
+
+- **Joining twice is harmless.** A reconnecting client sends `join` again, and the second one returns the same answer without a second announcement. Operations that are safe to repeat are called **idempotent**, and they make retries easy.
+- **`Map` for members, not an array or a plain object.** Lookups by id are fast, insertion order is kept (members are listed in the order they joined), and an id like `"__proto__"` can't do anything strange.
+- **Errors carry a `code`**: `ChatError("invalid_room", ...)`. In Part 2 the server turns them straight into `{ type: "error", code, message }` replies.
+- **The room name is checked against an allow-list pattern** (`/^[a-z0-9-]{1,30}$/`), not a block-list. The service only ever creates rooms with safe, short names.
+
+The other methods follow the same style. These are yours to write in the exercise:
+
+- **`postMessage(room, userId, text)`** checks, in this order: is the user a **member** (`not_member`)? Is the **trimmed** text 1 to 500 characters (`invalid_text`)? Does the user's **bucket** have a token (`rate_limited`)? Bad input is rejected *before* it costs a token. Then it stores `{ id, room, user, text, at }`, keeps only the newest `keep` messages in memory, emits a `message` event and returns the message.
+- **`leave(room, userId)`** and **`leaveAll(userId)`**: take a user out of one room, or all of them (when their connection closes), with a `presence` event for each.
+- **`history(room, { before, limit })`**: the cursor pagination from above.
+
+<Callout type="warning" title="A growing Map is a memory leak">
+
+Every room keeps its messages in an array, and every user gets a token bucket. Without `keep`, a busy room's array would grow until the process runs out of memory, the classic leak from the [Memory and Garbage Collection](/learn/javascript/memory-and-garbage-collection) lesson. In production the history lives in the database and the memory only holds a small recent window; the buckets of users who have been quiet for a while should be removed too (a good "take it further" task).
+
+</Callout>
+
+## Testing the core
+
+Because the core is plain JavaScript with injected time and ids, its tests need no server and no mocks. A `beforeEach` builds a fresh service with a fake clock, predictable ids (`m1`, `m2`, …) and small limits, and records every event:
+
+```js
+describe("chat service", () => {
+  let clock, chat, events;
+
+  beforeEach(() => {
+    clock = fakeClock(1_000_000);
+    let n = 0;
+    chat = createChatService({
+      clock,
+      newId: () => `m${++n}`,
+      limits: { burst: 3, perSecond: 1 },
+    });
+    events = [];
+    chat.subscribe((event) => events.push(event));
+  });
+
+  it("join adds members and announces them once", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    chat.join("general", bo);
+    expect(chat.members("general")).toEqual([mei, bo]);
+    expect(events.map((e) => `${e.action} ${e.user.name}`))
+      .toEqual(["join Mei", "join Bo"]);
+  });
+});
+```
+
+A test that needs time to pass calls `clock.advance(1000)`, and the service sees it immediately, because they share the same clock. To check an error's `code`, `toThrow` accepts an asymmetric matcher: `toThrow(expect.objectContaining({ code: "rate_limited" }))`.
+
+<Quiz
+  question="Why doesn't the client send its own user id with each chat message, like { type: 'message', room: 'general', user: 'u1', text: 'Hi' }?"
+  options={[
+    "To make the JSON shorter",
+    "Because anyone can put any id in a message; the server must take the user from the connection it authenticated",
+    "Because WebSockets can't send numbers",
+    "Because the database generates user ids",
+  ]}
+  answer={1}
+  explanation="Everything a client sends can be forged. The server authenticates the connection once, when it opens, and attaches the user to it, so a message's author always comes from the server's own records."
+/>
+
+<Quiz
+  question="New messages keep arriving while a user scrolls up and clicks 'load more'. Why does the history use 'the 50 messages before message X' instead of 'page 2'?"
+  options={[
+    "Page numbers are slower in JavaScript",
+    "Because page 2 is counted from the newest message, so it shifts when new messages arrive and shows some messages twice; a cursor always means the same messages",
+    "Because cursors use less memory in the browser",
+    "Because WebSockets don't support numbers in messages",
+  ]}
+  answer={1}
+  explanation="With offsets, every new message pushes the old ones further down, so the next page overlaps the one you already have. A cursor is anchored to a message id, so the next page starts exactly where the last one ended, whatever arrives in between."
+/>
+
+<Exercise
+  title="Build it: The chat core"
+  starter={`import { describe, it, expect, beforeEach } from "vitest";
+
+// ---------- errors ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- time ----------
+
+/** A clock for tests: time only moves when a test says so. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- the chat service ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // characters per message
+  keep: 200, // messages kept per room
+  burst: 5, // messages in a quick burst...
+  perSecond: 1, // ...then one per second
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // name -> { members, messages }
+  const buckets = new Map(); // user id -> token bucket
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "Room names use a-z, 0-9 and -, up to 30 characters",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", \`Join \${name} first\`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    // TODO 1: remove the user from the room and emit a "presence"
+    // event with action "leave" and the members who are left.
+    // Return true, or false if they weren't in the room.
+    return false;
+  }
+
+  function leaveAll(userId) {
+    // TODO 1: leave every room the user is in (for disconnects);
+    // return the names of the rooms they left
+    return [];
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    // TODO 2: check membership (not_member), the trimmed text
+    // (invalid_text), then the user's bucket (rate_limited).
+    // Store { id, room, user, text, at }, keep at most
+    // config.keep messages, emit { type: "message", room,
+    // message } and return the message.
+    throw new ChatError("todo", "postMessage isn't written yet");
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    // TODO 3: the \`limit\` messages just before the message whose
+    // id is \`before\` (or the newest ones), oldest first
+    return [];
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- tests: the core (Part 1) ----------
+
+const mei = { id: "u1", name: "Mei" };
+const bo = { id: "u2", name: "Bo" };
+
+describe("chat service", () => {
+  let clock, chat, events;
+
+  beforeEach(() => {
+    clock = fakeClock(1_000_000);
+    let n = 0;
+    chat = createChatService({
+      clock,
+      newId: () => \`m\${++n}\`,
+      limits: { burst: 3, perSecond: 1 },
+    });
+    events = [];
+    chat.subscribe((event) => events.push(event));
+  });
+
+  it("join adds members and announces them once", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    chat.join("general", bo);
+    expect(chat.members("general")).toEqual([mei, bo]);
+    expect(events.map((e) => \`\${e.action} \${e.user.name}\`))
+      .toEqual(["join Mei", "join Bo"]);
+  });
+
+  it.each(["", "General", "no spaces", "a".repeat(31), 42])(
+    'refuses the room name "%s"',
+    (name) => {
+      expect(() => chat.join(name, mei)).toThrow("Room names");
+    },
+  );
+
+  it("posts a trimmed message and tells listeners", () => {
+    chat.join("general", mei);
+    const message = chat.postMessage("general", "u1", "  Hi!  ");
+    expect(message).toEqual({
+      id: "m1", room: "general", user: mei, text: "Hi!",
+      at: 1_000_000,
+    });
+    expect(events.at(-1)).toEqual({
+      type: "message", room: "general", message,
+    });
+  });
+
+  it("refuses messages from people who haven't joined", () => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+    expect(() => chat.postMessage("random", "u1", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+  });
+
+  it.each([
+    ["empty", ""],
+    ["only spaces", "   "],
+    ["too long", "x".repeat(501)],
+    ["not text", 42],
+  ])("refuses a message that is %s", (_label, text) => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u1", text))
+      .toThrow(expect.objectContaining({ code: "invalid_text" }));
+  });
+
+  it("leave announces it, and leavers can't post", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    expect(chat.leave("general", "u2")).toBe(true);
+    expect(chat.leave("general", "u2")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      action: "leave", user: bo, members: [mei],
+    });
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow("Join general first");
+  });
+
+  it("history pages backwards with a cursor", () => {
+    chat.join("general", mei);
+    for (const text of ["a", "b", "c"]) {
+      chat.postMessage("general", "u1", text);
+      clock.advance(1000);
+    }
+    const texts = (list) => list.map((m) => m.text).join("");
+    expect(texts(chat.history("general"))).toBe("abc");
+    expect(texts(chat.history("general", { limit: 2 }))).toBe("bc");
+    expect(texts(chat.history("general", { before: "m2" }))).toBe("a");
+    expect(chat.history("nowhere")).toEqual([]);
+  });
+
+  // TODO 4: three rate-limit tests (burst is 3, perSecond is 1):
+  // - a user can send a burst of 3 messages, the 4th is refused
+  // - after 999 ms still refused, after 1000 ms one more is allowed
+  // - waiting a minute never saves up more than the burst
+});`}
+  tests={[
+    { name: "All the tests in the editor pass, including your three rate-limit tests", check: `__vitest.failed === 0 && __vitest.passed >= 17` },
+    { name: "leave() and leaveAll() take people out of rooms and announce it", check: `(() => { const c = createChatService({ clock: fakeClock(0), newId: () => 'x' }); const ev = []; c.subscribe((e) => ev.push(e)); const ann = { id: 'a', name: 'Ann' }; const ben = { id: 'b', name: 'Ben' }; c.join('one', ann); c.join('two', ann); c.join('one', ben); const left = c.leave('one', 'a'); const again = c.leave('one', 'a'); const unknown = c.leave('nowhere', 'a'); const all = c.leaveAll('a'); const none = c.leaveAll('zed'); const leaves = ev.filter((e) => e.action === 'leave'); return left === true && again === false && unknown === false && JSON.stringify(all) === '["two"]' && Array.isArray(none) && none.length === 0 && leaves.length === 2 && leaves.every((e) => e.type === 'presence' && e.user.name === 'Ann') && leaves[0].room === 'one' && JSON.stringify(leaves[0].members) === JSON.stringify([ben]) && leaves[1].room === 'two' && leaves[1].members.length === 0 && c.members('one').length === 1 && c.members('two').length === 0; })()` },
+    { name: "postMessage() stores a trimmed message with its id, user and time, and announces it", check: `(() => { const clock = fakeClock(5000); const c = createChatService({ clock, newId: () => 'id-7' }); const ev = []; c.subscribe((e) => ev.push(e)); const ann = { id: 'a', name: 'Ann' }; c.join('one', ann); clock.advance(250); const m = c.postMessage('one', 'a', '  Hello there  '); const last = ev.at(-1); return m.id === 'id-7' && m.room === 'one' && m.user.name === 'Ann' && m.text === 'Hello there' && m.at === 5250 && last.type === 'message' && last.room === 'one' && last.message === m && c.history('one').length === 1 && c.history('one')[0].text === 'Hello there'; })()` },
+    { name: "postMessage() refuses non-members, bad text and floods, with the right codes", check: `(() => { const clock = fakeClock(0); const c = createChatService({ clock, newId: () => 'x', limits: { maxLength: 10, burst: 2, perSecond: 0.5 } }); c.join('one', { id: 'a', name: 'Ann' }); c.join('one', { id: 'b', name: 'Ben' }); const post = (room, user, text) => { try { c.postMessage(room, user, text); return 'ok'; } catch (e) { return e instanceof ChatError ? e.code : 'other'; } }; const r = [post('one', 'zed', 'hi'), post('two', 'a', 'hi'), post('one', 'a', ''), post('one', 'a', '   '), post('one', 'a', 'x'.repeat(11)), post('one', 'a', null), post('one', 'a', ' ' + 'x'.repeat(10) + ' '), post('one', 'a', 'hi'), post('one', 'a', 'hi'), post('one', 'b', 'hi')]; clock.advance(1999); const early = post('one', 'a', 'hi'); clock.advance(1); const later = post('one', 'a', 'hi'); return r.join() === 'not_member,not_member,invalid_text,invalid_text,invalid_text,invalid_text,ok,ok,rate_limited,ok' && early === 'rate_limited' && later === 'ok'; })()` },
+    { name: "Each room keeps only its newest messages (limits.keep)", check: `(() => { let n = 0; const c = createChatService({ clock: fakeClock(0), newId: () => 'm' + ++n, limits: { keep: 3, burst: 100 } }); const ann = { id: 'a', name: 'Ann' }; c.join('one', ann); c.join('two', ann); for (const t of ['1', '2', '3', '4', '5']) c.postMessage('one', 'a', t); c.postMessage('two', 'a', 'other'); return c.history('one').map((m) => m.text).join() === '3,4,5' && c.history('two').length === 1; })()` },
+    { name: "history() pages backwards with before and limit", check: `(() => { let n = 0; const c = createChatService({ clock: fakeClock(0), newId: () => 'm' + ++n, limits: { burst: 1000 } }); c.join('one', { id: 'a', name: 'Ann' }); for (let i = 1; i <= 120; i++) c.postMessage('one', 'a', 'msg ' + i); const ids = (list) => list.map((m) => m.id).join(); const last50 = c.history('one'); return last50.length === 50 && last50[0].id === 'm71' && last50[49].id === 'm120' && ids(c.history('one', { limit: 3 })) === 'm118,m119,m120' && ids(c.history('one', { before: 'm71', limit: 2 })) === 'm69,m70' && c.history('one', { limit: 500 }).length === 100 && ids(c.history('one', { limit: 0 })) === 'm120' && c.history('one', { before: 'm1' }).length === 0 && ids(c.history('one', { before: 'm3' })) === 'm1,m2' && c.history('one', { before: 'nope' }).length === 0 && c.history('nowhere').length === 0 && ids(c.join('one', { id: 'b', name: 'Bo' }).history) === ids(last50); })()` },
+    { name: "Your tests catch a bucket that never says no", check: `(await __retest([["if (tokens < 1) return false;", "if (tokens < 0) return false;"]])).failed > __vitest.failed` },
+    { name: "Your tests catch a bucket that never refills", check: `(await __retest([["const earned = ((t - updated) / 1000) * perSecond;", "const earned = 0;"]])).failed > __vitest.failed` },
+    { name: "Your tests catch a bucket that saves up without a limit", check: `(await __retest([["tokens = Math.min(capacity, tokens + earned);", "tokens = tokens + earned;"]])).failed > __vitest.failed` },
+  ]}
+>
+
+Build PandaChat's core. `ChatError`, `fakeClock`, `createTokenBucket` and the start of `createChatService` (with `subscribe`, `members`, `join`, `typing` and `bucketFor`) are ready, and so are most of the tests. Don't change `createTokenBucket`: the checks will sneak bugs into it to see whether your tests notice. You write:
+
+1. **`leave(name, userId)`**: if the user is in the room, remove them, emit `{ type: "presence", room, action: "leave", user, members }` (the members **left**, like `join` does) and return `true`; otherwise return `false`. **`leaveAll(userId)`** leaves every room the user is in and returns those rooms' names.
+2. **`postMessage(name, userId, text)`**: throw `ChatError("not_member", …)` unless the user is in the room; `ChatError("invalid_text", …)` unless `text` is a string whose **trimmed** length is 1 to `config.maxLength`; `ChatError("rate_limited", "Slow down a little")` when `bucketFor(userId).take()` says no. Then build `{ id: newId(), room: name, user, text, at: clock() }` with the trimmed text, push it to `room.messages`, drop the oldest when there are more than `config.keep`, emit `{ type: "message", room: name, message }` and return the message.
+3. **`history(name, { before, limit = 50 })`**: the room's messages, oldest first, at most `limit` of them (whole numbers are clamped to 1–100; anything else means 50). Without `before`, the newest ones; with `before`, the ones just **before** the message with that id, or `[]` if there's no such message (also for unknown rooms).
+4. **Three rate-limit tests** in the `describe` block (the service there has `burst: 3, perSecond: 1`): a burst of 3 messages works and the 4th throws `rate_limited`; after `clock.advance(999)` it's still refused, after one more millisecond it's allowed; and after a minute of silence a user still can't send more than 3 in a row.
+
+<Hint>
+
+For `leave`, copy the lookup from `typing`: `const room = rooms.get(name); const user = room?.members.get(userId);`. `leaveAll` loops over `rooms.keys()` and calls `leave` for each. In `postMessage`, `typeof text === "string" ? text.trim() : ""` turns any bad type into an empty (invalid) string. In `history`, `messages.findIndex((m) => m.id === before)` finds where the page ends, and `messages.slice(Math.max(0, end - size), end)` cuts it out. For the third test, make sure the user's bucket exists **before** the minute passes (post one message first), or there's nothing to save up.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ---------- errors ----------
+
+class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "ChatError";
+    this.code = code;
+  }
+}
+
+// ---------- time ----------
+
+/** A clock for tests: time only moves when a test says so. */
+function fakeClock(start = 0) {
+  let now = start;
+  const clock = () => now;
+  clock.advance = (ms) => {
+    now += ms;
+  };
+  return clock;
+}
+
+function createTokenBucket({ capacity, perSecond, now = Date.now }) {
+  let tokens = capacity;
+  let updated = now();
+  return {
+    take() {
+      const t = now();
+      const earned = ((t - updated) / 1000) * perSecond;
+      tokens = Math.min(capacity, tokens + earned);
+      updated = t;
+      if (tokens < 1) return false;
+      tokens -= 1;
+      return true;
+    },
+  };
+}
+
+// ---------- the chat service ----------
+
+const DEFAULT_LIMITS = {
+  maxLength: 500, // characters per message
+  keep: 200, // messages kept per room
+  burst: 5, // messages in a quick burst...
+  perSecond: 1, // ...then one per second
+};
+const ROOM_NAME = /^[a-z0-9-]{1,30}$/;
+
+function createChatService({
+  clock = Date.now,
+  newId = () => crypto.randomUUID(),
+  limits = {},
+} = {}) {
+  const config = { ...DEFAULT_LIMITS, ...limits };
+  const rooms = new Map(); // name -> { members, messages }
+  const buckets = new Map(); // user id -> token bucket
+  const listeners = new Set();
+
+  function emit(event) {
+    for (const listener of listeners) listener(event);
+  }
+
+  function subscribe(listener) {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  function members(name) {
+    const room = rooms.get(name);
+    return room ? [...room.members.values()] : [];
+  }
+
+  function join(name, user) {
+    if (typeof name !== "string" || !ROOM_NAME.test(name)) {
+      throw new ChatError(
+        "invalid_room",
+        "Room names use a-z, 0-9 and -, up to 30 characters",
+      );
+    }
+    if (!rooms.has(name)) {
+      rooms.set(name, { members: new Map(), messages: [] });
+    }
+    const room = rooms.get(name);
+    if (!room.members.has(user.id)) {
+      room.members.set(user.id, user);
+      emit({
+        type: "presence",
+        room: name,
+        action: "join",
+        user,
+        members: members(name),
+      });
+    }
+    return { room: name, members: members(name), history: history(name) };
+  }
+
+  function typing(name, userId) {
+    const user = rooms.get(name)?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Join ${name} first`);
+    }
+    emit({ type: "typing", room: name, user });
+  }
+
+  function leave(name, userId) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) return false;
+    room.members.delete(userId);
+    emit({
+      type: "presence",
+      room: name,
+      action: "leave",
+      user,
+      members: members(name),
+    });
+    return true;
+  }
+
+  function leaveAll(userId) {
+    const left = [];
+    for (const name of rooms.keys()) {
+      if (leave(name, userId)) left.push(name);
+    }
+    return left;
+  }
+
+  function bucketFor(userId) {
+    if (!buckets.has(userId)) {
+      buckets.set(
+        userId,
+        createTokenBucket({
+          capacity: config.burst,
+          perSecond: config.perSecond,
+          now: clock,
+        }),
+      );
+    }
+    return buckets.get(userId);
+  }
+
+  function postMessage(name, userId, text) {
+    const room = rooms.get(name);
+    const user = room?.members.get(userId);
+    if (!user) {
+      throw new ChatError("not_member", `Join ${name} first`);
+    }
+    const clean = typeof text === "string" ? text.trim() : "";
+    if (clean.length < 1 || clean.length > config.maxLength) {
+      throw new ChatError(
+        "invalid_text",
+        `Messages have 1 to ${config.maxLength} characters`,
+      );
+    }
+    if (!bucketFor(userId).take()) {
+      throw new ChatError("rate_limited", "Slow down a little");
+    }
+    const message = {
+      id: newId(),
+      room: name,
+      user,
+      text: clean,
+      at: clock(),
+    };
+    room.messages.push(message);
+    if (room.messages.length > config.keep) room.messages.shift();
+    emit({ type: "message", room: name, message });
+    return message;
+  }
+
+  function history(name, { before, limit = 50 } = {}) {
+    const messages = rooms.get(name)?.messages ?? [];
+    const size = Number.isInteger(limit)
+      ? Math.min(Math.max(limit, 1), 100)
+      : 50;
+    let end = messages.length;
+    if (before !== undefined) {
+      end = messages.findIndex((m) => m.id === before);
+      if (end === -1) return []; // unknown, or too old to keep
+    }
+    return messages.slice(Math.max(0, end - size), end);
+  }
+
+  return {
+    subscribe,
+    join,
+    leave,
+    leaveAll,
+    members,
+    typing,
+    postMessage,
+    history,
+  };
+}
+
+// ---------- tests: the core (Part 1) ----------
+
+const mei = { id: "u1", name: "Mei" };
+const bo = { id: "u2", name: "Bo" };
+
+describe("chat service", () => {
+  let clock, chat, events;
+
+  beforeEach(() => {
+    clock = fakeClock(1_000_000);
+    let n = 0;
+    chat = createChatService({
+      clock,
+      newId: () => `m${++n}`,
+      limits: { burst: 3, perSecond: 1 },
+    });
+    events = [];
+    chat.subscribe((event) => events.push(event));
+  });
+
+  it("join adds members and announces them once", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    chat.join("general", bo);
+    expect(chat.members("general")).toEqual([mei, bo]);
+    expect(events.map((e) => `${e.action} ${e.user.name}`))
+      .toEqual(["join Mei", "join Bo"]);
+  });
+
+  it.each(["", "General", "no spaces", "a".repeat(31), 42])(
+    'refuses the room name "%s"',
+    (name) => {
+      expect(() => chat.join(name, mei)).toThrow("Room names");
+    },
+  );
+
+  it("posts a trimmed message and tells listeners", () => {
+    chat.join("general", mei);
+    const message = chat.postMessage("general", "u1", "  Hi!  ");
+    expect(message).toEqual({
+      id: "m1", room: "general", user: mei, text: "Hi!",
+      at: 1_000_000,
+    });
+    expect(events.at(-1)).toEqual({
+      type: "message", room: "general", message,
+    });
+  });
+
+  it("refuses messages from people who haven't joined", () => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+    expect(() => chat.postMessage("random", "u1", "Hi"))
+      .toThrow(expect.objectContaining({ code: "not_member" }));
+  });
+
+  it.each([
+    ["empty", ""],
+    ["only spaces", "   "],
+    ["too long", "x".repeat(501)],
+    ["not text", 42],
+  ])("refuses a message that is %s", (_label, text) => {
+    chat.join("general", mei);
+    expect(() => chat.postMessage("general", "u1", text))
+      .toThrow(expect.objectContaining({ code: "invalid_text" }));
+  });
+
+  it("leave announces it, and leavers can't post", () => {
+    chat.join("general", mei);
+    chat.join("general", bo);
+    expect(chat.leave("general", "u2")).toBe(true);
+    expect(chat.leave("general", "u2")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      action: "leave", user: bo, members: [mei],
+    });
+    expect(() => chat.postMessage("general", "u2", "Hi"))
+      .toThrow("Join general first");
+  });
+
+  it("history pages backwards with a cursor", () => {
+    chat.join("general", mei);
+    for (const text of ["a", "b", "c"]) {
+      chat.postMessage("general", "u1", text);
+      clock.advance(1000);
+    }
+    const texts = (list) => list.map((m) => m.text).join("");
+    expect(texts(chat.history("general"))).toBe("abc");
+    expect(texts(chat.history("general", { limit: 2 }))).toBe("bc");
+    expect(texts(chat.history("general", { before: "m2" }))).toBe("a");
+    expect(chat.history("nowhere")).toEqual([]);
+  });
+
+  it("lets a user send a burst, then refuses", () => {
+    chat.join("general", mei);
+    for (let i = 0; i < 3; i++) {
+      chat.postMessage("general", "u1", `hi ${i}`);
+    }
+    expect(() => chat.postMessage("general", "u1", "one more"))
+      .toThrow(expect.objectContaining({ code: "rate_limited" }));
+  });
+
+  it("refills one message per second", () => {
+    chat.join("general", mei);
+    for (let i = 0; i < 3; i++) chat.postMessage("general", "u1", "hi");
+    clock.advance(999);
+    expect(() => chat.postMessage("general", "u1", "hi")).toThrow();
+    clock.advance(1);
+    expect(chat.postMessage("general", "u1", "hi").text).toBe("hi");
+  });
+
+  it("never saves up more than the burst", () => {
+    chat.join("general", mei);
+    chat.postMessage("general", "u1", "hi");
+    clock.advance(60_000);
+    for (let i = 0; i < 3; i++) chat.postMessage("general", "u1", "hi");
+    expect(() => chat.postMessage("general", "u1", "hi")).toThrow();
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- A **design doc**: requirements and non-goals, the choice of WebSockets over polling and Server-Sent Events, a **JSON protocol** where every message has a `type` and errors have a `code`, the data model, the estimates (20,000 connections, 8,333 deliveries a second, 329 GB a year) and a table of trade-offs.
+- **Cursor pagination** that stays correct while new messages arrive.
+- A **token bucket** with an injected clock, and a `fakeClock` that makes a minute pass in no time.
+- **`createChatService`**: rooms, idempotent joins, presence events, messages that are validated, rate-limited and kept in a bounded history, and an observer API (`subscribe`) for whoever needs to know.
+- A fast **Vitest suite** that proves the rules, including tests that catch a broken rate limiter.
+
+The core works, but nobody can reach it yet. In **Part 2** we put it behind a real-time WebSocket server with authentication, validation, rooms, presence and heartbeats. ⚡

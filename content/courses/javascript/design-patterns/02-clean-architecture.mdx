@@ -1,0 +1,829 @@
+---
+title: Clean Architecture in JavaScript
+description: Split a Node app into domain, use cases and adapters, follow the dependency rule, write ports and repositories, keep Express routes thin, and test each layer with fakes.
+duration: 25
+xp: 25
+---
+
+Most Node backends start the same way: an Express route that validates the body, runs a SQL query, applies a discount rule, sends an email and returns JSON, all in 60 lines. It's quick, and for a small app it's fine. Then the app grows. One team I worked with wanted to move a busy service from MongoDB to PostgreSQL and found Mongo queries in route handlers, in middleware, in cron jobs and even in a React server component. The "two-week migration" took a quarter. 🏗️
+
+**Clean architecture** is a way to organise code so that the important part, your **business rules**, doesn't depend on details like the web framework or the database. In this lesson you'll learn its layers, the one rule that holds them together, how to express **ports** in a language without interfaces, the **repository** pattern, and how Express becomes "just an adapter" that is easy to replace and easy to test.
+
+## Three layers
+
+Think of the app as rings, with the most important and most stable code in the middle:
+
+| Layer | Contains | Knows about |
+| --- | --- | --- |
+| **Domain** (the core) | Business data and rules: an account, "you can't redeem more points than you have" | Nothing but plain JavaScript |
+| **Use cases** (application) | One function per thing a user can do: `redeemReward`, `earnPoints` | The domain, plus **ports**: agreed shapes for storage, email, payments |
+| **Adapters** (infrastructure) | Express routes, PostgreSQL repositories, an email client, a CLI, a queue worker | Everything: they plug the outside world into the use cases |
+
+You'll also hear this called **ports and adapters** or **hexagonal architecture**. The details differ, the idea is the same: the inside defines what it **needs** ("something that can load and save accounts"), and the outside **provides** it (a PostgreSQL repository in production, an in-memory one in tests).
+
+In a real project, organise folders **by feature first**, and by layer inside each feature. A `controllers/`, `services/`, `models/` split at the top level scatters one feature across the whole tree; feature folders keep everything about loyalty points together and make it obvious what can be deleted when a feature goes:
+
+```text
+src/
+├── loyalty/
+│   ├── domain/        account.js, errors.js       (pure JS)
+│   ├── use-cases/     redeem-reward.js, earn-points.js
+│   ├── adapters/      http.js, postgres-accounts.js
+│   └── loyalty.test.js
+├── orders/
+│   └── ...same shape...
+├── shared/            logger.js, http-errors.js
+└── main.js            wires everything together
+```
+
+## The domain: plain rules
+
+The domain is the code you'd show a product manager. It has **no** `import express`, no SQL and no `fetch`. Here the rules for loyalty points are pure functions that take and return plain objects, with errors that speak the business language:
+
+<CodeExample output={`{ id: 'a1', name: 'Mei', points: 170 } 120
+20
+NotEnoughPoints: Panda plush costs 300, you have 20
+true
+ValidationError: points must be a positive whole number`}>
+
+```js
+// loyalty/domain/errors.js
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name; // the subclass's name
+  }
+}
+class ValidationError extends DomainError {}
+class NotEnoughPoints extends DomainError {}
+
+// loyalty/domain/account.js: rules only, no I/O
+function earn(account, points) {
+  if (!Number.isInteger(points) || points <= 0) {
+    throw new ValidationError("points must be a positive whole number");
+  }
+  return { ...account, points: account.points + points };
+}
+
+function redeem(account, reward) {
+  if (account.points < reward.cost) {
+    throw new NotEnoughPoints(
+      `${reward.name} costs ${reward.cost}, you have ${account.points}`,
+    );
+  }
+  return { ...account, points: account.points - reward.cost };
+}
+
+const mei = { id: "a1", name: "Mei", points: 120 };
+const richer = earn(mei, 50);
+console.log(richer, mei.points); // the original is untouched
+const afterTea = redeem(richer, { name: "Bamboo tea", cost: 150 });
+console.log(afterTea.points);
+
+try {
+  redeem(afterTea, { name: "Panda plush", cost: 300 });
+} catch (error) {
+  console.log(`${error.name}: ${error.message}`);
+  console.log(error instanceof DomainError);
+}
+try {
+  earn(mei, 2.5);
+} catch (error) {
+  console.log(`${error.name}: ${error.message}`);
+}
+```
+
+</CodeExample>
+
+Because these functions only take and return values, they're tested in microseconds with no database, no server and no mocks. The same rules serve the HTTP API, an admin CLI and a nightly batch job. Notice what's **not** here: no `404` or `409`. HTTP status codes are a web concern; the domain throws `NotEnoughPoints`, and the web adapter decides that means `409 Conflict`.
+
+Pure functions on plain objects are one good style for a JavaScript domain. Classes with private fields are another; you'll see them next lesson. Either way, the rules live in **one** place.
+
+## The dependency rule
+
+The rule that makes the layers work: **source code dependencies point inwards**.
+
+- `domain/` imports nothing from use cases or adapters (and no npm packages with I/O).
+- `use-cases/` import the domain, never `express`, `pg` or `node:fs`.
+- `adapters/` may import anything, including the use cases they call.
+
+Data still flows both ways (a request comes in, a row comes back from the database), but the **imports** only point inwards. A use case never imports the PostgreSQL repository: it **receives** something with the right methods. You can enforce the rule in CI with ESLint, so a stray `import pg` in a use case fails the build:
+
+```js
+// eslint.config.js
+export default [
+  {
+    files: ["src/*/domain/**", "src/*/use-cases/**"],
+    rules: {
+      "no-restricted-imports": ["error", {
+        patterns: ["**/adapters/**", "express", "pg", "node:*"],
+      }],
+    },
+  },
+];
+```
+
+Tools like `dependency-cruiser` can draw and check the whole dependency graph if you need more.
+
+## Ports in JavaScript
+
+In Java or TypeScript, a port is an `interface`. Plain JavaScript has no interfaces, so a **port** is simply an agreement: "an object with these methods, taking these arguments, returning these promises". Two habits make that agreement real:
+
+1. **Write it down** with a JSDoc `@typedef`. Editors (VS Code included) read it, and with `// @ts-check` at the top of a file they underline code that breaks it.
+2. **Check it with tests**: a shared **contract test** that every implementation must pass.
+
+A **repository** is the most common port: an object that looks like a collection of domain objects (`get`, `save`, maybe `list`) and hides how they're stored. Ports are `async` even when the first implementation isn't, because the real one (a database) will be:
+
+<CodeExample output={`✓ in-memory implements AccountRepository > returns null for an unknown id
+✓ in-memory implements AccountRepository > saves and loads accounts
+✓ in-memory implements AccountRepository > returns copies, so unsaved changes are lost
+
+Tests  3 passed (3)`}>
+
+```js
+// @ts-check
+import { describe, it, expect } from "vitest";
+
+/**
+ * @typedef {{ id: string, name: string, points: number }} Account
+ *
+ * The port: what the use cases need from storage.
+ * @typedef {object} AccountRepository
+ * @property {(id: string) => Promise<Account | null>} get
+ * @property {(account: Account) => Promise<void>} save
+ */
+
+/** @returns {AccountRepository} */
+function createInMemoryAccounts(...seed) {
+  const rows = new Map(seed.map((a) => [a.id, structuredClone(a)]));
+  return {
+    async get(id) {
+      const row = rows.get(id);
+      return row ? structuredClone(row) : null; // a copy, like a DB
+    },
+    async save(account) {
+      rows.set(account.id, structuredClone(account));
+    },
+  };
+}
+
+// The contract: tests EVERY implementation of the port must pass
+function accountRepositoryContract(name, makeRepo) {
+  describe(`${name} implements AccountRepository`, () => {
+    it("returns null for an unknown id", async () => {
+      expect(await makeRepo().get("nope")).toBeNull();
+    });
+
+    it("saves and loads accounts", async () => {
+      const repo = makeRepo();
+      const mei = { id: "a1", name: "Mei", points: 5 };
+      await repo.save(mei);
+      expect(await repo.get("a1")).toEqual(mei);
+    });
+
+    it("returns copies, so unsaved changes are lost", async () => {
+      const repo = makeRepo();
+      await repo.save({ id: "a1", name: "Mei", points: 5 });
+      const account = await repo.get("a1");
+      account.points = 999; // changed, but never saved
+      expect((await repo.get("a1")).points).toBe(5);
+    });
+  });
+}
+
+accountRepositoryContract("in-memory", () => createInMemoryAccounts());
+// In the real project, the same contract runs against PostgreSQL:
+// accountRepositoryContract("postgres", () => createPostgresAccounts(pool));
+```
+
+</CodeExample>
+
+The in-memory repository stores and returns **copies** (`structuredClone`) on purpose. A real database also hands you a fresh object every time, and changes are lost unless you save them. If the fake returned the very object it stores, a use case that **forgets** to call `save` would pass every test and silently lose data in production. A fake is only useful if it behaves like the real thing, and the contract test is how you prove that it does.
+
+In TypeScript the port becomes an `interface AccountRepository { … }` and the compiler checks every implementation; the contract test is still worth having, because types can't tell you that `save` really saves.
+
+### The PostgreSQL version
+
+In Node on your machine, the production adapter implements the same port with SQL. It translates between rows and domain objects, so nothing above it ever sees a database row:
+
+```js
+// loyalty/adapters/postgres-accounts.js
+export function createPostgresAccounts(pool) {
+  return {
+    async get(id) {
+      const { rows } = await pool.query(
+        "SELECT id, name, points FROM accounts WHERE id = $1",
+        [id],
+      );
+      return rows[0] ?? null;
+    },
+    async save(account) {
+      await pool.query(
+        `INSERT INTO accounts (id, name, points)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (id) DO UPDATE
+         SET name = EXCLUDED.name, points = EXCLUDED.points`,
+        [account.id, account.name, account.points],
+      );
+    },
+  };
+}
+```
+
+```bash
+npm install pg
+```
+
+`$1, $2, $3` are **parameters**: the driver sends the values separately from the SQL, which is what stops SQL injection (more on that in the security module). Column names like `created_at` would be mapped to `createdAt` right here too. When one use case must change several rows atomically, the adapter layer also owns the **transaction** (`BEGIN … COMMIT` on one client from `pool.connect()`); a common pattern is a `withTransaction(fn)` adapter that hands the use case repositories bound to that transaction.
+
+Is the mapping worth it? It's the main cost of this architecture. For a CRUD app where the tables **are** the business, querying with an ORM like Prisma or Drizzle straight from the route can be the right call. The payoff comes when there are real rules to protect and test.
+
+## Use cases: one function per user action
+
+A **use case** (also called an application service) is the script for one thing a user can do. It loads what it needs through ports, lets the **domain** decide, saves the result and returns plain data. It contains no business rules of its own and no HTTP:
+
+<CodeExample output={`{ reward: 'Bamboo tea', pointsLeft: 20 }
+NotEnoughPoints: Panda plush costs 300, you have 20
+20
+NotFound: No reward with id r9`}>
+
+```js
+// --- domain (condensed from above) ---
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class NotFound extends DomainError {}
+class NotEnoughPoints extends DomainError {}
+
+function redeem(account, reward) {
+  if (account.points < reward.cost) {
+    throw new NotEnoughPoints(
+      `${reward.name} costs ${reward.cost}, you have ${account.points}`,
+    );
+  }
+  return { ...account, points: account.points - reward.cost };
+}
+
+// --- adapter: in-memory repositories ---
+function inMemoryRepo(...seed) {
+  const rows = new Map(seed.map((x) => [x.id, structuredClone(x)]));
+  return {
+    get: async (id) => structuredClone(rows.get(id)) ?? null,
+    save: async (x) => void rows.set(x.id, structuredClone(x)),
+  };
+}
+
+// --- use cases: receive their ports, contain no rules ---
+function createLoyalty({ accounts, rewards }) {
+  async function load(repo, id, what) {
+    const item = await repo.get(id);
+    if (!item) throw new NotFound(`No ${what} with id ${id}`);
+    return item;
+  }
+
+  return {
+    async redeemReward({ accountId, rewardId }) {
+      const account = await load(accounts, accountId, "account");
+      const reward = await load(rewards, rewardId, "reward");
+      const updated = redeem(account, reward); // the domain decides
+      await accounts.save(updated);
+      return { reward: reward.name, pointsLeft: updated.points };
+    },
+    async balance(accountId) {
+      const { id, points } = await load(accounts, accountId, "account");
+      return { id, points };
+    },
+  };
+}
+
+const loyalty = createLoyalty({
+  accounts: inMemoryRepo({ id: "a1", name: "Mei", points: 170 }),
+  rewards: inMemoryRepo(
+    { id: "r1", name: "Bamboo tea", cost: 150 },
+    { id: "r2", name: "Panda plush", cost: 300 },
+  ),
+});
+
+console.log(await loyalty.redeemReward({ accountId: "a1", rewardId: "r1" }));
+for (const rewardId of ["r2", "r9"]) {
+  try {
+    await loyalty.redeemReward({ accountId: "a1", rewardId });
+  } catch (error) {
+    console.log(`${error.name}: ${error.message}`);
+    if (rewardId === "r2") {
+      console.log((await loyalty.balance("a1")).points);
+    }
+  }
+}
+```
+
+</CodeExample>
+
+The failed redemption threw **before** `save`, so Mei still has 20 points. `createLoyalty` takes its repositories as parameters: that's **dependency injection**, which you'll take further in the next lesson. Use cases take one **input object** (`{ accountId, rewardId }`) rather than `req`, so the same use case can be called from an HTTP route, a CLI command, a queue consumer or a test.
+
+<Callout type="tip" title="Is it a rule or a step?">
+
+A quick test for where code belongs: if a product manager would describe it as a **rule** ("points can't go negative", "gold members get double points"), it goes in the domain. If it's a **step** ("load the account, check the rule, save, send a receipt"), it's a use case. If it mentions a technology ("parse the JSON body", "run this SQL"), it's an adapter.
+
+</Callout>
+
+## Express is just an adapter
+
+In clean architecture, Express is a **delivery mechanism**. A route handler does three small things: turn the request into plain input, call **one** use case, turn the result into a response. Errors are translated in **one** error middleware that maps domain errors to status codes. Anything else is a bug, so it goes on to Express's default handler as a `500`.
+
+Because the routes only need "an object with `balance` and `redeemReward`", you can build and check the whole HTTP layer with a tiny **fake** use case object:
+
+<CodeExample output={`GET /accounts/a1 → 200 { id: 'a1', points: 170 }
+GET /accounts/zz → 404 { error: 'No account with id zz' }
+POST /accounts/a1/redemptions → 201 { reward: 'Bamboo tea', pointsLeft: 20 }
+POST /accounts/a1/redemptions → 400 { error: 'rewardId is required' }
+POST /accounts/a1/redemptions → 409 { error: 'Panda plush costs 300' }
+GET /accounts/boom → 500 {}`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends DomainError {}
+class NotFound extends DomainError {}
+class NotEnoughPoints extends DomainError {}
+
+// loyalty/adapters/http.js: HTTP in, use case, HTTP out
+const errorStatus = [
+  [ValidationError, 400],
+  [NotFound, 404],
+  [NotEnoughPoints, 409],
+];
+
+function createApp({ loyalty }) {
+  const app = express();
+  app.use(express.json());
+
+  app.get("/accounts/:id", async (req, res) => {
+    res.json(await loyalty.balance(req.params.id));
+  });
+
+  app.post("/accounts/:id/redemptions", async (req, res) => {
+    const receipt = await loyalty.redeemReward({
+      accountId: req.params.id,
+      rewardId: req.body?.rewardId,
+    });
+    res.status(201).json(receipt);
+  });
+
+  app.use((error, req, res, next) => {
+    const match = errorStatus.find(([Type]) => error instanceof Type);
+    if (!match) return next(error); // a real bug: 500
+    res.status(match[1]).json({ error: error.message });
+  });
+  return app;
+}
+
+// A fake use case object is all the HTTP layer needs
+const fakeLoyalty = {
+  async balance(id) {
+    if (id === "boom") throw new TypeError("oops, a bug");
+    if (id !== "a1") throw new NotFound(`No account with id ${id}`);
+    return { id, points: 170 };
+  },
+  async redeemReward({ rewardId }) {
+    if (!rewardId) throw new ValidationError("rewardId is required");
+    if (rewardId === "r2") {
+      throw new NotEnoughPoints("Panda plush costs 300");
+    }
+    return { reward: "Bamboo tea", pointsLeft: 20 };
+  },
+};
+
+const api = request(createApp({ loyalty: fakeLoyalty }));
+const calls = [
+  ["get", "/accounts/a1"],
+  ["get", "/accounts/zz"],
+  ["post", "/accounts/a1/redemptions", { rewardId: "r1" }],
+  ["post", "/accounts/a1/redemptions", {}],
+  ["post", "/accounts/a1/redemptions", { rewardId: "r2" }],
+  ["get", "/accounts/boom"],
+];
+for (const [method, url, body] of calls) {
+  const res = await api[method](url).send(body);
+  console.log(method.toUpperCase(), url, "→", res.status, res.body);
+}
+```
+
+</CodeExample>
+
+Every route is two or three lines, and that's the point. If a handler grows `if` statements about points or rewards, those rules are leaking out of the domain. The `500` case matters too: an unexpected `TypeError` is **not** turned into a friendly `400`, because hiding bugs behind polite status codes makes them much harder to find. (In production, the 500 handler logs the stack trace and returns a generic message.)
+
+Swapping Express for Fastify, or adding a GraphQL API next to it, now means writing a new adapter. The use cases and the domain don't change.
+
+## Testing each layer
+
+Clean architecture gives you a testing strategy almost for free:
+
+- **Domain**: lots of fast unit tests with plain values. No fakes needed at all.
+- **Use cases**: unit tests with **in-memory repositories** (fakes), checking results and what got saved.
+- **Adapters**: a few tests each. The HTTP adapter with a fake use case (like above, or with `vi.fn()` to check what it was called with); each repository with the **contract test** against a real test database in CI.
+- **End to end**: a handful of tests through the real app with real adapters, to prove the wiring works.
+
+Here's the HTTP adapter tested with a mock use case. It checks the two things the adapter is responsible for: passing the right input in, and mapping the result or error out:
+
+<CodeExample output={`✓ POST /accounts/:id/redemptions > passes the ids to the use case
+✓ POST /accounts/:id/redemptions > maps NotEnoughPoints to 409
+
+Tests  2 passed (2)`}>
+
+```js
+import { describe, it, expect, vi } from "vitest";
+import express from "express";
+import request from "supertest";
+
+class NotEnoughPoints extends Error {}
+
+function createApp({ loyalty }) {
+  const app = express();
+  app.use(express.json());
+  app.post("/accounts/:id/redemptions", async (req, res) => {
+    const receipt = await loyalty.redeemReward({
+      accountId: req.params.id,
+      rewardId: req.body?.rewardId,
+    });
+    res.status(201).json(receipt);
+  });
+  app.use((error, req, res, next) => {
+    if (!(error instanceof NotEnoughPoints)) return next(error);
+    res.status(409).json({ error: error.message });
+  });
+  return app;
+}
+
+describe("POST /accounts/:id/redemptions", () => {
+  it("passes the ids to the use case", async () => {
+    const loyalty = {
+      redeemReward: vi.fn().mockResolvedValue({ pointsLeft: 1 }),
+    };
+    const res = await request(createApp({ loyalty }))
+      .post("/accounts/a7/redemptions")
+      .send({ rewardId: "r3" });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ pointsLeft: 1 });
+    expect(loyalty.redeemReward).toHaveBeenCalledWith({
+      accountId: "a7",
+      rewardId: "r3",
+    });
+  });
+
+  it("maps NotEnoughPoints to 409", async () => {
+    const loyalty = {
+      redeemReward: vi
+        .fn()
+        .mockRejectedValue(new NotEnoughPoints("not enough")),
+    };
+    const res = await request(createApp({ loyalty }))
+      .post("/accounts/a7/redemptions")
+      .send({ rewardId: "r3" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("not enough");
+  });
+});
+```
+
+</CodeExample>
+
+None of these tests needs a database, a network or `vi.mock`: just plain objects passed in. A codebase can have thousands of them and still run the whole suite in seconds.
+
+<Callout type="warning" title="Don't architect a to-do app">
+
+Layers, ports and repositories cost code: mapping functions, extra files, more names. For a prototype, a small CRUD service or an internal script, Express plus an ORM used directly (like the [Notes API](/learn/javascript/notes-api) in Level 2) is the right choice. Reach for clean architecture when the **business rules** are real and growing, the app will live for years, or several teams work on it. You can also adopt it gradually: move rules into a `domain/` folder first, add a repository the first time testing hurts.
+
+</Callout>
+
+<Quiz
+  question="In a clean architecture project, which import inside src/loyalty/use-cases/redeem-reward.js breaks the dependency rule?"
+  options={[
+    "import { redeem } from \"../domain/account.js\"",
+    "import { NotFound } from \"../domain/errors.js\"",
+    "import { createPostgresAccounts } from \"../adapters/postgres-accounts.js\"",
+    "No import at all, because the repository is passed in as a parameter",
+  ]}
+  answer={2}
+  explanation="Use cases may depend on the domain, but never on adapters. The PostgreSQL repository should be created in the composition root (main.js) and passed into the use case, which only knows the port: an object with get and save."
+/>
+
+<Quiz
+  question="An in-memory fake repository returns the very object it stores, while the PostgreSQL repository returns a fresh object for every get. A use case changes an account but forgets to call save. What happens?"
+  options={[
+    "Both the tests with the fake and production lose the change",
+    "Tests with the fake pass, but production silently loses the change",
+    "Tests with the fake fail, but production works",
+    "JavaScript throws an error because save was never called",
+  ]}
+  answer={1}
+  explanation="With the fake, the change is made to the stored object itself, so it looks saved. The real repository returns a copy, so without save nothing reaches the database. That's why fakes should store and return copies, and why a shared contract test runs against both."
+/>
+
+<Exercise
+  title="Workshop sign-ups, layer by layer"
+  starter={`import { describe, it, expect } from "vitest";
+import express from "express";
+import request from "supertest";
+
+// ---------- domain (done) ----------
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends DomainError {}
+class NotFound extends DomainError {}
+class WorkshopFull extends DomainError {}
+class AlreadyRegistered extends DomainError {}
+
+function register(workshop, email) {
+  if (typeof email !== "string" || !email.includes("@")) {
+    throw new ValidationError("a valid email is required");
+  }
+  if (workshop.attendees.includes(email)) {
+    throw new AlreadyRegistered(email + " is already registered");
+  }
+  if (workshop.attendees.length >= workshop.capacity) {
+    throw new WorkshopFull(workshop.title + " is full");
+  }
+  return { ...workshop, attendees: [...workshop.attendees, email] };
+}
+
+// ---------- TODO 1: adapter: in-memory repository ----------
+// get(id) → a COPY of the workshop or null; save(workshop)
+// Both async. Seed it with the workshops passed in.
+function createInMemoryWorkshops(...seed) {
+  return {};
+}
+
+// ---------- TODO 2: use case ----------
+// register({ workshopId, email }):
+//   load (NotFound "No workshop with id <id>" if missing),
+//   let the domain decide, save, and return
+//   { workshop: <title>, seatsLeft: <capacity - attendees> }
+function createRegistrations({ workshops }) {
+  return {};
+}
+
+// ---------- TODO 3: adapter: a thin Express app ----------
+// POST /workshops/:id/registrations with body { email }
+//   → 201 + the use case's result
+// Error middleware: ValidationError 400, NotFound 404,
+// WorkshopFull and AlreadyRegistered 409 (body { error }),
+// anything else → next(error)
+function createApp({ registrations }) {
+  const app = express();
+  return app;
+}
+
+// ---------- tests (don't change them) ----------
+function makeApp() {
+  const workshops = createInMemoryWorkshops(
+    { id: "w1", title: "Intro to Node", capacity: 2, attendees: [] },
+  );
+  const registrations = createRegistrations({ workshops });
+  return { workshops, api: request(createApp({ registrations })) };
+}
+const url = "/workshops/w1/registrations";
+
+describe("workshop sign-ups", () => {
+  it("registers someone and reports seats left", async () => {
+    const { api, workshops } = makeApp();
+    const res = await api.post(url).send({ email: "mei@pandadev.test" });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ workshop: "Intro to Node", seatsLeft: 1 });
+    const saved = await workshops.get("w1");
+    expect(saved.attendees).toEqual(["mei@pandadev.test"]);
+  });
+
+  it("rejects a bad email with 400", async () => {
+    const res = await makeApp().api.post(url).send({ email: "nope" });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "a valid email is required" });
+  });
+
+  it("answers 404 for an unknown workshop", async () => {
+    const res = await makeApp().api
+      .post("/workshops/w9/registrations")
+      .send({ email: "mei@pandadev.test" });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("No workshop with id w9");
+  });
+
+  it("answers 409 for duplicates and full workshops", async () => {
+    const { api } = makeApp();
+    await api.post(url).send({ email: "a@pandadev.test" });
+    const again = await api.post(url).send({ email: "a@pandadev.test" });
+    expect(again.status).toBe(409);
+    await api.post(url).send({ email: "b@pandadev.test" });
+    const full = await api.post(url).send({ email: "c@pandadev.test" });
+    expect(full.status).toBe(409);
+    expect(full.body.error).toBe("Intro to Node is full");
+  });
+
+  it("the repository hands out copies", async () => {
+    const { workshops } = makeApp();
+    const w = await workshops.get("w1");
+    w.attendees.push("sneaky@pandadev.test");
+    expect((await workshops.get("w1")).attendees).toEqual([]);
+    expect(await workshops.get("w9")).toBeNull();
+  });
+});
+`}
+  tests={[
+    { name: "All the tests in the editor pass", check: `__vitest.failed === 0 && __vitest.passed >= 5` },
+    { name: "The repository stores and returns copies", check: `await (async () => { const w = { id: "x", title: "T", capacity: 1, attendees: [] }; const repo = createInMemoryWorkshops(w); w.title = "changed"; const a = await repo.get("x"); a.attendees.push("q@q"); const b = await repo.get("x"); await repo.save({ ...b, capacity: 9 }); const c = await repo.get("x"); return b.title === "T" && b.attendees.length === 0 && a !== b && c.capacity === 9 && (await repo.get("nope")) === null; })()` },
+    { name: "The use case saves through the repository and returns seats left", check: `await (async () => { const workshops = createInMemoryWorkshops({ id: "k", title: "Kotlin", capacity: 3, attendees: ["a@a"] }); const r = await createRegistrations({ workshops }).register({ workshopId: "k", email: "b@b" }); const saved = await workshops.get("k"); return r.workshop === "Kotlin" && r.seatsLeft === 1 && saved.attendees.join() === "a@a,b@b"; })()` },
+    { name: "The use case saves nothing when the domain says no", check: `await (async () => { let saves = 0; const store = { id: "k", title: "K", capacity: 1, attendees: ["a@a"] }; const workshops = { get: async () => structuredClone(store), save: async () => { saves++; } }; try { await createRegistrations({ workshops }).register({ workshopId: "k", email: "b@b" }); return false; } catch (e) { return e instanceof WorkshopFull && saves === 0; } })()` },
+    { name: "The use case throws NotFound for unknown workshops", check: `await (async () => { try { await createRegistrations({ workshops: createInMemoryWorkshops() }).register({ workshopId: "zz", email: "a@a" }); return false; } catch (e) { return e instanceof NotFound && e.message === "No workshop with id zz"; } })()` },
+    { name: "The route is thin: it passes the input to the use case", check: `await (async () => { const calls = []; const registrations = { register: async (input) => { calls.push(input); return { ok: 1 }; } }; const res = await require("supertest")(createApp({ registrations })).post("/workshops/w42/registrations").send({ email: "kim@pandadev.test" }); return res.status === 201 && res.body.ok === 1 && calls.length === 1 && calls[0].workshopId === "w42" && calls[0].email === "kim@pandadev.test"; })()` },
+    { name: "Errors are mapped to 400 / 404 / 409, bugs to 500", check: `await (async () => { const statuses = []; for (const error of [new ValidationError("v"), new NotFound("n"), new WorkshopFull("f"), new AlreadyRegistered("d"), new TypeError("bug")]) { const registrations = { register: async () => { throw error; } }; const res = await require("supertest")(createApp({ registrations })).post("/workshops/w1/registrations").send({ email: "a@a" }); statuses.push(res.status + (res.status < 500 ? ":" + res.body.error : "")); } return statuses.join(",") === "400:v,404:n,409:f,409:d,500"; })()` },
+  ]}
+>
+
+Build a workshop sign-up feature in clean-architecture style. The **domain** (`register` and the error classes) and the **tests** are ready. You write the other layers:
+
+1. **`createInMemoryWorkshops(...seed)`**: a repository with `async get(id)` (a **copy** of the workshop, or `null`) and `async save(workshop)`. Store copies too, so changes to the seed objects don't leak in.
+2. **`createRegistrations({ workshops })`**: returns `{ register({ workshopId, email }) }`. Load the workshop (throw `NotFound` with the message `"No workshop with id <id>"` if it's missing), let the domain's `register` decide, save the result, and return `{ workshop: <title>, seatsLeft: <capacity minus attendees> }`.
+3. **`createApp({ registrations })`**: an Express app with `express.json()` and `POST /workshops/:id/registrations` that calls the use case with `{ workshopId, email }` and answers `201` with its result. One error middleware maps `ValidationError` → 400, `NotFound` → 404, `WorkshopFull` and `AlreadyRegistered` → 409, each with `{ error: message }`; anything else goes to `next(error)`.
+
+The checks also test each layer on its own, with their own fakes, so keep the route thin and the rules in the domain.
+
+<Hint>
+
+The repository is the `createInMemoryAccounts` from "Ports in JavaScript" with `structuredClone` on the way in and out. The use case is `redeemReward` from "Use cases" with `register(workshop, email)` in the middle; `seatsLeft` is `updated.capacity - updated.attendees.length`. For the app, copy the shape of `createApp` and the `errorStatus` list from "Express is just an adapter".
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect } from "vitest";
+import express from "express";
+import request from "supertest";
+
+// ---------- domain (done) ----------
+class DomainError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends DomainError {}
+class NotFound extends DomainError {}
+class WorkshopFull extends DomainError {}
+class AlreadyRegistered extends DomainError {}
+
+function register(workshop, email) {
+  if (typeof email !== "string" || !email.includes("@")) {
+    throw new ValidationError("a valid email is required");
+  }
+  if (workshop.attendees.includes(email)) {
+    throw new AlreadyRegistered(email + " is already registered");
+  }
+  if (workshop.attendees.length >= workshop.capacity) {
+    throw new WorkshopFull(workshop.title + " is full");
+  }
+  return { ...workshop, attendees: [...workshop.attendees, email] };
+}
+
+// ---------- adapter: in-memory repository ----------
+function createInMemoryWorkshops(...seed) {
+  const rows = new Map(seed.map((w) => [w.id, structuredClone(w)]));
+  return {
+    async get(id) {
+      const row = rows.get(id);
+      return row ? structuredClone(row) : null;
+    },
+    async save(workshop) {
+      rows.set(workshop.id, structuredClone(workshop));
+    },
+  };
+}
+
+// ---------- use case ----------
+function createRegistrations({ workshops }) {
+  return {
+    async register({ workshopId, email }) {
+      const workshop = await workshops.get(workshopId);
+      if (!workshop) {
+        throw new NotFound(`No workshop with id ${workshopId}`);
+      }
+      const updated = register(workshop, email);
+      await workshops.save(updated);
+      return {
+        workshop: updated.title,
+        seatsLeft: updated.capacity - updated.attendees.length,
+      };
+    },
+  };
+}
+
+// ---------- adapter: a thin Express app ----------
+const errorStatus = [
+  [ValidationError, 400],
+  [NotFound, 404],
+  [WorkshopFull, 409],
+  [AlreadyRegistered, 409],
+];
+
+function createApp({ registrations }) {
+  const app = express();
+  app.use(express.json());
+
+  app.post("/workshops/:id/registrations", async (req, res) => {
+    const result = await registrations.register({
+      workshopId: req.params.id,
+      email: req.body?.email,
+    });
+    res.status(201).json(result);
+  });
+
+  app.use((error, req, res, next) => {
+    const match = errorStatus.find(([Type]) => error instanceof Type);
+    if (!match) return next(error);
+    res.status(match[1]).json({ error: error.message });
+  });
+  return app;
+}
+
+// ---------- tests (don't change them) ----------
+function makeApp() {
+  const workshops = createInMemoryWorkshops(
+    { id: "w1", title: "Intro to Node", capacity: 2, attendees: [] },
+  );
+  const registrations = createRegistrations({ workshops });
+  return { workshops, api: request(createApp({ registrations })) };
+}
+const url = "/workshops/w1/registrations";
+
+describe("workshop sign-ups", () => {
+  it("registers someone and reports seats left", async () => {
+    const { api, workshops } = makeApp();
+    const res = await api.post(url).send({ email: "mei@pandadev.test" });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ workshop: "Intro to Node", seatsLeft: 1 });
+    const saved = await workshops.get("w1");
+    expect(saved.attendees).toEqual(["mei@pandadev.test"]);
+  });
+
+  it("rejects a bad email with 400", async () => {
+    const res = await makeApp().api.post(url).send({ email: "nope" });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "a valid email is required" });
+  });
+
+  it("answers 404 for an unknown workshop", async () => {
+    const res = await makeApp().api
+      .post("/workshops/w9/registrations")
+      .send({ email: "mei@pandadev.test" });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("No workshop with id w9");
+  });
+
+  it("answers 409 for duplicates and full workshops", async () => {
+    const { api } = makeApp();
+    await api.post(url).send({ email: "a@pandadev.test" });
+    const again = await api.post(url).send({ email: "a@pandadev.test" });
+    expect(again.status).toBe(409);
+    await api.post(url).send({ email: "b@pandadev.test" });
+    const full = await api.post(url).send({ email: "c@pandadev.test" });
+    expect(full.status).toBe(409);
+    expect(full.body.error).toBe("Intro to Node is full");
+  });
+
+  it("the repository hands out copies", async () => {
+    const { workshops } = makeApp();
+    const w = await workshops.get("w1");
+    w.attendees.push("sneaky@pandadev.test");
+    expect((await workshops.get("w1")).attendees).toEqual([]);
+    expect(await workshops.get("w9")).toBeNull();
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Clean architecture has three layers: the **domain** (rules, plain JavaScript), **use cases** (one function per user action, talking to ports) and **adapters** (Express, PostgreSQL, email, CLIs).
+- **The dependency rule**: imports point inwards. Use cases receive adapters; they never import them. ESLint's `no-restricted-imports` can enforce it.
+- In JavaScript a **port** is an agreed object shape: document it with JSDoc `@typedef` (or a TypeScript `interface`) and prove it with a shared **contract test**.
+- A **repository** hides storage behind `get`/`save`. In-memory fakes must return **copies**, like a real database.
+- Express is **just an adapter**: thin routes turn requests into use case input, and one error middleware maps domain errors to status codes (unknown errors stay 500).
+- Organise folders **by feature**, then by layer inside each feature.
+- Test the domain with plain values, use cases with in-memory repositories, adapters with fakes and contract tests, and keep a few end-to-end tests. Skip all of this for small CRUD apps.

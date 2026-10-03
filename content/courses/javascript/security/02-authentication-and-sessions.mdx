@@ -1,0 +1,942 @@
+---
+title: Authentication and Sessions
+description: Store passwords safely, log users in with secure session cookies, understand signed tokens and JWTs from the inside, and protect routes with roles and brute-force limits.
+duration: 25
+xp: 25
+---
+
+Every app with accounts has to answer two questions on every request: **who is this?** and **may they do this?** Getting either wrong is how real breaches happen: a leaked database of fast password hashes cracked in an afternoon, a session that never expires, an API that checks you're logged in but not that the order you're deleting is yours. In this lesson you'll build each piece with the Web Crypto API and Express so you see there's no magic in it, and learn which battle-tested library to reach for in production. 🔐
+
+## Authentication vs authorisation
+
+The two words sound alike, so people shorten them to **authn** and **authz**:
+
+- **Authentication** (authn): *who are you?* Proving identity with a password, a passkey, a token or "Sign in with Google".
+- **Authorisation** (authz): *what may you do?* Checking that this identity may perform this action on this particular thing.
+
+Each failure has its own status code, and using the right one helps clients react correctly:
+
+| Status | Means | The client should |
+| --- | --- | --- |
+| **401** Unauthorized | "I don't know who you are": missing, invalid or expired credentials | log in (again) |
+| **403** Forbidden | "I know who you are, and you can't do this" | show "no access", not retry |
+| **404** Not Found | also used to **hide** things that exist but aren't yours | treat it as missing |
+
+Yes, 401 is confusingly called "Unauthorized" even though it's about authentication. Blame history.
+
+## Storing passwords
+
+Rule number one: **never store passwords**. Store something that lets you **check** a password without being able to recover it. When (not if) your database leaks, that's the difference between "change your password, just in case" and every user's email account being taken over, because people reuse passwords.
+
+### Why a plain hash isn't enough
+
+A **hash** like SHA-256 turns any input into a fixed-size fingerprint and can't be reversed. So why not store `sha256(password)`? Watch two users who picked the same password:
+
+<CodeExample output={`ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f
+true`}>
+
+```js
+const encoder = new TextEncoder();
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256", encoder.encode(text)
+  );
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+const mei = await sha256Hex("password123");
+const po = await sha256Hex("password123");
+console.log(mei);
+console.log(mei === po);
+```
+
+</CodeExample>
+
+Two problems:
+
+- **Same password, same hash.** Attackers keep precomputed tables of the hashes of billions of common passwords, so `ef92b778…` is looked up in a blink. And every user with that hash falls at once.
+- **It's fast.** SHA-256 (and MD5, and SHA-1) were designed to be fast. A single gaming GPU computes **billions** of SHA-256 hashes per second, so even unusual passwords are found by brute force.
+
+### Salted, slow hashes
+
+The fix has two parts:
+
+- A **salt**: random bytes, different for every user, mixed into the hash and stored next to it. Now identical passwords give different hashes, and precomputed tables are useless.
+- A **slow** function that repeats its work many times on purpose. A login check taking 100 ms is unnoticeable for a user, but makes guessing billions of passwords impossibly expensive.
+
+**PBKDF2** is a slow, salted hash built into every browser and Node through `crypto.subtle`. We store everything needed to check the password later in one string: the algorithm, the iteration count, the salt and the hash.
+
+<CodeExample output={`[ 13, 4, 22, 43 ]
+true false
+16`}>
+
+```js
+const encoder = new TextEncoder();
+// Tiny so this runs instantly. Real apps: 600_000 or more!
+const ITERATIONS = 1_000;
+
+const toBase64Url = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+
+const fromBase64Url = (text) =>
+  Uint8Array.from(
+    atob(text.replaceAll("-", "+").replaceAll("_", "/")),
+    (char) => char.charCodeAt(0)
+  );
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations },
+    key,
+    256 // bits = 32 bytes
+  );
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt, ITERATIONS);
+  return ["pbkdf2-sha256", ITERATIONS,
+    toBase64Url(salt), toBase64Url(hash)].join("$");
+}
+
+const mei = await hashPassword("password123");
+const po = await hashPassword("password123");
+console.log(mei.split("$").map((part) => String(part).length));
+console.log(mei.startsWith("pbkdf2-sha256$1000$"), mei === po);
+console.log(fromBase64Url(mei.split("$")[2]).length);
+```
+
+</CodeExample>
+
+The stored string looks like `pbkdf2-sha256$1000$<salt>$<hash>`, and the same password now gives a **different** result for Mei and Po. (We print lengths rather than the values because the salt is random: your run gets different bytes, which is the whole point.) Keeping the algorithm and iteration count **inside** the string means you can raise the cost later: old hashes still verify, and you re-hash with the new settings the next time each user logs in.
+
+### Verifying, in constant time
+
+To check a login, split the stored string, run PBKDF2 again with the **same salt and iteration count**, and compare the result with the stored hash:
+
+<CodeExample output={`true
+false
+false`}>
+
+```js
+const encoder = new TextEncoder();
+const ITERATIONS = 1_000; // real apps: 600_000+
+
+const toBase64Url = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+const fromBase64Url = (text) =>
+  Uint8Array.from(
+    atob(text.replaceAll("-", "+").replaceAll("_", "/")),
+    (char) => char.charCodeAt(0)
+  );
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256
+  );
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt, ITERATIONS);
+  return ["pbkdf2-sha256", ITERATIONS,
+    toBase64Url(salt), toBase64Url(hash)].join("$");
+}
+
+// Looks at every byte, even after finding a difference
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
+}
+
+async function verifyPassword(password, stored) {
+  const [scheme, iterations, salt, hash] = stored.split("$");
+  if (scheme !== "pbkdf2-sha256") return false;
+  const actual = await pbkdf2(
+    password, fromBase64Url(salt), Number(iterations)
+  );
+  return timingSafeEqual(actual, fromBase64Url(hash));
+}
+
+const phrase = "correct horse battery staple";
+const stored = await hashPassword(phrase);
+console.log(await verifyPassword(phrase, stored));
+console.log(await verifyPassword(phrase.toUpperCase(), stored));
+console.log(await verifyPassword("anything", "md5$5f4dcc3b5aa7"));
+```
+
+</CodeExample>
+
+Why not just compare with `===`? Comparing strings or bytes the normal way **stops at the first difference**, so a wrong guess that starts with the right bytes takes a tiny bit longer to reject. Over many requests, an attacker can measure that and recover a secret (an API key, a token's signature) byte by byte. This is a **timing attack**. `timingSafeEqual` always walks through every byte, so the time doesn't depend on where the difference is. In Node, use the built-in `crypto.timingSafeEqual(bufferA, bufferB)`; for HMAC signatures, `crypto.subtle.verify` does it for you, as you'll see below.
+
+### In production: Argon2id or bcrypt
+
+PBKDF2 is fine (it's what many government standards require), but its weakness is that GPUs are great at it. **Argon2id** and **scrypt** are also **memory-hard**: each guess needs lots of RAM, which GPUs can't parallelise cheaply. OWASP's current minimums are Argon2id with 19 MiB of memory and 2 iterations, scrypt with N = 2^17, bcrypt with cost 10, or PBKDF2-SHA256 with **600,000** iterations. On your machine:
+
+```bash
+npm install argon2   # or: npm install bcrypt
+```
+
+```js
+import argon2 from "argon2";
+
+// Argon2id with sensible defaults; salt and settings are
+// stored inside the result string, like ours above
+const hash = await argon2.hash(password);
+const ok = await argon2.verify(hash, password);
+
+// bcrypt: cost 12 is a good start (it only uses the first 72 bytes)
+import bcrypt from "bcrypt";
+const hash2 = await bcrypt.hash(password, 12);
+const ok2 = await bcrypt.compare(password, hash2);
+```
+
+Node also has `crypto.scrypt` built in if you can't install native packages. Whatever you choose, **tune the cost** so one hash takes roughly 100–500 ms on your server, and never write your own algorithm.
+
+## Sessions with cookies
+
+After a successful login, the browser needs something to send with every later request, so the user doesn't type the password each time. The classic answer is a **session**:
+
+1. The server creates a long, random, unguessable **session id** and remembers what it means (`id → user`) in a **session store**.
+2. It sends the id to the browser in a **cookie** with `Set-Cookie`.
+3. The browser sends the cookie back automatically on every request to that site, and the server looks the session up.
+
+In Express, `res.cookie()` sets a cookie and the `cookie-parser` middleware reads incoming ones into `req.cookies`. Supertest's `request.agent(app)` keeps cookies between requests just like a browser:
+
+<CodeExample output={`[ 'Max-Age=3600', 'Path=/', 'HttpOnly', 'Secure', 'SameSite=Lax' ]
+{ username: 'mei' }
+401
+0`}>
+
+```js
+import express from "express";
+import cookieParser from "cookie-parser";
+import request from "supertest";
+
+// Session store: session id -> data. Real apps use Redis or a DB.
+const sessions = new Map();
+const HOUR = 60 * 60 * 1000;
+
+const app = express();
+app.use(express.json());
+app.use(cookieParser());
+
+app.post("/login", (req, res) => {
+  // (password check skipped here: see the section above)
+  const oldId = req.cookies.sid;
+  if (oldId) sessions.delete(oldId); // rotate: never reuse an id
+
+  const id = crypto.randomUUID(); // unguessable
+  sessions.set(id, { username: req.body.username });
+  res.cookie("sid", id, {
+    httpOnly: true,   // JavaScript can't read it
+    secure: true,     // only sent over HTTPS
+    sameSite: "lax",  // not sent on cross-site POSTs
+    maxAge: HOUR,     // expires in the browser after an hour
+  });
+  res.json({ ok: true });
+});
+
+app.get("/me", (req, res) => {
+  const session = sessions.get(req.cookies.sid);
+  if (!session) {
+    return res.status(401).json({ error: "Not logged in" });
+  }
+  res.json({ username: session.username });
+});
+
+app.post("/logout", (req, res) => {
+  sessions.delete(req.cookies.sid); // gone on the server too
+  res.clearCookie("sid");
+  res.sendStatus(204);
+});
+
+// request.agent keeps cookies between requests, like a browser
+const browser = request.agent(app);
+const login = await browser.post("/login").send({ username: "mei" });
+const [cookie] = login.headers["set-cookie"];
+const hidden = /^(sid|Expires)=/; // the random id and the date
+console.log(cookie.split("; ").filter((p) => !hidden.test(p)));
+
+console.log((await browser.get("/me")).body);
+await browser.post("/logout");
+console.log((await browser.get("/me")).status);
+console.log(sessions.size);
+```
+
+</CodeExample>
+
+The first line shows the cookie's **attributes** (we hide the random id and the date). Each one closes a door:
+
+| Attribute | What it does | Protects against |
+| --- | --- | --- |
+| `HttpOnly` | `document.cookie` can't see it | XSS stealing the session |
+| `Secure` | only sent over HTTPS | being read on public Wi-Fi |
+| `SameSite=Lax` | not sent on cross-site POSTs, iframes or `fetch` | CSRF (next lesson) |
+| `Max-Age` / `Expires` | the browser deletes it after this time | forgotten sessions living forever |
+| `Path` / `Domain` | which URLs get the cookie | leaking to other paths or subdomains |
+
+Three more habits that matter:
+
+- **Rotate the session id on login** (and when privileges change). Otherwise an attacker who planted a known session id in the victim's browser before login (**session fixation**) would be logged in as the victim afterwards.
+- **Expire sessions on the server too.** `Max-Age` only instructs the browser; a stolen cookie keeps working until the **server** forgets the session. Store an expiry time (e.g. idle 30 minutes, absolute 12 hours) with each session and check it.
+- **Logout deletes the session on the server**, not just the cookie. That's the big advantage of sessions: you can end one instantly, or all of a user's sessions after a password change.
+
+In a real Express app you'd usually use `express-session` with a store such as Redis rather than a `Map`, which disappears on restart and isn't shared between servers. Naming the cookie `__Host-sid` also makes the browser insist on `Secure`, `Path=/` and no `Domain`, so a subdomain can't overwrite it:
+
+```js
+import session from "express-session";
+import { RedisStore } from "connect-redis";
+
+app.use(session({
+  name: "__Host-sid",
+  secret: process.env.SESSION_SECRET,
+  store: new RedisStore({ client: redisClient }),
+  resave: false,
+  saveUninitialized: false,
+  cookie: { httpOnly: true, secure: true, sameSite: "lax",
+            maxAge: 12 * 60 * 60 * 1000 },
+}));
+
+// after checking the password:
+req.session.regenerate((err) => {      // rotate the id
+  if (err) return next(err);
+  req.session.userId = user.id;
+  res.json({ ok: true });
+});
+```
+
+## Signed tokens and JWTs
+
+Sessions need a lookup in a shared store on every request. The other big family, **signed tokens**, puts the data **in the token itself** and adds a signature, so any server holding the key can check it without a lookup. The format everyone uses is the **JWT** (JSON Web Token): three base64url parts joined by dots, `header.payload.signature`, signed with **HMAC-SHA256**. Here's one built with `crypto.subtle`, so you can see every step:
+
+<CodeExample output={`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+{ sub: 'mei', role: 'user' }
+43`}>
+
+```js
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const toBase64Url = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+const fromBase64Url = (text) =>
+  Uint8Array.from(
+    atob(text.replaceAll("-", "+").replaceAll("_", "/")),
+    (char) => char.charCodeAt(0)
+  );
+const encodeJson = (value) =>
+  toBase64Url(encoder.encode(JSON.stringify(value)));
+
+async function hmacKey(secret) {
+  return crypto.subtle.importKey(
+    "raw", encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]
+  );
+}
+
+async function signToken(claims, key) {
+  const header = encodeJson({ alg: "HS256", typ: "JWT" });
+  const payload = encodeJson(claims);
+  const data = encoder.encode(`${header}.${payload}`);
+  const mac = await crypto.subtle.sign("HMAC", key, data);
+  const signature = toBase64Url(new Uint8Array(mac));
+  return `${header}.${payload}.${signature}`;
+}
+
+const key = await hmacKey("dev-only-secret"); // from env in real life
+const token = await signToken({ sub: "mei", role: "user" }, key);
+
+const [header, payload, signature] = token.split(".");
+console.log(header);
+console.log(JSON.parse(decoder.decode(fromBase64Url(payload))));
+console.log(signature.length);
+```
+
+</CodeExample>
+
+That first line, `eyJhbGciOi…`, is how almost every JWT you'll ever see begins: it's just `{"alg":"HS256","typ":"JWT"}` in base64url. And the second line proves the most misunderstood fact about JWTs: **anyone can read the payload** without the key. Base64 is an encoding, not encryption. A JWT is **signed, not secret**, so never put passwords or private data in it.
+
+The payload fields are called **claims**. The standard short names are `sub` (subject: who it's about), `exp` (expiry, in **seconds** since 1970, not milliseconds), `iat` (issued at), `iss` (issuer) and `aud` (audience).
+
+### Verifying a token
+
+Verification is the important half: check the signature **first** (with `crypto.subtle.verify`, which compares in constant time), only then trust the payload, and check the expiry. The time `now` is a parameter, so expiry is easy to test without waiting:
+
+<CodeExample output={`{ sub: 'mei', role: 'user', exp: 1700000900 }
+tampered -> bad signature
+wrong key -> bad signature
+expired -> token expired
+garbage -> malformed token`}>
+
+```js
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const toBase64Url = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+const fromBase64Url = (text) =>
+  Uint8Array.from(
+    atob(text.replaceAll("-", "+").replaceAll("_", "/")),
+    (char) => char.charCodeAt(0)
+  );
+const encodeJson = (value) =>
+  toBase64Url(encoder.encode(JSON.stringify(value)));
+const decodeJson = (text) =>
+  JSON.parse(decoder.decode(fromBase64Url(text)));
+
+async function hmacKey(secret) {
+  return crypto.subtle.importKey(
+    "raw", encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]
+  );
+}
+
+async function signToken(claims, key) {
+  const header = encodeJson({ alg: "HS256", typ: "JWT" });
+  const payload = encodeJson(claims);
+  const data = encoder.encode(`${header}.${payload}`);
+  const mac = await crypto.subtle.sign("HMAC", key, data);
+  const signature = toBase64Url(new Uint8Array(mac));
+  return `${header}.${payload}.${signature}`;
+}
+
+class InvalidToken extends Error {}
+
+async function verifyToken(token, key, now) {
+  const parts = String(token).split(".");
+  if (parts.length !== 3) throw new InvalidToken("malformed token");
+  const [header, payload, signature] = parts;
+  let valid;
+  try {
+    valid = await crypto.subtle.verify(  // constant-time check
+      "HMAC", key, fromBase64Url(signature),
+      encoder.encode(`${header}.${payload}`)
+    );
+  } catch {
+    throw new InvalidToken("malformed token");
+  }
+  if (!valid) throw new InvalidToken("bad signature");
+  const claims = decodeJson(payload); // only now trust the data
+  if (now >= claims.exp) throw new InvalidToken("token expired");
+  return claims;
+}
+
+const key = await hmacKey("dev-only-secret");
+const issuedAt = 1_700_000_000; // seconds, like JWT's exp
+const token = await signToken(
+  { sub: "mei", role: "user", exp: issuedAt + 15 * 60 }, key
+);
+console.log(await verifyToken(token, key, issuedAt + 60));
+
+const [header, , signature] = token.split(".");
+const evil = encodeJson({ sub: "mei", role: "admin", exp: 2e9 });
+const attempts = [
+  ["tampered", `${header}.${evil}.${signature}`, key],
+  ["wrong key", token, await hmacKey("guessed-secret")],
+  ["expired", token, key],
+  ["garbage", "not-a-token", key],
+];
+for (const [name, candidate, candidateKey] of attempts) {
+  try {
+    await verifyToken(candidate, candidateKey, issuedAt + 901);
+  } catch (error) {
+    console.log(name, "->", error.message);
+  }
+}
+```
+
+</CodeExample>
+
+Mei tried to promote herself to `admin` by editing the payload, but without the server's secret she can't produce a matching signature. That's the entire security of a JWT: **the secret key**. Make it long and random (at least 32 random bytes), load it from the environment, and remember that whoever has it can mint a token for any user.
+
+Notice that `verifyToken` **ignores the header's `alg`** and always checks HMAC-SHA256. Real JWT libraries have had famous bugs where an attacker set `"alg": "none"` and the server skipped the signature check entirely.
+
+### In production: use a library
+
+Writing token code by hand was for understanding. In real projects, use a maintained library such as **`jose`**, which works in Node, browsers, Deno, Bun and edge runtimes, and handles the standard claims, clock skew and key types:
+
+```js
+// npm install jose
+import { SignJWT, jwtVerify } from "jose";
+
+const secret = new TextEncoder().encode(process.env.JWT_SECRET);
+
+const token = await new SignJWT({ role: "user" })
+  .setProtectedHeader({ alg: "HS256" })
+  .setSubject(String(user.id))
+  .setIssuedAt()
+  .setExpirationTime("15m")
+  .sign(secret);
+
+// Throws if the signature, algorithm or expiry is wrong
+const { payload } = await jwtVerify(token, secret, {
+  algorithms: ["HS256"],  // always pin the algorithms you accept
+});
+```
+
+<Callout type="warning" title="JWT pitfalls that bite real teams">
+
+- **You can't easily revoke a JWT.** Logging out or banning a user doesn't stop a token that's still valid. Keep access tokens short-lived (5–15 minutes) and pair them with a **refresh token** stored server-side, which you *can* revoke. At that point you've rebuilt sessions, which is why sessions are still the simpler default for a website.
+- **Pin the algorithm** when verifying, and check `exp` (libraries do both if you pass the options).
+- **Signed, not encrypted**: everything in the payload is readable.
+- Use **asymmetric keys** (RS256, ES256, EdDSA) when other services verify your tokens: they get only the public key and can't mint tokens.
+
+</Callout>
+
+## Where should the browser keep the token?
+
+If your front end receives a token, where it lives decides what an attacker can do with an XSS bug (from the [previous lesson](/learn/javascript/xss-and-injection)):
+
+| Storage | XSS can steal it? | Sent automatically? | Notes |
+| --- | --- | --- | --- |
+| `HttpOnly` cookie | **no** (but XSS can still make requests while the page is open) | yes, so think about CSRF | best default for your own website |
+| `localStorage` | **yes**, and it survives closing the tab | no, you add the header | simple, but one XSS = stolen account |
+| JS memory (a variable) | yes, while the page is open | no | lost on reload; pair with a refresh cookie |
+
+The usual recommendation for a browser app talking to **its own** backend: a session (or token) in an **`HttpOnly`, `Secure`, `SameSite` cookie**, plus CSRF protection where needed. Bearer tokens in an `Authorization` header shine for mobile apps, CLIs and service-to-service calls, where there's no browser cookie jar.
+
+## Authorisation middleware with roles
+
+Once you know **who** is calling, every protected route must check **what** they may do. In Express that's middleware: `requireLogin` finds the user, and a middleware **factory** `requireRole(...roles)` returns a middleware for the roles a route needs:
+
+<CodeExample output={`/admin/stats nobody 401 { error: 'Not logged in' }
+/admin/stats sess-mei 403 { error: 'Forbidden' }
+/admin/stats sess-boss 200 { notes: 2 }
+/notes/1 sess-mei 200 { owner: 'mei', text: 'Buy bamboo' }
+/notes/2 sess-mei 404 { error: 'Note not found' }`}>
+
+```js
+import express from "express";
+import cookieParser from "cookie-parser";
+import request from "supertest";
+
+// Pretend these sessions were created by /login
+const sessions = new Map([
+  ["sess-mei", { username: "mei", role: "user" }],
+  ["sess-boss", { username: "boss", role: "admin" }],
+]);
+const notes = new Map([
+  ["1", { owner: "mei", text: "Buy bamboo" }],
+  ["2", { owner: "boss", text: "Raise prices" }],
+]);
+
+function requireLogin(req, res, next) {
+  const user = sessions.get(req.cookies.sid);
+  if (!user) {
+    return res.status(401).json({ error: "Not logged in" });
+  }
+  req.user = user;
+  next();
+}
+
+// A middleware factory: each route says which roles it needs
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    next();
+  };
+}
+
+const app = express();
+app.use(cookieParser());
+
+app.get("/admin/stats", requireLogin, requireRole("admin"),
+  (req, res) => res.json({ notes: notes.size }));
+
+app.get("/notes/:id", requireLogin, (req, res) => {
+  const note = notes.get(req.params.id);
+  // ownership: someone else's note looks exactly like a missing one
+  if (!note || note.owner !== req.user.username) {
+    return res.status(404).json({ error: "Note not found" });
+  }
+  res.json(note);
+});
+
+const as = (sid) => ["Cookie", `sid=${sid}`];
+const checks = [
+  ["/admin/stats", "nobody"],
+  ["/admin/stats", "sess-mei"],
+  ["/admin/stats", "sess-boss"],
+  ["/notes/1", "sess-mei"],
+  ["/notes/2", "sess-mei"],
+];
+for (const [url, sid] of checks) {
+  const res = await request(app).get(url).set(...as(sid));
+  console.log(url, sid, res.status, res.body);
+}
+```
+
+</CodeExample>
+
+The last line is the check that most often goes missing: **ownership**. Mei is logged in and note 2 exists, but it isn't hers. Forgetting this is called **IDOR** (Insecure Direct Object Reference), or "Broken Object Level Authorization" in OWASP's API list, where it's the number one risk: change `/notes/1` to `/notes/2` in the URL and read someone else's data. Answering 404 rather than 403 also avoids confirming that note 2 exists.
+
+<Callout type="tip" title="Deny by default">
+
+Make "protected" the default rather than something each route must remember: mount `requireLogin` on whole routers (`apiRouter.use(requireLogin)`) and keep the few public routes (login, sign-up, `/health`) on a separate router. Then add one test that calls every route without a cookie and expects 401: it catches the endpoint someone forgot. As apps grow, roles become **permissions** (`notes:read`, `billing:write`), but the pattern stays the same.
+
+</Callout>
+
+## Slowing down password guessing
+
+Even perfect hashing doesn't stop an attacker from simply **trying** passwords against your login form, either many passwords for one account (**brute force**) or leaked username/password pairs from other sites (**credential stuffing**). Count failures per account and per IP address, and lock out for a while after too many. As always, inject the clock so it's testable:
+
+<CodeExample output={`after 3 failures: true
+other user: false
+15 minutes later: false`}>
+
+```js
+function createLoginThrottle({ maxFailures, windowMs, now }) {
+  const failures = new Map(); // key -> timestamps of failures
+
+  const recent = (key) =>
+    (failures.get(key) ?? []).filter((t) => now() - t < windowMs);
+
+  return {
+    isLocked: (key) => recent(key).length >= maxFailures,
+    fail: (key) => failures.set(key, [...recent(key), now()]),
+    succeed: (key) => failures.delete(key),
+  };
+}
+
+let time = 0; // a fake clock: tests move time forward by hand
+const throttle = createLoginThrottle({
+  maxFailures: 3, windowMs: 15 * 60_000, now: () => time,
+});
+
+const key = "mei|203.0.113.7"; // username + IP address
+for (let i = 0; i < 3; i++) {
+  throttle.fail(key);
+  time += 1000;
+}
+console.log("after 3 failures:", throttle.isLocked(key));
+console.log("other user:", throttle.isLocked("po|203.0.113.7"));
+time += 15 * 60_000;
+console.log("15 minutes later:", throttle.isLocked(key));
+```
+
+</CodeExample>
+
+The login route checks `isLocked` first and answers **429 Too Many Requests**, calls `fail` on a wrong password and `succeed` on a right one. In production:
+
+- Keep the counters in a **shared store** (Redis) so every server sees them, or use `express-rate-limit` with a Redis store for simple per-IP limits on `/login`, `/signup` and `/forgot-password`.
+- Answer **the same** error for "no such user" and "wrong password" (`Invalid username or password`), so attackers can't discover which emails have accounts.
+- Lock out with **growing delays** rather than permanently, or attackers can lock real users out on purpose.
+- Offer **multi-factor authentication** and **passkeys** (WebAuthn): a stolen password alone is then useless. Checking new passwords against known-breached ones (e.g. the Have I Been Pwned range API) also helps.
+
+```js
+// npm install express-rate-limit
+import { rateLimit } from "express-rate-limit";
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,              // 10 attempts per IP per 15 minutes
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+});
+app.post("/login", loginLimiter, loginHandler);
+```
+
+<Quiz
+  question="Your users table leaks. Which stored value makes it hardest for the attacker to recover the original passwords?"
+  options={["sha256(password)", "md5(password + a secret pepper shared by all users)", "argon2id with a random per-user salt, tuned to take about 200 ms per hash", "The password encrypted with AES, with the key stored in the same database"]}
+  answer={2}
+  explanation="A slow, memory-hard hash with a unique salt per user makes every single guess expensive and stops precomputed tables. Fast hashes (SHA-256, MD5) can be guessed billions of times per second, and encryption is reversible by anyone who finds the key."
+/>
+
+<Quiz
+  question="A user edits the payload of their HS256 JWT from role user to role admin and sends it back. With correct verification, what happens and why?"
+  options={["It works, because the payload is just base64 and anyone can change it", "It's rejected, because the signature was computed over the original header and payload with the server's secret, so it no longer matches", "It's rejected, because JWT payloads are encrypted", "It works until the token expires, because the server only checks exp"]}
+  answer={1}
+  explanation="Anyone can read and edit the payload, but the signature is an HMAC of header and payload under a key only the server has. Recomputing it over the edited payload gives a different value, so verification fails."
+/>
+
+<Exercise
+  title="Log in, stay in, log out"
+  starter={`import express from "express";
+import cookieParser from "cookie-parser";
+import request from "supertest";
+
+// ---------- password helpers from the lesson (done) ----------
+const encoder = new TextEncoder();
+const toB64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const fromB64 = (text) =>
+  Uint8Array.from(atob(text), (char) => char.charCodeAt(0));
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256
+  );
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password, iterations = 1_000) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt, iterations);
+  return \`pbkdf2$\${iterations}$\${toB64(salt)}$\${toB64(hash)}\`;
+}
+
+async function verifyPassword(password, stored) {
+  const [, iterations, salt, hash] = stored.split("$");
+  const actual = await pbkdf2(
+    password, fromB64(salt), Number(iterations)
+  );
+  const expected = fromB64(hash);
+  let diff = actual.length ^ expected.length;
+  for (let i = 0; i < actual.length; i++) {
+    diff |= actual[i] ^ expected[i];
+  }
+  return diff === 0;
+}
+// --------------------------------------------------------------
+
+const HOUR = 60 * 60 * 1000;
+
+async function createApp() {
+  const users = new Map([
+    ["mei", { role: "user", hash: await hashPassword("bamboo") }],
+    ["boss", { role: "admin", hash: await hashPassword("s3cret") }],
+  ]);
+  const sessions = new Map(); // session id -> username
+
+  const app = express();
+  app.use(express.json());
+  app.use(cookieParser());
+
+  app.post("/login", async (req, res) => {
+    const { username, password } = req.body ?? {};
+    // TODO 1: 400 { error: "Invalid input" } unless both are strings
+    // TODO 2: 401 { error: "Invalid username or password" } for an
+    //         unknown user OR a wrong password (verifyPassword)
+    // TODO 3: delete the old session (req.cookies.sid), create a new
+    //         id with crypto.randomUUID(), store it in sessions and
+    //         set the "sid" cookie: httpOnly, secure, sameSite "lax",
+    //         maxAge HOUR. Answer { username, role }.
+    res.status(501).json({ error: "Not implemented" });
+  });
+
+  function requireLogin(req, res, next) {
+    // TODO 4: look up req.cookies.sid in sessions; if there's no
+    //         session, 401 { error: "Not logged in" }. Otherwise
+    //         set req.user = { username, role } and call next()
+    next();
+  }
+
+  function requireRole(role) {
+    // TODO 5: 403 { error: "Forbidden" } unless req.user.role
+    //         is the required role
+    return (req, res, next) => next();
+  }
+
+  app.get("/me", requireLogin, (req, res) => {
+    res.json(req.user);
+  });
+
+  app.get("/admin/stats", requireLogin, requireRole("admin"),
+    (req, res) => res.json({ users: users.size }));
+
+  app.post("/logout", (req, res) => {
+    // TODO 6: delete the session, clear the "sid" cookie, 204
+    res.sendStatus(501);
+  });
+
+  return app;
+}
+
+const browser = request.agent(await createApp());
+const login = await browser
+  .post("/login")
+  .send({ username: "mei", password: "bamboo" });
+console.log("login", login.status, login.body);
+console.log("me", (await browser.get("/me")).body);
+console.log("logout", (await browser.post("/logout")).status);
+console.log("me", (await browser.get("/me")).status);
+`}
+  tests={[
+    { name: "A correct login sets an HttpOnly, Secure, SameSite=Lax sid cookie for an hour", check: `await (async () => { const r = await require('supertest')(await createApp()).post('/login').send({ username: 'mei', password: 'bamboo' }); const c = (r.headers['set-cookie'] ?? [])[0] ?? ''; return r.status === 200 && r.body.username === 'mei' && r.body.role === 'user' && /^sid=[^;]{20,}/.test(c) && ['HttpOnly', 'Secure', 'SameSite=Lax', 'Max-Age=3600'].every((f) => c.split('; ').includes(f)); })()` },
+    { name: "Wrong passwords and unknown users get the same 401, and no cookie", check: `await (async () => { const api = require('supertest')(await createApp()); const a = await api.post('/login').send({ username: 'mei', password: 'Bamboo' }); const b = await api.post('/login').send({ username: 'nobody', password: 'bamboo' }); return a.status === 401 && b.status === 401 && a.body.error === 'Invalid username or password' && b.body.error === a.body.error && !a.headers['set-cookie'] && !b.headers['set-cookie']; })()` },
+    { name: "Non-string usernames and passwords get 400 Invalid input", check: `await (async () => { const api = require('supertest')(await createApp()); const a = await api.post('/login').send({ username: 'mei', password: { $ne: '' } }); const b = await api.post('/login'); const c = await api.post('/login').send({ username: ['boss'], password: 's3cret' }); return [a, b, c].every((r) => r.status === 400 && r.body.error === 'Invalid input' && !r.headers['set-cookie']); })()` },
+    { name: "requireLogin answers 401 without a valid session and fills req.user with one", check: `await (async () => { const app = await createApp(); const api = require('supertest')(app); const anon = await api.get('/me'); const forged = await api.get('/me').set('Cookie', 'sid=boss'); const agent = require('supertest').agent(app); await agent.post('/login').send({ username: 'boss', password: 's3cret' }); const me = await agent.get('/me'); return anon.status === 401 && anon.body.error === 'Not logged in' && forged.status === 401 && me.status === 200 && JSON.stringify(me.body) === JSON.stringify({ username: 'boss', role: 'admin' }); })()` },
+    { name: "Logout answers 204, clears the cookie and ends the session on the server", check: `await (async () => { const app = await createApp(); const agent = require('supertest').agent(app); const login = await agent.post('/login').send({ username: 'mei', password: 'bamboo' }); const sid = /sid=([^;]*)/.exec(login.headers['set-cookie'][0])[1]; const out = await agent.post('/logout'); const after = await agent.get('/me'); const replay = await require('supertest')(app).get('/me').set('Cookie', 'sid=' + sid); return out.status === 204 && /^sid=;/.test((out.headers['set-cookie'] ?? [])[0] ?? '') && after.status === 401 && replay.status === 401; })()` },
+    { name: "Logging in again rotates the session id, and the old id stops working", check: `await (async () => { const app = await createApp(); const agent = require('supertest').agent(app); const sidOf = (r) => /sid=([^;]*)/.exec(r.headers['set-cookie'][0])[1]; const first = sidOf(await agent.post('/login').send({ username: 'mei', password: 'bamboo' })); const second = sidOf(await agent.post('/login').send({ username: 'mei', password: 'bamboo' })); const api = require('supertest')(app); const old = await api.get('/me').set('Cookie', 'sid=' + first); const cur = await api.get('/me').set('Cookie', 'sid=' + second); return first !== second && old.status === 401 && cur.status === 200; })()` },
+    { name: "requireRole lets admins in, answers 403 for users and 401 for strangers", check: `await (async () => { const app = await createApp(); const st = require('supertest'); const mei = st.agent(app); await mei.post('/login').send({ username: 'mei', password: 'bamboo' }); const boss = st.agent(app); await boss.post('/login').send({ username: 'boss', password: 's3cret' }); const a = await mei.get('/admin/stats'); const b = await boss.get('/admin/stats'); const c = await st(app).get('/admin/stats'); return a.status === 403 && a.body.error === 'Forbidden' && b.status === 200 && b.body.users === 2 && c.status === 401; })()` },
+  ]}
+>
+
+Build the login system for a small Express app. The password helpers from the lesson are ready at the top, and the users `mei` (password `bamboo`, role `user`) and `boss` (password `s3cret`, role `admin`) are stored as salted PBKDF2 hashes. Press **Run** to see the demo at the bottom fail, then:
+
+1. **`POST /login`**: answer **400** `{ error: "Invalid input" }` unless `username` and `password` are both strings (no `{ "$ne": "" }` tricks).
+2. For an unknown user **or** a wrong password (`await verifyPassword(password, user.hash)`), answer **401** with the same `{ error: "Invalid username or password" }`.
+3. On success, **rotate** the session: delete the old one (`req.cookies.sid`), create a new id with `crypto.randomUUID()`, store `id → username` in `sessions`, and set the `sid` cookie with `httpOnly: true`, `secure: true`, `sameSite: "lax"` and `maxAge: HOUR`. Answer `{ username, role }`.
+4. **`requireLogin`**: look the cookie up in `sessions`. No session: **401** `{ error: "Not logged in" }`. Otherwise set `req.user = { username, role }` and call `next()`.
+5. **`requireRole(role)`** returns a middleware that answers **403** `{ error: "Forbidden" }` unless `req.user.role === role`.
+6. **`POST /logout`**: delete the session on the server, `res.clearCookie("sid")` and answer **204**.
+
+The checks log in with `request.agent`, replay old cookies after logout and after a second login, and try the admin route as each user.
+
+<Hint>
+
+In `/login`, check the types first, then `const user = users.get(username);` and `if (!user || !(await verifyPassword(password, user.hash)))`. Note the brackets around `await`: `!await ...` would also work, but is easy to misread. `sessions.delete(undefined)` is harmless, so you can always delete `req.cookies.sid` before creating the new id. In `requireLogin`, `sessions.get(req.cookies.sid)` gives the username; the role comes from `users.get(username).role`.
+
+</Hint>
+
+<Solution>
+
+```js
+import express from "express";
+import cookieParser from "cookie-parser";
+import request from "supertest";
+
+// ---------- password helpers from the lesson (done) ----------
+const encoder = new TextEncoder();
+const toB64 = (bytes) => btoa(String.fromCharCode(...bytes));
+const fromB64 = (text) =>
+  Uint8Array.from(atob(text), (char) => char.charCodeAt(0));
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    "raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256
+  );
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password, iterations = 1_000) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt, iterations);
+  return `pbkdf2$${iterations}$${toB64(salt)}$${toB64(hash)}`;
+}
+
+async function verifyPassword(password, stored) {
+  const [, iterations, salt, hash] = stored.split("$");
+  const actual = await pbkdf2(
+    password, fromB64(salt), Number(iterations)
+  );
+  const expected = fromB64(hash);
+  let diff = actual.length ^ expected.length;
+  for (let i = 0; i < actual.length; i++) {
+    diff |= actual[i] ^ expected[i];
+  }
+  return diff === 0;
+}
+// --------------------------------------------------------------
+
+const HOUR = 60 * 60 * 1000;
+
+async function createApp() {
+  const users = new Map([
+    ["mei", { role: "user", hash: await hashPassword("bamboo") }],
+    ["boss", { role: "admin", hash: await hashPassword("s3cret") }],
+  ]);
+  const sessions = new Map(); // session id -> username
+
+  const app = express();
+  app.use(express.json());
+  app.use(cookieParser());
+
+  app.post("/login", async (req, res) => {
+    const { username, password } = req.body ?? {};
+    if (typeof username !== "string" ||
+        typeof password !== "string") {
+      return res.status(400).json({ error: "Invalid input" });
+    }
+    const user = users.get(username);
+    if (!user || !(await verifyPassword(password, user.hash))) {
+      return res
+        .status(401)
+        .json({ error: "Invalid username or password" });
+    }
+    sessions.delete(req.cookies.sid); // rotate the session id
+    const id = crypto.randomUUID();
+    sessions.set(id, username);
+    res.cookie("sid", id, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      maxAge: HOUR,
+    });
+    res.json({ username, role: user.role });
+  });
+
+  function requireLogin(req, res, next) {
+    const username = sessions.get(req.cookies.sid);
+    if (!username) {
+      return res.status(401).json({ error: "Not logged in" });
+    }
+    req.user = { username, role: users.get(username).role };
+    next();
+  }
+
+  function requireRole(role) {
+    return (req, res, next) => {
+      if (req.user.role !== role) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+      next();
+    };
+  }
+
+  app.get("/me", requireLogin, (req, res) => {
+    res.json(req.user);
+  });
+
+  app.get("/admin/stats", requireLogin, requireRole("admin"),
+    (req, res) => res.json({ users: users.size }));
+
+  app.post("/logout", (req, res) => {
+    sessions.delete(req.cookies.sid);
+    res.clearCookie("sid");
+    res.sendStatus(204);
+  });
+
+  return app;
+}
+
+const browser = request.agent(await createApp());
+const login = await browser
+  .post("/login")
+  .send({ username: "mei", password: "bamboo" });
+console.log("login", login.status, login.body);
+console.log("me", (await browser.get("/me")).body);
+console.log("logout", (await browser.post("/logout")).status);
+console.log("me", (await browser.get("/me")).status);
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Authentication** is *who are you* (fail with **401**); **authorisation** is *what may you do* (fail with **403**, or **404** to hide things that aren't yours).
+- Never store passwords or fast hashes of them. Use a **salted, slow** hash: Argon2id or bcrypt in production, or PBKDF2 with 600,000+ iterations (`crypto.subtle` can do it). Store algorithm, cost, salt and hash together.
+- Compare secrets in **constant time** (`crypto.timingSafeEqual`, `crypto.subtle.verify`) to avoid timing attacks.
+- **Sessions**: a random id in a cookie with `HttpOnly`, `Secure`, `SameSite` and an expiry; rotate the id on login, expire sessions on the server, and delete them on logout. `cookie-parser` reads `req.cookies`; `request.agent` tests it like a browser.
+- A **JWT** is `header.payload.signature`: **signed, not encrypted**. Verify the signature before trusting anything, pin the algorithm, check `exp`, keep tokens short-lived, and use a library like `jose`.
+- Prefer `HttpOnly` cookies over `localStorage` for tokens in browser apps: XSS can read `localStorage`.
+- Protect routes with **middleware**: `requireLogin`, `requireRole(...roles)`, and always check **ownership** (IDOR). Deny by default.
+- Slow down guessing with **per-account and per-IP limits**, identical error messages, and MFA or passkeys.
