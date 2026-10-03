@@ -77,6 +77,7 @@ const HARNESS = String.raw`
     }
     if (value instanceof Date) return isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
     if (value instanceof RegExp) return value.toString();
+    if (Object.prototype.toString.call(value) === "[object Generator]") return "Object [Generator] {}";
     if (typeof Node !== "undefined" && value instanceof Node) return describeNode(value);
 
     var nested = depth + 1;
@@ -272,23 +273,32 @@ const HARNESS = String.raw`
       return realFetch ? realFetch.call(window, input, init) : Promise.reject(new TypeError("Failed to fetch"));
     }
     inflight++;
+    requestsStarted++;
     var finished = false;
     var done = function () {
       if (!finished) { finished = true; inflight--; }
     };
-    var body = request.method === "GET" || request.method === "HEAD" ? Promise.resolve(undefined) : request.text();
+    var body = request.method === "GET" || request.method === "HEAD" ? Promise.resolve("") : request.text();
     return body.then(function (text) {
+      if (text === "") text = undefined;
       var headers = {};
       request.headers.forEach(function (value, key) { headers[key] = value; });
       var logged = text;
       try { logged = text === undefined ? undefined : JSON.parse(text); } catch (e) {}
-      window.__requests.push({ method: request.method, url: request.url, body: logged });
+      window.__requests.push({ method: request.method, url: request.url, headers: headers, body: logged });
       if (signal && signal.aborted) throw signal.reason;
       return fetchBridge({ method: request.method, url: request.url, headers: headers, body: text });
     }).then(function (fake) {
+      // __hold(): answers wait until the check calls __release().
+      if (held) return new Promise(function (go) { held.push(function () { go(fake); }); });
+      return fake;
+    }).then(function (fake) {
       return new Promise(function (resolve, reject) {
         var id = setTimeout(function () {
-          resolve(new Response(fake.body, { status: fake.status, statusText: fake.statusText, headers: fake.headers }));
+          if (fake.networkError) return reject(new TypeError("Failed to fetch"));
+          var response = new Response(fake.body, { status: fake.status, statusText: fake.statusText, headers: fake.headers });
+          Object.defineProperty(response, "url", { value: request.url });
+          resolve(response);
         }, fake.delayMs);
         if (signal) signal.addEventListener("abort", function () {
           clearTimeout(id);
@@ -308,15 +318,26 @@ const HARNESS = String.raw`
     return new Promise(function (resolve) { setTimeout(resolve, ms || 0); });
   }
   // Waits until requests have answered and the page (e.g. React) has updated.
-  async function settle() {
-    for (var i = 0; i < 150; i++) {
+  // Waits until no request is in flight and none has started for quietMs,
+  // so renders, effects and the requests they start have all finished.
+  // (React may run a first render's effects a while after the render.)
+  var requestsStarted = 0;
+  async function settle(quietMs) {
+    var quiet = quietMs || 40;
+    var until = Date.now() + 3000;
+    var seen = -1;
+    var calmSince = 0;
+    while (Date.now() < until) {
       await macrotask(0);
-      if (inflight === 0) {
-        await macrotask(16);
-        if (inflight === 0) return;
-      } else {
-        await macrotask(20);
+      if (inflight > 0 || requestsStarted !== seen) {
+        seen = requestsStarted;
+        calmSince = inflight > 0 ? 0 : Date.now();
+        await macrotask(10);
+        continue;
       }
+      if (calmSince === 0) calmSince = Date.now();
+      if (Date.now() - calmSince >= quiet) return;
+      await macrotask(10);
     }
   }
   function find(target) {
@@ -325,7 +346,29 @@ const HARNESS = String.raw`
     return el;
   }
   // Helpers for checks: click or type like a person, then wait for the page.
-  window.__settle = settle;
+  window.__settle = function () { return settle(); };
+  // Hold practice-API answers, e.g. to check a loading state without racing
+  // the response; __release(value) lets them through, waits, returns value.
+  var held = null;
+  window.__hold = function () {
+    held = held || [];
+  };
+  window.__release = async function (value) {
+    var waiting = held || [];
+    held = null;
+    waiting.forEach(function (go) { go(); });
+    await settle();
+    return value;
+  };
+  // Waits (up to ms) until test() is true; returns whether it became true.
+  window.__waitFor = async function (test, ms) {
+    var until = Date.now() + (ms || 2000);
+    for (;;) {
+      try { if (test()) return true; } catch (e) {}
+      if (Date.now() > until) return false;
+      await macrotask(5);
+    }
+  };
   window.__click = function (target) {
     find(target).click();
     return settle();
@@ -351,8 +394,9 @@ const HARNESS = String.raw`
     var probe = /:(\d+):\d+\)?\s*$/m.exec(String(window.__pandaProbe).split("\n")[1] || "");
     lineBase = probe ? Number(probe[1]) - 1 : 0;
     insertScript(code);
-    // Let promise callbacks, zero-delay timers, requests and renders finish.
-    await settle();
+    // Let promise callbacks, zero-delay timers, requests and renders finish
+    // (longer at the start: first effects may start their requests late).
+    await settle(150);
     var error = firstError;
     var tests = [];
     for (var i = 0; i < checks.length; i++) {

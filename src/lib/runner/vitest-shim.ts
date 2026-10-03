@@ -343,6 +343,19 @@ export function createVitest(options: {
   let current = root;
   let collected = 0;
   const mocks: Mock[] = [];
+  // Async assertions (resolves/rejects) that the test may forget to await.
+  const pending = new Set<Promise<void>>();
+  const track = (run: () => Promise<void>) => {
+    const promise = run();
+    pending.add(promise);
+    promise.then(
+      () => pending.delete(promise),
+      () => {
+        // Reported by the test that made it, not as an unhandled rejection.
+      },
+    );
+    return promise;
+  };
   let clock: ReturnType<typeof createFakeClock> | null = null;
   const realDateNow = Date.now;
 
@@ -387,6 +400,17 @@ export function createVitest(options: {
       current = parent;
     }
   }
+  describe.only = (name: string, fn: () => void) => {
+    describe(name, () => {
+      const before = current.children.length;
+      fn();
+      const mark = (nodes: (Suite | TestCase)[]) =>
+        nodes.forEach((child) =>
+          isSuite(child) ? mark(child.children) : (child.only = true),
+        );
+      mark(current.children.slice(before));
+    });
+  };
   describe.skip = (name: string, fn: () => void) => {
     describe(name, () => {
       const before = current.children.length;
@@ -728,38 +752,39 @@ export function createVitest(options: {
       new Proxy({} as AsyncMatchers & { not: AsyncMatchers }, {
         get: (_, key: string) => {
           if (key === "not") return wrapAsync(mode, !negated);
-          return async (...args: unknown[]) => {
-            const { rejected, value } = await settle();
-            if (mode === "resolves" && rejected) {
-              const reason =
-                value instanceof Error
-                  ? `${value.name}: ${value.message}`
-                  : formatArgs([value]);
-              throw new AssertionError(
-                `promise rejected "${reason}" instead of resolving`,
-              );
-            }
-            if (mode === "rejects" && !rejected) {
-              throw new AssertionError(
-                `promise resolved "${formatArgs([value])}" instead of rejecting`,
-              );
-            }
-            // With rejects, toThrow looks at the rejection reason.
-            const subject =
-              mode === "rejects" &&
-              (key === "toThrow" || key === "toThrowError")
-                ? () => {
-                    throw value;
-                  }
-                : value;
-            const inner = expect(subject);
-            const matcher = (negated ? inner.not : inner)[
-              key as keyof Matchers
-            ] as Fn | undefined;
-            if (typeof matcher !== "function")
-              throw new TypeError(`${key} is not a function`);
-            matcher(...args);
-          };
+          return (...args: unknown[]) =>
+            track(async () => {
+              const { rejected, value } = await settle();
+              if (mode === "resolves" && rejected) {
+                const reason =
+                  value instanceof Error
+                    ? `${value.name}: ${value.message}`
+                    : formatArgs([value]);
+                throw new AssertionError(
+                  `promise rejected "${reason}" instead of resolving`,
+                );
+              }
+              if (mode === "rejects" && !rejected) {
+                throw new AssertionError(
+                  `promise resolved "${formatArgs([value])}" instead of rejecting`,
+                );
+              }
+              // With rejects, toThrow looks at the rejection reason.
+              const subject =
+                mode === "rejects" &&
+                (key === "toThrow" || key === "toThrowError")
+                  ? () => {
+                      throw value;
+                    }
+                  : value;
+              const inner = expect(subject);
+              const matcher = (negated ? inner.not : inner)[
+                key as keyof Matchers
+              ] as Fn | undefined;
+              if (typeof matcher !== "function")
+                throw new TypeError(`${key} is not a function`);
+              matcher(...args);
+            });
         },
       });
 
@@ -872,6 +897,16 @@ export function createVitest(options: {
       clock.runAll();
       return vi;
     },
+    advanceTimersByTimeAsync: async (ms: number) => {
+      vi.advanceTimersByTime(ms);
+      await Promise.resolve();
+      return vi;
+    },
+    runAllTimersAsync: async () => {
+      vi.runAllTimers();
+      await Promise.resolve();
+      return vi;
+    },
     getTimerCount: () => clock?.count() ?? 0,
     setSystemTime: (time: number | Date) => {
       if (!clock)
@@ -959,6 +994,12 @@ export function createVitest(options: {
             await child.fn();
           } catch (error) {
             failure = error;
+          }
+          // `expect(…).rejects…` without await: still check it, like Vitest.
+          const forgotten = [...pending];
+          pending.clear();
+          for (const result of await Promise.allSettled(forgotten)) {
+            if (result.status === "rejected") failure ??= result.reason;
           }
           for (const s of [...suites].reverse()) {
             for (const hook of s.afterEach) {

@@ -51,6 +51,7 @@ describe("preview harness", () => {
       "/ab+c/g",
       '"it\'s\\nnew"',
       '["it\'s"]',
+      "(function* () { yield 1; })()",
     ];
     const window = openPreview("").window as unknown as {
       eval(code: string): unknown;

@@ -1,0 +1,649 @@
+---
+title: Middleware, Routers & Validation
+description: Build Express apps like the pros with middleware, routers, input validation, 404 and error handlers, async handlers in Express 5 and app configuration.
+duration: 18
+xp: 25
+---
+
+Your first Express app answered requests, but a real API has jobs that **every** request needs: logging what happened, reading the JSON body, checking who's calling, rejecting bad data and turning crashes into tidy error messages. Writing that code inside every route would be a mess. Express's answer is **middleware**, and once you understand it, you understand how Express itself works. 🧩
+
+## What middleware is
+
+A **middleware** is a function `(req, res, next)` that runs **before** your route handler. It can look at the request, add things to it, answer it, or call **`next()`** to pass the request on to the next function in line. `app.use(fn)` adds a middleware for **every** request:
+
+<CodeExample output={`1. log: GET /hello
+2. user: Mei
+3. route handler
+{ message: 'Hello, Mei!' }
+1. log: GET /hello
+2. user: guest
+3. route handler
+{ message: 'Hello, guest!' }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const app = express();
+
+app.use((req, res, next) => {
+  console.log(`1. log: ${req.method} ${req.url}`);
+  next(); // pass the request on to the next function
+});
+
+app.use((req, res, next) => {
+  req.user = req.get("X-User") ?? "guest";
+  console.log(`2. user: ${req.user}`);
+  next();
+});
+
+app.get("/hello", (req, res) => {
+  console.log("3. route handler");
+  res.json({ message: `Hello, ${req.user}!` });
+});
+
+const res = await request(app).get("/hello").set("X-User", "Mei");
+console.log(res.body);
+const guest = await request(app).get("/hello");
+console.log(guest.body);
+```
+
+</CodeExample>
+
+Think of it as a **pipeline**: the request travels through the functions in the order you registered them, until one of them sends a response. Notice the second middleware **adds** `req.user`, and the route handler later reads it. That's how real apps pass the logged-in user, a database connection or a request id along the chain.
+
+Every middleware must do **one** of two things: send a response, or call `next()`. If it does neither, the request just hangs. In real projects you'd use a ready-made logger such as `morgan` (`app.use(morgan("dev"))`) instead of writing your own.
+
+### Middleware that says no
+
+A middleware doesn't have to call `next()`. If something is wrong, it can answer straight away and the route never runs. You can also give middleware to **one route only**, by listing it before the handler:
+
+<CodeExample output={`200 { pandas: 3 }
+401 { error: 'Missing or wrong API key' }
+200 { bambooEatenKg: 1240 }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+function requireApiKey(req, res, next) {
+  if (req.get("X-API-Key") !== "bamboo-123") {
+    return res.status(401).json({ error: "Missing or wrong API key" });
+  }
+  next();
+}
+
+const app = express();
+
+app.get("/stats/public", (req, res) => {
+  res.json({ pandas: 3 });
+});
+
+// Middleware for one route: list it before the handler
+app.get("/stats/secret", requireApiKey, (req, res) => {
+  res.json({ bambooEatenKg: 1240 });
+});
+
+const open = await request(app).get("/stats/public");
+console.log(open.status, open.body);
+
+const blocked = await request(app).get("/stats/secret");
+console.log(blocked.status, blocked.body);
+
+const allowed = await request(app)
+  .get("/stats/secret")
+  .set("X-API-Key", "bamboo-123");
+console.log(allowed.status, allowed.body);
+```
+
+</CodeExample>
+
+This is exactly how authentication works in Express apps: a `requireLogin` middleware checks a token, and routes that need it list it first. (Hard-coding the key like this isn't how it's done for real, though; we'll fix that at the end of the lesson.)
+
+## Reading JSON bodies with express.json()
+
+When a client sends JSON, it arrives as plain **text**. The built-in middleware **`express.json()`** reads that text, parses it and puts the result in `req.body`. Like all middleware, it only helps routes that come **after** it:
+
+<CodeExample output={`/before got undefined
+/after got { text: 'Hi' }
+400`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const app = express();
+
+function echo(req, res) {
+  console.log(req.path, "got", req.body);
+  res.json({ youSent: req.body ?? null });
+}
+
+app.post("/before", echo); // registered BEFORE the JSON parser
+app.use(express.json());
+app.post("/after", echo); // registered after it
+
+await request(app).post("/before").send({ text: "Hi" });
+await request(app).post("/after").send({ text: "Hi" });
+
+const broken = await request(app)
+  .post("/after")
+  .set("Content-Type", "application/json")
+  .send('{ "text": "Hi"'); // broken JSON
+console.log(broken.status);
+```
+
+</CodeExample>
+
+- Without the parser, `req.body` is `undefined` in Express 5, so `req.body.text` would crash with a `TypeError`. Put `app.use(express.json())` near the **top** of your app.
+- `express.json()` only parses requests whose `Content-Type` is `application/json`. `fetch` doesn't set that for you, so remember `headers: { "Content-Type": "application/json" }` on the client.
+- Broken JSON is rejected with **400 Bad Request** before your route runs.
+- HTML forms send a different format; `app.use(express.urlencoded())` parses those.
+
+## Organising routes with express.Router()
+
+Real APIs have dozens of routes. An **`express.Router()`** is a mini-app for one part of the API. You give it routes with **relative** paths, then **mount** it at a path prefix with `app.use("/api/notes", router)`:
+
+<CodeExample output={`200 [ { id: 1, title: 'Buy bamboo' }, { id: 2, title: 'Nap' } ]
+/api/notes /2 { id: '2' }
+200 { id: 2, title: 'Nap' }
+404 Cannot GET /notes/2`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+// routes/notes.js
+const notes = [
+  { id: 1, title: "Buy bamboo" },
+  { id: 2, title: "Nap" },
+];
+const notesRouter = express.Router();
+
+notesRouter.get("/", (req, res) => {
+  res.json(notes);
+});
+
+notesRouter.get("/:id", (req, res) => {
+  console.log(req.baseUrl, req.path, req.params);
+  const note = notes.find((n) => n.id === Number(req.params.id));
+  if (!note) {
+    return res.status(404).json({ error: "Note not found" });
+  }
+  res.json(note);
+});
+
+// app.js
+const app = express();
+app.use(express.json());
+app.use("/api/notes", notesRouter);
+
+for (const url of ["/api/notes", "/api/notes/2"]) {
+  const res = await request(app).get(url);
+  console.log(res.status, res.body);
+}
+const wrong = await request(app).get("/notes/2");
+console.log(wrong.status, wrong.text);
+```
+
+</CodeExample>
+
+Inside the router, `"/"` means `/api/notes` and `"/:id"` means `/api/notes/:id`. `req.baseUrl` is where the router is mounted and `req.path` is the rest. In a real project, each router lives in its own file:
+
+```text
+notes-api/
+├── package.json
+└── src/
+    ├── app.js            creates the app and mounts the routers
+    ├── server.js         imports the app and calls app.listen()
+    └── routes/
+        ├── notes.js      export default notesRouter;
+        └── users.js
+```
+
+```js title="src/app.js"
+import express from "express";
+import notesRouter from "./routes/notes.js";
+
+export const app = express();
+app.use(express.json());
+app.use("/api/notes", notesRouter);
+```
+
+The prefix lives in **one** place, so moving everything to `/api/v2/notes` later is a one-line change.
+
+## Validating input
+
+Never trust what a client sends. It might be missing fields, have the wrong types, or be deliberately nasty. Checking a request body before you use it is called **validation**, and when it fails you answer **400 Bad Request** with messages that say **exactly** what's wrong, so the person building the front end can fix it:
+
+<CodeExample output={`201 { id: 1, title: 'Buy bamboo', tags: [ 'shopping' ] }
+400 [ 'title is required' ]
+400 [ 'title must be at most 100 characters', 'tags must be an array' ]`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+function validateNote(body) {
+  const errors = [];
+  const title = body?.title;
+  if (typeof title !== "string" || title.trim() === "") {
+    errors.push("title is required");
+  } else if (title.length > 100) {
+    errors.push("title must be at most 100 characters");
+  }
+  if (body?.tags !== undefined && !Array.isArray(body.tags)) {
+    errors.push("tags must be an array");
+  }
+  return errors;
+}
+
+const app = express();
+app.use(express.json());
+
+app.post("/api/notes", (req, res) => {
+  const errors = validateNote(req.body);
+  if (errors.length > 0) {
+    return res
+      .status(400)
+      .json({ error: "Invalid note", details: errors });
+  }
+  const { title, tags = [] } = req.body;
+  res.status(201).json({ id: 1, title: title.trim(), tags });
+});
+
+const bodies = [
+  { title: "  Buy bamboo ", tags: ["shopping"] },
+  {},
+  { title: "x".repeat(101), tags: "food" },
+];
+for (const body of bodies) {
+  const res = await request(app).post("/api/notes").send(body);
+  console.log(res.status, res.body.details ?? res.body);
+}
+```
+
+</CodeExample>
+
+A few habits worth copying:
+
+- `validateNote` is a plain function: easy to read and easy to test without any HTTP at all.
+- It collects **all** the problems instead of stopping at the first, so the client can fix everything in one go.
+- `body?.title` copes with a missing body (`undefined`), and `typeof` checks the **type**, not just that something is there.
+- The route builds the new note from the fields it **expects** (`title`, `tags`), never by copying the whole `req.body`. Otherwise a client could sneak in fields like `"id"` or `"isAdmin": true`.
+
+<Callout type="tip" title="Validation in real projects">
+
+Checking in the browser is for a **nice user experience**; checking on the server is for **safety**, because anyone can call your API directly with `curl`. Hand-written checks are great for learning. Bigger projects describe the shape of the data with a schema library such as Zod:
+
+```js
+import { z } from "zod";
+
+const NoteSchema = z.object({
+  title: z.string().trim().min(1).max(100),
+  tags: z.array(z.string()).default([]),
+});
+
+const result = NoteSchema.safeParse(req.body);
+if (!result.success) {
+  return res.status(400).json({ error: result.error.issues });
+}
+```
+
+</Callout>
+
+## 404 and error-handling middleware
+
+Two special middlewares go at the **very end** of every Express app:
+
+- A **404 handler**: a normal middleware with no path. It only runs if no route answered, so it can send a JSON 404 instead of Express's HTML `Cannot GET /x`.
+- An **error handler**: a middleware with **four** parameters, `(err, req, res, next)`. Express jumps straight to it whenever a handler **throws** or calls `next(err)`, skipping all the normal middleware and routes in between.
+
+A small `HttpError` class (you know [classes](/learn/javascript/classes)) lets any route throw an error that carries its status code:
+
+<CodeExample output={`200 { id: 1, title: 'Buy bamboo' }
+404 { error: 'Note not found' }
+Server error: Connection lost
+500 { error: 'Something went wrong' }
+404 { error: 'Cannot GET /api/nope' }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// Pretend database: answers after a short wait
+const db = {
+  async findNote(id) {
+    await new Promise((done) => setTimeout(done, 10));
+    if (id === 13) throw new Error("Connection lost");
+    return id === 1 ? { id: 1, title: "Buy bamboo" } : undefined;
+  },
+};
+
+const app = express();
+
+app.get("/api/notes/:id", async (req, res) => {
+  const note = await db.findNote(Number(req.params.id));
+  if (!note) {
+    throw new HttpError(404, "Note not found");
+  }
+  res.json(note);
+});
+
+// 404 handler: runs when no route answered
+app.use((req, res) => {
+  res.status(404).json({ error: `Cannot ${req.method} ${req.path}` });
+});
+
+// Error handler: 4 parameters, always last
+app.use((err, req, res, next) => {
+  const status = err.status ?? 500;
+  if (status >= 500) {
+    console.log("Server error:", err.message); // for developers
+  }
+  res.status(status).json({
+    error: status >= 500 ? "Something went wrong" : err.message,
+  });
+});
+
+for (const url of ["/api/notes/1", "/api/notes/2",
+                   "/api/notes/13", "/api/nope"]) {
+  const res = await request(app).get(url);
+  console.log(res.status, res.body);
+}
+```
+
+</CodeExample>
+
+Look at what the route **doesn't** contain: no `try/catch`, no error formatting. It just throws, and one error handler decides how **every** error in the app looks. Notice too how it treats the two kinds of error differently:
+
+- **Expected** errors (status below 500, like our 404) are the client's business, so their message is sent back.
+- **Unexpected** errors (a crash, a lost database connection) get a vague `"Something went wrong"`. The real message is logged for the developers, but never sent to the client: it might reveal file paths, SQL or other details an attacker would love.
+
+<Callout type="warning" title="Express 5 catches async errors; Express 4 didn't">
+
+In **Express 5**, if an `async` handler throws (or an `await` rejects), Express passes the error to your error handler automatically, as you saw above. In **Express 4**, the same code left the request hanging and crashed with an "unhandled promise rejection". You'll still find this pattern everywhere in older code and tutorials:
+
+```js
+// Express 4 style: catch and forward the error yourself
+app.get("/api/notes/:id", async (req, res, next) => {
+  try {
+    res.json(await db.findNote(Number(req.params.id)));
+  } catch (err) {
+    next(err);
+  }
+});
+```
+
+Other Express 5 changes you may bump into: `res.send(404)` was removed (use `res.sendStatus(404)`), and wildcard routes are written `/files/*path` instead of `/files/*`. Check which version a project uses in `package.json` before copying code from the internet.
+
+</Callout>
+
+The error handler is recognised **only** by its four parameters. Even if you don't use `next`, keep it in the list: `(err, req, res)` with three would be treated as a normal middleware and never receive errors.
+
+## Configuration: pass options in
+
+Our API key was hard-coded as `"bamboo-123"`. Real apps have lots of settings like that: the port, API keys, the database address. They differ between your laptop, the tests and production, and secrets must **never** be committed to Git.
+
+On a real server, settings come from **environment variables**: named values the operating system gives a program when it starts. Node reads them from `process.env`, e.g. `process.env.PORT`. The clean way to use them is to read them in **one** place, `server.js`, and pass them into a function that **creates** the app as an options object:
+
+<CodeExample output={`200 { bambooEatenKg: 1240 }
+[ 'GET /stats/secret' ]`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+function createApp({ apiKey, log = console.log }) {
+  const app = express();
+
+  app.use((req, res, next) => {
+    log(`${req.method} ${req.url}`);
+    next();
+  });
+
+  app.get("/stats/secret", (req, res) => {
+    if (req.get("X-API-Key") !== apiKey) {
+      return res.status(401).json({ error: "Wrong API key" });
+    }
+    res.json({ bambooEatenKg: 1240 });
+  });
+
+  return app;
+}
+
+// In a test: a known key and a logger that remembers lines
+const lines = [];
+const app = createApp({
+  apiKey: "test-key",
+  log: (line) => lines.push(line),
+});
+
+const res = await request(app)
+  .get("/stats/secret")
+  .set("X-API-Key", "test-key");
+console.log(res.status, res.body);
+console.log(lines);
+```
+
+</CodeExample>
+
+The app no longer cares **where** its settings come from. Tests pass a fake key and a quiet logger, and the real server passes values from the environment:
+
+```js title="src/server.js"
+import { createApp } from "./app.js";
+
+const app = createApp({ apiKey: process.env.API_KEY });
+const port = Number(process.env.PORT ?? 3000);
+
+app.listen(port, () => {
+  console.log(`Listening on http://localhost:${port}`);
+});
+```
+
+```bash
+API_KEY=bamboo-123 PORT=4000 node src/server.js
+# or keep them in a .env file (and add .env to .gitignore!)
+node --env-file=.env src/server.js
+```
+
+This is **dependency injection** again: hand a function what it needs instead of letting it reach out for global things. It's what makes the app easy to test.
+
+<Quiz
+  question="An app has app.use(logger), then app.get('/notes', listNotes), then app.use(notFound) and finally app.use(errorHandler). A client requests GET /notes and listNotes throws an error. Which functions run?"
+  options={["logger, listNotes, notFound, errorHandler", "logger, listNotes, errorHandler", "listNotes and errorHandler only", "logger, listNotes, and then the request hangs"]}
+  answer={1}
+  explanation="The logger runs first and calls next(). listNotes throws, so Express skips every normal middleware (including notFound) and jumps to the next error handler, the one with four parameters."
+/>
+
+<Quiz
+  question="A route crashes because the database password is wrong. What should the error handler send to the client?"
+  options={["Status 400 with the full error message, so the client can fix it", "Status 500 with a generic message like Something went wrong, while the details are logged on the server", "Status 200 with an empty body, so the client doesn't notice", "Status 500 with err.stack so developers can debug from the browser"]}
+  answer={1}
+  explanation="A crash is the server's fault, so 500 is right. Its details (stack traces, passwords, SQL) can help an attacker, so they stay in the server's logs and the client only gets a generic message."
+/>
+
+<Exercise
+  title="Bookshelf API with validation"
+  starter={`import express from "express";
+import request from "supertest";
+
+// Pretend service that is broken today
+async function loadStats() {
+  throw new Error("Stats service is down");
+}
+
+function validateBook(body) {
+  const errors = [];
+  // TODO 2: check body?.title and body?.year, push messages
+  return errors;
+}
+
+function createApp({ log = console.log } = {}) {
+  const books = [{ id: 1, title: "The Hobbit", year: 1937 }];
+  let nextId = 2;
+
+  const app = express();
+  app.use(express.json());
+  // TODO 1: a logger middleware: log(\`\${req.method} \${req.originalUrl}\`)
+
+  const router = express.Router();
+  router.get("/", (req, res) => {
+    res.json(books);
+  });
+  router.get("/stats", async (req, res) => {
+    res.json(await loadStats());
+  });
+  router.post("/", (req, res) => {
+    // TODO 3: answer 400 { error: "Invalid book", details }
+    //         when validateBook finds problems
+    const book = {
+      id: nextId++,
+      title: req.body.title.trim(),
+      year: req.body.year,
+    };
+    books.push(book);
+    res.status(201).json(book);
+  });
+  app.use("/api/books", router);
+
+  // TODO 4: 404 handler -> { error: "Not found" }
+  // TODO 5: error handler -> status below 500: that status and
+  //         { error: err.message }; otherwise 500 and
+  //         { error: "Something went wrong" }
+
+  return app;
+}
+
+const app = createApp();
+const res = await request(app).post("/api/books").send({ year: 2020 });
+console.log(res.status, res.body);
+`}
+  tests={[
+    { name: "A logger middleware logs every request with the log option", check: `(await require('supertest')(createApp()).get('/api/books?sort=title'), __output.includes('GET /api/books?sort=title')) && await (async () => { const lines = []; await require('supertest')(createApp({ log: (l) => lines.push(l) })).post('/api/books').send({}); return lines.includes('POST /api/books'); })()` },
+    { name: "validateBook returns every problem, in order", check: `JSON.stringify(validateBook({})) === JSON.stringify(['title is required', 'year must be a whole number']) && JSON.stringify(validateBook(undefined)) === JSON.stringify(['title is required', 'year must be a whole number']) && JSON.stringify(validateBook({ title: '   ', year: 2001 })) === JSON.stringify(['title is required']) && JSON.stringify(validateBook({ title: 'y'.repeat(101), year: '1999' })) === JSON.stringify(['title must be at most 100 characters', 'year must be a whole number']) && validateBook({ title: 'y'.repeat(100), year: 1999 }).length === 0 && JSON.stringify(validateBook({ title: 'Dune', year: 19.5 })) === JSON.stringify(['year must be a whole number'])` },
+    { name: "A valid book is still created with 201", check: `await (async () => { const api = require('supertest')(createApp({ log: () => {} })); const r = await api.post('/api/books').send({ title: '  Momo ', year: 1973 }); const list = (await api.get('/api/books')).body; return r.status === 201 && r.body.id === 2 && r.body.title === 'Momo' && r.body.year === 1973 && list.length === 2; })()` },
+    { name: "Invalid books get 400 with details and aren't saved", check: `await (async () => { const api = require('supertest')(createApp({ log: () => {} })); const r = await api.post('/api/books').send({ title: '', year: 'soon' }); const none = await api.post('/api/books'); const list = (await api.get('/api/books')).body; return r.status === 400 && r.body.error === 'Invalid book' && JSON.stringify(r.body.details) === JSON.stringify(['title is required', 'year must be a whole number']) && none.status === 400 && list.length === 1; })()` },
+    { name: "Unknown routes answer 404 { error: 'Not found' }", check: `await (async () => { const api = require('supertest')(createApp({ log: () => {} })); const a = await api.get('/api/nope'); const b = await api.delete('/api/books'); return a.status === 404 && a.body.error === 'Not found' && b.status === 404 && b.body.error === 'Not found'; })()` },
+    { name: "The error handler hides crashes (500) and keeps 4xx errors", check: `await (async () => { const api = require('supertest')(createApp({ log: () => {} })); const a = await api.get('/api/books/stats'); const b = await api.post('/api/books').set('Content-Type', 'application/json').send('{ "title": '); return a.status === 500 && a.body.error === 'Something went wrong' && b.status === 400 && typeof b.body.error === 'string'; })()` },
+  ]}
+>
+
+A library's Bookshelf API works for happy cases, but bad input crashes it: press **Run** and see the 500 for a book without a title. Make it production-ready:
+
+1. **Logger**: add a middleware that calls `log(...)` with the method and the original URL, e.g. `GET /api/books?sort=title`, then passes the request on. Use the `log` option, not `console.log` directly, so tests can replace it.
+2. **`validateBook(body)`** returns an array of messages (empty when the book is fine), checking in this order:
+   - `title` must be a string that isn't empty after trimming, or add `"title is required"`; if it's longer than 100 characters, add `"title must be at most 100 characters"`;
+   - `year` must be a whole number (`1937`, not `"1937"` or `19.5`), or add `"year must be a whole number"`.
+
+   Careful: `body` may be `undefined` when the request has no JSON.
+3. **`POST /api/books`**: if there are problems, answer **400** with `{ error: "Invalid book", details: [...] }` and don't save anything.
+4. **404 handler**: unknown routes answer **404** `{ error: "Not found" }`.
+5. **Error handler**: errors with a `status` below 500 (like the 400 that `express.json()` gives for broken JSON) answer with that status and `{ error: err.message }`. Everything else (like the broken `/api/books/stats`) answers **500** `{ error: "Something went wrong" }`.
+
+<Hint>
+
+The logger is `app.use((req, res, next) => { log(...); next(); });`, placed before the router. In `validateBook`, `body?.title` and `body?.year` work even when `body` is `undefined`, and `Number.isInteger(value)` is only `true` for whole numbers. Both handlers go after `app.use("/api/books", router)`, with the 404 handler first; the error handler needs four parameters: `(err, req, res, next)`. Use `const status = err.status ?? 500;`.
+
+</Hint>
+
+<Solution>
+
+```js
+import express from "express";
+import request from "supertest";
+
+// Pretend service that is broken today
+async function loadStats() {
+  throw new Error("Stats service is down");
+}
+
+function validateBook(body) {
+  const errors = [];
+  const title = body?.title;
+  if (typeof title !== "string" || title.trim() === "") {
+    errors.push("title is required");
+  } else if (title.length > 100) {
+    errors.push("title must be at most 100 characters");
+  }
+  if (!Number.isInteger(body?.year)) {
+    errors.push("year must be a whole number");
+  }
+  return errors;
+}
+
+function createApp({ log = console.log } = {}) {
+  const books = [{ id: 1, title: "The Hobbit", year: 1937 }];
+  let nextId = 2;
+
+  const app = express();
+  app.use(express.json());
+  app.use((req, res, next) => {
+    log(`${req.method} ${req.originalUrl}`);
+    next();
+  });
+
+  const router = express.Router();
+  router.get("/", (req, res) => {
+    res.json(books);
+  });
+  router.get("/stats", async (req, res) => {
+    res.json(await loadStats());
+  });
+  router.post("/", (req, res) => {
+    const errors = validateBook(req.body);
+    if (errors.length > 0) {
+      return res
+        .status(400)
+        .json({ error: "Invalid book", details: errors });
+    }
+    const book = {
+      id: nextId++,
+      title: req.body.title.trim(),
+      year: req.body.year,
+    };
+    books.push(book);
+    res.status(201).json(book);
+  });
+  app.use("/api/books", router);
+
+  app.use((req, res) => {
+    res.status(404).json({ error: "Not found" });
+  });
+
+  app.use((err, req, res, next) => {
+    const status = err.status ?? 500;
+    if (status < 500) {
+      return res.status(status).json({ error: err.message });
+    }
+    res.status(500).json({ error: "Something went wrong" });
+  });
+
+  return app;
+}
+
+const app = createApp();
+const res = await request(app).post("/api/books").send({ year: 2020 });
+console.log(res.status, res.body);
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Middleware** is `(req, res, next) => { ... }`: it runs in the order registered, and must either respond or call `next()`. `app.use(fn)` applies it to every request; `app.get(path, mw, handler)` to one route.
+- `app.use(express.json())` near the top fills `req.body` from JSON; without it, `req.body` is `undefined` in Express 5. Broken JSON gets a 400.
+- `express.Router()` groups routes with relative paths; `app.use("/api/notes", router)` mounts them under a prefix.
+- **Validate** every body on the server: collect all the problems, answer **400** with clear `details`, and build new objects only from the fields you expect.
+- End the app with a **404 handler** and an **error handler** with four parameters `(err, req, res, next)`. Throw errors (e.g. an `HttpError` with a `status`) and let it format them; hide the details of 500s.
+- **Express 5** sends errors from `async` handlers to the error handler automatically; Express 4 needed `try/catch` and `next(err)`.
+- Read settings from **environment variables** in `server.js` only, and pass them in: `createApp({ apiKey, log })`. Tests then pass their own values.

@@ -71,6 +71,37 @@ describe("fetch and the practice API", () => {
     expect(r.tests?.map((t) => t.passed)).toEqual([true, true]);
   });
 
+  it("fills in response.url, logs headers and can fail like a lost connection", async () => {
+    const r = await execute(
+      `
+      const res = await fetch("https://api.pandadev.test/users/1", {
+        headers: { Authorization: "Bearer abc" },
+      });
+      console.log(res.url);
+      try {
+        await fetch("https://api.pandadev.test/offline");
+      } catch (error) {
+        console.log(error.name, error.message);
+      }
+      await fetch("https://api.pandadev.test/todos/1", { method: "DELETE" });
+    `,
+      {
+        tests: [
+          {
+            name: "headers",
+            check: "__requests[0].headers.authorization === 'Bearer abc'",
+          },
+          { name: "no body", check: "__requests[2].body === undefined" },
+        ],
+      },
+    );
+    expect(texts(r)).toEqual([
+      "https://api.pandadev.test/users/1",
+      "TypeError Failed to fetch",
+    ]);
+    expect(r.tests?.map((t) => t.passed)).toEqual([true, true]);
+  });
+
   it("can abort a slow request", async () => {
     const r = await execute(`
       try {
@@ -162,6 +193,22 @@ describe("Vitest in the editor", () => {
       });
     `);
     expect(texts(r)).toEqual(["✓ debounce", "", "Tests  1 passed (1)"]);
+  });
+
+  it("fails a test whose rejects assertion wasn't awaited", async () => {
+    const r = await execute(`
+      import { test, expect } from "vitest";
+      test("forgot await", () => {
+        expect(Promise.resolve(1)).rejects.toThrow();
+      });
+    `);
+    expect(r.error).toBeUndefined();
+    expect(texts(r)).toEqual([
+      "× forgot await",
+      '  → promise resolved "1" instead of rejecting',
+      "",
+      "Tests  1 failed (1)",
+    ]);
   });
 
   it("lets checks rerun the tests against buggy code", async () => {

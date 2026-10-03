@@ -274,9 +274,13 @@ export async function execute(
       if (!changed.includes(from)) {
         throw new Error(`Couldn't find ${JSON.stringify(from)} in the code`);
       }
-      changed = changed.replace(from, to);
+      changed = changed.replace(from, () => to); // no $& patterns
     }
     const again = await execute(changed, { language });
+    // Code that crashes before its tests run counts as a caught bug.
+    if (again.error && !again.vitest) {
+      return { total: 1, passed: 0, failed: 1, skipped: 0, tests: [] };
+    }
     return (
       again.vitest ?? {
         ...vitestSummary,

@@ -23,6 +23,8 @@ export type FakeResponse = {
   headers: Record<string, string>;
   body: string | null;
   delayMs: number;
+  /** /offline: fail like a dropped connection instead of answering */
+  networkError?: boolean;
 };
 
 const STATUS_TEXT: Record<number, string> = {
@@ -604,6 +606,9 @@ export function createFakeApi() {
         const ms = Math.min(5000, Math.max(0, Number(parts[1]) || 0));
         return json(200, { waited: ms }, ms);
       }
+      case "offline":
+        // Fails like a lost connection: fetch rejects with a TypeError.
+        return { ...json(200, null), networkError: true };
       case "flaky": {
         // Fails twice with 503, then works: for practising retries.
         flakyCalls++;
@@ -632,24 +637,37 @@ export async function toFakeRequest(
   request.headers.forEach((value, key) => {
     headers[key] = value;
   });
-  const body =
+  const text =
     request.method === "GET" || request.method === "HEAD"
-      ? undefined
+      ? ""
       : await request.text();
-  return { method: request.method, url: request.url, headers, body };
+  return {
+    method: request.method,
+    url: request.url,
+    headers,
+    body: text === "" ? undefined : text,
+  };
 }
 
 /** A real Response for a fake one (204 and friends have no body). */
-export function toResponse(fake: FakeResponse): Response {
-  return new Response(fake.body, {
+export function toResponse(fake: FakeResponse, url: string): Response {
+  const response = new Response(fake.body, {
     status: fake.status,
     statusText: fake.statusText,
     headers: fake.headers,
   });
+  // A real fetch fills in response.url; the constructor can't.
+  Object.defineProperty(response, "url", { value: url });
+  return response;
 }
 
 /** What a run remembers about each request, so checks can look at them. */
-export type RequestLogEntry = { method: string; url: string; body?: unknown };
+export type RequestLogEntry = {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body?: unknown;
+};
 
 /**
  * A `fetch` that answers https://api.pandadev.test from the fake API after
@@ -677,12 +695,18 @@ export function createFetch(
     } catch {
       // keep it as text
     }
-    log.push({ method: request.method, url: request.url, body });
+    log.push({
+      method: request.method,
+      url: request.url,
+      headers: request.headers,
+      body,
+    });
     const signal =
       init?.signal ?? (input instanceof Request ? input.signal : null);
     if (signal?.aborted) throw signal.reason;
     const fake = api.handle(request);
     await wait(fake.delayMs, signal);
-    return toResponse(fake);
+    if (fake.networkError) throw new TypeError("Failed to fetch");
+    return toResponse(fake, request.url);
   };
 }

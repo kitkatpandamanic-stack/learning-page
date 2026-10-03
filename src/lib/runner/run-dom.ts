@@ -5,7 +5,7 @@ import {
 } from "./dom-harness";
 import type { OutputLine, TestSpec } from "./execute";
 import { createFakeApi, type FakeRequest } from "./fake-api";
-import { RUN_TIMEOUT_MS, type RunResult } from "./run-code";
+import { CHECK_TIMEOUT_MS, RUN_TIMEOUT_MS, type RunResult } from "./run-code";
 
 type FrameMessage =
   | { type: "line"; token: string; line: OutputLine }
@@ -68,7 +68,7 @@ export function runDom(
     tests,
     container,
     onLine,
-    timeoutMs = RUN_TIMEOUT_MS,
+    timeoutMs = tests?.length ? CHECK_TIMEOUT_MS : RUN_TIMEOUT_MS,
     storage,
     onStorage,
     react = false,

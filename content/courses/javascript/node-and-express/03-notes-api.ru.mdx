@@ -1,0 +1,865 @@
+---
+title: "Мини-проект: API заметок"
+description: Создайте полноценный CRUD API заметок на Express с репозиторием в памяти, валидацией и middleware для ошибок и протестируйте его с помощью Vitest и supertest.
+duration: 20
+xp: 25
+---
+
+Пора собрать весь модуль воедино. Вы создадите **API заметок** — такой бэкенд, с которым общается приложение для заметок на вашем телефоне: клиенты могут создавать заметки, получать их список и искать по ним, читать одну заметку, изменять её и удалять. По пути вы познакомитесь с **паттерном «Репозиторий» (repository pattern)**, который делает маршруты независимыми от того, как хранятся данные, и протестируете API так, как это делают профессиональные команды, — с Vitest и supertest в одном файле. 📝
+
+## План
+
+Хорошие API сначала проектируют, а потом программируют. У нашего один ресурс, `notes`, смонтированный на `/api/notes`, с пятью классическими операциями **CRUD** (Create, Read, Update, Delete — создать, прочитать, изменить, удалить):
+
+| Запрос | Что делает | При успехе |
+| --- | --- | --- |
+| `GET /api/notes` | список заметок, поиск через `?search=bamboo` | 200 + массив |
+| `POST /api/notes` | создаёт заметку из `{ title, text?, pinned? }` | 201 + новая заметка |
+| `GET /api/notes/:id` | получает одну заметку | 200 + заметка |
+| `PATCH /api/notes/:id` | меняет некоторые поля | 200 + обновлённая заметка |
+| `DELETE /api/notes/:id` | удаляет её | 204, без тела |
+
+Заметка выглядит так: `{ id: 1, title: "Buy bamboo", text: "", pinned: false }`. Неизвестный id даёт **404** `{ error: "Note not found" }`, некорректные данные — **400** `{ error: "Invalid note", details: [...] }`, а неизвестные маршруты — **404** `{ error: "Not found" }`.
+
+## Репозиторий для данных
+
+Где живут заметки? В настоящем приложении — в **базе данных (database)**. Но маршрутам это должно быть безразлично. **Паттерн «Репозиторий»** прячет весь код хранения за небольшим объектом с понятными методами (`list`, `get`, `create`, `update`, `remove`), а маршруты вызывают только эти методы. Пока наш репозиторий хранит заметки в памяти, в `Map`, где ключ — id, а значение — заметка:
+
+<CodeExample output={`{ id: 2, title: 'Nap', text: 'After lunch', pinned: true }
+true false
+{ id: 3, title: 'Climb tree', text: '', pinned: false }
+[ 2, 3 ]
+undefined`}>
+
+```js
+function createNotesRepository() {
+  const notes = new Map(); // id -> заметка
+  let nextId = 1;
+
+  return {
+    async list() {
+      return [...notes.values()];
+    },
+    async get(id) {
+      return notes.get(id);
+    },
+    async create({ title, text = "", pinned = false }) {
+      const note = { id: nextId++, title, text, pinned };
+      notes.set(note.id, note);
+      return note;
+    },
+    async update(id, changes) {
+      const note = notes.get(id);
+      if (!note) return undefined;
+      const updated = { ...note, ...changes };
+      notes.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return notes.delete(id);
+    },
+  };
+}
+
+const notes = createNotesRepository();
+await notes.create({ title: "Buy bamboo" });
+const nap = await notes.create({ title: "Nap", pinned: true });
+console.log(await notes.update(nap.id, { text: "After lunch" }));
+console.log(await notes.remove(1), await notes.remove(1));
+console.log(await notes.create({ title: "Climb tree" }));
+console.log((await notes.list()).map((n) => n.id));
+console.log(await notes.get(1));
+```
+
+</CodeExample>
+
+Здесь важны три детали:
+
+- **Методы — `async`.** Настоящая база данных всегда отвечает позже, поэтому настоящий репозиторий возвращает промисы. Если сделать `async` и репозиторий в памяти, маршруты сразу будут использовать `await`, и замена на базу данных их не затронет.
+- **Id берутся из счётчика, который только растёт.** Заметку 1 удалили, но следующая получила id 3, а не 2. Если бы мы использовали что-то вроде `notes.size + 1`, после удаления выдавался бы id, который **уже занят**, и заметка молча перезаписывалась бы. Базы данных используют ту же идею (автоинкрементные id).
+- **`update` создаёт новый объект** через spread — `{ ...note, ...changes }`, — поэтому поля, которые вы не прислали, остаются прежними.
+
+<Callout type="tip" title="Подключаем настоящую базу данных">
+
+Поскольку маршруты общаются только с репозиторием, переход на настоящую базу данных означает написать **один** новый объект с теми же методами. Например, с SQLite и пакетом `better-sqlite3`:
+
+```js title="src/sqlite-notes.js"
+import Database from "better-sqlite3";
+
+export function createSqliteNotesRepository(file = "notes.db") {
+  const db = new Database(file);
+  return {
+    async list() {
+      return db.prepare("SELECT * FROM notes").all();
+    },
+    async get(id) {
+      return db.prepare("SELECT * FROM notes WHERE id = ?").get(id);
+    },
+    // ...create, update и remove через INSERT, UPDATE, DELETE
+  };
+}
+```
+
+Приложение создаётся через `createApp({ notes: createSqliteNotesRepository() })`, и больше ничего не меняется. Тесты по-прежнему используют быструю версию в памяти. (Настоящий код ещё превращал бы `0`/`1` из SQLite обратно в `true`/`false` для `pinned`.)
+
+</Callout>
+
+## Разбор и валидация входных данных
+
+`validateNote` из прошлого урока возвращала список проблем. В этот раз мы идём на шаг дальше: **`parseNote`** либо возвращает **чистые данные**, в которых есть только разрешённые поля, либо **выбрасывает** `HttpError` с кодом 400, который middleware для ошибок превращает в ответ. Тогда маршрутам для валидации хватает одной строки. Для `PATCH` все поля необязательны, поэтому у функции есть настройка `partial`:
+
+<CodeExample output={`{ title: 'Nap' }
+{ pinned: true }
+400 Invalid note
+- title is required
+- text must be a string
+- pinned must be true or false`}>
+
+```js
+class HttpError extends Error {
+  constructor(status, message, details) {
+    super(message);
+    this.status = status;
+    this.details = details;
+  }
+}
+
+// Возвращает чистые данные только с разрешёнными полями или выбрасывает 400.
+// partial: true — для PATCH, где все поля необязательны.
+function parseNote(input, { partial = false } = {}) {
+  const body = input ?? {};
+  const errors = [];
+  const data = {};
+  if (!partial || body.title !== undefined) {
+    const title = body.title;
+    if (typeof title !== "string" || title.trim() === "") {
+      errors.push("title is required");
+    } else if (title.length > 100) {
+      errors.push("title must be at most 100 characters");
+    } else {
+      data.title = title.trim();
+    }
+  }
+  if (body.text !== undefined) {
+    if (typeof body.text !== "string") {
+      errors.push("text must be a string");
+    } else {
+      data.text = body.text;
+    }
+  }
+  if (body.pinned !== undefined) {
+    if (typeof body.pinned !== "boolean") {
+      errors.push("pinned must be true or false");
+    } else {
+      data.pinned = body.pinned;
+    }
+  }
+  if (errors.length > 0) {
+    throw new HttpError(400, "Invalid note", errors);
+  }
+  return data;
+}
+
+console.log(parseNote({ title: " Nap ", id: 99, isAdmin: true }));
+console.log(parseNote({ pinned: true }, { partial: true }));
+try {
+  parseNote({ text: 42, pinned: "yes" });
+} catch (err) {
+  console.log(err.status, err.message);
+  for (const problem of err.details) console.log("-", problem);
+}
+```
+
+</CodeExample>
+
+Посмотрите на первую строку вывода: клиент прислал `id: 99` и `isAdmin: true`, и они просто **отброшены**. Если копировать `req.body` прямо в данные, клиенты смогут перезаписывать id или задавать поля, которых им никогда не следует касаться, — это классическая дыра в безопасности под названием **массовое присваивание (mass assignment)**. Выбор разрешённых полей по одному её закрывает.
+
+## Подключаем маршруты
+
+Теперь само приложение. `createApp` получает репозиторий как **настройку** (внедрение зависимостей, как с конфигурацией в прошлом уроке). Небольшой помощник `findNote` превращает текст `:id` в число и выбрасывает 404, если такой заметки нет, — так им могут пользоваться все маршруты, которым нужна одна заметка:
+
+<CodeExample output={`201 { id: 1, title: 'Buy bamboo', text: '', pinned: true }
+400 Invalid note
+[ 'title is required', 'text must be a string' ]
+{ id: 1, title: 'Buy bamboo', text: '', pinned: true }
+{ error: 'Note not found' }
+1`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+class HttpError extends Error {
+  constructor(status, message, details) {
+    super(message);
+    this.status = status;
+    this.details = details;
+  }
+}
+
+function parseNote(input, { partial = false } = {}) {
+  const body = input ?? {};
+  const errors = [];
+  const data = {};
+  if (!partial || body.title !== undefined) {
+    const title = body.title;
+    if (typeof title !== "string" || title.trim() === "") {
+      errors.push("title is required");
+    } else if (title.length > 100) {
+      errors.push("title must be at most 100 characters");
+    } else {
+      data.title = title.trim();
+    }
+  }
+  if (body.text !== undefined) {
+    if (typeof body.text !== "string") {
+      errors.push("text must be a string");
+    } else {
+      data.text = body.text;
+    }
+  }
+  if (body.pinned !== undefined) {
+    if (typeof body.pinned !== "boolean") {
+      errors.push("pinned must be true or false");
+    } else {
+      data.pinned = body.pinned;
+    }
+  }
+  if (errors.length > 0) {
+    throw new HttpError(400, "Invalid note", errors);
+  }
+  return data;
+}
+
+function createNotesRepository() {
+  const notes = new Map();
+  let nextId = 1;
+  return {
+    async list() {
+      return [...notes.values()];
+    },
+    async get(id) {
+      return notes.get(id);
+    },
+    async create({ title, text = "", pinned = false }) {
+      const note = { id: nextId++, title, text, pinned };
+      notes.set(note.id, note);
+      return note;
+    },
+    async update(id, changes) {
+      const note = notes.get(id);
+      if (!note) return undefined;
+      const updated = { ...note, ...changes };
+      notes.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return notes.delete(id);
+    },
+  };
+}
+
+function createApp({ notes }) {
+  const app = express();
+  app.use(express.json());
+
+  const router = express.Router();
+
+  async function findNote(idText) {
+    const note = await notes.get(Number(idText));
+    if (!note) throw new HttpError(404, "Note not found");
+    return note;
+  }
+
+  router.get("/", async (req, res) => {
+    res.json(await notes.list());
+  });
+
+  router.post("/", async (req, res) => {
+    const data = parseNote(req.body);
+    const note = await notes.create(data);
+    res.status(201).json(note);
+  });
+
+  router.get("/:id", async (req, res) => {
+    res.json(await findNote(req.params.id));
+  });
+
+  app.use("/api/notes", router);
+
+  app.use((req, res) => {
+    res.status(404).json({ error: "Not found" });
+  });
+
+  app.use((err, req, res, next) => {
+    const status = err.status ?? 500;
+    if (status >= 500) console.log("Ошибка сервера:", err);
+    res.status(status).json({
+      error: status >= 500 ? "Something went wrong" : err.message,
+      details: err.details,
+    });
+  });
+
+  return app;
+}
+
+const app = createApp({ notes: createNotesRepository() });
+const api = request(app);
+
+const created = await api
+  .post("/api/notes")
+  .send({ title: "Buy bamboo", pinned: true });
+console.log(created.status, created.body);
+
+const invalid = await api.post("/api/notes").send({ text: 7 });
+console.log(invalid.status, invalid.body.error);
+console.log(invalid.body.details);
+
+console.log((await api.get("/api/notes/1")).body);
+console.log((await api.get("/api/notes/2")).body);
+console.log((await api.get("/api/notes")).body.length);
+```
+
+</CodeExample>
+
+Маршруты короткие, потому что вся тяжёлая работа сделана в другом месте: `parseNote` проверяет данные, `findNote` находит заметку или выбрасывает 404, репозиторий хранит, а обработчик ошибок оформляет любую неудачу одинаково. Обработчик ошибок также отправляет `details`, если они есть; `res.json` пропускает свойства со значением `undefined`, поэтому в ответе 404 есть только `error`.
+
+<Callout type="warning" title="Сначала проверка, потом данные">
+
+Всегда вызывайте `parseNote` **до** обращения к репозиторию. Если сначала создать заметку, а проверить потом, некорректный запрос всё равно оставит после себя недоделанную заметку — хотя клиент получил 400 и думает, что ничего не произошло.
+
+</Callout>
+
+## Тестируем API с Vitest и supertest
+
+В реальных проектах у каждого эндпоинта есть тесты, и тесты API выглядят точно так же, как модульные тесты из модуля про тестирование, только запросы отправляет supertest. Главный приём — давать **каждому тесту своё свежее приложение и репозиторий** в `beforeEach`, чтобы тесты никогда не зависели друг от друга и от порядка запуска. Вот как это выглядит на крошечной версии API:
+
+<CodeExample output={`✓ API заметок > сначала заметок нет
+✓ API заметок > создаёт заметку и показывает её в списке
+✓ API заметок > даёт каждому тесту свой пустой репозиторий
+✓ API заметок > отклоняет заметку без title
+
+Tests  4 passed (4)`}>
+
+```js
+import express from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+function createNotesRepository() {
+  const notes = new Map();
+  let nextId = 1;
+  return {
+    async list() {
+      return [...notes.values()];
+    },
+    async create({ title }) {
+      const note = { id: nextId++, title };
+      notes.set(note.id, note);
+      return note;
+    },
+  };
+}
+
+function createApp({ notes }) {
+  const app = express();
+  app.use(express.json());
+  app.get("/api/notes", async (req, res) => {
+    res.json(await notes.list());
+  });
+  app.post("/api/notes", async (req, res) => {
+    if (typeof req.body?.title !== "string") {
+      return res.status(400).json({ error: "title is required" });
+    }
+    res.status(201).json(await notes.create(req.body));
+  });
+  return app;
+}
+
+describe("API заметок", () => {
+  let api;
+
+  beforeEach(() => {
+    // свежее приложение с пустым репозиторием для каждого теста
+    api = request(createApp({ notes: createNotesRepository() }));
+  });
+
+  it("сначала заметок нет", async () => {
+    const res = await api.get("/api/notes").expect(200);
+    expect(res.body).toEqual([]);
+  });
+
+  it("создаёт заметку и показывает её в списке", async () => {
+    const res = await api
+      .post("/api/notes")
+      .send({ title: "Buy bamboo" })
+      .expect(201);
+    expect(res.body).toEqual({ id: 1, title: "Buy bamboo" });
+    const list = await api.get("/api/notes");
+    expect(list.body).toEqual([res.body]);
+  });
+
+  it("даёт каждому тесту свой пустой репозиторий", async () => {
+    const res = await api.post("/api/notes").send({ title: "Nap" });
+    expect(res.body.id).toBe(1); // не 2: заметки прошлого теста нет
+  });
+
+  it("отклоняет заметку без title", async () => {
+    const res = await api.post("/api/notes").send({}).expect(400);
+    expect(res.body.error).toBe("title is required");
+  });
+});
+```
+
+</CodeExample>
+
+Третий тест доказывает главное: его заметка снова получает id **1**, потому что заметка из предыдущего теста жила в другом репозитории. `.expect(201)` из supertest и `expect(...)` из Vitest работают вместе: `.expect()` — для кода ответа и заголовков, а `expect` — для подробностей тела.
+
+<Callout type="note" title="Что тестировать в API">
+
+Для каждого эндпоинта проверяйте **удачный сценарий (happy path)** (правильный код и тело), **плохие данные** (400 с полезными `details`), **отсутствующие объекты** (404) и **побочные эффекты**: после `DELETE` запросите заметку снова и убедитесь, что её действительно нет. Тест, который проверяет только «DELETE ответил 204», пройдёт, даже если ничего не удалилось.
+
+</Callout>
+
+## Запускаем по-настоящему
+
+На вашем компьютере API заметок разбит на файлы: `createApp` в одном модуле, сервер — в другом, чтобы тесты могли импортировать приложение, не запуская сервер:
+
+```text
+notes-api/
+├── package.json
+├── src/
+│   ├── app.js          export function createApp({ notes }) { ... }
+│   ├── notes.js        parseNote, HttpError
+│   ├── repository.js   export function createNotesRepository() { ... }
+│   └── server.js       createApp(...) и app.listen(port)
+└── test/
+    └── notes.test.js   import { createApp } from "../src/app.js";
+```
+
+```json title="package.json (scripts)"
+{
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "test": "vitest"
+  }
+}
+```
+
+```bash
+npm install express
+npm install -D vitest supertest
+npm run dev     # сервер на http://localhost:3000, перезапускается при сохранении
+npm test        # запускает test/notes.test.js
+```
+
+Пока сервер работает, попробуйте обратиться к нему из другого терминала через `curl`:
+
+```bash
+curl -X POST http://localhost:3000/api/notes \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Buy bamboo"}'
+curl "http://localhost:3000/api/notes?search=bamboo"
+curl -X PATCH http://localhost:3000/api/notes/1 \
+  -H "Content-Type: application/json" \
+  -d '{"pinned": true}'
+curl -i -X DELETE http://localhost:3000/api/notes/1
+```
+
+Ваш фронтенд тоже может обращаться к нему через `fetch` — точно так же, как к учебному API. Но если остановить сервер и запустить его снова, все заметки пропадут: они жили только в памяти. Это и есть момент, когда пора написать репозиторий для базы данных, и благодаря паттерну «Репозиторий» это будет **единственный** файл, который придётся добавить.
+
+<Quiz
+  question="Репозиторий выбирает новые id как notes.size + 1. В нём лежат заметки 1, 2 и 3, и заметку 1 удаляют. Что произойдёт при создании следующей заметки?"
+  options={["Она получит id 4, как и ожидалось", "Она получит id 3 и заменит существующую заметку 3", "Она снова получит id 1, и это нормально, ведь заметка 1 удалена", "Создание выбросит ошибку, потому что Map заполнен"]}
+  answer={1}
+  explanation="После удаления в Map 2 заметки, поэтому size + 1 равно 3 — а этот id всё ещё занят. notes.set(3, ...) молча перезаписывает заметку 3. Счётчик, который только растёт, никогда не выдаёт id повторно."
+/>
+
+<Quiz
+  question="Почему набор тестов создаёт новое приложение и репозиторий в beforeEach, а не использует один общий на весь файл?"
+  options={["supertest может отправить только один запрос на приложение", "Чтобы каждый тест начинался с одного и того же пустого состояния и тесты не влияли друг на друга", "Потому что приложения на Express перестают работать после нескольких запросов", "Чтобы Vitest запускал тесты параллельно"]}
+  answer={1}
+  explanation="С общим репозиторием заметки, созданные в одном тесте, появлялись бы в следующем, и результаты зависели бы от того, какие тесты выполнились раньше. Свежее приложение для каждого теста делает каждый тест независимым и воспроизводимым."
+/>
+
+<Exercise
+  title="Мини-проект: API заметок"
+  starter={`import express from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ---------- готовая часть: не меняйте её ----------
+
+class HttpError extends Error {
+  constructor(status, message, details) {
+    super(message);
+    this.status = status;
+    this.details = details;
+  }
+}
+
+function parseNote(input, { partial = false } = {}) {
+  const body = input ?? {};
+  const errors = [];
+  const data = {};
+  if (!partial || body.title !== undefined) {
+    const title = body.title;
+    if (typeof title !== "string" || title.trim() === "") {
+      errors.push("title is required");
+    } else if (title.length > 100) {
+      errors.push("title must be at most 100 characters");
+    } else {
+      data.title = title.trim();
+    }
+  }
+  if (body.text !== undefined) {
+    if (typeof body.text !== "string") {
+      errors.push("text must be a string");
+    } else {
+      data.text = body.text;
+    }
+  }
+  if (body.pinned !== undefined) {
+    if (typeof body.pinned !== "boolean") {
+      errors.push("pinned must be true or false");
+    } else {
+      data.pinned = body.pinned;
+    }
+  }
+  if (errors.length > 0) {
+    throw new HttpError(400, "Invalid note", errors);
+  }
+  return data;
+}
+
+function createNotesRepository() {
+  const notes = new Map();
+  let nextId = 1;
+  return {
+    async list() {
+      return [...notes.values()];
+    },
+    async get(id) {
+      return notes.get(id);
+    },
+    async create({ title, text = "", pinned = false }) {
+      const note = { id: nextId++, title, text, pinned };
+      notes.set(note.id, note);
+      return note;
+    },
+    async update(id, changes) {
+      const note = notes.get(id);
+      if (!note) return undefined;
+      const updated = { ...note, ...changes };
+      notes.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return notes.delete(id);
+    },
+  };
+}
+
+// ---------- ваш API ----------
+
+function createApp({ notes }) {
+  const app = express();
+  app.use(express.json());
+  const router = express.Router();
+
+  async function findNote(idText) {
+    const note = await notes.get(Number(idText));
+    if (!note) throw new HttpError(404, "Note not found");
+    return note;
+  }
+
+  router.get("/", async (req, res) => {
+    // TODO 1: ?search=text оставляет заметки, в title или text
+    //         которых есть этот текст, без учёта регистра
+    res.json(await notes.list());
+  });
+
+  router.post("/", async (req, res) => {
+    const note = await notes.create(parseNote(req.body));
+    res.status(201).json(note);
+  });
+
+  // TODO 2: GET /:id -> заметка (findNote сам ответит 404)
+  // TODO 3: PATCH /:id -> изменить только присланные поля,
+  //         проверив их через parseNote(req.body, { partial: true })
+  // TODO 4: DELETE /:id -> 204 или 404 для неизвестной заметки
+
+  app.use("/api/notes", router);
+
+  app.use((req, res) => {
+    res.status(404).json({ error: "Not found" });
+  });
+
+  app.use((err, req, res, next) => {
+    const status = err.status ?? 500;
+    if (status >= 500) console.log("Ошибка сервера:", err);
+    res.status(status).json({
+      error: status >= 500 ? "Something went wrong" : err.message,
+      details: err.details,
+    });
+  });
+
+  return app;
+}
+
+// ---------- тесты ----------
+
+describe("API заметок", () => {
+  let api;
+
+  beforeEach(() => {
+    api = request(createApp({ notes: createNotesRepository() }));
+  });
+
+  it("создаёт заметку", async () => {
+    const res = await api
+      .post("/api/notes")
+      .send({ title: "Buy bamboo" })
+      .expect(201);
+    expect(res.body).toEqual({
+      id: 1, title: "Buy bamboo", text: "", pinned: false,
+    });
+  });
+
+  it("выводит список заметок", async () => {
+    await api.post("/api/notes").send({ title: "Nap" });
+    const res = await api.get("/api/notes").expect(200);
+    expect(res.body.map((n) => n.title)).toEqual(["Nap"]);
+  });
+
+  // TODO 5: напишите эти два теста (замените it.todo на it)
+  it.todo("отклоняет заметку без title с кодом 400");
+  it.todo("DELETE удаляет заметку, и GET отвечает 404");
+});
+`}
+  tests={[
+    { name: "Все тесты в редакторе проходят (it.todo не осталось)", check: `__vitest.failed === 0 && __vitest.skipped === 0 && __vitest.passed >= 4` },
+    { name: "Ваши тесты ловят сломанную проверку title", check: `(await __retest([['errors.push("title is required");', ';']])).failed > 0` },
+    { name: "Ваши тесты ловят DELETE, который ничего не удаляет", check: `(await __retest([['return notes.delete(id);', 'return notes.has(id);']])).failed > 0` },
+    { name: "GET /api/notes/:id возвращает заметку, неизвестные id дают 404", check: `await (async () => { const api = require('supertest')(createApp({ notes: createNotesRepository() })); await api.post('/api/notes').send({ title: 'One' }); const { body: n } = await api.post('/api/notes').send({ title: 'Two', text: 'Hi', pinned: true }); const r = await api.get('/api/notes/' + n.id); const a = await api.get('/api/notes/99'); const b = await api.get('/api/notes/abc'); return r.status === 200 && JSON.stringify(r.body) === JSON.stringify(n) && [a, b].every((x) => x.status === 404 && x.body.error === 'Note not found'); })()` },
+    { name: "?search= ищет по title или text без учёта регистра", check: `await (async () => { const api = require('supertest')(createApp({ notes: createNotesRepository() })); for (const [title, text] of [['Buy BAMBOO', ''], ['Nap', 'after the bamboo snack'], ['Climb tree', 'tall one']]) await api.post('/api/notes').send({ title, text }); const s = (q) => api.get('/api/notes').query({ search: q }).then((r) => r.body.map((n) => n.title).join('|')); return (await s('Bamboo')) === 'Buy BAMBOO|Nap' && (await s('TALL')) === 'Climb tree' && (await s('zebra')) === '' && (await api.get('/api/notes')).body.length === 3; })()` },
+    { name: "PATCH меняет только присланные поля, проверяет их и отвечает 404 на неизвестные id", check: `await (async () => { const api = require('supertest')(createApp({ notes: createNotesRepository() })); const { body: n } = await api.post('/api/notes').send({ title: 'Nap', text: 'Soon' }); const url = '/api/notes/' + n.id; const p = await api.patch(url).send({ pinned: true, id: 500 }); const t = await api.patch(url).send({ title: '  Long nap ' }); const bad = await api.patch(url).send({ title: '' }); const missing = await api.patch('/api/notes/99').send({ pinned: true }); const after = (await api.get(url)).body; return p.status === 200 && JSON.stringify(p.body) === JSON.stringify({ id: n.id, title: 'Nap', text: 'Soon', pinned: true }) && t.body.title === 'Long nap' && t.body.pinned === true && bad.status === 400 && JSON.stringify(bad.body.details) === JSON.stringify(['title is required']) && missing.status === 404 && JSON.stringify(after) === JSON.stringify({ id: n.id, title: 'Long nap', text: 'Soon', pinned: true }); })()` },
+    { name: "DELETE отвечает 204, заметка исчезает, а неизвестные id дают 404", check: `await (async () => { const api = require('supertest')(createApp({ notes: createNotesRepository() })); const { body: n } = await api.post('/api/notes').send({ title: 'Temp' }); const url = '/api/notes/' + n.id; const d = await api.delete(url); const g = await api.get(url); const again = await api.delete(url); const next = await api.post('/api/notes').send({ title: 'Next' }); return d.status === 204 && d.text === '' && g.status === 404 && again.status === 404 && again.body.error === 'Note not found' && next.body.id === n.id + 1 && (await api.get('/api/notes')).body.length === 1; })()` },
+  ]}
+>
+
+Доделайте API заметок, чтобы он умел всё, что есть в плане, и допишите его набор тестов. Готовая часть наверху (`HttpError`, `parseNote` и репозиторий) работает — не меняйте её. В `createApp` уже работают `POST` и простой список, а `findNote` готов к использованию. Вам нужно написать:
+
+1. **Поиск**: `GET /api/notes?search=bamboo` оставляет только заметки, в `title` **или** `text` которых есть искомый текст, **без учёта регистра**. Без `search` возвращаются все заметки.
+2. **`GET /api/notes/:id`**: ответьте заметкой (используйте `findNote`, он сам выбросит 404).
+3. **`PATCH /api/notes/:id`**: проверьте данные через `parseNote(req.body, { partial: true })`, обновите только присланные поля и ответьте обновлённой заметкой. Неизвестные id получают 404.
+4. **`DELETE /api/notes/:id`**: удалите заметку и ответьте **204** без тела. Неизвестные id получают 404.
+5. **Тесты**: замените две строки `it.todo` настоящими тестами. Первый должен проверять, что заметка без заголовка получает **400**. Второй должен создать заметку, удалить её и проверить, что запрос этой заметки после удаления даёт **404**.
+
+Проверки также следят, чтобы ваши тесты были полезными: они подкладывают баг в готовую часть (в проверку title и в удаление в репозитории), и ваши тесты должны его заметить.
+
+<Hint>
+
+Для поиска прочитайте `req.query.search?.toLowerCase()` и, если значение есть, отфильтруйте через `` `${note.title} ${note.text}`.toLowerCase().includes(search) ``. Все маршруты для одной заметки начинаются с `await findNote(req.params.id)`. В `PATCH` сначала вызовите `parseNote`, а потом `notes.update(note.id, changes)`. В `DELETE` закончите вызовом `res.sendStatus(204)`. В тестах используйте `api` из `beforeEach`, например `await api.post("/api/notes").send({}).expect(400)`.
+
+</Hint>
+
+<Solution>
+
+```js
+import express from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ---------- готовая часть: не меняйте её ----------
+
+class HttpError extends Error {
+  constructor(status, message, details) {
+    super(message);
+    this.status = status;
+    this.details = details;
+  }
+}
+
+function parseNote(input, { partial = false } = {}) {
+  const body = input ?? {};
+  const errors = [];
+  const data = {};
+  if (!partial || body.title !== undefined) {
+    const title = body.title;
+    if (typeof title !== "string" || title.trim() === "") {
+      errors.push("title is required");
+    } else if (title.length > 100) {
+      errors.push("title must be at most 100 characters");
+    } else {
+      data.title = title.trim();
+    }
+  }
+  if (body.text !== undefined) {
+    if (typeof body.text !== "string") {
+      errors.push("text must be a string");
+    } else {
+      data.text = body.text;
+    }
+  }
+  if (body.pinned !== undefined) {
+    if (typeof body.pinned !== "boolean") {
+      errors.push("pinned must be true or false");
+    } else {
+      data.pinned = body.pinned;
+    }
+  }
+  if (errors.length > 0) {
+    throw new HttpError(400, "Invalid note", errors);
+  }
+  return data;
+}
+
+function createNotesRepository() {
+  const notes = new Map();
+  let nextId = 1;
+  return {
+    async list() {
+      return [...notes.values()];
+    },
+    async get(id) {
+      return notes.get(id);
+    },
+    async create({ title, text = "", pinned = false }) {
+      const note = { id: nextId++, title, text, pinned };
+      notes.set(note.id, note);
+      return note;
+    },
+    async update(id, changes) {
+      const note = notes.get(id);
+      if (!note) return undefined;
+      const updated = { ...note, ...changes };
+      notes.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return notes.delete(id);
+    },
+  };
+}
+
+// ---------- ваш API ----------
+
+function createApp({ notes }) {
+  const app = express();
+  app.use(express.json());
+  const router = express.Router();
+
+  async function findNote(idText) {
+    const note = await notes.get(Number(idText));
+    if (!note) throw new HttpError(404, "Note not found");
+    return note;
+  }
+
+  router.get("/", async (req, res) => {
+    let list = await notes.list();
+    const search = req.query.search?.toLowerCase();
+    if (search) {
+      list = list.filter((note) =>
+        `${note.title} ${note.text}`.toLowerCase().includes(search),
+      );
+    }
+    res.json(list);
+  });
+
+  router.post("/", async (req, res) => {
+    const note = await notes.create(parseNote(req.body));
+    res.status(201).json(note);
+  });
+
+  router.get("/:id", async (req, res) => {
+    res.json(await findNote(req.params.id));
+  });
+
+  router.patch("/:id", async (req, res) => {
+    const changes = parseNote(req.body, { partial: true });
+    const note = await findNote(req.params.id);
+    res.json(await notes.update(note.id, changes));
+  });
+
+  router.delete("/:id", async (req, res) => {
+    const note = await findNote(req.params.id);
+    await notes.remove(note.id);
+    res.sendStatus(204);
+  });
+
+  app.use("/api/notes", router);
+
+  app.use((req, res) => {
+    res.status(404).json({ error: "Not found" });
+  });
+
+  app.use((err, req, res, next) => {
+    const status = err.status ?? 500;
+    if (status >= 500) console.log("Ошибка сервера:", err);
+    res.status(status).json({
+      error: status >= 500 ? "Something went wrong" : err.message,
+      details: err.details,
+    });
+  });
+
+  return app;
+}
+
+// ---------- тесты ----------
+
+describe("API заметок", () => {
+  let api;
+
+  beforeEach(() => {
+    api = request(createApp({ notes: createNotesRepository() }));
+  });
+
+  it("создаёт заметку", async () => {
+    const res = await api
+      .post("/api/notes")
+      .send({ title: "Buy bamboo" })
+      .expect(201);
+    expect(res.body).toEqual({
+      id: 1, title: "Buy bamboo", text: "", pinned: false,
+    });
+  });
+
+  it("выводит список заметок", async () => {
+    await api.post("/api/notes").send({ title: "Nap" });
+    const res = await api.get("/api/notes").expect(200);
+    expect(res.body.map((n) => n.title)).toEqual(["Nap"]);
+  });
+
+  it("отклоняет заметку без title с кодом 400", async () => {
+    const res = await api
+      .post("/api/notes")
+      .send({ text: "Здесь нет заголовка" })
+      .expect(400);
+    expect(res.body.details).toContain("title is required");
+  });
+
+  it("DELETE удаляет заметку, и GET отвечает 404", async () => {
+    const { body: note } = await api
+      .post("/api/notes")
+      .send({ title: "Временная" });
+    await api.delete(`/api/notes/${note.id}`).expect(204);
+    await api.get(`/api/notes/${note.id}`).expect(404);
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Сначала спланируйте API: ресурс, его маршруты **CRUD**, а также код ответа и тело для каждого успеха и каждой ошибки.
+- **Паттерн «Репозиторий»** прячет хранение за `list/get/create/update/remove`. Делайте его методы `async`, чтобы база данных могла заменить `Map` в памяти, не трогая маршруты. Выдавайте id из счётчика, который только растёт.
+- **Разбирайте, а не просто проверяйте**: возвращайте только разрешённые поля (никакого массового присваивания) или выбрасывайте `HttpError(400, ..., details)`. Проверяйте данные до того, как их трогать.
+- Держите маршруты тонкими: помощник вроде `findNote` выбрасывает 404, а **один обработчик ошибок** оформляет любую ошибку. Express 5 передаёт ему ошибки из `async`-обработчиков.
+- `createApp({ notes })` получает зависимости как настройки, поэтому тесты могут передать свежий репозиторий.
+- Тестируйте через Vitest + supertest: свежее приложение в `beforeEach` и тесты на удачный сценарий, плохие данные, 404 и побочные эффекты (после `DELETE` проверьте, что заметки больше нет).

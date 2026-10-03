@@ -19,6 +19,8 @@ export type RunResult = ExecuteResult & {
 };
 
 export const RUN_TIMEOUT_MS = 3000;
+// Checks may rerun the learner's tests (e.g. __retest), so they get longer.
+export const CHECK_TIMEOUT_MS = 10_000;
 
 /**
  * "loading" while Python or the TypeScript checker downloads the first time,
@@ -101,7 +103,7 @@ function runInWorker(code: string, options: RunOptions): Run {
   const {
     language = "javascript",
     tests,
-    timeoutMs = RUN_TIMEOUT_MS,
+    timeoutMs = tests?.length ? CHECK_TIMEOUT_MS : RUN_TIMEOUT_MS,
     onLine,
   } = options;
   const worker = new Worker(new URL("./runner.worker.ts", import.meta.url), {

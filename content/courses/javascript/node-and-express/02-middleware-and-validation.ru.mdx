@@ -1,0 +1,649 @@
+---
+title: Middleware, роутеры и валидация
+description: Пишите приложения на Express как профессионалы — с middleware, роутерами, валидацией входных данных, обработчиками 404 и ошибок, async-обработчиками в Express 5 и настройками приложения.
+duration: 18
+xp: 25
+---
+
+Ваше первое приложение на Express отвечало на запросы, но у настоящего API есть задачи, которые нужны **каждому** запросу: записать в лог, что произошло, прочитать JSON-тело, проверить, кто обращается, отклонить плохие данные и превратить падения в аккуратные сообщения об ошибках. Писать этот код внутри каждого маршрута — путь к хаосу. Ответ Express — **middleware (промежуточный обработчик)**, и как только вы его поймёте, вы поймёте, как устроен сам Express. 🧩
+
+## Что такое middleware
+
+**Middleware** — это функция `(req, res, next)`, которая выполняется **до** обработчика маршрута. Она может посмотреть на запрос, что-то к нему добавить, ответить на него или вызвать **`next()`**, чтобы передать запрос следующей функции в очереди. `app.use(fn)` добавляет middleware для **каждого** запроса:
+
+<CodeExample output={`1. лог: GET /hello
+2. пользователь: Mei
+3. обработчик маршрута
+{ message: 'Привет, Mei!' }
+1. лог: GET /hello
+2. пользователь: guest
+3. обработчик маршрута
+{ message: 'Привет, guest!' }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const app = express();
+
+app.use((req, res, next) => {
+  console.log(`1. лог: ${req.method} ${req.url}`);
+  next(); // передаём запрос следующей функции
+});
+
+app.use((req, res, next) => {
+  req.user = req.get("X-User") ?? "guest";
+  console.log(`2. пользователь: ${req.user}`);
+  next();
+});
+
+app.get("/hello", (req, res) => {
+  console.log("3. обработчик маршрута");
+  res.json({ message: `Привет, ${req.user}!` });
+});
+
+const res = await request(app).get("/hello").set("X-User", "Mei");
+console.log(res.body);
+const guest = await request(app).get("/hello");
+console.log(guest.body);
+```
+
+</CodeExample>
+
+Представьте это как **конвейер (pipeline)**: запрос проходит через функции в том порядке, в котором вы их зарегистрировали, пока одна из них не отправит ответ. Обратите внимание: второй middleware **добавляет** `req.user`, а обработчик маршрута потом его читает. Именно так настоящие приложения передают по цепочке вошедшего пользователя, подключение к базе данных или id запроса.
+
+Каждый middleware должен сделать **одно** из двух: отправить ответ или вызвать `next()`. Если он не сделает ни того ни другого, запрос просто повиснет. В реальных проектах вместо самописного логгера используют готовый, например `morgan` (`app.use(morgan("dev"))`).
+
+### Middleware, который говорит «нет»
+
+Middleware не обязан вызывать `next()`. Если что-то не так, он может сразу ответить, и маршрут так и не выполнится. А ещё middleware можно подключить **только к одному маршруту** — достаточно указать его перед обработчиком:
+
+<CodeExample output={`200 { pandas: 3 }
+401 { error: 'Missing or wrong API key' }
+200 { bambooEatenKg: 1240 }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+function requireApiKey(req, res, next) {
+  if (req.get("X-API-Key") !== "bamboo-123") {
+    return res.status(401).json({ error: "Missing or wrong API key" });
+  }
+  next();
+}
+
+const app = express();
+
+app.get("/stats/public", (req, res) => {
+  res.json({ pandas: 3 });
+});
+
+// Middleware для одного маршрута: указываем его перед обработчиком
+app.get("/stats/secret", requireApiKey, (req, res) => {
+  res.json({ bambooEatenKg: 1240 });
+});
+
+const open = await request(app).get("/stats/public");
+console.log(open.status, open.body);
+
+const blocked = await request(app).get("/stats/secret");
+console.log(blocked.status, blocked.body);
+
+const allowed = await request(app)
+  .get("/stats/secret")
+  .set("X-API-Key", "bamboo-123");
+console.log(allowed.status, allowed.body);
+```
+
+</CodeExample>
+
+Ровно так работает аутентификация в приложениях на Express: middleware `requireLogin` проверяет токен, а маршруты, которым он нужен, указывают его первым. (Правда, вписывать ключ прямо в код, как здесь, в реальности не принято — мы исправим это в конце урока.)
+
+## Читаем JSON-тела через express.json()
+
+Когда клиент отправляет JSON, он приходит как обычный **текст**. Встроенный middleware **`express.json()`** читает этот текст, разбирает его и кладёт результат в `req.body`. Как и любой middleware, он помогает только тем маршрутам, которые идут **после** него:
+
+<CodeExample output={`/before получил undefined
+/after получил { text: 'Hi' }
+400`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+const app = express();
+
+function echo(req, res) {
+  console.log(req.path, "получил", req.body);
+  res.json({ youSent: req.body ?? null });
+}
+
+app.post("/before", echo); // зарегистрирован ДО парсера JSON
+app.use(express.json());
+app.post("/after", echo); // зарегистрирован после него
+
+await request(app).post("/before").send({ text: "Hi" });
+await request(app).post("/after").send({ text: "Hi" });
+
+const broken = await request(app)
+  .post("/after")
+  .set("Content-Type", "application/json")
+  .send('{ "text": "Hi"'); // сломанный JSON
+console.log(broken.status);
+```
+
+</CodeExample>
+
+- Без парсера в Express 5 `req.body` равно `undefined`, так что `req.body.text` упадёт с `TypeError`. Ставьте `app.use(express.json())` ближе к **началу** приложения.
+- `express.json()` разбирает только запросы с `Content-Type: application/json`. `fetch` сам этот заголовок не ставит, поэтому не забывайте `headers: { "Content-Type": "application/json" }` на клиенте.
+- Сломанный JSON отклоняется с **400 Bad Request** ещё до того, как выполнится ваш маршрут.
+- HTML-формы отправляют данные в другом формате; их разбирает `app.use(express.urlencoded())`.
+
+## Организуем маршруты через express.Router()
+
+В настоящих API десятки маршрутов. **`express.Router()`** — это мини-приложение для одной части API, **роутер (router)**. Вы задаёте ему маршруты с **относительными** путями, а потом **монтируете** его по префиксу пути через `app.use("/api/notes", router)`:
+
+<CodeExample output={`200 [ { id: 1, title: 'Buy bamboo' }, { id: 2, title: 'Nap' } ]
+/api/notes /2 { id: '2' }
+200 { id: 2, title: 'Nap' }
+404 Cannot GET /notes/2`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+// routes/notes.js
+const notes = [
+  { id: 1, title: "Buy bamboo" },
+  { id: 2, title: "Nap" },
+];
+const notesRouter = express.Router();
+
+notesRouter.get("/", (req, res) => {
+  res.json(notes);
+});
+
+notesRouter.get("/:id", (req, res) => {
+  console.log(req.baseUrl, req.path, req.params);
+  const note = notes.find((n) => n.id === Number(req.params.id));
+  if (!note) {
+    return res.status(404).json({ error: "Note not found" });
+  }
+  res.json(note);
+});
+
+// app.js
+const app = express();
+app.use(express.json());
+app.use("/api/notes", notesRouter);
+
+for (const url of ["/api/notes", "/api/notes/2"]) {
+  const res = await request(app).get(url);
+  console.log(res.status, res.body);
+}
+const wrong = await request(app).get("/notes/2");
+console.log(wrong.status, wrong.text);
+```
+
+</CodeExample>
+
+Внутри роутера `"/"` означает `/api/notes`, а `"/:id"` — `/api/notes/:id`. `req.baseUrl` — это место, куда смонтирован роутер, а `req.path` — оставшаяся часть. В реальном проекте каждый роутер живёт в своём файле:
+
+```text
+notes-api/
+├── package.json
+└── src/
+    ├── app.js            создаёт приложение и монтирует роутеры
+    ├── server.js         импортирует приложение и вызывает app.listen()
+    └── routes/
+        ├── notes.js      export default notesRouter;
+        └── users.js
+```
+
+```js title="src/app.js"
+import express from "express";
+import notesRouter from "./routes/notes.js";
+
+export const app = express();
+app.use(express.json());
+app.use("/api/notes", notesRouter);
+```
+
+Префикс записан в **одном** месте, поэтому перенести всё на `/api/v2/notes` потом можно, поменяв одну строку.
+
+## Валидация входных данных
+
+Никогда не доверяйте тому, что присылает клиент. В данных могут не хватать полей, у них могут быть не те типы, а иногда их специально делают вредоносными. Проверка тела запроса перед использованием называется **валидацией (validation)**. Если она не прошла, вы отвечаете **400 Bad Request** с сообщениями, которые **точно** говорят, что не так, чтобы разработчик фронтенда мог всё исправить:
+
+<CodeExample output={`201 { id: 1, title: 'Buy bamboo', tags: [ 'shopping' ] }
+400 [ 'title is required' ]
+400 [ 'title must be at most 100 characters', 'tags must be an array' ]`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+function validateNote(body) {
+  const errors = [];
+  const title = body?.title;
+  if (typeof title !== "string" || title.trim() === "") {
+    errors.push("title is required");
+  } else if (title.length > 100) {
+    errors.push("title must be at most 100 characters");
+  }
+  if (body?.tags !== undefined && !Array.isArray(body.tags)) {
+    errors.push("tags must be an array");
+  }
+  return errors;
+}
+
+const app = express();
+app.use(express.json());
+
+app.post("/api/notes", (req, res) => {
+  const errors = validateNote(req.body);
+  if (errors.length > 0) {
+    return res
+      .status(400)
+      .json({ error: "Invalid note", details: errors });
+  }
+  const { title, tags = [] } = req.body;
+  res.status(201).json({ id: 1, title: title.trim(), tags });
+});
+
+const bodies = [
+  { title: "  Buy bamboo ", tags: ["shopping"] },
+  {},
+  { title: "x".repeat(101), tags: "food" },
+];
+for (const body of bodies) {
+  const res = await request(app).post("/api/notes").send(body);
+  console.log(res.status, res.body.details ?? res.body);
+}
+```
+
+</CodeExample>
+
+Несколько привычек, которые стоит перенять:
+
+- `validateNote` — обычная функция: её легко читать и легко тестировать вообще без HTTP.
+- Она собирает **все** проблемы, а не останавливается на первой, чтобы клиент мог исправить всё за один раз.
+- `body?.title` справляется с отсутствующим телом (`undefined`), а `typeof` проверяет **тип**, а не просто наличие значения.
+- Маршрут собирает новую заметку только из **ожидаемых** полей (`title`, `tags`) и никогда не копирует весь `req.body`. Иначе клиент мог бы подсунуть поля вроде `"id"` или `"isAdmin": true`.
+
+<Callout type="tip" title="Валидация в реальных проектах">
+
+Проверка в браузере нужна для **удобства пользователя**, а проверка на сервере — для **безопасности**, потому что кто угодно может обратиться к вашему API напрямую через `curl`. Самописные проверки отлично подходят для обучения. В больших проектах форму данных описывают схемой с помощью библиотеки вроде Zod:
+
+```js
+import { z } from "zod";
+
+const NoteSchema = z.object({
+  title: z.string().trim().min(1).max(100),
+  tags: z.array(z.string()).default([]),
+});
+
+const result = NoteSchema.safeParse(req.body);
+if (!result.success) {
+  return res.status(400).json({ error: result.error.issues });
+}
+```
+
+</Callout>
+
+## Обработчики 404 и ошибок
+
+Два особых middleware ставят в **самый конец** любого приложения на Express:
+
+- **Обработчик 404**: обычный middleware без пути. Он срабатывает, только если ни один маршрут не ответил, и может отправить 404 в виде JSON вместо HTML-ответа Express `Cannot GET /x`.
+- **Обработчик ошибок (error handler)**: middleware с **четырьмя** параметрами, `(err, req, res, next)`. Express сразу переходит к нему, когда обработчик **выбрасывает** ошибку или вызывает `next(err)`, пропуская все обычные middleware и маршруты между ними.
+
+Небольшой класс `HttpError` (вы знаете [классы](/learn/javascript/classes)) позволяет любому маршруту выбросить ошибку вместе с её кодом ответа:
+
+<CodeExample output={`200 { id: 1, title: 'Buy bamboo' }
+404 { error: 'Note not found' }
+Ошибка сервера: Connection lost
+500 { error: 'Something went wrong' }
+404 { error: 'Cannot GET /api/nope' }`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// Мнимая база данных: отвечает после короткой паузы
+const db = {
+  async findNote(id) {
+    await new Promise((done) => setTimeout(done, 10));
+    if (id === 13) throw new Error("Connection lost");
+    return id === 1 ? { id: 1, title: "Buy bamboo" } : undefined;
+  },
+};
+
+const app = express();
+
+app.get("/api/notes/:id", async (req, res) => {
+  const note = await db.findNote(Number(req.params.id));
+  if (!note) {
+    throw new HttpError(404, "Note not found");
+  }
+  res.json(note);
+});
+
+// Обработчик 404: срабатывает, когда ни один маршрут не ответил
+app.use((req, res) => {
+  res.status(404).json({ error: `Cannot ${req.method} ${req.path}` });
+});
+
+// Обработчик ошибок: 4 параметра, всегда последний
+app.use((err, req, res, next) => {
+  const status = err.status ?? 500;
+  if (status >= 500) {
+    console.log("Ошибка сервера:", err.message); // для разработчиков
+  }
+  res.status(status).json({
+    error: status >= 500 ? "Something went wrong" : err.message,
+  });
+});
+
+for (const url of ["/api/notes/1", "/api/notes/2",
+                   "/api/notes/13", "/api/nope"]) {
+  const res = await request(app).get(url);
+  console.log(res.status, res.body);
+}
+```
+
+</CodeExample>
+
+Посмотрите, чего в маршруте **нет**: ни `try/catch`, ни форматирования ошибок. Он просто выбрасывает ошибку, а единственный обработчик ошибок решает, как будет выглядеть **любая** ошибка в приложении. Заметьте также, что он по-разному обходится с двумя видами ошибок:
+
+- **Ожидаемые** ошибки (код ниже 500, как наш 404) касаются клиента, поэтому их сообщение отправляется ему.
+- **Неожиданные** ошибки (падение, потеря соединения с базой данных) получают расплывчатое `"Something went wrong"`. Настоящее сообщение записывается в лог для разработчиков, но никогда не отправляется клиенту: в нём могут оказаться пути к файлам, SQL и другие детали, которые очень пригодились бы злоумышленнику.
+
+<Callout type="warning" title="Express 5 ловит асинхронные ошибки, а Express 4 — нет">
+
+В **Express 5**, если `async`-обработчик выбрасывает ошибку (или `await` получает отклонённый промис), Express автоматически передаёт ошибку в ваш обработчик ошибок — вы видели это выше. В **Express 4** такой же код оставлял запрос висеть и падал с «unhandled promise rejection». Этот приём до сих пор повсюду встречается в старом коде и туториалах:
+
+```js
+// Стиль Express 4: ловим ошибку и передаём её дальше сами
+app.get("/api/notes/:id", async (req, res, next) => {
+  try {
+    res.json(await db.findNote(Number(req.params.id)));
+  } catch (err) {
+    next(err);
+  }
+});
+```
+
+Другие изменения Express 5, на которые можно наткнуться: `res.send(404)` убрали (используйте `res.sendStatus(404)`), а маршруты с подстановочным знаком теперь пишутся как `/files/*path` вместо `/files/*`. Прежде чем копировать код из интернета, проверьте в `package.json`, какая версия используется в проекте.
+
+</Callout>
+
+Обработчик ошибок распознаётся **только** по четырём параметрам. Даже если вы не используете `next`, оставьте его в списке: функция `(err, req, res)` с тремя параметрами будет считаться обычным middleware и никогда не получит ошибок.
+
+## Настройки: передавайте их снаружи
+
+Наш API-ключ был вписан в код как `"bamboo-123"`. У настоящих приложений таких настроек много: порт, API-ключи, адрес базы данных. На вашем ноутбуке, в тестах и в продакшене они разные, а секреты **никогда** нельзя коммитить в Git.
+
+На настоящем сервере настройки берутся из **переменных окружения (environment variables)** — именованных значений, которые операционная система передаёт программе при запуске. Node читает их из `process.env`, например `process.env.PORT`. Аккуратный способ работать с ними — читать их в **одном** месте, `server.js`, и передавать в функцию, которая **создаёт** приложение, в виде объекта с настройками:
+
+<CodeExample output={`200 { bambooEatenKg: 1240 }
+[ 'GET /stats/secret' ]`}>
+
+```js
+import express from "express";
+import request from "supertest";
+
+function createApp({ apiKey, log = console.log }) {
+  const app = express();
+
+  app.use((req, res, next) => {
+    log(`${req.method} ${req.url}`);
+    next();
+  });
+
+  app.get("/stats/secret", (req, res) => {
+    if (req.get("X-API-Key") !== apiKey) {
+      return res.status(401).json({ error: "Wrong API key" });
+    }
+    res.json({ bambooEatenKg: 1240 });
+  });
+
+  return app;
+}
+
+// В тесте: известный ключ и логгер, который запоминает строки
+const lines = [];
+const app = createApp({
+  apiKey: "test-key",
+  log: (line) => lines.push(line),
+});
+
+const res = await request(app)
+  .get("/stats/secret")
+  .set("X-API-Key", "test-key");
+console.log(res.status, res.body);
+console.log(lines);
+```
+
+</CodeExample>
+
+Приложению больше не важно, **откуда** берутся его настройки. Тесты передают ненастоящий ключ и «тихий» логгер, а настоящий сервер — значения из окружения:
+
+```js title="src/server.js"
+import { createApp } from "./app.js";
+
+const app = createApp({ apiKey: process.env.API_KEY });
+const port = Number(process.env.PORT ?? 3000);
+
+app.listen(port, () => {
+  console.log(`Сервер слушает http://localhost:${port}`);
+});
+```
+
+```bash
+API_KEY=bamboo-123 PORT=4000 node src/server.js
+# или храните их в файле .env (и добавьте .env в .gitignore!)
+node --env-file=.env src/server.js
+```
+
+Это снова **внедрение зависимостей (dependency injection)**: функции передают то, что ей нужно, вместо того чтобы она сама тянулась к глобальным вещам. Именно поэтому приложение легко тестировать.
+
+<Quiz
+  question="В приложении есть app.use(logger), затем app.get('/notes', listNotes), затем app.use(notFound) и, наконец, app.use(errorHandler). Клиент запрашивает GET /notes, и listNotes выбрасывает ошибку. Какие функции выполнятся?"
+  options={["logger, listNotes, notFound, errorHandler", "logger, listNotes, errorHandler", "только listNotes и errorHandler", "logger, listNotes, а потом запрос повиснет"]}
+  answer={1}
+  explanation="Сначала выполняется logger и вызывает next(). listNotes выбрасывает ошибку, поэтому Express пропускает все обычные middleware (включая notFound) и переходит к следующему обработчику ошибок — тому, у которого четыре параметра."
+/>
+
+<Quiz
+  question="Маршрут падает, потому что пароль от базы данных неверный. Что обработчик ошибок должен отправить клиенту?"
+  options={["Код 400 с полным текстом ошибки, чтобы клиент мог её исправить", "Код 500 с общим сообщением вроде Something went wrong, а подробности записать в лог на сервере", "Код 200 с пустым телом, чтобы клиент ничего не заметил", "Код 500 с err.stack, чтобы разработчики могли отлаживать прямо из браузера"]}
+  answer={1}
+  explanation="Падение — вина сервера, поэтому 500 подходит. Подробности (стек вызовов, пароли, SQL) могут помочь злоумышленнику, поэтому они остаются в логах сервера, а клиент получает только общее сообщение."
+/>
+
+<Exercise
+  title="API книжной полки с валидацией"
+  starter={`import express from "express";
+import request from "supertest";
+
+// Мнимый сервис, который сегодня сломан
+async function loadStats() {
+  throw new Error("Stats service is down");
+}
+
+function validateBook(body) {
+  const errors = [];
+  // TODO 2: проверьте body?.title и body?.year, добавьте сообщения
+  return errors;
+}
+
+function createApp({ log = console.log } = {}) {
+  const books = [{ id: 1, title: "The Hobbit", year: 1937 }];
+  let nextId = 2;
+
+  const app = express();
+  app.use(express.json());
+  // TODO 1: middleware-логгер: log(\`\${req.method} \${req.originalUrl}\`)
+
+  const router = express.Router();
+  router.get("/", (req, res) => {
+    res.json(books);
+  });
+  router.get("/stats", async (req, res) => {
+    res.json(await loadStats());
+  });
+  router.post("/", (req, res) => {
+    // TODO 3: ответьте 400 { error: "Invalid book", details },
+    //         если validateBook нашла проблемы
+    const book = {
+      id: nextId++,
+      title: req.body.title.trim(),
+      year: req.body.year,
+    };
+    books.push(book);
+    res.status(201).json(book);
+  });
+  app.use("/api/books", router);
+
+  // TODO 4: обработчик 404 -> { error: "Not found" }
+  // TODO 5: обработчик ошибок -> код ниже 500: этот код и
+  //         { error: err.message }; иначе 500 и
+  //         { error: "Something went wrong" }
+
+  return app;
+}
+
+const app = createApp();
+const res = await request(app).post("/api/books").send({ year: 2020 });
+console.log(res.status, res.body);
+`}
+  tests={[
+    { name: "Middleware-логгер записывает каждый запрос через настройку log", check: `(await require('supertest')(createApp()).get('/api/books?sort=title'), __output.includes('GET /api/books?sort=title')) && await (async () => { const lines = []; await require('supertest')(createApp({ log: (l) => lines.push(l) })).post('/api/books').send({}); return lines.includes('POST /api/books'); })()` },
+    { name: "validateBook возвращает все проблемы по порядку", check: `JSON.stringify(validateBook({})) === JSON.stringify(['title is required', 'year must be a whole number']) && JSON.stringify(validateBook(undefined)) === JSON.stringify(['title is required', 'year must be a whole number']) && JSON.stringify(validateBook({ title: '   ', year: 2001 })) === JSON.stringify(['title is required']) && JSON.stringify(validateBook({ title: 'y'.repeat(101), year: '1999' })) === JSON.stringify(['title must be at most 100 characters', 'year must be a whole number']) && validateBook({ title: 'y'.repeat(100), year: 1999 }).length === 0 && JSON.stringify(validateBook({ title: 'Dune', year: 19.5 })) === JSON.stringify(['year must be a whole number'])` },
+    { name: "Корректная книга по-прежнему создаётся с кодом 201", check: `await (async () => { const api = require('supertest')(createApp({ log: () => {} })); const r = await api.post('/api/books').send({ title: '  Momo ', year: 1973 }); const list = (await api.get('/api/books')).body; return r.status === 201 && r.body.id === 2 && r.body.title === 'Momo' && r.body.year === 1973 && list.length === 2; })()` },
+    { name: "Некорректные книги получают 400 с details и не сохраняются", check: `await (async () => { const api = require('supertest')(createApp({ log: () => {} })); const r = await api.post('/api/books').send({ title: '', year: 'soon' }); const none = await api.post('/api/books'); const list = (await api.get('/api/books')).body; return r.status === 400 && r.body.error === 'Invalid book' && JSON.stringify(r.body.details) === JSON.stringify(['title is required', 'year must be a whole number']) && none.status === 400 && list.length === 1; })()` },
+    { name: "Неизвестные маршруты отвечают 404 { error: 'Not found' }", check: `await (async () => { const api = require('supertest')(createApp({ log: () => {} })); const a = await api.get('/api/nope'); const b = await api.delete('/api/books'); return a.status === 404 && a.body.error === 'Not found' && b.status === 404 && b.body.error === 'Not found'; })()` },
+    { name: "Обработчик ошибок скрывает падения (500) и сохраняет ошибки 4xx", check: `await (async () => { const api = require('supertest')(createApp({ log: () => {} })); const a = await api.get('/api/books/stats'); const b = await api.post('/api/books').set('Content-Type', 'application/json').send('{ "title": '); return a.status === 500 && a.body.error === 'Something went wrong' && b.status === 400 && typeof b.body.error === 'string'; })()` },
+  ]}
+>
+
+API «Книжная полка» для библиотеки работает в удачных случаях, но плохие данные его роняют: нажмите **«Запустить»** и посмотрите на 500 для книги без названия. Подготовьте его к продакшену:
+
+1. **Логгер**: добавьте middleware, который вызывает `log(...)` с методом и исходным URL, например `GET /api/books?sort=title`, а затем передаёт запрос дальше. Используйте настройку `log`, а не `console.log` напрямую, чтобы тесты могли её подменить.
+2. **`validateBook(body)`** возвращает массив сообщений (пустой, если с книгой всё в порядке) и проверяет в таком порядке:
+   - `title` должен быть строкой, которая не пуста после обрезки пробелов, иначе добавьте `"title is required"`; если он длиннее 100 символов, добавьте `"title must be at most 100 characters"`;
+   - `year` должен быть целым числом (`1937`, а не `"1937"` или `19.5`), иначе добавьте `"year must be a whole number"`.
+
+   Осторожно: `body` может быть `undefined`, если в запросе нет JSON.
+3. **`POST /api/books`**: если есть проблемы, ответьте **400** с `{ error: "Invalid book", details: [...] }` и ничего не сохраняйте.
+4. **Обработчик 404**: неизвестные маршруты отвечают **404** `{ error: "Not found" }`.
+5. **Обработчик ошибок**: ошибки со `status` ниже 500 (например, 400, который `express.json()` выдаёт на сломанный JSON) отвечают этим кодом и `{ error: err.message }`. Всё остальное (например, сломанный `/api/books/stats`) отвечает **500** `{ error: "Something went wrong" }`.
+
+<Hint>
+
+Логгер — это `app.use((req, res, next) => { log(...); next(); });`, поставленный перед роутером. В `validateBook` выражения `body?.title` и `body?.year` работают, даже когда `body` равно `undefined`, а `Number.isInteger(value)` возвращает `true` только для целых чисел. Оба обработчика идут после `app.use("/api/books", router)`, сначала обработчик 404; обработчику ошибок нужны четыре параметра: `(err, req, res, next)`. Используйте `const status = err.status ?? 500;`.
+
+</Hint>
+
+<Solution>
+
+```js
+import express from "express";
+import request from "supertest";
+
+// Мнимый сервис, который сегодня сломан
+async function loadStats() {
+  throw new Error("Stats service is down");
+}
+
+function validateBook(body) {
+  const errors = [];
+  const title = body?.title;
+  if (typeof title !== "string" || title.trim() === "") {
+    errors.push("title is required");
+  } else if (title.length > 100) {
+    errors.push("title must be at most 100 characters");
+  }
+  if (!Number.isInteger(body?.year)) {
+    errors.push("year must be a whole number");
+  }
+  return errors;
+}
+
+function createApp({ log = console.log } = {}) {
+  const books = [{ id: 1, title: "The Hobbit", year: 1937 }];
+  let nextId = 2;
+
+  const app = express();
+  app.use(express.json());
+  app.use((req, res, next) => {
+    log(`${req.method} ${req.originalUrl}`);
+    next();
+  });
+
+  const router = express.Router();
+  router.get("/", (req, res) => {
+    res.json(books);
+  });
+  router.get("/stats", async (req, res) => {
+    res.json(await loadStats());
+  });
+  router.post("/", (req, res) => {
+    const errors = validateBook(req.body);
+    if (errors.length > 0) {
+      return res
+        .status(400)
+        .json({ error: "Invalid book", details: errors });
+    }
+    const book = {
+      id: nextId++,
+      title: req.body.title.trim(),
+      year: req.body.year,
+    };
+    books.push(book);
+    res.status(201).json(book);
+  });
+  app.use("/api/books", router);
+
+  app.use((req, res) => {
+    res.status(404).json({ error: "Not found" });
+  });
+
+  app.use((err, req, res, next) => {
+    const status = err.status ?? 500;
+    if (status < 500) {
+      return res.status(status).json({ error: err.message });
+    }
+    res.status(500).json({ error: "Something went wrong" });
+  });
+
+  return app;
+}
+
+const app = createApp();
+const res = await request(app).post("/api/books").send({ year: 2020 });
+console.log(res.status, res.body);
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Middleware** — это `(req, res, next) => { ... }`: выполняется в порядке регистрации и должен либо ответить, либо вызвать `next()`. `app.use(fn)` применяет его ко всем запросам, `app.get(path, mw, handler)` — к одному маршруту.
+- `app.use(express.json())` в начале приложения заполняет `req.body` из JSON; без него в Express 5 `req.body` равно `undefined`. Сломанный JSON получает 400.
+- `express.Router()` группирует маршруты с относительными путями; `app.use("/api/notes", router)` монтирует их под префиксом.
+- **Валидируйте** каждое тело на сервере: собирайте все проблемы, отвечайте **400** с понятными `details` и создавайте новые объекты только из ожидаемых полей.
+- Завершайте приложение **обработчиком 404** и **обработчиком ошибок** с четырьмя параметрами `(err, req, res, next)`. Выбрасывайте ошибки (например, `HttpError` со `status`) и позвольте обработчику их оформить; скрывайте подробности ошибок 500.
+- **Express 5** автоматически передаёт ошибки из `async`-обработчиков в обработчик ошибок; в Express 4 нужны были `try/catch` и `next(err)`.
+- Читайте настройки из **переменных окружения** только в `server.js` и передавайте их внутрь: `createApp({ apiKey, log })`. Тогда тесты смогут передать свои значения.

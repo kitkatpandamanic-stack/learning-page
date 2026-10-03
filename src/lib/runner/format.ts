@@ -45,6 +45,9 @@ function inspect(value: unknown, depth: number, seen: Set<unknown>): string {
   if (obj instanceof Date)
     return Number.isNaN(obj.getTime()) ? "Invalid Date" : obj.toISOString();
   if (obj instanceof RegExp) return obj.toString();
+  if (Object.prototype.toString.call(obj) === "[object Generator]") {
+    return "Object [Generator] {}";
+  }
 
   const nested = depth + 1;
   seen.add(obj);

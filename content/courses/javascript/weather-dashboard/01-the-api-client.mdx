@@ -1,0 +1,646 @@
+---
+title: "Part 1: The API client"
+description: Plan the weather dashboard, write a weather API client with proper error handling and formatting helpers, and prove it works with Vitest and a fake fetch.
+duration: 22
+xp: 30
+---
+
+Welcome to the **Level 2 capstone**! 🌦️ Over three parts you'll build a **weather dashboard**: type a city, see the weather right now and a five-day forecast, switch between °C and °F, and keep your favourite cities saved for next time. It's a small app, but it's built the way real front-end apps are: a **tested API client** at the bottom, **React components** on top.
+
+You'll use almost everything from this level: destructuring with defaults and `?.`/`??` from [Modern JavaScript Power Tools](/learn/javascript/spread-rest-and-optional-chaining), `async`/`await`, the request helper and `AbortController` from [Sending Data and Handling Errors](/learn/javascript/sending-data-and-handling-errors), fake `fetch` tests from [Test-Driven Development](/learn/javascript/test-driven-development), and in Parts 2 and 3, components, state and effects from [React Fundamentals](/learn/javascript/recipe-browser). In this first part there's no page yet: we build and test the code that talks to the weather API.
+
+## The plan
+
+Here's what the finished dashboard does:
+
+1. A **search box**: type a city and press Enter.
+2. The **current weather**: temperature, conditions, "feels like", humidity and wind.
+3. A **five-day forecast**: "Today", "Tomorrow", then the day names.
+4. A **°C / °F switch**.
+5. **Favourites** and **recent searches**, saved in the browser.
+6. Proper **loading, error and empty states**.
+
+Before writing code, split the app into layers. Each layer only talks to the one below it:
+
+| Layer | What it does | Built in |
+| --- | --- | --- |
+| API client | builds URLs, calls the API, turns bad answers into errors | Part 1 |
+| Formatting helpers | `14` → `"14°C"`, `"Fri"` → `"Friday"` | Part 1 |
+| React components | the search form, current weather and forecast | Part 2 |
+| Storage | favourites and recent searches in `localStorage` | Part 3 |
+
+The bottom two layers are **plain JavaScript** with no React and no page, so they're quick to write and easy to test. That's on purpose: the trickiest bugs (wrong URLs, swallowed errors, bad rounding) live in this kind of code, and here Vitest can catch them in milliseconds. In a real project they'd be separate files:
+
+```text
+weather-dashboard/
+└── src/
+    ├── weather.js         API, ApiError, weatherUrl, getWeather
+    ├── format.js          formatTemp, formatWind, dayLabel, ...
+    ├── weather.test.js    Vitest tests for both
+    ├── App.jsx            (Part 2)
+    └── components/        (Part 2)
+```
+
+In these lessons everything lives in one file, so you can run it in the editor.
+
+## Meet the weather endpoint
+
+PandaDev has a practice API built in, so these lessons work offline and always give the same answers. Real APIs work the same way. Its weather endpoint takes a `city` and, optionally, how many `days` of forecast you want (1 to 7):
+
+<CodeExample output={`200 { city: 'London', country: 'GB', temperature: 14, feelsLike: 12, condition: 'Cloudy', humidity: 78, windKph: 18 }
+Paris 3 days
+{ day: 'Mon', high: 18, low: 11, condition: 'Windy', chanceOfRain: 10 }
+404 { error: 'City not found' }
+400 { error: 'city is required' }`}>
+
+```js
+const API = "https://api.pandadev.test";
+
+const res = await fetch(`${API}/weather?city=London`);
+console.log(res.status, await res.json());
+
+const paris = await fetch(`${API}/weather?city=paris&days=3`)
+  .then((r) => r.json());
+console.log(paris.city, paris.forecast.length, "days");
+console.log(paris.forecast[0]);
+
+for (const query of ["city=Atlantis", "city="]) {
+  const bad = await fetch(`${API}/weather?${query}`);
+  console.log(bad.status, await bad.json());
+}
+```
+
+</CodeExample>
+
+Read the answers like a client developer would:
+
+- The **current weather** is a flat object. Temperatures are in **°C** and wind in **km/h**; converting is our job.
+- With `days`, the answer gets a `forecast` array with a short `day` name (`"Mon"`), `high`, `low`, `condition` and `chanceOfRain` in percent.
+- The city name is **case-insensitive** (`paris` works), and the API answers with the proper spelling (`Paris`). We'll show the API's spelling, not what the user typed.
+- Errors are **JSON with an `error` field**: 404 for an unknown city, 400 when the city is missing.
+
+## Building the URL
+
+The first function turns a city and a number of days into a URL. `URLSearchParams` encodes spaces and special characters, as you saw in [Fetch Basics](/learn/javascript/fetch-basics), and we leave out `days` when we don't need a forecast:
+
+<CodeExample output={`https://api.pandadev.test/weather?city=London
+https://api.pandadev.test/weather?city=Paris&days=3
+https://api.pandadev.test/weather?city=Rio+de+Janeiro&days=5
+https://api.pandadev.test/weather?city=Tokyo%26days%3D7`}>
+
+```js
+const API = "https://api.pandadev.test";
+
+function weatherUrl(city, days = 0) {
+  const params = new URLSearchParams({ city: city.trim() });
+  if (days > 0) params.set("days", days);
+  return `${API}/weather?${params}`;
+}
+
+console.log(weatherUrl("London"));
+console.log(weatherUrl("  Paris ", 3));
+console.log(weatherUrl("Rio de Janeiro", 5));
+console.log(weatherUrl("Tokyo&days=7"));
+```
+
+</CodeExample>
+
+The last line shows why we never glue user input into a URL by hand: someone typing `Tokyo&days=7` can't sneak in an extra parameter, because the `&` and `=` are encoded. And `trim()` removes the spaces people often type by accident.
+
+## getWeather: one function for every request
+
+Now the heart of the client. `getWeather` is the weather version of the `request` helper from [Sending Data and Handling Errors](/learn/javascript/sending-data-and-handling-errors), with three options in a destructured object:
+
+- **`days`**: how many forecast days to ask for (none by default).
+- **`signal`**: an `AbortSignal`, so the React app in Part 2 can **cancel** a search that's no longer needed.
+- **`fetch`**: the `fetch` function to use. The app leaves it out and gets the real one; tests pass in a fake. That's **dependency injection**, from [Mocks and Async Tests](/learn/javascript/mocks-and-async-tests).
+
+<CodeExample output={`Tokyo 22 2
+ApiError 404 City not found
+Error - Please enter a city
+AbortError`}>
+
+```js
+const API = "https://api.pandadev.test";
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+function weatherUrl(city, days = 0) {
+  const params = new URLSearchParams({ city: city.trim() });
+  if (days > 0) params.set("days", days);
+  return `${API}/weather?${params}`;
+}
+
+async function getWeather(
+  city,
+  { days = 0, signal, fetch: fetchFn = fetch } = {},
+) {
+  if (!city.trim()) throw new Error("Please enter a city");
+  const res = await fetchFn(weatherUrl(city, days), { signal });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = data?.error ?? `HTTP ${res.status}`;
+    throw new ApiError(res.status, message);
+  }
+  return data;
+}
+
+const tokyo = await getWeather("tokyo", { days: 2 });
+console.log(tokyo.city, tokyo.temperature, tokyo.forecast.length);
+
+for (const city of ["Atlantis", "   "]) {
+  try {
+    await getWeather(city);
+  } catch (error) {
+    console.log(error.name, error.status ?? "-", error.message);
+  }
+}
+
+const controller = new AbortController();
+const slow = getWeather("Cairo", { signal: controller.signal });
+controller.abort();
+await slow.catch((error) => console.log(error.name));
+```
+
+</CodeExample>
+
+Line by line, the important decisions:
+
+- **An empty city never reaches the server.** Checking first saves a pointless request, and the user gets a clear message instead of the API's `city is required`. That's why the second error has no status (`-`): no request was sent.
+- **`response.json().catch(() => null)`** copes with error pages that aren't JSON (a proxy's HTML "502 Bad Gateway" page, for example).
+- **`ApiError` keeps the status**, so the app could treat 404 ("check the spelling") differently from 503 ("try again later"), and `data?.error ?? ...` keeps the API's own message.
+- **Network errors and aborts pass straight through.** The `TypeError` for "offline" and the `AbortError` for a cancelled request aren't the client's business; the caller decides what to do with them. In Part 2, React will simply ignore `AbortError`.
+
+<Callout type="warning" title="Why fetch: fetchFn = fetch?">
+
+The option is called `fetch`, so it reads nicely when you call it: `getWeather("Oslo", { fetch: fakeFetch })`. But inside the function we can't write `{ fetch = fetch }`: the default would refer to the **parameter itself**, which doesn't exist yet, and you'd get `ReferenceError: Cannot access 'fetch' before initialization`. Renaming it while destructuring (`fetch: fetchFn`) gives the parameter a different name, so the default `fetch` means the real, global one.
+
+</Callout>
+
+## Formatting helpers
+
+The API speaks °C, km/h and `"Fri"`; people want `"57°F"`, `"11 mph"` and `"Friday"`. Small **pure functions** do the translating, so the components in Part 2 stay simple and the rules are easy to test.
+
+An **object as a lookup table** turns conditions into emoji, and `??` gives a fallback for conditions we don't know (APIs add new ones without asking you):
+
+<CodeExample output={`🌧️ ⛅
+🌡️
+14°C 57°F
+28°F 22°C`}>
+
+```js
+const ICONS = {
+  Sunny: "☀️",
+  "Partly cloudy": "⛅",
+  Cloudy: "☁️",
+  Rain: "🌧️",
+  Thunderstorm: "⛈️",
+  Snow: "❄️",
+  Fog: "🌫️",
+  Windy: "💨",
+};
+
+function conditionIcon(condition) {
+  return ICONS[condition] ?? "🌡️";
+}
+
+function formatTemp(celsius, unit = "C") {
+  const value = unit === "F" ? (celsius * 9) / 5 + 32 : celsius;
+  return `${Math.round(value)}°${unit}`;
+}
+
+console.log(conditionIcon("Rain"), conditionIcon("Partly cloudy"));
+console.log(conditionIcon("Volcanic ash"));
+console.log(formatTemp(14), formatTemp(14, "F"));
+console.log(formatTemp(-2, "F"), formatTemp(21.6));
+```
+
+</CodeExample>
+
+`formatTemp` converts with **°F = °C × 9 / 5 + 32** and rounds, because nobody wants to read `57.2°F`. The `unit` parameter (`"C"` or `"F"`) will come from the unit switch in Part 3. You'll write two more helpers in the exercise, following the same idea:
+
+| Call | Result |
+| --- | --- |
+| `formatWind(18)` | `"18 km/h"` |
+| `formatWind(18, "F")` | `"11 mph"` (km/h ÷ 1.609, rounded) |
+| `dayLabel("Wed", 0)` | `"Today"` |
+| `dayLabel("Thu", 1)` | `"Tomorrow"` |
+| `dayLabel("Fri", 2)` | `"Friday"` |
+
+`formatWind` takes the same `unit` as `formatTemp`: people who want °F usually want miles per hour too. `dayLabel(day, index)` gets the forecast's short day name and its position in the list: the first day is today, the second tomorrow.
+
+## Testing the client with a fake fetch
+
+The client is small, but a lot can go wrong in it: a misspelt parameter, a forgotten `trim()`, an error that gets lost. Exactly as in the TDD lesson, we inject a **fake `fetch`** made with `vi.fn()`, so the tests never touch the network and can fake answers that are hard to get for real, like a 502 with an HTML body:
+
+<CodeExample output={`✓ getWeather > asks for the city and the number of days
+✓ getWeather > returns the weather from the API
+✓ getWeather > throws an ApiError with the status and message
+✓ getWeather > copes with an error that isn't JSON
+✓ getWeather > passes on network errors
+
+Tests  5 passed (5)`}>
+
+```js
+import { describe, it, expect, vi } from "vitest";
+
+const API = "https://api.pandadev.test";
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+function weatherUrl(city, days = 0) {
+  const params = new URLSearchParams({ city: city.trim() });
+  if (days > 0) params.set("days", days);
+  return `${API}/weather?${params}`;
+}
+
+async function getWeather(
+  city,
+  { days = 0, signal, fetch: fetchFn = fetch } = {},
+) {
+  if (!city.trim()) throw new Error("Please enter a city");
+  const res = await fetchFn(weatherUrl(city, days), { signal });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = data?.error ?? `HTTP ${res.status}`;
+    throw new ApiError(res.status, message);
+  }
+  return data;
+}
+
+function fakeResponse(status, body) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  };
+}
+
+describe("getWeather", () => {
+  it("asks for the city and the number of days", async () => {
+    const fetch = vi.fn().mockResolvedValue(fakeResponse(200, {}));
+    await getWeather("Rio de Janeiro", { days: 5, fetch });
+    const [url] = fetch.mock.calls[0];
+    expect(url).toBe(
+      "https://api.pandadev.test/weather?city=Rio+de+Janeiro&days=5",
+    );
+  });
+
+  it("returns the weather from the API", async () => {
+    const weather = { city: "Oslo", temperature: 4 };
+    const fetch = vi.fn().mockResolvedValue(fakeResponse(200, weather));
+    const result = await getWeather("Oslo", { fetch });
+    expect(result).toEqual(weather);
+  });
+
+  it("throws an ApiError with the status and message", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      fakeResponse(404, { error: "City not found" }),
+    );
+    await expect(
+      getWeather("Atlantis", { fetch }),
+    ).rejects.toMatchObject({
+      name: "ApiError",
+      status: 404,
+      message: "City not found",
+    });
+  });
+
+  it("copes with an error that isn't JSON", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 502,
+      json: async () => JSON.parse("<html>Bad Gateway</html>"),
+    });
+    await expect(
+      getWeather("Oslo", { fetch }),
+    ).rejects.toThrow("HTTP 502");
+  });
+
+  it("passes on network errors", async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError("offline"));
+    await expect(
+      getWeather("Oslo", { fetch }),
+    ).rejects.toThrow(TypeError);
+  });
+});
+```
+
+</CodeExample>
+
+Two new tricks here:
+
+- **`fetch.mock.calls[0]`** is the list of arguments of the first call. `getWeather` calls `fetch(url, { signal })`, so we destructure the first one, `[url]`, and check just that. (`toHaveBeenCalledWith` would need the options object too.)
+- **`rejects.toMatchObject({...})`** checks several properties of the error at once: its `name`, our extra `status` and the `message`. Like `toEqual`, but extra properties (such as the error's `stack`) are allowed.
+
+Look at the fake for the 502: its `json()` really throws a `SyntaxError`, like a real HTML body would. A double only has to behave like the real thing **from the code's point of view**.
+
+<Quiz
+  question="A test calls getWeather('  Paris ', { days: 3, fetch }) with a fake fetch and expects the URL ...weather?city=Paris&days=3. Which bug does this test catch that the other tests in the lesson would miss?"
+  options={[
+    "getWeather ignoring 404 answers",
+    "weatherUrl forgetting to trim the city",
+    "getWeather losing the API's error message",
+    "getWeather not passing on network errors",
+  ]}
+  answer={1}
+  explanation="Without trim(), the URL would contain the spaces (city=++Paris+) and the test fails. The other bugs are about answers, not about the request, so they need tests with error responses."
+/>
+
+<Exercise
+  title="Build it: the weather client"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ---- The client (built in this lesson, don't change it) ----
+const API = "https://api.pandadev.test";
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+function weatherUrl(city, days = 0) {
+  const params = new URLSearchParams({ city: city.trim() });
+  if (days > 0) params.set("days", days);
+  return \`\${API}/weather?\${params}\`;
+}
+
+async function getWeather(
+  city,
+  { days = 0, signal, fetch: fetchFn = fetch } = {},
+) {
+  if (!city.trim()) throw new Error("Please enter a city");
+  const res = await fetchFn(weatherUrl(city, days), { signal });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = data?.error ?? \`HTTP \${res.status}\`;
+    throw new ApiError(res.status, message);
+  }
+  return data;
+}
+
+const ICONS = {
+  Sunny: "☀️",
+  "Partly cloudy": "⛅",
+  Cloudy: "☁️",
+  Rain: "🌧️",
+  Thunderstorm: "⛈️",
+  Snow: "❄️",
+  Fog: "🌫️",
+  Windy: "💨",
+};
+
+function conditionIcon(condition) {
+  return ICONS[condition] ?? "🌡️";
+}
+
+// ---- Your helpers ----
+function formatTemp(celsius, unit = "C") {
+  // "14°C", or converted to °F; always a whole number
+}
+
+function formatWind(kph, unit = "C") {
+  // "18 km/h", or for unit "F": miles per hour ("11 mph")
+}
+
+function dayLabel(day, index) {
+  // "Today", "Tomorrow", then the full name ("Fri" → "Friday")
+}
+
+// ---- Your tests ----
+function fakeResponse(status, body) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  };
+}
+
+describe("getWeather", () => {
+  // Write at least 5 tests with a fake fetch
+});
+
+// Try it out
+const london = await getWeather("London");
+const icon = conditionIcon(london.condition);
+console.log(\`\${icon} \${london.city}: \${formatTemp(london.temperature)}\`);
+console.log(formatTemp(london.temperature, "F"));
+console.log(formatWind(london.windKph, "F"));
+console.log(dayLabel("Fri", 2));
+`}
+  tests={[
+    { name: "formatTemp shows whole degrees in °C and °F", check: `formatTemp(14) === "14°C" && formatTemp(21.6) === "22°C" && formatTemp(14, "C") === "14°C" && formatTemp(14, "F") === "57°F" && formatTemp(0, "F") === "32°F" && formatTemp(-2, "F") === "28°F" && formatTemp(-40, "F") === "-40°F"` },
+    { name: "formatWind shows km/h, or mph for °F", check: `formatWind(18) === "18 km/h" && formatWind(45, "C") === "45 km/h" && formatWind(18, "F") === "11 mph" && formatWind(45, "F") === "28 mph" && formatWind(6, "F") === "4 mph"` },
+    { name: "dayLabel says Today, Tomorrow, then the full day name", check: `dayLabel("Wed", 0) === "Today" && dayLabel("Sun", 1) === "Tomorrow" && ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => dayLabel(d, 3)).join(",") === "Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday"` },
+    { name: "The client is unchanged and still works with the practice API", check: `getWeather.toString().includes("fetch: fetchFn = fetch") && (await getWeather("cairo", { days: 4 })).forecast.length === 4 && weatherUrl("  Paris ", 3) === "https://api.pandadev.test/weather?city=Paris&days=3"` },
+    { name: "You wrote at least 5 tests and they all pass", check: `__vitest.failed === 0 && __vitest.passed >= 5` },
+    { name: "Your tests catch a misspelt days parameter", check: `(await __retest([['params.set("days", days)', 'params.set("day", days)']])).failed > 0` },
+    { name: "Your tests catch a client that forgets to trim the city", check: `(await __retest([["{ city: city.trim() }", "{ city }"]])).failed > 0` },
+    { name: "Your tests catch a client that ignores 404s", check: `(await __retest([["if (!res.ok)", "if (res.status >= 500)"]])).failed > 0` },
+    { name: "Your tests catch a client that loses the API's message", check: `(await __retest([["data?.error ??", "data?.message ??"]])).failed > 0` },
+    { name: "Your tests catch a client that sends empty searches", check: `(await __retest([['if (!city.trim()) throw new Error("Please enter a city");', ""]])).failed > 0` },
+    { name: "Your tests catch a client that drops the signal", check: `(await __retest([["{ signal });", "{});"]])).failed > 0` },
+  ]}
+>
+
+Finish the client layer of the dashboard. The API client itself is ready (it's the code from this lesson); you write the helpers and the tests.
+
+1. **`formatTemp(celsius, unit = "C")`** returns e.g. `"14°C"`. For `unit` `"F"`, convert first (`°C × 9 / 5 + 32`). Always round to a whole number: `21.6` → `"22°C"`.
+2. **`formatWind(kph, unit = "C")`** returns `"18 km/h"`, or for `unit` `"F"` the speed in miles per hour, rounded: `kph / 1.609` → `"11 mph"`.
+3. **`dayLabel(day, index)`** returns `"Today"` for index `0`, `"Tomorrow"` for index `1`, and otherwise the full English name of the short `day` (`"Fri"` → `"Friday"`).
+4. **Tests for `getWeather`**, with a fake `fetch` made from `vi.fn()` and `fakeResponse`. The checks will sneak six bugs into the client, so test that:
+   - `getWeather("  Paris ", { days: 3, fetch })` calls `fetch` with the URL `https://api.pandadev.test/weather?city=Paris&days=3`,
+   - a `404` with `{ error: "City not found" }` rejects with an `ApiError` whose `status` is `404` and whose message is `"City not found"`,
+   - an empty city (`"   "`) rejects with `"Please enter a city"`, and `fetch` is **not** called,
+   - the `signal` you pass in reaches `fetch` (it's in the second argument: `fetch.mock.calls[0][1].signal`),
+   - and that the data from a successful answer comes back.
+
+You need at least **5** passing tests. Run your code: the "Try it out" part should print `☁️ London: 14°C`, `57°F`, `11 mph` and `Friday`.
+
+<Hint>
+
+For `formatTemp`, copy the lesson's version. For `formatWind`, `` if (unit === "F") return `${Math.round(kph / 1.609)} mph`; `` then return the km/h text. For `dayLabel`, check the index first, then use a lookup object like `{ Mon: "Monday", Tue: "Tuesday", ... }`. For the tests, start each one with `const fetch = vi.fn().mockResolvedValue(fakeResponse(200, {}));`. For the signal: `const controller = new AbortController();`, pass `signal: controller.signal`, then `expect(fetch.mock.calls[0][1].signal).toBe(controller.signal);`. For the empty city, a plain `vi.fn()` is enough, then `expect(fetch).not.toHaveBeenCalled()`.
+
+</Hint>
+
+<Solution>
+
+```js
+import { describe, it, expect, vi } from "vitest";
+
+// ---- The client (built in this lesson, don't change it) ----
+const API = "https://api.pandadev.test";
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+function weatherUrl(city, days = 0) {
+  const params = new URLSearchParams({ city: city.trim() });
+  if (days > 0) params.set("days", days);
+  return `${API}/weather?${params}`;
+}
+
+async function getWeather(
+  city,
+  { days = 0, signal, fetch: fetchFn = fetch } = {},
+) {
+  if (!city.trim()) throw new Error("Please enter a city");
+  const res = await fetchFn(weatherUrl(city, days), { signal });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = data?.error ?? `HTTP ${res.status}`;
+    throw new ApiError(res.status, message);
+  }
+  return data;
+}
+
+const ICONS = {
+  Sunny: "☀️",
+  "Partly cloudy": "⛅",
+  Cloudy: "☁️",
+  Rain: "🌧️",
+  Thunderstorm: "⛈️",
+  Snow: "❄️",
+  Fog: "🌫️",
+  Windy: "💨",
+};
+
+function conditionIcon(condition) {
+  return ICONS[condition] ?? "🌡️";
+}
+
+// ---- Your helpers ----
+function formatTemp(celsius, unit = "C") {
+  const value = unit === "F" ? (celsius * 9) / 5 + 32 : celsius;
+  return `${Math.round(value)}°${unit}`;
+}
+
+function formatWind(kph, unit = "C") {
+  if (unit === "F") return `${Math.round(kph / 1.609)} mph`;
+  return `${kph} km/h`;
+}
+
+const DAY_NAMES = {
+  Mon: "Monday",
+  Tue: "Tuesday",
+  Wed: "Wednesday",
+  Thu: "Thursday",
+  Fri: "Friday",
+  Sat: "Saturday",
+  Sun: "Sunday",
+};
+
+function dayLabel(day, index) {
+  if (index === 0) return "Today";
+  if (index === 1) return "Tomorrow";
+  return DAY_NAMES[day] ?? day;
+}
+
+// ---- Your tests ----
+function fakeResponse(status, body) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  };
+}
+
+describe("getWeather", () => {
+  it("asks for the trimmed city and the days", async () => {
+    const fetch = vi.fn().mockResolvedValue(fakeResponse(200, {}));
+    await getWeather("  Paris ", { days: 3, fetch });
+    const [url] = fetch.mock.calls[0];
+    expect(url).toBe(
+      "https://api.pandadev.test/weather?city=Paris&days=3",
+    );
+  });
+
+  it("returns the weather from the API", async () => {
+    const weather = { city: "Paris", temperature: 17 };
+    const fetch = vi.fn().mockResolvedValue(fakeResponse(200, weather));
+    const result = await getWeather("Paris", { fetch });
+    expect(result).toEqual(weather);
+  });
+
+  it("throws an ApiError with the API's message", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      fakeResponse(404, { error: "City not found" }),
+    );
+    await expect(
+      getWeather("Atlantis", { fetch }),
+    ).rejects.toMatchObject({
+      name: "ApiError",
+      status: 404,
+      message: "City not found",
+    });
+  });
+
+  it("doesn't send a request for an empty city", async () => {
+    const fetch = vi.fn();
+    await expect(
+      getWeather("   ", { fetch }),
+    ).rejects.toThrow("Please enter a city");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("passes the signal on to fetch", async () => {
+    const fetch = vi.fn().mockResolvedValue(fakeResponse(200, {}));
+    const controller = new AbortController();
+    await getWeather("Paris", { fetch, signal: controller.signal });
+    expect(fetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+});
+
+describe("formatTemp", () => {
+  it.each([
+    [14, "C", "14°C"],
+    [21.6, "C", "22°C"],
+    [0, "F", "32°F"],
+    [-2, "F", "28°F"],
+  ])("formats %s in °%s as %s", (celsius, unit, expected) => {
+    expect(formatTemp(celsius, unit)).toBe(expected);
+  });
+});
+
+// Try it out
+const london = await getWeather("London");
+const icon = conditionIcon(london.condition);
+console.log(`${icon} ${london.city}: ${formatTemp(london.temperature)}`);
+console.log(formatTemp(london.temperature, "F"));
+console.log(formatWind(london.windKph, "F"));
+console.log(dayLabel("Fri", 2));
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- A **plan** that splits the dashboard into layers, with the plain-JavaScript layers at the bottom where they're easy to test.
+- **`weatherUrl(city, days)`**, which builds a safe URL with `URLSearchParams` and trims the city.
+- **`getWeather(city, { days, signal, fetch })`**: validates the city, sends the request, turns bad answers into an **`ApiError`** with the status and the API's message, and lets network errors and aborts pass through. Injecting `fetch` makes it testable; the `signal` makes it cancellable.
+- **Formatting helpers** (`formatTemp`, `formatWind`, `dayLabel`, `conditionIcon`) that turn raw data into friendly text.
+- **Vitest tests** with a fake `fetch` that check the request, the happy path and every error path, strong enough to catch real bugs.
+
+In Part 2 you'll put a face on it: **React components** for the search form, the current weather and the forecast, wired to `getWeather` with loading and error states.
