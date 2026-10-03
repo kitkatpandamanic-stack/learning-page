@@ -13,7 +13,11 @@ import {
   getTimeZone,
   markLessonComplete,
 } from "@/lib/progress";
+import { createRateLimiter } from "@/lib/rate-limit";
 import { getSession } from "@/lib/session";
+
+/** A learner finishes a few things a minute; a script trying thousands doesn't get far. */
+const allowAward = createRateLimiter(30, 60_000);
 
 export type AwardResult =
   | {
@@ -25,7 +29,7 @@ export type AwardResult =
       leveledUp: boolean;
       newAchievements: AchievementInfo[];
     }
-  | { ok: false; reason: "signed-out" | "invalid" };
+  | { ok: false; reason: "signed-out" | "invalid" | "rate-limited" };
 
 async function finish(userId: string, xpAwarded: number): Promise<AwardResult> {
   const { stats, newAchievements } = await evaluateAchievements(
@@ -51,6 +55,8 @@ export async function completeLesson(
 ): Promise<AwardResult> {
   const session = await getSession();
   if (!session) return { ok: false, reason: "signed-out" };
+  if (!allowAward(session.user.id))
+    return { ok: false, reason: "rate-limited" };
 
   // XP comes from the content, never from the browser.
   const lesson = getAllLessons().find(
@@ -71,6 +77,8 @@ export async function recordActivity(
 ): Promise<AwardResult> {
   const session = await getSession();
   if (!session) return { ok: false, reason: "signed-out" };
+  if (!allowAward(session.user.id))
+    return { ok: false, reason: "rate-limited" };
 
   const lesson = getAllLessons().find((l) => l.permalink === permalink);
   // No leading zeros: "exercise-01" must not count as a second "exercise-1".

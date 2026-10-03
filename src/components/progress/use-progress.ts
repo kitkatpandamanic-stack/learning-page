@@ -101,6 +101,8 @@ export function useAward(language: string) {
         await refresh();
       } else if (result.reason === "invalid") {
         toast.error(t("toast.saveFailed"));
+      } else if (result.reason === "rate-limited") {
+        toast.error(t("toast.slowDown"));
       }
       return result;
     },
@@ -119,6 +121,8 @@ export function useAward(language: string) {
           tAchievements,
         );
         await refresh();
+      } else if (result.reason === "rate-limited") {
+        toast.error(t("toast.slowDown"));
       }
       return result;
     },

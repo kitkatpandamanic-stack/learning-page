@@ -11,8 +11,46 @@ const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 // from node_modules/react, which isn't the React copy Next.js runs on).
 const reactVendor = `/vendor/${reactVendorName}`;
 
+// Security headers for every response. The code editor runs learners' code
+// (Web Workers, `new Function`, sandboxed preview pages that inherit this
+// policy), so scripts may be inline and use eval; but they only load from
+// this site and jsDelivr (Python and the TypeScript compiler), the site can't
+// be framed, and plugins and <base> tricks are blocked.
+const isDev = process.env.NODE_ENV === "development";
+const contentSecurityPolicy = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net",
+  "style-src 'self' 'unsafe-inline'",
+  // Learners' pages may show any https image; GitHub avatars; charts are data: URLs
+  "img-src 'self' data: blob: https:",
+  "font-src 'self' data:",
+  // Learners' code may call real https APIs; Sentry; jsDelivr downloads
+  `connect-src 'self' https:${isDev ? " ws: http://localhost:*" : ""}`,
+  "worker-src 'self' blob:",
+  "frame-src 'self' blob:",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  ...(isDev ? [] : ["upgrade-insecure-requests"]),
+].join("; ");
+
+const securityHeaders = [
+  { key: "Content-Security-Policy", value: contentSecurityPolicy },
+  { key: "X-Content-Type-Options", value: "nosniff" },
+  { key: "X-Frame-Options", value: "DENY" },
+  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+  {
+    key: "Permissions-Policy",
+    value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+  },
+];
+
 const nextConfig: NextConfig = {
   env: { NEXT_PUBLIC_REACT_VENDOR: reactVendor },
+  async headers() {
+    return [{ source: "/:path*", headers: securityHeaders }];
+  },
   // Lesson bodies are read from disk (src/lib/lesson-body.ts).
   outputFileTracingIncludes: {
     "/[locale]/learn/[lang]/[lesson]": ["./.velite/bodies/**/*"],
