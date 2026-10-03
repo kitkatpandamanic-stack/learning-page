@@ -137,11 +137,25 @@ type TocEntry = { title: string; url: string; items: TocEntry[] };
 function buildToc(raw: string): TocEntry[] {
   const slugger = new GithubSlugger();
   const toc: TocEntry[] = [];
-  let inFence = false;
+  // The open code fence, e.g. "````": only a fence of the same character
+  // and at least as long closes it, so blocks can show fenced code inside.
+  let fence = "";
   let inTag = false;
   for (const line of raw.split("\n")) {
-    if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
-    if (inFence) continue;
+    const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (fence) {
+      if (
+        marker?.[0] === fence[0] &&
+        marker.length >= fence.length &&
+        /^\s*[`~]+\s*$/.test(line)
+      )
+        fence = "";
+      continue;
+    }
+    if (marker) {
+      fence = marker;
+      continue;
+    }
     if (inTag) {
       if (/^\s*\/?>\s*$/.test(line)) inTag = false;
       continue;
