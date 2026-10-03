@@ -87,6 +87,22 @@ describe("executePython", () => {
 });
 
 // These install real packages (pytest, FastAPI, pandas…), like lessons do.
+describe("error hints", () => {
+  it("adds Python's suggestions to error messages", async () => {
+    const message = async (code: string) =>
+      (await executePython(py, code)).error?.message;
+    expect(await message("score = 3\nprint(scor)")).toBe(
+      "name 'scor' is not defined. Did you mean: 'score'?",
+    );
+    expect(await message("print(math.pi)")).toBe(
+      "name 'math' is not defined. Did you forget to import 'math'?",
+    );
+    expect(await message("[].apend(1)")).toBe(
+      "'list' object has no attribute 'apend'. Did you mean: 'append'?",
+    );
+  });
+});
+
 describe("executePython with packages", () => {
   it("has time zones for zoneinfo", async () => {
     const r = await executePython(

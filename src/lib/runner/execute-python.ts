@@ -24,7 +24,7 @@ import {
  * collect the tests in it.
  */
 export const PYTHON_DRIVER = `
-import asyncio, builtins, contextlib, io, json, os, selectors, sys, time, traceback
+import asyncio, builtins, contextlib, io, json, os, re, selectors, sys, time, traceback
 import importlib, importlib.util
 
 _PANDA_MAX_LINES = __MAX_LINES__
@@ -91,6 +91,18 @@ def _panda_error(exc):
         frames = [f for f in traceback.extract_tb(exc.__traceback__) if f.filename == "<lesson>"]
         line = frames[-1].lineno if frames else None
     message = str(exc) if not isinstance(exc, SyntaxError) else (exc.msg or str(exc))
+    # Python adds hints when it prints an error ("Did you mean: 'score'?");
+    # they aren't part of str(exc), so take them from the printed form.
+    try:
+        # (with the traceback: name hints come from the failing frame)
+        printed = list(
+            traceback.TracebackException.from_exception(exc).format_exception_only()
+        )[-1].rstrip("\\n")
+        hint = re.search(r"\\. (Did you mean: .+|Did you forget to import .+)$", printed)
+        if hint and hint.group(1) not in message:
+            message = f"{message}. {hint.group(1)}"
+    except Exception:
+        pass
     return {"name": type(exc).__name__, "message": message, "line": line}
 
 # --- asyncio without threads or sockets ---------------------------------
