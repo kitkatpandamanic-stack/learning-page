@@ -6,7 +6,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { loadPyodide, type PyodideInterface } from "pyodide";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   compareOutput,
@@ -24,17 +24,18 @@ import { checkTypes } from "./node-typecheck";
 /** The first lesson that imports pandas or FastAPI downloads it (cached after). */
 const PACKAGE_TIMEOUT_MS = 120_000;
 
-let pyodide: PyodideInterface;
-beforeAll(async () => {
-  pyodide = await loadPyodide();
-}, 60_000);
+// Loaded on first use, so checking only other languages stays light.
+let pyodide: Promise<PyodideInterface> | undefined;
 
 /**
  * Runs lesson code the same way the browser does, in the right language.
  * TypeScript with type errors doesn't run, just like in the browser.
  */
 async function run(code: string, language: RunLanguage, tests?: TestSpec[]) {
-  if (language === "python") return executePython(pyodide, code, { tests });
+  if (language === "python") {
+    pyodide ??= loadPyodide();
+    return executePython(await pyodide, code, { tests });
+  }
   if (language === "typescript") {
     const diagnostics = checkTypes(code);
     if (diagnostics.length) return typeErrorResult(diagnostics, tests);
