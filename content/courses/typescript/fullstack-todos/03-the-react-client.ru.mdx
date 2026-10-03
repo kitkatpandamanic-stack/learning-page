@@ -1,0 +1,1555 @@
+---
+title: "Часть 3: Клиент на React"
+description: "Завершите full-stack приложение со списком задач фронтендом на React: объединение статусов в редьюсере, оптимистичные обновления с откатом при ошибках и типизированный клиент на учебном API."
+duration: 25
+xp: 30
+---
+
+Пора заняться той частью, которую люди действительно видят. 🎨 В этой последней части вы соберёте приложение на React поверх типизированного клиента из части 2. Оно загружает задачи, добавляет, отмечает и удаляет их — и ощущается **мгновенным**: каждое изменение появляется на экране раньше, чем ответит сервер, и тихо откатывается, если сервер скажет «нет».
+
+Вам пригодятся объединения статусов, редьюсеры и собственные хуки из урока [Редьюсеры, контекст и собственные хуки](/learn/typescript/reducers-context-and-hooks), типизированные формы и события из [Состояния, событий и форм](/learn/typescript/state-events-and-forms), типизированные пропсы из [Типизированных компонентов и пропсов](/learn/typescript/typed-components-and-props) и, конечно, `TodosClient`.
+
+## План
+
+```text
+App                 пропсы: client     состояние: useTodos(client)
+├── (loading)       Загрузка...
+├── (failed)        😿 сообщение
+└── (ready)
+    ├── AddTodoForm   состояние: title   пропсы: onAdd
+    ├── уведомление   что пошло не так, с ✕, чтобы его закрыть
+    ├── TodoItem      пропсы: todo, onToggle, onRemove   (на каждую задачу)
+    └── Сохраняем...  на каждое название, которое идёт на сервер
+```
+
+Решения, которые за этим стоят:
+
+- **`App` получает клиент через пропсы (props).** Это снова внедрение зависимостей: настоящее приложение передаёт `createTodosClient()`, а демо или тест могут передать фейк.
+- **Всё состояние (state) задач живёт в одном редьюсере (reducer)** внутри собственного хука (custom hook) `useTodos(client)`. Компоненты получают состояние и четыре функции: `add`, `toggle`, `remove` и `dismissNotice`.
+- **Изменения оптимистичны.** Сначала меняется экран, потом уходит запрос, и только сбой возвращает всё назад.
+
+## Шаг 1: состояние и его действия
+
+Экран находится в одной из трёх ситуаций, поэтому состояние — это **объединение статусов**, как `FetchState` в уроке про хуки:
+
+- **`loading`**: показывать пока нечего.
+- **`failed`**: список не загрузился, есть `message`.
+- **`ready`**: задачи `todos` и ещё два поля. `adding` хранит названия, которые идут на сервер, а `notice` объясняет, какое последнее изменение не удалось (или равно `null`).
+
+Каждое изменение — это действие, названное по тому, что произошло, а каждое действие о **сбое** несёт то, что нужно редьюсеру, чтобы отменить изменение: задачу в прежнем виде или название, которое так и не сохранилось. Поскольку редьюсер — это обычный TypeScript, можно проиграть целый сеанс без всякого React:
+
+<CodeExample output={`loaded       [ 'Вздремнуть', 'Чай' ] [] null
+changed      [ '✓ Вздремнуть', 'Чай' ] [] null
+changeFailed [ 'Вздремнуть', 'Чай' ] [] Сервер занят
+removed      [ 'Чай' ] [] Сервер занят
+removeFailed [ 'Вздремнуть', 'Чай' ] [] Всё ещё занят
+addStarted   [ 'Вздремнуть', 'Чай' ] [ 'Бамбук' ] Всё ещё занят`}>
+
+```ts
+// Из shared/ (на деле Todo выводится из TodoSchema)
+type Todo = { id: number; title: string; done: boolean };
+
+// ========== web/todos-state.ts ==========
+type TodosState =
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | {
+      status: "ready";
+      todos: Todo[];
+      adding: string[]; // названия, которые ещё идут на сервер
+      notice: string | null; // что не так с последним изменением
+    };
+
+type TodosAction =
+  | { type: "loaded"; todos: Todo[] }
+  | { type: "loadFailed"; message: string }
+  | { type: "addStarted"; title: string }
+  | { type: "added"; title: string; todo: Todo }
+  | { type: "addFailed"; title: string; message: string }
+  | { type: "changed"; todo: Todo }
+  | { type: "changeFailed"; todo: Todo; message: string }
+  | { type: "removed"; id: number }
+  | { type: "removeFailed"; todo: Todo; message: string }
+  | { type: "noticeDismissed" };
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled action: ${JSON.stringify(value)}`);
+}
+
+// Удаляет первую копию title (названия могут совпадать)
+function withoutFirst(list: string[], title: string): string[] {
+  const index = list.indexOf(title);
+  return index === -1 ? list : list.filter((_, i) => i !== index);
+}
+
+function replaceTodo(todos: Todo[], todo: Todo): Todo[] {
+  return todos.map((t) => (t.id === todo.id ? todo : t));
+}
+
+function todosReducer(
+  state: TodosState,
+  action: TodosAction,
+): TodosState {
+  switch (action.type) {
+    case "loaded":
+      return {
+        status: "ready",
+        todos: action.todos,
+        adding: [],
+        notice: null,
+      };
+    case "loadFailed":
+      return { status: "failed", message: action.message };
+  }
+  // Все остальные действия меняют уже загруженный список
+  if (state.status !== "ready") return state;
+
+  switch (action.type) {
+    case "addStarted":
+      return { ...state, adding: [...state.adding, action.title] };
+    case "added":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        todos: [...state.todos, action.todo],
+      };
+    case "addFailed":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        notice: action.message,
+      };
+    case "changed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+      };
+    case "changeFailed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+        notice: action.message,
+      };
+    case "removed":
+      return {
+        ...state,
+        todos: state.todos.filter((t) => t.id !== action.id),
+      };
+    case "removeFailed":
+      return {
+        ...state,
+        // Обратно на своё место: список отсортирован по id
+        todos: [...state.todos, action.todo].sort(
+          (a, b) => a.id - b.id,
+        ),
+        notice: action.message,
+      };
+    case "noticeDismissed":
+      return { ...state, notice: null };
+    default:
+      return assertNever(action);
+  }
+}
+
+// ========== проигрываем сеанс ==========
+const nap: Todo = { id: 1, title: "Вздремнуть", done: false };
+const tea: Todo = { id: 2, title: "Чай", done: false };
+
+const session: TodosAction[] = [
+  { type: "loaded", todos: [nap, tea] },
+  { type: "changed", todo: { ...nap, done: true } }, // оптимистично
+  { type: "changeFailed", todo: nap, message: "Сервер занят" },
+  { type: "removed", id: 1 }, // оптимистично
+  { type: "removeFailed", todo: nap, message: "Всё ещё занят" },
+  { type: "addStarted", title: "Бамбук" },
+];
+
+const show = (t: Todo) => (t.done ? "✓ " : "") + t.title;
+
+let state: TodosState = { status: "loading" };
+for (const action of session) {
+  state = todosReducer(state, action);
+  if (state.status !== "ready") continue;
+  console.log(action.type.padEnd(12), state.todos.map(show),
+    state.adding, state.notice);
+}
+```
+
+</CodeExample>
+
+Этот проигрыш — оптимистичный сеанс в миниатюре: «Вздремнуть» отмечается сразу, сервер отказывает, и `changeFailed` возвращает всё назад; «Вздремнуть» сразу удаляется, сервер снова отказывает, и `removeFailed` возвращает задачу **на её место** (список сервера отсортирован по id, так что сортировка ставит её туда, где она была). Уведомление всегда показывает последнюю проблему.
+
+Несколько деталей типов делают этот редьюсер надёжным:
+
+- **Два switch, одно сужение.** Первый `switch` обрабатывает действия, которые работают в любом состоянии. Затем `if (state.status !== "ready") return state;` сужает `state` до формы ready, так что каждый `case` ниже может пользоваться `state.todos`. TypeScript сузил и `action`: после `return` в первом `switch` он знает, что `action` не может быть `"loaded"` или `"loadFailed"`, поэтому `assertNever` в `default` по-прежнему компилируется.
+- **Ожидающие названия — не задачи.** Соблазнительно дать несохранённой задаче временный id вроде `-1` и положить её в `todos`. Но тогда остальной код будет считать её сохранённой: отметьте её — и приложение отправит `PATCH /todos/-1`. Как обычная `string` в отдельном списке она не может быть случайно отмечена или удалена, потому что `toggle` и `remove` принимают `Todo`, а строку компилятор не пропустит. Это снова «сделайте невозможные состояния невозможными».
+- **`withoutFirst` убирает одну копию.** Быстро добавьте «Чай» дважды — и в ожидании будут два «Чая»; когда первый сохранится, исчезнуть должен только один из них.
+
+## Шаг 2: загрузка в собственном хуке
+
+`useTodos` владеет редьюсером и общается с клиентом. Вот как он загружает список и добавляет задачу:
+
+```tsx title="web/use-todos.ts"
+// ========== web/use-todos.ts ==========
+function useTodos(client: TodosClient) {
+  const [state, dispatch] = useReducer(todosReducer, {
+    status: "loading",
+  });
+
+  useEffect(() => {
+    let ignore = false; // true, когда эффект уже очищен
+    async function load() {
+      const result = await client.list();
+      if (ignore) return;
+      if (result.ok) {
+        dispatch({ type: "loaded", todos: result.value });
+      } else {
+        const message = errorMessage(result.error);
+        dispatch({ type: "loadFailed", message });
+      }
+    }
+    load();
+    return () => {
+      ignore = true;
+    };
+  }, [client]);
+
+  async function add(title: string) {
+    dispatch({ type: "addStarted", title }); // сразу на экране
+    const result = await client.create({ title });
+    if (result.ok) {
+      dispatch({ type: "added", title, todo: result.value });
+    } else {
+      const message = errorMessage(result.error);
+      dispatch({ type: "addFailed", title, message });
+    }
+  }
+  // ...дальше идут toggle, remove и dismissNotice
+}
+```
+
+- **`useReducer` типизируется редьюсером.** `state` — это `TodosState`, а `dispatch` принимает только `TodosAction`, без единого аргумента типа.
+- **Эффект загружает список один раз на клиент.** Если компонент исчезнет до прихода ответа, его функция очистки выставит `ignore`, и опоздавший ответ будет отброшен, а не обновит компонент, которого уже нет. ([Хук `useFetch`](/learn/typescript/reducers-context-and-hooks) делал то же самое с помощью `AbortController`.)
+- **`client` — зависимость эффекта**, поэтому при каждом рендере он должен быть **тем же самым** объектом. Создайте его один раз, вне всех компонентов, как вы увидите в шаге 4. Клиент, созданный внутри `App`, был бы новым при каждом рендере, и эффект загружал бы список снова и снова.
+- **`add` тоже оптимистичен.** `addStarted` сразу показывает название с пометкой «Сохраняем...», а `added` заменяет его задачей от сервера с настоящим id.
+
+## Шаг 3: оптимистичные обновления с откатом
+
+Запрос занимает 100 мс на хорошем соединении и несколько секунд в поезде. Если галочка ставится только после ответа сервера, приложение кажется сломанным. Но большинство запросов **успешны**, так что результат можно показать сразу и отменить его лишь в редком случае, когда запрос не удался. Это и есть **оптимистичное обновление** (optimistic update):
+
+1. Запомните, как всё было.
+2. Сразу измените экран.
+3. Отправьте запрос.
+4. Если он успешен, возьмите версию сервера. Если нет — верните то, что запомнили, и **сообщите пользователю**: изменение, которое молча исчезает, хуже медленного.
+
+Вот эта идея сама по себе, с фейковым сервером, который думает 1,5 секунды. Поставьте несколько галочек, затем включите **«Сделать вид, что сервер упал»** и попробуйте снова:
+
+<TryIt
+  language="tsx"
+  code={`import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+// ----- из части 2 (только то, что нужно демо) -----
+type Todo = { id: number; title: string; done: boolean };
+type TodoPatch = { title?: string; done?: boolean };
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+type ApiError = { kind: "network"; message: string };
+interface TodosClient {
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+}
+
+// ----- фейковый сервер: медленный и падает по вашей команде -----
+let serverDown = false;
+const saved = new Map<number, Todo>([
+  [1, { id: 1, title: "Learn fetch", done: true }],
+  [2, { id: 2, title: "Build the movie app", done: false }],
+]);
+const fakeClient: TodosClient = {
+  async update(id, patch) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const todo = saved.get(id);
+    if (serverDown || todo === undefined) {
+      const message = "Failed to fetch";
+      return { ok: false, error: { kind: "network", message } };
+    }
+    const updated = { ...todo, ...patch };
+    saved.set(id, updated);
+    return { ok: true, value: updated };
+  },
+};
+
+// ----- оптимистичные обновления с откатом -----
+function TodoList({ client }: { client: TodosClient }) {
+  const [todos, setTodos] = useState<Todo[]>([...saved.values()]);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  function replace(todo: Todo) {
+    setTodos((list) =>
+      list.map((t) => (t.id === todo.id ? todo : t)),
+    );
+  }
+
+  async function toggle(todo: Todo) {
+    replace({ ...todo, done: !todo.done }); // 1. показываем сразу
+    const result = await client.update(todo.id, { done: !todo.done });
+    if (result.ok) {
+      replace(result.value); // 2a. побеждает версия сервера
+    } else {
+      replace(todo); // 2b. откатываем и объясняем почему
+      const why = result.error.message;
+      setNotice(\`Не удалось сохранить «\${todo.title}»: \${why}\`);
+    }
+  }
+
+  return (
+    <>
+      <ul>
+        {todos.map((todo) => (
+          <li key={todo.id}>
+            <label>
+              <input
+                type="checkbox"
+                checked={todo.done}
+                onChange={() => toggle(todo)}
+              />
+              {todo.title}
+            </label>
+          </li>
+        ))}
+      </ul>
+      {notice !== null && <p className="notice">😿 {notice}</p>}
+    </>
+  );
+}
+
+function Playground() {
+  const [down, setDown] = useState(false);
+  return (
+    <>
+      <label>
+        <input
+          type="checkbox"
+          checked={down}
+          onChange={(e) => {
+            serverDown = e.target.checked;
+            setDown(e.target.checked);
+          }}
+        />
+        Сделать вид, что сервер упал
+      </label>
+      <hr />
+      <TodoList client={fakeClient} />
+    </>
+  );
+}
+
+createRoot(document.getElementById("root")!).render(<Playground />);`}
+/>
+
+`useTodos` делает то же самое через действия редьюсера:
+
+```tsx
+  async function toggle(todo: Todo) {
+    const done = !todo.done;
+    // Оптимистично: показываем изменение до ответа сервера
+    dispatch({ type: "changed", todo: { ...todo, done } });
+    const result = await client.update(todo.id, { done });
+    if (result.ok) {
+      dispatch({ type: "changed", todo: result.value });
+    } else {
+      // Откатываемся к прежней задаче и объясняем почему
+      const message = errorMessage(result.error);
+      dispatch({ type: "changeFailed", todo, message });
+    }
+  }
+```
+
+`remove` следует тем же шагам, и вы напишете его в упражнении: сразу отправьте действие `"removed"`, вызовите `client.remove`, а если не получилось — отправьте `"removeFailed"` с задачей, чтобы редьюсер мог вернуть её на место.
+
+<Callout type="warning" title="Не каждое изменение должно быть оптимистичным">
+
+Оптимистичные обновления подходят для изменений, которые почти всегда успешны и легко отменяются: галочки, лайки, переименования, удаление из списка. Не используйте их, когда исход решает сервер (оплата, бронирование последнего места, имя пользователя, которое может быть занято) или когда ошибочное «готово!» чего-то стоило бы пользователю. В таких случаях показывайте «Сохраняем...» и ждите ответа.
+
+</Callout>
+
+## Шаг 4: настоящий клиент
+
+Компоненты никогда не импортируют `fetch`, URL или схемы: они знают только `TodosClient`. Поэтому переход с фейка на настоящий клиент — это две строки в самом низу приложения:
+
+```tsx
+// Один клиент на всё приложение, создан один раз (не в рендере)
+const client = createTodosClient();
+createRoot(document.getElementById("root")!).render(
+  <App client={client} />,
+);
+```
+
+`createTodosClient()` общается с учебным API, который заменяет ваш развёрнутый сервер. В настоящем проекте адрес сервера передавался бы из конфигурации сборки, например `createTodosClient({ baseUrl: import.meta.env.VITE_API_URL })` в приложении на Vite. И не забудьте про `!`: `getElementById` возвращает `HTMLElement | null`, и только вы знаете, что `#root` существует.
+
+## Выпускаем приложение
+
+На вашем компьютере три части становятся одним репозиторием с тремя **воркспейсами** (workspaces), так что общий код — это пакет, который импортируют обе стороны:
+
+```text
+todo-app/
+├── package.json        "workspaces": ["shared", "server", "web"]
+├── shared/             schemas.ts, contract.ts      (пакет @todo/shared)
+├── server/             Express API + тесты Vitest   (импортирует @todo/shared)
+└── web/                Vite + React + тесты         (импортирует @todo/shared)
+```
+
+```ts title="web/src/todos-client.ts"
+import { TodoSchema, array, nothing } from "@todo/shared/schemas";
+import type {
+  NewTodo,
+  TodoPatch,
+  TodosApi,
+} from "@todo/shared/contract";
+```
+
+`import type` исчезает из скомпилированного кода, так что контракт ничего не стоит браузеру; схемы же — настоящий код, который выполняют обе стороны. Дальше пусть CI проверяет **весь** репозиторий при каждом пуше. Если кто-то изменит контракт, каждое место, которое ему больше не соответствует, на любой стороне, сломает сборку:
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npx tsc --noEmit -p server && npx tsc --noEmit -p web
+      - run: npx vitest run
+```
+
+Когда приложение выходит в сеть, меняются две вещи:
+
+- **Сервер и веб-приложение обычно живут по разным адресам** (скажем, `api.example.com` и `todos.example.com`), а браузеры блокируют такие запросы, если сервер их не разрешил заголовками **CORS**. Пакет `cors` делает это одной строкой: `app.use(cors({ origin: "https://todos.example.com" }))`. (Или раздавайте оба с одного адреса, а API — по пути `/api`.)
+- **Репозиторий в памяти всё забывает при перезапуске.** Напишите `TodoRepository` на настоящей базе данных (например, SQLite или Postgres) и передайте его в `createApp`. Больше на сервере ничего не меняется, а тесты продолжают пользоваться репозиторием в памяти.
+
+<Quiz
+  question="Только что добавленная задача показывается с пометкой «Сохраняем...», пока сервер не ответит. Почему приложение хранит её как название в state.adding, а не как Todo с временным id вроде -1 в state.todos?"
+  options={[
+    "Потому что React не умеет отрисовывать отрицательные id",
+    "Потому что фейковый id позволил бы остальному приложению считать её сохранённой, например отправить PATCH /todos/-1 при отметке; строку же нельзя передать в toggle или remove",
+    "Потому что сервер отклоняет id меньше 1",
+    "Потому что строки занимают меньше памяти, чем объекты"
+  ]}
+  answer={1}
+  explanation="Всё, что принимает Todo, предполагает, что сервер о нём знает. Ожидающее название — ещё не Todo, поэтому собственный тип (строка в отдельном списке) не даёт вам с помощью компилятора отметить или удалить то, чего сервер никогда не видел."
+/>
+
+<Exercise
+  title="Соберите: готовое приложение со списком задач"
+  language="tsx"
+  html={`<style>
+  #root { max-width: 440px; }
+  .add { display: flex; gap: 8px; margin-bottom: 12px; }
+  .add input { flex: 1; }
+  .todos { list-style: none; margin: 0; padding: 0; }
+  .todo { display: flex; align-items: center; justify-content: space-between; padding: 6px 4px; border-bottom: 1px solid #ffffff1a; }
+  .todo label { display: flex; gap: 8px; align-items: center; }
+  .done .title { text-decoration: line-through; opacity: 0.6; }
+  .saving { opacity: 0.6; font-style: italic; }
+  .saving small { margin-left: 8px; }
+  .delete { background: none; border: none; color: inherit; cursor: pointer; }
+  .notice { display: flex; justify-content: space-between; gap: 8px; padding: 8px 12px; border-radius: 8px; background: #7f1d1d66; color: #fecaca; }
+  .notice button { background: none; border: none; color: inherit; cursor: pointer; }
+  .error { color: #fca5a5; }
+  .count, .status, .empty { color: #a1a1c2; }
+</style>
+<div id="root"></div>`}
+  starter={`import { useEffect, useReducer, useState } from "react";
+import type { SubmitEvent } from "react";
+import { createRoot } from "react-dom/client";
+
+// ========== shared/schemas.ts ==========
+// Библиотека схем из урока «Валидация во время выполнения»
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// Что присылает сервер: тип Todo выводится из схемы
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// Новое в части 2: ответ 204 «без содержимого»
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// Что присылают клиенты
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Любой ответ с ошибкой, например { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: клиент для ЛЮБОГО контракта ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// По схеме на каждый маршрут, сверенной с контрактом
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? \`HTTP \${res.status}\`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// Что остальное приложение может делать с сервером
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    update: (id, patch) =>
+      call("PATCH /todos/:id", { params: params(id), body: patch }),
+    remove: (id) => call("DELETE /todos/:id", { params: params(id) }),
+  };
+}
+
+// По понятной фразе на каждый вид ошибки
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Не удаётся связаться с сервером. Вы в сети?";
+    case "http":
+      return \`\${error.message} (HTTP \${error.status})\`;
+    case "invalid":
+      return "Сервер прислал что-то неожиданное.";
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+
+// ========== web/todos-state.ts ==========
+type TodosState =
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | {
+      status: "ready";
+      todos: Todo[];
+      adding: string[]; // названия, которые ещё идут на сервер
+      notice: string | null; // что не так с последним изменением
+    };
+
+type TodosAction =
+  | { type: "loaded"; todos: Todo[] }
+  | { type: "loadFailed"; message: string }
+  | { type: "addStarted"; title: string }
+  | { type: "added"; title: string; todo: Todo }
+  | { type: "addFailed"; title: string; message: string }
+  | { type: "changed"; todo: Todo }
+  | { type: "changeFailed"; todo: Todo; message: string }
+  | { type: "removed"; id: number }
+  | { type: "removeFailed"; todo: Todo; message: string }
+  | { type: "noticeDismissed" };
+
+function assertNever(value: never): never {
+  throw new Error(\`Unhandled action: \${JSON.stringify(value)}\`);
+}
+
+// Удаляет первую копию title (названия могут совпадать)
+function withoutFirst(list: string[], title: string): string[] {
+  const index = list.indexOf(title);
+  return index === -1 ? list : list.filter((_, i) => i !== index);
+}
+
+function replaceTodo(todos: Todo[], todo: Todo): Todo[] {
+  return todos.map((t) => (t.id === todo.id ? todo : t));
+}
+
+function todosReducer(
+  state: TodosState,
+  action: TodosAction,
+): TodosState {
+  switch (action.type) {
+    case "loaded":
+      return {
+        status: "ready",
+        todos: action.todos,
+        adding: [],
+        notice: null,
+      };
+    case "loadFailed":
+      return { status: "failed", message: action.message };
+  }
+  // Все остальные действия меняют уже загруженный список
+  if (state.status !== "ready") return state;
+
+  switch (action.type) {
+    case "addStarted":
+      return { ...state, adding: [...state.adding, action.title] };
+    case "added":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        todos: [...state.todos, action.todo],
+      };
+    case "addFailed":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        notice: action.message,
+      };
+    case "changed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+      };
+    case "changeFailed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+        notice: action.message,
+      };
+    case "removed":
+      return {
+        ...state,
+        todos: state.todos.filter((t) => t.id !== action.id),
+      };
+    case "removeFailed":
+      return {
+        ...state,
+        // Обратно на своё место: список отсортирован по id
+        todos: [...state.todos, action.todo].sort(
+          (a, b) => a.id - b.id,
+        ),
+        notice: action.message,
+      };
+    case "noticeDismissed":
+      return { ...state, notice: null };
+    default:
+      return assertNever(action);
+  }
+}
+
+// ========== web/use-todos.ts ==========
+function useTodos(client: TodosClient) {
+  const [state, dispatch] = useReducer(todosReducer, {
+    status: "loading",
+  });
+
+  useEffect(() => {
+    let ignore = false; // true, когда эффект уже очищен
+    async function load() {
+      const result = await client.list();
+      if (ignore) return;
+      if (result.ok) {
+        dispatch({ type: "loaded", todos: result.value });
+      } else {
+        const message = errorMessage(result.error);
+        dispatch({ type: "loadFailed", message });
+      }
+    }
+    load();
+    return () => {
+      ignore = true;
+    };
+  }, [client]);
+
+  async function add(title: string) {
+    dispatch({ type: "addStarted", title }); // сразу на экране
+    const result = await client.create({ title });
+    if (result.ok) {
+      dispatch({ type: "added", title, todo: result.value });
+    } else {
+      const message = errorMessage(result.error);
+      dispatch({ type: "addFailed", title, message });
+    }
+  }
+
+  async function toggle(todo: Todo) {
+    const done = !todo.done;
+    // Оптимистично: показываем изменение до ответа сервера
+    dispatch({ type: "changed", todo: { ...todo, done } });
+    const result = await client.update(todo.id, { done });
+    if (result.ok) {
+      dispatch({ type: "changed", todo: result.value });
+    } else {
+      // Откатываемся к прежней задаче и объясняем почему
+      const message = errorMessage(result.error);
+      dispatch({ type: "changeFailed", todo, message });
+    }
+  }
+
+  // TODO 1: оптимистичное удаление с откатом при ошибке
+  async function remove(todo: Todo) {}
+
+  function dismissNotice() {
+    dispatch({ type: "noticeDismissed" });
+  }
+
+  return { state, add, toggle, remove, dismissNotice };
+}
+
+// ========== web/components.tsx ==========
+function AddTodoForm({ onAdd }: { onAdd: (title: string) => void }) {
+  const [title, setTitle] = useState("");
+
+  function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const clean = title.trim();
+    if (clean === "") return;
+    onAdd(clean);
+    setTitle("");
+  }
+
+  return (
+    <form className="add" onSubmit={handleSubmit}>
+      <input
+        name="title"
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        placeholder="Что нужно сделать?"
+      />
+      <button type="submit">Добавить</button>
+    </form>
+  );
+}
+
+type TodoItemProps = {
+  todo: Todo;
+  onToggle: (todo: Todo) => void;
+  onRemove: (todo: Todo) => void;
+};
+
+function TodoItem({ todo, onToggle, onRemove }: TodoItemProps) {
+  return (
+    <li className={todo.done ? "todo done" : "todo"}>
+      <label>
+        <input
+          type="checkbox"
+          checked={todo.done}
+          onChange={() => onToggle(todo)}
+        />
+        <span className="title">{todo.title}</span>
+      </label>
+      {/* TODO 2: кнопка удаления */}
+    </li>
+  );
+}
+
+function App({ client }: { client: TodosClient }) {
+  const todos = useTodos(client);
+  const { state } = todos;
+
+  switch (state.status) {
+    // TODO 3: "loading" и "failed"
+    case "ready": {
+      const left = state.todos.filter((t) => !t.done).length;
+      const empty = state.todos.length + state.adding.length === 0;
+      return (
+        <main>
+          <AddTodoForm onAdd={todos.add} />
+          {/* TODO 4: уведомление с кнопкой, которая его закрывает */}
+          {empty && <p className="empty">Дел нет 🎉</p>}
+          <ul className="todos">
+            {state.todos.map((todo) => (
+              <TodoItem
+                key={todo.id}
+                todo={todo}
+                onToggle={todos.toggle}
+                onRemove={todos.remove}
+              />
+            ))}
+            {/* TODO 5: названия из state.adding, «Сохраняем...» */}
+          </ul>
+          <p className="count">
+            Осталось {left} из {state.todos.length}
+          </p>
+        </main>
+      );
+    }
+  }
+}
+
+// Один клиент на всё приложение, создан один раз (не в рендере)
+const client = createTodosClient();
+createRoot(document.getElementById("root")!).render(
+  <App client={client} />,
+);`}
+  tests={[
+    { name: "Показывает задачи из учебного API", check: `(await __waitFor(() => document.querySelector('li.todo')), [...document.querySelectorAll('li.todo .title')].map((s) => s.textContent).join('|') === 'Learn fetch|Build the movie app|Eat some bamboo' && [...document.querySelectorAll('li.todo input[type=checkbox]')].map((c) => c.checked).join() === 'true,false,false' && document.querySelector('li.todo').classList.contains('done') && __requests.length === 1 && __requests[0].method === 'GET' && __requests[0].url === 'https://api.pandadev.test/todos')` },
+    { name: "Новая задача сразу появляется как «Сохраняем...», а поле очищается", check: `await (async () => { __hold(); try { await __type('input[name=title]', '  Ship it  '); __click('form.add button[type=submit]'); return await __waitFor(() => { const last = [...document.querySelectorAll('li.todo')].at(-1); return last.classList.contains('saving') && last.querySelector('.title').textContent === 'Ship it' && !last.querySelector('input') && document.querySelector('input[name=title]').value === ''; }); } finally { await __release(); } })()` },
+    { name: "Затем её место занимает задача от сервера", check: `(() => { const last = [...document.querySelectorAll('li.todo')].at(-1); const sent = __requests.at(-1); return !last.classList.contains('saving') && last.querySelector('.title').textContent === 'Ship it' && last.querySelector('input[type=checkbox]')?.checked === false && document.querySelectorAll('li.todo').length === 4 && sent.method === 'POST' && JSON.stringify(sent.body) === '{"title":"Ship it"}' && document.querySelector('.count')?.textContent === 'Осталось 3 из 4'; })()` },
+    { name: "Пустое название ничего не отправляет", check: `(await __type('input[name=title]', '   '), await __click('form.add button[type=submit]'), __requests.length === 2 && document.querySelectorAll('li.todo').length === 4 && !document.querySelector('.saving'))` },
+    { name: "Галочка появляется сразу, до ответа сервера", check: `await (async () => { const item = () => [...document.querySelectorAll('li.todo')].find((li) => li.textContent.includes('Build the movie app')); __hold(); try { __click(item().querySelector('input[type=checkbox]')); return await __waitFor(() => item().querySelector('input').checked && item().classList.contains('done')); } finally { await __release(); } })()` },
+    { name: "Галочка сохраняется через PATCH /todos/2", check: `(() => { const li = [...document.querySelectorAll('li.todo')].find((li) => li.textContent.includes('Build the movie app')); const sent = __requests.at(-1); return li.querySelector('input').checked && sent.method === 'PATCH' && sent.url === 'https://api.pandadev.test/todos/2' && JSON.stringify(sent.body) === '{"done":true}' && document.querySelector('.count')?.textContent === 'Осталось 2 из 4'; })()` },
+    { name: "Удалённая задача сразу исчезает, и уходит DELETE", check: `await (async () => { let gone = false; __hold(); try { __click([...document.querySelectorAll('li.todo')].find((li) => li.textContent.includes('Eat some bamboo')).querySelector('button.delete')); gone = await __waitFor(() => !document.querySelector('#root').textContent.includes('Eat some bamboo')); } finally { await __release(); } const sent = __requests.at(-1); return gone && sent.method === 'DELETE' && sent.url === 'https://api.pandadev.test/todos/3' && !document.querySelector('#root').textContent.includes('Eat some bamboo') && !document.querySelector('.notice'); })()` },
+    { name: "У каждой задачи есть кнопка \u2715 с понятным aria-label", check: `(() => { const b = [...document.querySelectorAll('li.todo button.delete')].map((b) => b.getAttribute('aria-label')).join('|'); return b === 'Удалить Learn fetch|Удалить Build the movie app|Удалить Ship it' && [...document.querySelectorAll('li.todo button.delete')].every((x) => x.textContent === '✕'); })()` },
+    { name: "Изменение, которое сервер отклонил, откатывается с уведомлением", check: `(await fetch('https://api.pandadev.test/todos/1', { method: 'DELETE' }), await __click(document.querySelector('li.todo input[type=checkbox]')), (() => { const li = document.querySelector('li.todo'); return li.querySelector('.title').textContent === 'Learn fetch' && li.querySelector('input').checked === true && li.classList.contains('done') && __requests.at(-1).method === 'PATCH' && __requests.at(-1).url.endsWith('/todos/1') && document.querySelector('.notice')?.textContent.includes('Todo not found (HTTP 404)'); })())` },
+    { name: "Уведомление можно закрыть", check: `(await __click('.notice button'), !document.querySelector('.notice'))` },
+    { name: "Неудачное удаление возвращает задачу на её место", check: `await (async () => { let open; const gate = new Promise((r) => { open = r; }); const todos = [{ id: 1, title: 'Nap', done: false }, { id: 2, title: 'Tea', done: true }, { id: 3, title: 'Bamboo', done: false }]; const fake = async (url, init) => { if (init.method === 'GET') return Response.json(todos); await gate; return Response.json({ error: 'Server is busy' }, { status: 503 }); }; const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); root.render(require('react').createElement(App, { client: createTodosClient({ fetch: fake }) })); await __waitFor(() => box.querySelector('li.todo')); const titles = () => [...box.querySelectorAll('li.todo .title')].map((s) => s.textContent).join('|'); await __click(box.querySelectorAll('li.todo button.delete')[1]); const gone = titles() === 'Nap|Bamboo'; open(); await __waitFor(() => box.querySelector('.notice')); await __settle(); const ok = gone && titles() === 'Nap|Tea|Bamboo' && box.querySelectorAll('li.todo input')[1].checked === true && box.querySelector('.notice').textContent.includes('Server is busy (HTTP 503)'); root.unmount(); box.remove(); return ok; })()` },
+    { name: "Неудачная галочка откатывается, когда сервер недоступен", check: `await (async () => { let open; const gate = new Promise((r) => { open = r; }); const fake = async (url, init) => { if (init.method === 'GET') return Response.json([{ id: 1, title: 'Nap', done: false }]); await gate; throw new TypeError('Failed to fetch'); }; const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); root.render(require('react').createElement(App, { client: createTodosClient({ fetch: fake }) })); await __waitFor(() => box.querySelector('li.todo')); await __click(box.querySelector('li.todo input[type=checkbox]')); const flipped = box.querySelector('li.todo input').checked === true && box.querySelector('li.todo').classList.contains('done'); open(); await __waitFor(() => box.querySelector('.notice')); await __settle(); const ok = flipped && box.querySelector('li.todo input').checked === false && !box.querySelector('li.todo').classList.contains('done') && box.querySelector('.notice').textContent.includes("Не удаётся связаться с сервером"); root.unmount(); box.remove(); return ok; })()` },
+    { name: "Неудачное добавление убирает ожидающее название и объясняет почему", check: `await (async () => { const fake = async (url, init) => { if (init.method === 'GET') return Response.json([]); throw new TypeError('Failed to fetch'); }; const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); root.render(require('react').createElement(App, { client: createTodosClient({ fetch: fake }) })); await __waitFor(() => box.querySelector('.empty')); const input = box.querySelector('input[name=title]'); await __type(input, 'Tea'); await __click(box.querySelector('form.add button[type=submit]')); await __waitFor(() => box.querySelector('.notice')); const ok = box.querySelector('.empty')?.textContent === 'Дел нет 🎉' && !box.querySelector('li') && box.querySelector('.notice').textContent.includes("Не удаётся связаться с сервером"); root.unmount(); box.remove(); return ok; })()` },
+    { name: "Показывает ошибку, когда список не загрузился", check: `await (async () => { const fake = async () => { throw new TypeError('Failed to fetch'); }; const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); root.render(require('react').createElement(App, { client: createTodosClient({ fetch: fake }) })); await __waitFor(() => box.querySelector('.error')); const ok = box.querySelector('.error').textContent.includes("Не удаётся связаться с сервером. Вы в сети?") && !box.querySelector('form') && !box.querySelector('.status'); root.unmount(); box.remove(); return ok; })()` },
+    { name: "Показывает «Загрузка...», пока список загружается", check: `await (async () => { const box = document.createElement('div'); document.body.append(box); const root = require('react-dom/client').createRoot(box); let loading = false; __hold(); try { root.render(require('react').createElement(App, { client: createTodosClient() })); loading = await __waitFor(() => box.querySelector('.status')?.textContent === 'Загрузка...' && !box.querySelector('form')); } finally { await __release(); } await __waitFor(() => box.querySelector('li.todo')); const ok = loading && !box.querySelector('.status') && box.textContent.includes('Build the movie app'); root.unmount(); box.remove(); return ok; })()` },
+  ]}
+>
+
+Соберите приложение целиком. В заготовке есть клиент из части 2 (его тесты остаются в части 2), редьюсер из шага 1 и `useTodos` с загрузкой, `add` и `toggle`. Оно уже работает с учебным API: попробуйте добавлять и отмечать задачи в превью. Затем доделайте его:
+
+1. **`remove(todo)`** в `useTodos`, оптимистичный, как `toggle`: сразу отправьте `"removed"`, вызовите `client.remove(todo.id)`, а если не получилось — отправьте `"removeFailed"` с задачей и `errorMessage(result.error)`.
+2. **Кнопка удаления** в `TodoItem`: `<button className="delete">✕</button>` с `aria-label` вроде `Удалить Learn fetch`, которая вызывает `onRemove(todo)`.
+3. **Загрузка и сбой** в `App`: `<p className="status">Загрузка...</p>` во время загрузки и `<p className="error">😿 {state.message}</p>`, если список не загрузился.
+4. **Уведомление**: когда `state.notice` не `null`, покажите `<p className="notice" role="alert">` с сообщением в `<span>` и кнопкой `<button aria-label="Закрыть">✕</button>`, которая вызывает `todos.dismissNotice`.
+5. **«Сохраняем...»**: после задач — по одному `<li className="todo saving">` на каждое название из `state.adding`, с названием в `<span className="title">` и затем `<small>Сохраняем...</small>`. Без чекбокса: это ещё не задача.
+
+Проверки придерживают ответы учебного API, чтобы посмотреть на экран до ответа сервера, удаляют задачу за спиной у приложения (как будто с другого устройства) и отрисовывают ваш `App` с фейковыми клиентами, у которых сервер даёт сбой.
+
+<Hint>
+
+1. Повторите форму `toggle`: `dispatch({ type: "removed", id: todo.id }); const result = await client.remove(todo.id); if (!result.ok) { const message = errorMessage(result.error); dispatch({ type: "removeFailed", todo, message }); }`.
+2. ``<button className="delete" aria-label={`Удалить ${todo.title}`} onClick={() => onRemove(todo)}>✕</button>``, после `label`.
+3. Добавьте `case "loading": return <p className="status">Загрузка...</p>;` и `case "failed"` перед `case "ready"`. Внутри `case "failed"` TypeScript знает, что `state.message` существует.
+4. `{state.notice !== null && (<p className="notice" role="alert">...</p>)}`.
+5. ``{state.adding.map((title, i) => (<li key={`adding-${i}`} className="todo saving">...</li>))}`` внутри `ul`. Индекс здесь годится в качестве ключа: у этих элементов нет собственного состояния (нет полей ввода), так что ничего не перепутается, когда один из них исчезнет.
+
+</Hint>
+
+<Solution>
+
+```tsx
+import { useEffect, useReducer, useState } from "react";
+import type { SubmitEvent } from "react";
+import { createRoot } from "react-dom/client";
+
+// ========== shared/schemas.ts ==========
+// Библиотека схем из урока «Валидация во время выполнения»
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// Что присылает сервер: тип Todo выводится из схемы
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// Новое в части 2: ответ 204 «без содержимого»
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// Что присылают клиенты
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Любой ответ с ошибкой, например { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: клиент для ЛЮБОГО контракта ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// По схеме на каждый маршрут, сверенной с контрактом
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? `HTTP ${res.status}`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// Что остальное приложение может делать с сервером
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    update: (id, patch) =>
+      call("PATCH /todos/:id", { params: params(id), body: patch }),
+    remove: (id) => call("DELETE /todos/:id", { params: params(id) }),
+  };
+}
+
+// По понятной фразе на каждый вид ошибки
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Не удаётся связаться с сервером. Вы в сети?";
+    case "http":
+      return `${error.message} (HTTP ${error.status})`;
+    case "invalid":
+      return "Сервер прислал что-то неожиданное.";
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+
+// ========== web/todos-state.ts ==========
+type TodosState =
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | {
+      status: "ready";
+      todos: Todo[];
+      adding: string[]; // названия, которые ещё идут на сервер
+      notice: string | null; // что не так с последним изменением
+    };
+
+type TodosAction =
+  | { type: "loaded"; todos: Todo[] }
+  | { type: "loadFailed"; message: string }
+  | { type: "addStarted"; title: string }
+  | { type: "added"; title: string; todo: Todo }
+  | { type: "addFailed"; title: string; message: string }
+  | { type: "changed"; todo: Todo }
+  | { type: "changeFailed"; todo: Todo; message: string }
+  | { type: "removed"; id: number }
+  | { type: "removeFailed"; todo: Todo; message: string }
+  | { type: "noticeDismissed" };
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled action: ${JSON.stringify(value)}`);
+}
+
+// Удаляет первую копию title (названия могут совпадать)
+function withoutFirst(list: string[], title: string): string[] {
+  const index = list.indexOf(title);
+  return index === -1 ? list : list.filter((_, i) => i !== index);
+}
+
+function replaceTodo(todos: Todo[], todo: Todo): Todo[] {
+  return todos.map((t) => (t.id === todo.id ? todo : t));
+}
+
+function todosReducer(
+  state: TodosState,
+  action: TodosAction,
+): TodosState {
+  switch (action.type) {
+    case "loaded":
+      return {
+        status: "ready",
+        todos: action.todos,
+        adding: [],
+        notice: null,
+      };
+    case "loadFailed":
+      return { status: "failed", message: action.message };
+  }
+  // Все остальные действия меняют уже загруженный список
+  if (state.status !== "ready") return state;
+
+  switch (action.type) {
+    case "addStarted":
+      return { ...state, adding: [...state.adding, action.title] };
+    case "added":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        todos: [...state.todos, action.todo],
+      };
+    case "addFailed":
+      return {
+        ...state,
+        adding: withoutFirst(state.adding, action.title),
+        notice: action.message,
+      };
+    case "changed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+      };
+    case "changeFailed":
+      return {
+        ...state,
+        todos: replaceTodo(state.todos, action.todo),
+        notice: action.message,
+      };
+    case "removed":
+      return {
+        ...state,
+        todos: state.todos.filter((t) => t.id !== action.id),
+      };
+    case "removeFailed":
+      return {
+        ...state,
+        // Обратно на своё место: список отсортирован по id
+        todos: [...state.todos, action.todo].sort(
+          (a, b) => a.id - b.id,
+        ),
+        notice: action.message,
+      };
+    case "noticeDismissed":
+      return { ...state, notice: null };
+    default:
+      return assertNever(action);
+  }
+}
+
+// ========== web/use-todos.ts ==========
+function useTodos(client: TodosClient) {
+  const [state, dispatch] = useReducer(todosReducer, {
+    status: "loading",
+  });
+
+  useEffect(() => {
+    let ignore = false; // true, когда эффект уже очищен
+    async function load() {
+      const result = await client.list();
+      if (ignore) return;
+      if (result.ok) {
+        dispatch({ type: "loaded", todos: result.value });
+      } else {
+        const message = errorMessage(result.error);
+        dispatch({ type: "loadFailed", message });
+      }
+    }
+    load();
+    return () => {
+      ignore = true;
+    };
+  }, [client]);
+
+  async function add(title: string) {
+    dispatch({ type: "addStarted", title }); // сразу на экране
+    const result = await client.create({ title });
+    if (result.ok) {
+      dispatch({ type: "added", title, todo: result.value });
+    } else {
+      const message = errorMessage(result.error);
+      dispatch({ type: "addFailed", title, message });
+    }
+  }
+
+  async function toggle(todo: Todo) {
+    const done = !todo.done;
+    // Оптимистично: показываем изменение до ответа сервера
+    dispatch({ type: "changed", todo: { ...todo, done } });
+    const result = await client.update(todo.id, { done });
+    if (result.ok) {
+      dispatch({ type: "changed", todo: result.value });
+    } else {
+      // Откатываемся к прежней задаче и объясняем почему
+      const message = errorMessage(result.error);
+      dispatch({ type: "changeFailed", todo, message });
+    }
+  }
+
+  async function remove(todo: Todo) {
+    dispatch({ type: "removed", id: todo.id }); // оптимистично
+    const result = await client.remove(todo.id);
+    if (!result.ok) {
+      const message = errorMessage(result.error);
+      dispatch({ type: "removeFailed", todo, message });
+    }
+  }
+
+  function dismissNotice() {
+    dispatch({ type: "noticeDismissed" });
+  }
+
+  return { state, add, toggle, remove, dismissNotice };
+}
+
+// ========== web/components.tsx ==========
+function AddTodoForm({ onAdd }: { onAdd: (title: string) => void }) {
+  const [title, setTitle] = useState("");
+
+  function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const clean = title.trim();
+    if (clean === "") return;
+    onAdd(clean);
+    setTitle("");
+  }
+
+  return (
+    <form className="add" onSubmit={handleSubmit}>
+      <input
+        name="title"
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        placeholder="Что нужно сделать?"
+      />
+      <button type="submit">Добавить</button>
+    </form>
+  );
+}
+
+type TodoItemProps = {
+  todo: Todo;
+  onToggle: (todo: Todo) => void;
+  onRemove: (todo: Todo) => void;
+};
+
+function TodoItem({ todo, onToggle, onRemove }: TodoItemProps) {
+  return (
+    <li className={todo.done ? "todo done" : "todo"}>
+      <label>
+        <input
+          type="checkbox"
+          checked={todo.done}
+          onChange={() => onToggle(todo)}
+        />
+        <span className="title">{todo.title}</span>
+      </label>
+      <button
+        className="delete"
+        aria-label={`Удалить ${todo.title}`}
+        onClick={() => onRemove(todo)}
+      >
+        ✕
+      </button>
+    </li>
+  );
+}
+
+function App({ client }: { client: TodosClient }) {
+  const todos = useTodos(client);
+  const { state } = todos;
+
+  switch (state.status) {
+    case "loading":
+      return <p className="status">Загрузка...</p>;
+    case "failed":
+      return <p className="error">😿 {state.message}</p>;
+    case "ready": {
+      const left = state.todos.filter((t) => !t.done).length;
+      const empty = state.todos.length + state.adding.length === 0;
+      return (
+        <main>
+          <AddTodoForm onAdd={todos.add} />
+          {state.notice !== null && (
+            <p className="notice" role="alert">
+              <span>{state.notice}</span>
+              <button
+                aria-label="Закрыть"
+                onClick={todos.dismissNotice}
+              >
+                ✕
+              </button>
+            </p>
+          )}
+          {empty && <p className="empty">Дел нет 🎉</p>}
+          <ul className="todos">
+            {state.todos.map((todo) => (
+              <TodoItem
+                key={todo.id}
+                todo={todo}
+                onToggle={todos.toggle}
+                onRemove={todos.remove}
+              />
+            ))}
+            {state.adding.map((title, i) => (
+              <li key={`adding-${i}`} className="todo saving">
+                <span className="title">{title}</span>
+                <small>Сохраняем...</small>
+              </li>
+            ))}
+          </ul>
+          <p className="count">
+            Осталось {left} из {state.todos.length}
+          </p>
+        </main>
+      );
+    }
+  }
+}
+
+// Один клиент на всё приложение, создан один раз (не в рендере)
+const client = createTodosClient();
+createRoot(document.getElementById("root")!).render(
+  <App client={client} />,
+);
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- **Объединение статусов** для экрана и редьюсер, действия которого несут всё нужное для отмены изменения.
+- **`useTodos`** — собственный хук, который загружает список один раз на клиент и превращает каждое изменение в **оптимистичное обновление** с откатом и уведомлением.
+- Типизированные компоненты (`AddTodoForm`, `TodoItem`, `App`), которые знают только интерфейс `TodosClient`, так что одно и то же приложение работает и с фейковым сервером, и с настоящим.
+- Состояния загрузки, ошибки, пустого списка и «Сохраняем...» для каждого момента жизни приложения.
+
+Вместе с частями 1 и 2 это законченное full-stack приложение на TypeScript: один контракт, общий для Express API и фронтенда на React, который проверяют компилятор на обеих сторонах, схемы во время выполнения и тесты — и с фейками, и на настоящем сервере.
+
+## Что дальше
+
+Идеи для вашей собственной копии (создайте веб-приложение командой `npm create vite@latest`, выбрав React и TypeScript):
+
+- **Редактирование названий.** По двойному щелчку по названию открывайте редактирование и отправляйте `update(id, { title })` оптимистично. Сервер обрезает названия, поэтому берите его ответ (`"changed"` с `result.value`), а не свою копию.
+- **Фильтры.** Добавьте кнопки «Все», «Открытые» и «Готовые» с объединением `Filter` и **вычисляйте** видимый список из него, а не храните второй список.
+- **Повторить попытку.** Дайте состоянию сбоя кнопку «Попробовать снова» и повторяйте сетевые ошибки с нарастающей задержкой (backoff) с помощью помощника `withRetry` и его внедрённого `sleep` из [Внедрения зависимостей и фейков](/learn/typescript/dependency-injection-and-fakes).
+- **Отмена устаревших запросов.** Научите `createApi` принимать `AbortSignal` и отменяйте запрос списка в функции очистки эффекта, как это делал `useFetch`.
+- **Выпустите его по-настоящему.** Настройте воркспейсы из раздела «Выпускаем приложение», разместите сервер на Node-хостинге с репозиторием на базе данных, разверните веб-приложение как статические файлы и пусть CI при каждом пуше запускает `tsc --noEmit` и оба набора тестов.
+
+<Callout type="tip" title="Поздравляем! 🎉">
+
+Вы прошли **Уровень 2** курса TypeScript! Вы типизировали промисы и вызовы `fetch` и проверяли данные во время выполнения, тестировали типизированный код с фейками и тестами типов, строили React-компоненты и хуки с точными типами и типизировали Express API. Это приложение объединяет всё это так, как работают профессиональные команды: один контракт, общие типы и схемы, проверенный и протестированный сервер, клиент, который не доверяет ничему непроверенному, и интерфейс, который ощущается мгновенным и никогда не обманывает надолго. Выложите его на GitHub и похвастайтесь. 🐼🚀
+
+Дальше вас ждёт Уровень 3, где вы глубоко погрузитесь в саму систему типов. В этом проекте вы уже написали два **сопоставленных типа** (`Handlers` и `ResponseSchemas`); Уровень 3 начинается с [Условных типов и infer](/learn/typescript/conditional-types-and-infer) и показывает, как библиотеки вроде Express вычитывают параметры маршрута прямо из строки пути.
+
+</Callout>

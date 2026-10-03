@@ -1,0 +1,1221 @@
+---
+title: "Часть 2: Типизированный клиент"
+description: "Соберите API-клиент веб-приложения из общего контракта: каждый ответ проверен, каждый сбой — типизированный Result, fetch внедряется, а тесты идут с фейковым fetch и на учебном API."
+duration: 25
+xp: 30
+---
+
+В части 1 вы построили серверную сторону контракта. Теперь очередь другой стороны: **API-клиента**, которым приложение на React будет пользоваться в части 3. Это единственная часть фронтенда, которая знает про URL, HTTP и JSON. Всё остальное просто вызывает `todos.update(2, { done: true })` и получает в ответ типизированный `Result`. 🔌
+
+Вы снова используете `Result` и объединение `ApiError` из [Типизированного fetch](/learn/typescript/typed-fetch), схемы и внедрённый `fetch` из [Валидации во время выполнения](/learn/typescript/runtime-validation), типизированный контрактом `call` из [Общих типов для клиента и сервера](/learn/typescript/sharing-types-between-client-and-server) и типизированные фейки из [Внедрения зависимостей и фейков](/learn/typescript/dependency-injection-and-fakes).
+
+## План
+
+Клиент состоит из двух слоёв:
+
+```text
+web/
+├── api.ts            createApi<Api>: запросы для ЛЮБОГО контракта
+└── todos-client.ts   todoSchemas и createTodosClient: методы для задач
+```
+
+И вот всё, что остальное приложение когда-либо увидит:
+
+```ts
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+```
+
+Каждый метод **возвращает** свои сбои в виде `Result`, а не бросает исключение, поэтому компонент не может забыть, что запрос может не удаться: до задачи не добраться, не проверив сначала `ok`.
+
+Эта часть работает в `shared/` и `web/`. Сервер остаётся в файле части 1 — так же, как в настоящем репозитории веб-приложение никогда не импортирует код сервера. Клиент общается с учебным API, который заменяет ваш сервер, развёрнутый в сети.
+
+## Шаг 1: доверяй, но проверяй
+
+В модуле про Node типизированный контрактом клиент заканчивался приведением типа `value as Api[R]["response"]`: он просто верил серверу. Это честная сделка, когда одна команда выкатывает обе стороны вместе. Но как только сервер работает где-то ещё, стороны расходятся так, что никакой компилятор этого не увидит:
+
+- **Деплои происходят не одновременно.** Браузер может запускать вчерашний фронтенд против сегодняшнего сервера, а мобильному приложению могут быть месяцы.
+- **Не каждый ответ приходит от вашего кода.** Прокси или балансировщик нагрузки перед сервером может ответить HTML-страницей с ошибкой или собственным JSON.
+- **Серверы меняются.** Кто-то переименовывает поле и обновляет тесты сервера, чтобы они совпадали, так что на стороне сервера всё остаётся зелёным.
+
+Поэтому клиент проверяет каждый ответ **общими схемами**. Тогда неудачный деплой превращается в одну понятную ошибку `id: expected a number, got "4"` вместо `undefined`, расползающегося по всему приложению.
+
+### Схема для каждого маршрута
+
+Каждому маршруту (route) нужна схема для его ответа. `DELETE` отвечает 204 без содержимого, и клиент превращает это в `null`, так что в общих схемах появляется ещё один строительный блок:
+
+```ts
+// Новое в части 2: ответ 204 «без содержимого»
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+```
+
+Чтобы у каждого маршрута была схема, причём **правильная**, опишите весь набор сопоставленным типом (mapped type) поверх контракта, совсем как `Handlers` на сервере: «для каждого маршрута `R` — схема для ответа `R`».
+
+```ts
+// По схеме на каждый маршрут, сверенной с контрактом
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+```
+
+Теперь контракт и схемы не могут разойтись. Неправильная или устаревшая схема не компилируется:
+
+```ts
+const OldTodoSchema = object({ id: number(), title: string() });
+
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": TodoSchema, // одна задача вместо списка
+  // ❌ Error: Type 'Schema<{ id: number; title: string; done: boolean; }>' is not assignable to type 'Schema<{ id: number; title: string; done: boolean; }[]>'.
+  "POST /todos": OldTodoSchema, // из времён, когда "done" ещё не было
+  // ❌ Error: Type 'Schema<{ id: number; title: string; }>' is not assignable to type 'Schema<{ id: number; title: string; done: boolean; }>'.
+  // ...
+};
+```
+
+Как и забытый маршрут. С этой ошибкой вы встретитесь, когда нажмёте **«Запустить»** в упражнении:
+
+```ts
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+};
+// ❌ Error: Type '{ "GET /todos": Schema<{ id: number; title: string; done: boolean; }[]>; "POST /todos": Schema<{ id: number; title: string; done: boolean; }>; }' is missing the following properties from type 'ResponseSchemas<TodosApi>': "GET /todos/:id", "PATCH /todos/:id", "DELETE /todos/:id"
+```
+
+## Шаг 2: один дженерик-вызов
+
+`createApi<Api>` принимает схемы и настройки и возвращает одну функцию `call` для всех маршрутов контракта. Это `call` из модуля про Node с тремя улучшениями: он использует `fetch` с `baseUrl` (оба можно внедрить), возвращает `Result` для любого исхода и **проверяет** данные вместо приведения типа:
+
+<CodeExample output={`{ id: 4, title: 'Вздремнуть', done: false }
+true
+{ ok: true, value: null }
+{
+  ok: false,
+  error: { kind: 'http', status: 404, message: 'Todo not found' }
+}
+{
+  ok: false,
+  error: { kind: 'http', status: 400, message: 'title is required' }
+}
+{
+  ok: false,
+  error: {
+    kind: 'invalid',
+    message: '[0].done: expected a boolean, got undefined'
+  }
+}`}>
+
+```ts
+// ========== shared/schemas.ts ==========
+// Библиотека схем из урока «Валидация во время выполнения»
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// Что присылает сервер: тип Todo выводится из схемы
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// Новое в части 2: ответ 204 «без содержимого»
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// Что присылают клиенты
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Любой ответ с ошибкой, например { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: клиент для ЛЮБОГО контракта ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// По схеме на каждый маршрут, сверенной с контрактом
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? `HTTP ${res.status}`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// ========== пробуем на учебном API ==========
+const call = createApi<TodosApi>(todoSchemas);
+
+const created = await call("POST /todos", {
+  body: { title: "Вздремнуть" },
+});
+if (created.ok) console.log(created.value); // Todo
+
+const id = created.ok ? String(created.value.id) : "0";
+const updated = await call("PATCH /todos/:id", {
+  params: { id },
+  body: { done: true },
+});
+if (updated.ok) console.log(updated.value.done); // boolean
+
+console.log(await call("DELETE /todos/:id", { params: { id } }));
+console.log(await call("GET /todos/:id", { params: { id } }));
+console.log(await call("POST /todos", { body: { title: " " } }));
+
+// Сервер, который нарушает контракт (фейковый fetch)
+const odd = createApi<TodosApi>(todoSchemas, {
+  fetch: async () => Response.json([{ id: 1, title: "Вздремнуть" }]),
+});
+console.log(await odd("GET /todos", {}));
+```
+
+</CodeExample>
+
+Проследим один запрос через `call`:
+
+1. **Собираем запрос.** `"PATCH /todos/:id"` делится на метод и шаблон пути, `:id` подставляется из `params`, а `body` отправляется как JSON.
+2. **Ответа нет вообще** (нет сети, сбой DNS, отменённый запрос): `fetch` отклоняется, и это становится `{ kind: "network" }`.
+3. **Код ошибки**: `{ kind: "http" }` с собственным сообщением сервера из `{ "error": "..." }` или `HTTP 503`, если сервер его не прислал. Ответ 204 вообще не читается, потому что у него нет тела.
+4. **Успех** проходит через `schemas[route].parse(data)`. Благодаря сопоставленному типу `schemas[route]` — это `Schema<Api[R]["response"]>`, так что `parse` возвращает **ровно** тип ответа из контракта, без единого приведения типа. Если данные нарушают схему, `ValidationError` становится `{ kind: "invalid" }` с путём к проблеме, как у «странного» сервера в конце вывода.
+
+Любая другая ошибка внутри `call` — это баг в клиенте, поэтому она бросается дальше, а не маскируется под `ApiError`.
+
+## Шаг 3: клиент для приложения
+
+`call("PATCH /todos/:id", { params: { id: "2" }, body: { done: true } })` точен, но писать такое в React-компоненте не хочется. Клиент задач оборачивает его в интерфейс `TodosClient` из плана и добавляет одного помощника, который понадобится интерфейсу пользователя:
+
+```ts title="web/todos-client.ts"
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// Что остальное приложение может делать с сервером
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    update: (id, patch) =>
+      call("PATCH /todos/:id", { params: params(id), body: patch }),
+    remove: (id) => call("DELETE /todos/:id", { params: params(id) }),
+  };
+}
+
+// По понятной фразе на каждый вид ошибки
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Не удаётся связаться с сервером. Вы в сети?";
+    case "http":
+      return `${error.message} (HTTP ${error.status})`;
+    case "invalid":
+      return "Сервер прислал что-то неожиданное.";
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+```
+
+- **id — числа** для приложения и строки в пути, поэтому `params(id)` преобразует их в одном месте.
+- **`createTodosClient` возвращает `TodosClient`.** Приложение зависит от интерфейса, а не от `fetch` или URL, так что в части 3 компонент так же легко получит фейковый клиент, как и настоящий.
+- **`errorMessage`** превращает любую `ApiError` в фразу для экрана. Проверка `never` в `default` означает, что новый вид ошибки, добавленный в `ApiError`, не скомпилируется, пока для него тоже не появится фраза.
+
+## Шаг 4: тесты с типизированным фейковым fetch
+
+Фейки — способ протестировать то, что настоящий сервер делает редко: оборвать соединение или прислать данные, нарушающие контракт. `vi.fn<typeof fetch>` следит, чтобы фейк возвращал настоящий `Promise<Response>`, а `Response.json(body, { status })` собирает ответ одной строкой:
+
+```ts title="web/todos-client.test.ts"
+// ========== web/todos-client.test.ts ==========
+const TEST_URL = "https://todos.test";
+
+describe("клиент задач с фейковым fetch", () => {
+  it("создаёт задачу: POST с JSON-телом", async () => {
+    const todo = { id: 9, title: "Вздремнуть", done: false };
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json(todo, { status: 201 }),
+    );
+    const client = createTodosClient({
+      baseUrl: TEST_URL,
+      fetch: fakeFetch,
+    });
+
+    expect(await client.create({ title: "Вздремнуть" })).toEqual({
+      ok: true,
+      value: todo,
+    });
+    expect(fakeFetch).toHaveBeenCalledWith(`${TEST_URL}/todos`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: '{"title":"Вздремнуть"}',
+    });
+  });
+
+  it("сообщает о сетевых ошибках", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createTodosClient({ fetch: offline }).list();
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+  });
+
+  // ...и ваши два теста из упражнения
+});
+```
+
+`TEST_URL` — выдуманный адрес, и по нему сразу видно, что эти запросы никогда не покидают тест. `toHaveBeenCalledWith` проверяет **весь** запрос: URL, метод, заголовки и тело. Обратите внимание: фейк создаёт новый `Response` при каждом вызове (`async`-функция, а не `mockResolvedValue`), потому что тело ответа можно прочитать только один раз.
+
+## Шаг 5: контрактные тесты на учебном API
+
+Фейки доказывают, что клиент делает то, что, по **вашему** мнению, делает сервер. Доказать, что вы правы, может только настоящий сервер. Для этого здесь и нужен учебный API: он заменяет ваш сервер, развёрнутый в сети, поэтому тесты на нём — **контрактные тесты** для клиента.
+
+```ts
+// Учебный API заменяет ваш сервер, развёрнутый в сети
+describe("клиент задач на учебном API", () => {
+  const client = createTodosClient();
+
+  it("получает список задач", async () => {
+    const result = await client.list();
+    const ids = result.ok ? result.value.map((t) => t.id) : [];
+    expect(ids).toEqual([1, 2, 3]);
+  });
+
+  it("превращает 400 в ошибку http", async () => {
+    expect(await client.create({ title: " " })).toEqual({
+      ok: false,
+      error: {
+        kind: "http",
+        status: 400,
+        message: "title is required",
+      },
+    });
+  });
+
+  // ...и ваш тест из упражнения
+});
+```
+
+Настоящие контрактные тесты медленнее фейков, и им нужен работающий сервер с известными данными, поэтому команды обычно запускают их отдельно: тесты с фейковым fetch — при каждом сохранении, а контрактные тесты — в CI на тестовом сервере (его часто называют **staging**) после каждого деплоя. На PandaDev известные данные достаются бесплатно: учебный API при каждом запуске начинается заново.
+
+<Callout type="warning" title="Контрактные тесты меняют данные">
+
+Тест, который создаёт или удаляет задачи на общем сервере, меняет его для всех остальных, включая следующий тест. На настоящем staging-сервере давайте каждому запуску тестов собственные данные (создайте то, что нужно, и уберите за собой) и никогда не направляйте контрактные тесты на продакшен.
+
+</Callout>
+
+<Quiz
+  question="Сервер изменили, и теперь он присылает done как строку 'yes' вместо true. Какой тест это заметит?"
+  options={[
+    "Тест create с фейковым fetch, потому что он проверяет запрос",
+    "Никакой: по типам клиента done — логическое значение, значит, так и есть",
+    "Контрактный тест на сервере: клиент проверяет ответ схемой TodoSchema и возвращает ошибку invalid",
+    "TypeScript сообщит об изменении при компиляции клиента"
+  ]}
+  answer={2}
+  explanation="Во время выполнения типов уже нет, а фейк присылает только то, что ему велит тест, поэтому изменение увидит лишь тест на настоящем сервере. Поскольку клиент проверяет каждый ответ, результатом будет { ok: false, error: { kind: 'invalid', ... } }, и тест упадёт."
+/>
+
+<Exercise
+  title="Соберите: типизированный клиент"
+  language="typescript"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ========== shared/schemas.ts ==========
+// Библиотека схем из урока «Валидация во время выполнения»
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// Что присылает сервер: тип Todo выводится из схемы
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// Новое в части 2: ответ 204 «без содержимого»
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// Что присылают клиенты
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Любой ответ с ошибкой, например { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: клиент для ЛЮБОГО контракта ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// По схеме на каждый маршрут, сверенной с контрактом
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? \`HTTP \${res.status}\`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  // TODO 1: остальные три маршрута
+};
+
+// Что остальное приложение может делать с сервером
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    // TODO 2: update и remove
+  };
+}
+
+// По понятной фразе на каждый вид ошибки
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Не удаётся связаться с сервером. Вы в сети?";
+    case "http":
+      return \`\${error.message} (HTTP \${error.status})\`;
+    // TODO 3: недостающий вид ошибки
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+
+// ========== web/todos-client.test.ts ==========
+const TEST_URL = "https://todos.test";
+
+describe("клиент задач с фейковым fetch", () => {
+  it("создаёт задачу: POST с JSON-телом", async () => {
+    const todo = { id: 9, title: "Вздремнуть", done: false };
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json(todo, { status: 201 }),
+    );
+    const client = createTodosClient({
+      baseUrl: TEST_URL,
+      fetch: fakeFetch,
+    });
+
+    expect(await client.create({ title: "Вздремнуть" })).toEqual({
+      ok: true,
+      value: todo,
+    });
+    expect(fakeFetch).toHaveBeenCalledWith(\`\${TEST_URL}/todos\`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: '{"title":"Вздремнуть"}',
+    });
+  });
+
+  it("сообщает о сетевых ошибках", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createTodosClient({ fetch: offline }).list();
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+  });
+
+  // TODO 4: два теста с фейковым fetch
+  it.todo("отклоняет задачу, которая нарушает контракт");
+  it.todo("update отправляет только изменённые поля");
+});
+
+// Учебный API заменяет ваш сервер, развёрнутый в сети
+describe("клиент задач на учебном API", () => {
+  const client = createTodosClient();
+
+  it("получает список задач", async () => {
+    const result = await client.list();
+    const ids = result.ok ? result.value.map((t) => t.id) : [];
+    expect(ids).toEqual([1, 2, 3]);
+  });
+
+  it("превращает 400 в ошибку http", async () => {
+    expect(await client.create({ title: " " })).toEqual({
+      ok: false,
+      error: {
+        kind: "http",
+        status: 400,
+        message: "title is required",
+      },
+    });
+  });
+
+  // TODO 5: тест на учебном API
+  it.todo("обновляет, а затем удаляет задачу");
+});`}
+  tests={[
+    { name: "Все тесты проходят, и it.todo не осталось", check: `__vitest.failed === 0 && __vitest.skipped === 0 && __vitest.passed >= 7` },
+    { name: "Ваши тесты ловят клиент, который не проверяет ответы", check: `(await __retest([['value: schemas[route].parse(data)', 'value: data as Api[R]["response"]']])).failed > 0` },
+    { name: "Ваши тесты ловят клиент, который теряет id в URL", check: `(await __retest([['encodeURIComponent(params[name] ?? "")', 'encodeURIComponent("")']])).failed > 0` },
+    { name: "В todoSchemas правильная схема для каждого маршрута", check: `(() => { const s = todoSchemas; const t = { id: 1, title: 'Nap', done: true }; const throws = (f) => { try { f(); return false; } catch (e) { return e instanceof ValidationError; } }; return s['DELETE /todos/:id'].parse(null) === null && throws(() => s['DELETE /todos/:id'].parse({})) && s['GET /todos/:id'].parse(t).title === 'Nap' && s['PATCH /todos/:id'].parse(t).done === true && throws(() => s['PATCH /todos/:id'].parse({ id: 1, title: 'Nap' })) && throws(() => s['GET /todos/:id'].parse([t])) && s['GET /todos'].parse([t]).length === 1; })()` },
+    { name: "update и remove обращаются к учебному API и возвращают проверенные Result", check: `await (async () => { const c = createTodosClient(); const made = await c.create({ title: 'Check me' }); if (!made.ok) return false; const id = made.value.id; const u = await c.update(id, { done: true }); const sentU = __requests.at(-1); const r = await c.remove(id); const sentR = __requests.at(-1); const g = await c.get(id); return u.ok && u.value.id === id && u.value.title === 'Check me' && u.value.done === true && sentU.method === 'PATCH' && sentU.url === 'https://api.pandadev.test/todos/' + id && JSON.stringify(sentU.body) === '{"done":true}' && /json/.test(sentU.headers['content-type'] ?? '') && r.ok && r.value === null && sentR.method === 'DELETE' && sentR.url === 'https://api.pandadev.test/todos/' + id && sentR.body === undefined && !g.ok && g.error.kind === 'http' && g.error.status === 404; })()` },
+    { name: "update и remove превращают ошибки сервера в ошибки http", check: `await (async () => { const c = createTodosClient(); const a = await c.update(999, { done: true }); const b = await c.remove(999); const made = await c.create({ title: 'Keep me' }); const bad = made.ok ? await c.update(made.value.id, { title: '' }) : null; const same = (r, status, message) => r && !r.ok && r.error.kind === 'http' && r.error.status === status && r.error.message === message; return same(a, 404, 'Todo not found') && same(b, 404, 'Todo not found') && same(bad, 400, 'title is required'); })()` },
+    { name: "Всё, что присылает сервер, проверяется, даже пустые ответы", check: `await (async () => { const answer = (body, status) => createTodosClient({ fetch: async () => body === undefined ? new Response(null, { status }) : Response.json(body, { status }) }); const a = await answer({ id: 2, title: 7, done: true }, 200).update(2, { done: true }); const b = await answer({}, 200).remove(2); const c = await answer(undefined, 204).remove(2); const d = await answer({ error: 'Slow down' }, 429).update(2, {}); return !a.ok && a.error.kind === 'invalid' && a.error.message === 'title: expected a string, got 7' && !b.ok && b.error.kind === 'invalid' && b.error.message === 'value: expected no content, got {}' && c.ok && c.value === null && !d.ok && d.error.kind === 'http' && d.error.status === 429 && d.error.message === 'Slow down'; })()` },
+    { name: "У errorMessage есть фраза для каждого вида ошибки", check: `errorMessage({ kind: 'network', message: 'Failed to fetch' }) === "Не удаётся связаться с сервером. Вы в сети?" && errorMessage({ kind: 'http', status: 404, message: 'Todo not found' }) === 'Todo not found (HTTP 404)' && errorMessage({ kind: 'invalid', message: 'id: expected a number, got "1"' }) === 'Сервер прислал что-то неожиданное.'` },
+  ]}
+>
+
+Закончите клиент. В заготовке есть `shared/` из части 1 (плюс `nothing`), `createApi` и уже начатый клиент задач. Нажмите **«Запустить»**: TypeScript найдёт три пробела.
+
+1. **`todoSchemas`**: добавьте схемы для `GET /todos/:id`, `PATCH /todos/:id` и `DELETE /todos/:id`.
+2. **`update` и `remove`** в `createTodosClient`, по образцу `get`: `update(id, patch)` отправляет `PATCH /todos/:id` с патчем в теле, а `remove(id)` отправляет `DELETE /todos/:id`.
+3. **`errorMessage`**: для вида `invalid` — фраза `"Сервер прислал что-то неожиданное."`.
+4. **Три теста** вместо строк `it.todo`:
+   - с фейковым fetch, «отклоняет задачу, которая нарушает контракт»: фейк отвечает `{ id: 2, title: "Вздремнуть", done: "yes" }`, а `update(2, { done: true })` даёт `{ ok: false, error: { kind: "invalid", message: 'done: expected a boolean, got "yes"' } }`;
+   - с фейковым fetch и `baseUrl: TEST_URL`, «update отправляет только изменённые поля»: `update(2, { done: true })` вызывает `fetch` с `` `${TEST_URL}/todos/2` `` и `{ method: "PATCH", headers: { "Content-Type": "application/json" }, body: '{"done":true}' }`;
+   - на учебном API, «обновляет, а затем удаляет задачу»: `update(2, { done: true })` даёт `{ ok: true, value: { id: 2, title: "Build the movie app", done: true } }`, `remove(2)` даёт `{ ok: true, value: null }`, а `get(2)` после этого даёт ошибку `http` с кодом 404 и сообщением `"Todo not found"`.
+
+Проверки убеждаются, что ваши тесты ловят клиент, который пропускает проверку данных, и клиент, который теряет id в URL.
+
+<Hint>
+
+1. `"DELETE /todos/:id": nothing()`; два других маршрута отвечают одной задачей, поэтому используют `TodoSchema`.
+2. `update: (id, patch) => call("PATCH /todos/:id", { params: params(id), body: patch })`, а `remove` устроен как `get`, только с маршрутом `DELETE`.
+3. `case "invalid": return "Сервер прислал что-то неожиданное.";` ставится перед `default`.
+4. Скопируйте тест «создаёт задачу»: `vi.fn<typeof fetch>(async () => Response.json({ id: 2, title: "Вздремнуть", done: "yes" }))`, затем `expect(await client.update(2, { done: true })).toEqual({ ... })`. Для теста на учебном API используйте `client`, который уже создаёт `describe`.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+// ========== shared/schemas.ts ==========
+// Библиотека схем из урока «Валидация во время выполнения»
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// Что присылает сервер: тип Todo выводится из схемы
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// Новое в части 2: ответ 204 «без содержимого»
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+// ========== shared/contract.ts ==========
+// Что присылают клиенты
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Любой ответ с ошибкой, например { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== web/api.ts: клиент для ЛЮБОГО контракта ==========
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+// По схеме на каждый маршрут, сверенной с контрактом
+type ResponseSchemas<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: Schema<Api[R]["response"]>;
+};
+
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+function createApi<Api extends Record<keyof Api, Endpoint>>(
+  schemas: ResponseSchemas<Api>,
+  options: ClientOptions = {},
+) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? `HTTP ${res.status}`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schemas[route].parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  };
+}
+
+// ========== web/todos-client.ts ==========
+const todoSchemas: ResponseSchemas<TodosApi> = {
+  "GET /todos": array(TodoSchema),
+  "POST /todos": TodoSchema,
+  "GET /todos/:id": TodoSchema,
+  "PATCH /todos/:id": TodoSchema,
+  "DELETE /todos/:id": nothing(),
+};
+
+// Что остальное приложение может делать с сервером
+interface TodosClient {
+  list(): Promise<Result<Todo[], ApiError>>;
+  get(id: number): Promise<Result<Todo, ApiError>>;
+  create(input: NewTodo): Promise<Result<Todo, ApiError>>;
+  update(
+    id: number,
+    patch: TodoPatch,
+  ): Promise<Result<Todo, ApiError>>;
+  remove(id: number): Promise<Result<null, ApiError>>;
+}
+
+function createTodosClient(options: ClientOptions = {}): TodosClient {
+  const call = createApi<TodosApi>(todoSchemas, options);
+  const params = (id: number) => ({ id: String(id) });
+  return {
+    list: () => call("GET /todos", {}),
+    get: (id) => call("GET /todos/:id", { params: params(id) }),
+    create: (input) => call("POST /todos", { body: input }),
+    update: (id, patch) =>
+      call("PATCH /todos/:id", { params: params(id), body: patch }),
+    remove: (id) => call("DELETE /todos/:id", { params: params(id) }),
+  };
+}
+
+// По понятной фразе на каждый вид ошибки
+function errorMessage(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return "Не удаётся связаться с сервером. Вы в сети?";
+    case "http":
+      return `${error.message} (HTTP ${error.status})`;
+    case "invalid":
+      return "Сервер прислал что-то неожиданное.";
+    default: {
+      const unhandled: never = error;
+      return unhandled;
+    }
+  }
+}
+
+// ========== web/todos-client.test.ts ==========
+const TEST_URL = "https://todos.test";
+
+describe("клиент задач с фейковым fetch", () => {
+  it("создаёт задачу: POST с JSON-телом", async () => {
+    const todo = { id: 9, title: "Вздремнуть", done: false };
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json(todo, { status: 201 }),
+    );
+    const client = createTodosClient({
+      baseUrl: TEST_URL,
+      fetch: fakeFetch,
+    });
+
+    expect(await client.create({ title: "Вздремнуть" })).toEqual({
+      ok: true,
+      value: todo,
+    });
+    expect(fakeFetch).toHaveBeenCalledWith(`${TEST_URL}/todos`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: '{"title":"Вздремнуть"}',
+    });
+  });
+
+  it("сообщает о сетевых ошибках", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createTodosClient({ fetch: offline }).list();
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+  });
+
+  it("отклоняет задачу, которая нарушает контракт", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({ id: 2, title: "Вздремнуть", done: "yes" }),
+    );
+    const client = createTodosClient({ fetch: fakeFetch });
+    expect(await client.update(2, { done: true })).toEqual({
+      ok: false,
+      error: {
+        kind: "invalid",
+        message: 'done: expected a boolean, got "yes"',
+      },
+    });
+  });
+
+  it("update отправляет только изменённые поля", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({ id: 2, title: "Вздремнуть", done: true }),
+    );
+    const client = createTodosClient({
+      baseUrl: TEST_URL,
+      fetch: fakeFetch,
+    });
+    await client.update(2, { done: true });
+    expect(fakeFetch).toHaveBeenCalledWith(`${TEST_URL}/todos/2`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: '{"done":true}',
+    });
+  });
+});
+
+// Учебный API заменяет ваш сервер, развёрнутый в сети
+describe("клиент задач на учебном API", () => {
+  const client = createTodosClient();
+
+  it("получает список задач", async () => {
+    const result = await client.list();
+    const ids = result.ok ? result.value.map((t) => t.id) : [];
+    expect(ids).toEqual([1, 2, 3]);
+  });
+
+  it("превращает 400 в ошибку http", async () => {
+    expect(await client.create({ title: " " })).toEqual({
+      ok: false,
+      error: {
+        kind: "http",
+        status: 400,
+        message: "title is required",
+      },
+    });
+  });
+
+  it("обновляет, а затем удаляет задачу", async () => {
+    const updated = await client.update(2, { done: true });
+    expect(updated).toEqual({
+      ok: true,
+      value: { id: 2, title: "Build the movie app", done: true },
+    });
+    expect(await client.remove(2)).toEqual({ ok: true, value: null });
+    const gone = await client.get(2);
+    expect(gone).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Todo not found" },
+    });
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- **`nothing()` и `ResponseSchemas<Api>`**: сопоставленный тип, благодаря которому компилятор проверяет, что у каждого маршрута контракта есть правильная схема.
+- **`createApi<Api>`** — один дженерик-`call` для любого контракта, с внедряемыми `fetch` и `baseUrl`, `Result` для любого исхода и проверкой данных вместо приведения типа.
+- **`createTodosClient`** — маленький интерфейс `TodosClient` для приложения, и **`errorMessage`**, у которой есть фраза для каждого вида `ApiError`.
+- **Тесты с типизированным фейковым fetch** для редких случаев (оборванное соединение, данные, нарушающие контракт) и **контрактные тесты** на учебном API, который заменяет ваш развёрнутый сервер.
+
+В [части 3](/learn/typescript/the-react-client) приложение на React получит этот клиент и построит интерфейс, который отвечает мгновенно, ещё до ответа сервера.

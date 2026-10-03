@@ -1,0 +1,1601 @@
+---
+title: "Часть 1: Общие типы и API"
+description: "Спланируйте full-stack приложение со списком задач, напишите общий для обеих сторон контракт и соберите проверенный, покрытый тестами Express API, который отвечает точно как учебный API."
+duration: 25
+xp: 30
+---
+
+Добро пожаловать в итоговый проект Уровня 2! 🐼 За три части вы соберёте на TypeScript **full-stack приложение со списком задач** (to-do app): Express API, типизированный клиент для него и фронтенд на React — и всё это скреплено **одним контрактом** (contract), общим для всех частей. Если сервер и фронтенд разойдутся во мнениях о данных, компилятор и тесты скажут вам об этом задолго до пользователя.
+
+В этой части мы заложим фундамент: общие типы и схемы, а также сервер с валидацией, обработкой ошибок и тестами. Вам пригодятся библиотека схем из урока [Валидация во время выполнения](/learn/typescript/runtime-validation), парсеры и middleware для ошибок из [Валидации и обработки ошибок](/learn/typescript/validation-and-errors), контракт и `mountApi` из [Общих типов для клиента и сервера](/learn/typescript/sharing-types-between-client-and-server), а также интерфейс репозитория и фейки из [Внедрения зависимостей и фейков](/learn/typescript/dependency-injection-and-fakes).
+
+## План
+
+Настоящий full-stack проект держит всё, что нужно обеим сторонам, в одном общем месте:
+
+```text
+todo-app/
+├── shared/
+│   ├── schemas.ts        TodoSchema и тип Todo              Часть 1
+│   └── contract.ts       NewTodo, TodoPatch, TodosApi       Часть 1
+├── server/               Express API и его тесты            Часть 1
+└── web/
+    ├── todos-client.ts   типизированный API-клиент и тесты  Часть 2
+    └── App.tsx           приложение на React                Часть 3
+```
+
+И сервер, и веб-приложение импортируют из `shared/`, поэтому они не могут разойтись в том, как выглядит задача. На PandaDev одно упражнение — это один файл, так что здесь файлы идут в редакторе друг за другом, и каждый начинается с комментария вроде `// ========== shared/contract.ts ==========`.
+
+Есть и ещё один участник. У учебного API по адресу `https://api.pandadev.test` уже есть эндпоинт (endpoint) `/todos`, и в этом проекте он **заменяет ваш сервер, развёрнутый в сети**. В частях 2 и 3 клиент и приложение на React общаются с ним точно так же, как общались бы с вашим Express-сервером на настоящем хостинге. Это работает, только если ваш сервер отвечает **точно** так же, поэтому совпасть с ним — цель этой части. (Учебный API встроен в PandaDev, так что всё работает без интернета, а его данные при каждом запуске начинаются заново. Настоящие API работают так же.)
+
+## Шаг 1: проектная записка
+
+Прежде чем писать код, профессиональные команды пишут короткую **проектную записку** (design note): что предлагает API, что он отвечает и что может пойти не так. У нас есть поворот: API, с которым нужно совпасть, уже существует. Так что начнём с того, что спросим его самого:
+
+<CodeExample output={`GET /todos → 200 [
+  { id: 1, title: 'Learn fetch', done: true },
+  { id: 2, title: 'Build the movie app', done: false },
+  { id: 3, title: 'Eat some bamboo', done: false }
+]
+POST /todos → 201 { id: 4, title: 'Написать контракт', done: false }
+POST /todos → 400 { error: 'title is required' }
+PATCH /todos/2 → 200 { id: 2, title: 'Build the movie app', done: true }
+DELETE /todos/1 → 204 (без тела)
+GET /todos/1 → 404 { error: 'Todo not found' }`}>
+
+```ts
+const API = "https://api.pandadev.test";
+
+async function show(method: string, path: string, body?: object) {
+  const res = await fetch(API + path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text(); // у ответа 204 тела нет вовсе
+  const answer = text ? JSON.parse(text) : "(без тела)";
+  console.log(`${method} ${path} → ${res.status}`, answer);
+}
+
+await show("GET", "/todos");
+await show("POST", "/todos", { title: "  Написать контракт " });
+await show("POST", "/todos", { title: "" });
+await show("PATCH", "/todos/2", { done: true });
+await show("DELETE", "/todos/1");
+await show("GET", "/todos/1");
+```
+
+</CodeExample>
+
+По этим ответам записка почти пишется сама:
+
+| Маршрут | Клиент присылает | Успех | Ошибки |
+| --- | --- | --- | --- |
+| `GET /todos` | | 200 со списком | |
+| `POST /todos` | `{ title, done? }` | 201 с новой задачей | 400 |
+| `GET /todos/:id` | | 200 с задачей | 404 |
+| `PATCH /todos/:id` | `{ title?, done? }` | 200 с изменённой задачей | 400, 404 |
+| `DELETE /todos/:id` | | 204 без тела | 404 |
+
+И решения, которые за ней стоят:
+
+- **id выдаёт сервер.** Клиенты никогда не присылают `id`: сервер берёт следующее число.
+- **Название обрезается и обязательно.** `"  Написать контракт "` сохраняется как `"Написать контракт"`, а пустое название — это 400.
+- **`done` при создании задачи необязателен** и начинается с `false`.
+- **`PATCH` меняет только то, что прислали**, поэтому, чтобы отметить задачу, достаточно отправить `{ "done": true }`.
+- **Любая ошибка — это `{ "error": "..." }`** с сообщением, понятным человеку.
+
+<Callout type="note" title="Если API уже существует, контракт — это он">
+
+В [Валидации и обработке ошибок](/learn/typescript/validation-and-errors) у каждой ошибки помимо сообщения был ещё `code`. Это хороший дизайн, но API, с которым нам нужно совпасть, его не присылает, а клиент не может полагаться на поле, которое присылают только некоторые серверы. Поэтому наше тело ошибки — просто `{ error: string }`. Изменение контракта, которым уже пользуются, — решение для **обеих** сторон: добавить необязательное поле безопасно, а переименование или удаление поля ломает каждого клиента, который его читает.
+
+</Callout>
+
+## Шаг 2: общие схемы
+
+То, что сервер **отправляет**, проверяется схемой. Клиентам эта проверка нужна (это часть 2), а собственные тесты сервера могут с её помощью доказать, что каждый ответ следует контракту. Вот библиотека схем из урока «Валидация во время выполнения» без изменений, а в конце — схема задачи, которая проверяет настоящие данные из учебного API:
+
+<CodeExample output={`[ 'Build the movie app', 'Eat some bamboo' ]
+id: expected a number, got "4"
+done: expected a boolean, got undefined`}>
+
+```ts
+// ========== shared/schemas.ts ==========
+// Библиотека схем из урока «Валидация во время выполнения»
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// Что присылает сервер: тип Todo выводится из схемы
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// Проверяем настоящие данные из учебного API
+const res = await fetch("https://api.pandadev.test/todos");
+const todos = array(TodoSchema).parse(await res.json()); // Todo[]
+console.log(todos.filter((t) => !t.done).map((t) => t.title));
+
+// И данные, которые нарушают контракт
+const broken: unknown[] = [
+  { id: "4", title: "Вздремнуть", done: false },
+  { id: 4, title: "Вздремнуть" },
+];
+for (const data of broken) {
+  try {
+    TodoSchema.parse(data);
+  } catch (error) {
+    if (error instanceof ValidationError) console.log(error.message);
+  }
+}
+```
+
+</CodeExample>
+
+Тип `Todo` никто не пишет вручную: это `Infer<typeof TodoSchema>`, и редактор показывает его как `{ id: number; title: string; done: boolean }`. Добавьте поле в схему — и тип вырастет вместе с ней, одновременно на сервере и в веб-приложении.
+
+## Шаг 3: контракт
+
+Рядом со схемами живёт контракт: типы для того, что клиенты **присылают**, тело ошибки и карта всех эндпоинтов вида `"METHOD /path"` из урока [Общие типы для клиента и сервера](/learn/typescript/sharing-types-between-client-and-server):
+
+```ts title="shared/contract.ts"
+// ========== shared/contract.ts ==========
+// Что присылают клиенты
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Любой ответ с ошибкой, например { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+```
+
+Почему `NewTodo` и `TodoPatch` — простые типы, а не схемы? Потому что они описывают то, что присылают клиенты, а сервер проверяет это **парсерами**, которые перечисляют **все** проблемы сразу (следующий шаг). Наша маленькая библиотека схем останавливается на первой проблеме и не знает необязательных полей, так что она подходит для проверки ответов, а не тел запросов. `TodoPatch` — это `Partial<NewTodo>`: те же поля, но все необязательные, ровно то, что может прислать `PATCH`.
+
+Контракт ловит ошибки на обеих сторонах ещё до запуска:
+
+```ts
+type CreateBody = TodosApi["POST /todos"]["body"]; // NewTodo
+type DeleteAnswer = TodosApi["DELETE /todos/:id"]["response"];
+
+const draft: CreateBody = { title: "Вздремнуть", done: "no" };
+// ❌ Error: Type 'string' is not assignable to type 'boolean | undefined'.
+const patch: TodoPatch = { titel: "Вздремнуть" };
+// ❌ Error: Object literal may only specify known properties, but 'titel' does not exist in type 'Partial<NewTodo>'. Did you mean to write 'title'?
+const gone: DeleteAnswer = { ok: true };
+// ❌ Error: Type '{ ok: boolean; }' is not assignable to type 'null'.
+const route: keyof TodosApi = "PUT /todos/:id";
+// ❌ Error: Type '"PUT /todos/:id"' is not assignable to type 'keyof TodosApi'. Did you mean '"GET /todos/:id"'?
+```
+
+Последняя ошибка сделана намеренно: учебный API принимает и `PUT`, но нашему приложению он не нужен, поэтому в наш контракт он не входит. Контракт описывает то, на что опирается **это** приложение, а не всё, что умеет сервер.
+
+## Шаг 4: разбираем то, что присылают клиенты
+
+На сервере `req.body` — это то, что пришло, поэтому он `unknown`, пока парсер не превратит его в `NewTodo` или в список проблем. Это паттерн парсера из [Валидации и обработки ошибок](/learn/typescript/validation-and-errors) с одним улучшением: маленькие помощники `check...` возвращают чистое значение **или** добавляют сообщение, так что каждое поле проверяется ровно один раз:
+
+<CodeExample output={`корректно: { title: 'Вздремнуть' }
+корректно: { title: 'Выпустить релиз', done: true }
+с ошибками: [ 'title is required', 'done must be true or false' ]
+с ошибками: [ 'body must be a JSON object' ]`}>
+
+```ts
+// Из shared/: типы контракта и isRecord
+type NewTodo = { title: string; done?: boolean };
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+// ========== server/parse.ts ==========
+// Каждая проверка возвращает чистое значение
+// или добавляет сообщение в errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  errors.push("title is required");
+  return undefined;
+}
+
+function checkDone(
+  value: unknown,
+  errors: string[],
+): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  errors.push("done must be true or false");
+  return undefined;
+}
+
+function parseNewTodo(input: unknown): Result<NewTodo, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  let done: boolean | undefined;
+  if (input.done !== undefined) done = checkDone(input.done, errors);
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  // Копируем только известные поля: остальное отбрасываем
+  const todo: NewTodo = { title };
+  if (done !== undefined) todo.done = done;
+  return { ok: true, value: todo };
+}
+
+const inputs: unknown[] = [
+  { title: "  Вздремнуть  ", id: 99, isAdmin: true },
+  { title: "Выпустить релиз", done: true },
+  { title: "   ", done: "yes" },
+  ["not", "an", "object"],
+];
+for (const input of inputs) {
+  const result = parseNewTodo(input);
+  if (result.ok) console.log("корректно:", result.value); // NewTodo
+  else console.log("с ошибками:", result.error); // string[]
+}
+```
+
+</CodeExample>
+
+Первый ввод показывает две привычки, которые делают API безопасным: название **обрезается**, а неизвестные поля `id` и `isAdmin` **отбрасываются**, так что клиент не может выбрать себе id (или что-то ещё, чего ему нельзя). Третий ввод получает обе свои проблемы в одном ответе.
+
+## Шаг 5: сервер
+
+Три строительных блока превращают парсеры в сервер. Все они знакомы вам по модулю про Node, так что вот их версии для задач:
+
+- **Ошибки.** `HttpError` несёт код ответа (status code), а его тип — объединение `400 | 404 | 500`, единственные коды, которые использует этот API, поэтому опечатка вроде `new HttpError(440, ...)` не скомпилируется. `parseOrThrow` превращает плохое тело в 400, в сообщении которого перечислены все проблемы. Обработчик ошибок (четыре аннотированных параметра, регистрируется последним) отвечает телом `ErrorBody` и скрывает подробности всего неожиданного.
+- **Репозиторий за интерфейсом.** Маршруты знают только `TodoRepository`: пять асинхронных методов, как у настоящей базы данных. `createMemoryRepository` хранит задачи в `Map` и начинает с тех же трёх, что и учебный API, так что оба сервера стартуют одинаковыми.
+- **Маршруты из контракта.** `mountApi<Api>` из модуля про Node регистрирует по обработчику на маршрут, а его тип `Handlers` заставляет каждый обработчик возвращать ровно ответ своего маршрута.
+
+Пока сервер подключает только часть контракта. Утилитный тип `Pick` из [Утилитных типов](/learn/typescript/utility-types) урезает `TodosApi` до трёх маршрутов, а остальные два — ваша задача в упражнении:
+
+<CodeExample output={`200 { id: 2, title: 'Build the movie app', done: false }
+201 { id: 4, title: 'Написать сервер', done: false }
+400 { error: 'title is required, done must be true or false' }
+400 { error: 'Unexpected token in JSON' }
+404 { error: 'Todo not found' }
+404 { error: 'Not found' }`}>
+
+```ts
+import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+  type Router,
+} from "express";
+import request from "supertest";
+
+// ===== shared/ (кратко: на деле Todo берётся из TodoSchema) =====
+type Todo = { id: number; title: string; done: boolean };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+// ========== shared/contract.ts ==========
+// Что присылают клиенты
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Любой ответ с ошибкой, например { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== server/parse.ts ==========
+// Каждая проверка возвращает чистое значение
+// или добавляет сообщение в errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  errors.push("title is required");
+  return undefined;
+}
+
+function checkDone(
+  value: unknown,
+  errors: string[],
+): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  errors.push("done must be true or false");
+  return undefined;
+}
+
+function parseNewTodo(input: unknown): Result<NewTodo, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  let done: boolean | undefined;
+  if (input.done !== undefined) done = checkDone(input.done, errors);
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  // Копируем только известные поля: остальное отбрасываем
+  const todo: NewTodo = { title };
+  if (done !== undefined) todo.done = done;
+  return { ok: true, value: todo };
+}
+
+// ========== server/errors.ts ==========
+type ErrorStatus = 400 | 404 | 500;
+
+class HttpError extends Error {
+  readonly status: ErrorStatus;
+  constructor(status: ErrorStatus, message: string) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+// Плохое тело — это 400 со списком всех проблем
+function parseOrThrow<T>(
+  parse: (input: unknown) => Result<T, string[]>,
+  input: unknown,
+): T {
+  const result = parse(input);
+  if (!result.ok) throw new HttpError(400, result.error.join(", "));
+  return result.value;
+}
+
+// Ошибки самого Express (например, битый JSON) несут статус 4xx
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+function errorHandler(
+  err: unknown,
+  req: Request,
+  res: Response<ErrorBody>,
+  _next: NextFunction,
+): void {
+  if (err instanceof HttpError || isClientError(err)) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  console.error("Unexpected:", String(err));
+  res.status(500).json({ error: "Something went wrong" });
+}
+
+// ========== server/repository.ts ==========
+// Что маршрутам нужно от хранилища (асинхронно, как у БД)
+interface TodoRepository {
+  list(): Promise<Todo[]>;
+  get(id: number): Promise<Todo | undefined>;
+  create(input: NewTodo): Promise<Todo>;
+  update(id: number, patch: TodoPatch): Promise<Todo | undefined>;
+  remove(id: number): Promise<boolean>;
+}
+
+// Те же три задачи, с которых начинает учебный API
+const STARTER_TODOS: Todo[] = [
+  { id: 1, title: "Learn fetch", done: true },
+  { id: 2, title: "Build the movie app", done: false },
+  { id: 3, title: "Eat some bamboo", done: false },
+];
+
+function createMemoryRepository(
+  start: Todo[] = STARTER_TODOS,
+): TodoRepository {
+  const todos = new Map<number, Todo>();
+  for (const todo of start) todos.set(todo.id, { ...todo });
+  let nextId = Math.max(0, ...todos.keys()) + 1;
+  return {
+    async list() {
+      return [...todos.values()];
+    },
+    async get(id) {
+      return todos.get(id);
+    },
+    async create(input) {
+      const todo: Todo = {
+        id: nextId++,
+        title: input.title,
+        done: input.done ?? false,
+      };
+      todos.set(todo.id, todo);
+      return todo;
+    },
+    async update(id, patch) {
+      const todo = todos.get(id);
+      if (!todo) return undefined;
+      const updated: Todo = { ...todo, ...patch };
+      todos.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return todos.delete(id);
+    },
+  };
+}
+
+// ========== server/mount-api.ts (из модуля про Node) ==========
+type RawRequest = { params: Record<string, string>; body: unknown };
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+
+function register(
+  router: Router,
+  method: string,
+  path: string,
+  handler: RequestHandler,
+): void {
+  if (method === "GET") router.get(path, handler);
+  else if (method === "POST") router.post(path, handler);
+  else if (method === "PATCH") router.patch(path, handler);
+  else if (method === "DELETE") router.delete(path, handler);
+  else throw new Error(`Unsupported method: ${method}`);
+}
+
+// POST отвечает 201, результат null — 204, всё остальное — 200
+function mountApi<Api extends Record<keyof Api, Endpoint>>(
+  router: Router,
+  handlers: Handlers<Api>,
+): void {
+  for (const route of Object.keys(handlers) as (keyof Api & string)[]) {
+    const [method, path] = route.split(" ");
+    const handler = handlers[route];
+    register(router, method, path, async (req, res) => {
+      const { params, body } = req;
+      const result = await handler({ params, body });
+      if (result === null) {
+        res.sendStatus(204);
+        return;
+      }
+      res.status(method === "POST" ? 201 : 200).json(result);
+    });
+  }
+}
+
+// ========== server/app.ts ==========
+// Пока только часть контракта (остальное — ваша задача)
+type FirstRoutes = Pick<
+  TodosApi,
+  "GET /todos" | "POST /todos" | "GET /todos/:id"
+>;
+
+function createApp(
+  repo: TodoRepository = createMemoryRepository(),
+): Application {
+  async function findTodo(idText: string): Promise<Todo> {
+    const todo = await repo.get(Number(idText));
+    if (!todo) throw new HttpError(404, "Todo not found");
+    return todo;
+  }
+
+  const router = express.Router();
+  mountApi<FirstRoutes>(router, {
+    "GET /todos": () => repo.list(),
+    "POST /todos": async ({ body }) =>
+      repo.create(parseOrThrow(parseNewTodo, body)),
+    "GET /todos/:id": ({ params }) => findTodo(params.id),
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use(router);
+  app.use((req, res: Response<ErrorBody>) => {
+    res.status(404).json({ error: "Not found" });
+  });
+  app.use(errorHandler);
+  return app;
+}
+
+// ========== пробуем ==========
+const api = request(createApp());
+type Answer = { status: number; body: unknown };
+async function show(test: PromiseLike<Answer>) {
+  const res = await test;
+  console.log(res.status, res.body);
+}
+
+await show(api.get("/todos/2"));
+await show(api.post("/todos").send({ title: "  Написать сервер " }));
+await show(api.post("/todos").send({ title: 42, done: "yes" }));
+await show(
+  api
+    .post("/todos")
+    .set("Content-Type", "application/json")
+    .send('{ "title": '), // битый JSON
+);
+await show(api.get("/todos/99"));
+await show(api.patch("/todos/2").send({ done: true })); // пока нет!
+```
+
+</CodeExample>
+
+На что обратить внимание:
+
+- **Маршруты крошечные.** `POST /todos` проверяет и сохраняет в одну строку, а `GET /todos/:id` — это просто `findTodo`, который бросает 404. Любой сбой заканчивается в обработчике ошибок, в одной и той же форме `{ error }`.
+- **Битый JSON — это 400, а не 500.** `express.json()` бросает свою `SyntaxError` со `status` 400, и `isClientError` её узнаёт.
+- **`PATCH` отвечает "Not found"**: этот маршрут ещё не подключён, поэтому отвечает обработчик 404. Когда в упражнении вы замените `mountApi<FirstRoutes>` на `mountApi<TodosApi>`, компилятор сам перечислит два недостающих обработчика.
+- **`createApp` получает репозиторий параметром.** Настоящий сервер передал бы репозиторий на базе данных, а тесты могут передать что угодно, что реализует `TodoRepository`.
+
+## Шаг 6: тесты, которые держат сервер в рамках контракта
+
+Набор тестов отправляет настоящие запросы через supertest, каждому тесту — свежее приложение:
+
+```ts title="server/todos.test.ts"
+// ========== server/todos.test.ts ==========
+describe("API задач", () => {
+  let api: ReturnType<typeof request>;
+
+  beforeEach(() => {
+    api = request(createApp(createMemoryRepository()));
+  });
+
+  it("отдаёт стартовые задачи, как в контракте", async () => {
+    const res = await api.get("/todos").expect(200);
+    const todos = array(TodoSchema).parse(res.body); // Todo[]
+    expect(todos.map((t) => t.title)).toEqual([
+      "Learn fetch",
+      "Build the movie app",
+      "Eat some bamboo",
+    ]);
+  });
+
+  it("создаёт задачу с обрезанным названием", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: "  Вздремнуть  " })
+      .expect(201);
+    expect(TodoSchema.parse(res.body)).toEqual({
+      id: 4,
+      title: "Вздремнуть",
+      done: false,
+    });
+  });
+
+  it("перечисляет все проблемы тела запроса", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: " ", done: "yes" })
+      .expect(400);
+    const body: ErrorBody = res.body;
+    expect(body).toEqual({
+      error: "title is required, done must be true or false",
+    });
+  });
+
+  it("отвечает 404 на несуществующую задачу", async () => {
+    const res = await api.get("/todos/99").expect(404);
+    expect(res.body).toEqual({ error: "Todo not found" });
+  });
+
+  it("скрывает подробности, когда падает база данных", async () => {
+    const broken: TodoRepository = {
+      ...createMemoryRepository(),
+      list: async () => {
+        throw new Error("База данных упала");
+      },
+    };
+    const res = await request(createApp(broken)).get("/todos");
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: "Something went wrong" });
+  });
+
+  // ...и два теста, которые вы напишете в упражнении
+});
+```
+
+Два вида тестов отсюда стоит перенести в собственные проекты:
+
+- **Контрактные тесты.** `array(TodoSchema).parse(res.body)` бросает исключение, если хоть одна задача в ответе нарушает общую схему. Если кто-то изменит сервер, и он станет присылать `done: "yes"` или забудет поле, этот тест упадёт раньше, чем это увидит клиент.
+- **Фейк, который ломается.** Последний тест берёт рабочий репозиторий в памяти через spread и подменяет один метод другим, который бросает исключение. Поскольку `createApp` получает свой репозиторий, тест «база данных упала» занимает три строки и доказывает, что клиенты получают вежливый 500 без подробностей. (Строка `console.error` из обработчика ошибок появится в выводе: на настоящем сервере это ваш лог.)
+
+<Callout type="tip" title="Одни и те же запросы, два сервера">
+
+Как убедиться, что ваш сервер действительно совпадает с учебным API? Отправьте обоим одни и те же запросы и сравните каждый код ответа и каждое тело. Именно это делают проверки упражнения ниже. Команды поступают так же, когда заменяют старый сервис новым: запускают старый и новый бок о бок и сравнивают их ответы.
+
+</Callout>
+
+<Quiz
+  question="В запросе PATCH /todos/9 битое тело, а задачи 9 нет. Учебный API отвечает 404. Почему ваш сервер тоже должен ответить 404, а не 400?"
+  options={[
+    "Потому что 404 всегда важнее 400",
+    "Потому что клиенты написаны под поведение существующего API, и то, какая ошибка побеждает, тоже часть контракта",
+    "Потому что Express автоматически проверяет id раньше тела",
+    "Это неважно: клиенты никогда не смотрят на коды ответа"
+  ]}
+  answer={1}
+  explanation="Ваш сервер заменяет API, которым клиенты уже пользуются. Если на тот же запрос он сообщит о другой ошибке, клиент, который обрабатывает «не найдено» (например, убирает задачу из своего списка), поведёт себя иначе. Совпадение с существующим поведением, вплоть до того, какая проверка идёт первой, сохраняет работоспособность всех клиентов."
+/>
+
+<Exercise
+  title="Соберите: API задач"
+  language="typescript"
+  starter={`import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+  type Router,
+} from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ========== shared/schemas.ts ==========
+// Библиотека схем из урока «Валидация во время выполнения»
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// Что присылает сервер: тип Todo выводится из схемы
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// ========== shared/contract.ts ==========
+// Что присылают клиенты
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Любой ответ с ошибкой, например { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== server/parse.ts ==========
+// Каждая проверка возвращает чистое значение
+// или добавляет сообщение в errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  errors.push("title is required");
+  return undefined;
+}
+
+function checkDone(
+  value: unknown,
+  errors: string[],
+): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  errors.push("done must be true or false");
+  return undefined;
+}
+
+function parseNewTodo(input: unknown): Result<NewTodo, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  let done: boolean | undefined;
+  if (input.done !== undefined) done = checkDone(input.done, errors);
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  // Копируем только известные поля: остальное отбрасываем
+  const todo: NewTodo = { title };
+  if (done !== undefined) todo.done = done;
+  return { ok: true, value: todo };
+}
+
+// TODO 1: как parseNewTodo, но все поля необязательны
+function parseTodoPatch(input: unknown): Result<TodoPatch, string[]> {
+  return { ok: false, error: ["ещё не написано"] };
+}
+
+// ========== server/errors.ts ==========
+type ErrorStatus = 400 | 404 | 500;
+
+class HttpError extends Error {
+  readonly status: ErrorStatus;
+  constructor(status: ErrorStatus, message: string) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+// Плохое тело — это 400 со списком всех проблем
+function parseOrThrow<T>(
+  parse: (input: unknown) => Result<T, string[]>,
+  input: unknown,
+): T {
+  const result = parse(input);
+  if (!result.ok) throw new HttpError(400, result.error.join(", "));
+  return result.value;
+}
+
+// Ошибки самого Express (например, битый JSON) несут статус 4xx
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+function errorHandler(
+  err: unknown,
+  req: Request,
+  res: Response<ErrorBody>,
+  _next: NextFunction,
+): void {
+  if (err instanceof HttpError || isClientError(err)) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  console.error("Unexpected:", String(err));
+  res.status(500).json({ error: "Something went wrong" });
+}
+
+// ========== server/repository.ts ==========
+// Что маршрутам нужно от хранилища (асинхронно, как у БД)
+interface TodoRepository {
+  list(): Promise<Todo[]>;
+  get(id: number): Promise<Todo | undefined>;
+  create(input: NewTodo): Promise<Todo>;
+  update(id: number, patch: TodoPatch): Promise<Todo | undefined>;
+  remove(id: number): Promise<boolean>;
+}
+
+// Те же три задачи, с которых начинает учебный API
+const STARTER_TODOS: Todo[] = [
+  { id: 1, title: "Learn fetch", done: true },
+  { id: 2, title: "Build the movie app", done: false },
+  { id: 3, title: "Eat some bamboo", done: false },
+];
+
+function createMemoryRepository(
+  start: Todo[] = STARTER_TODOS,
+): TodoRepository {
+  const todos = new Map<number, Todo>();
+  for (const todo of start) todos.set(todo.id, { ...todo });
+  let nextId = Math.max(0, ...todos.keys()) + 1;
+  return {
+    async list() {
+      return [...todos.values()];
+    },
+    async get(id) {
+      return todos.get(id);
+    },
+    async create(input) {
+      const todo: Todo = {
+        id: nextId++,
+        title: input.title,
+        done: input.done ?? false,
+      };
+      todos.set(todo.id, todo);
+      return todo;
+    },
+    async update(id, patch) {
+      const todo = todos.get(id);
+      if (!todo) return undefined;
+      const updated: Todo = { ...todo, ...patch };
+      todos.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return todos.delete(id);
+    },
+  };
+}
+
+// ========== server/mount-api.ts (из модуля про Node) ==========
+type RawRequest = { params: Record<string, string>; body: unknown };
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+
+function register(
+  router: Router,
+  method: string,
+  path: string,
+  handler: RequestHandler,
+): void {
+  if (method === "GET") router.get(path, handler);
+  else if (method === "POST") router.post(path, handler);
+  else if (method === "PATCH") router.patch(path, handler);
+  else if (method === "DELETE") router.delete(path, handler);
+  else throw new Error(\`Unsupported method: \${method}\`);
+}
+
+// POST отвечает 201, результат null — 204, всё остальное — 200
+function mountApi<Api extends Record<keyof Api, Endpoint>>(
+  router: Router,
+  handlers: Handlers<Api>,
+): void {
+  for (const route of Object.keys(handlers) as (keyof Api & string)[]) {
+    const [method, path] = route.split(" ");
+    const handler = handlers[route];
+    register(router, method, path, async (req, res) => {
+      const { params, body } = req;
+      const result = await handler({ params, body });
+      if (result === null) {
+        res.sendStatus(204);
+        return;
+      }
+      res.status(method === "POST" ? 201 : 200).json(result);
+    });
+  }
+}
+
+// ========== server/app.ts ==========
+function createApp(
+  repo: TodoRepository = createMemoryRepository(),
+): Application {
+  async function findTodo(idText: string): Promise<Todo> {
+    const todo = await repo.get(Number(idText));
+    if (!todo) throw new HttpError(404, "Todo not found");
+    return todo;
+  }
+
+  const router = express.Router();
+  mountApi<TodosApi>(router, {
+    "GET /todos": () => repo.list(),
+    "POST /todos": async ({ body }) =>
+      repo.create(parseOrThrow(parseNewTodo, body)),
+    "GET /todos/:id": ({ params }) => findTodo(params.id),
+    // TODO 2: "PATCH /todos/:id" и "DELETE /todos/:id"
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use(router);
+  app.use((req, res: Response<ErrorBody>) => {
+    res.status(404).json({ error: "Not found" });
+  });
+  app.use(errorHandler);
+  return app;
+}
+
+// ========== server/todos.test.ts ==========
+describe("API задач", () => {
+  let api: ReturnType<typeof request>;
+
+  beforeEach(() => {
+    api = request(createApp(createMemoryRepository()));
+  });
+
+  it("отдаёт стартовые задачи, как в контракте", async () => {
+    const res = await api.get("/todos").expect(200);
+    const todos = array(TodoSchema).parse(res.body); // Todo[]
+    expect(todos.map((t) => t.title)).toEqual([
+      "Learn fetch",
+      "Build the movie app",
+      "Eat some bamboo",
+    ]);
+  });
+
+  it("создаёт задачу с обрезанным названием", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: "  Вздремнуть  " })
+      .expect(201);
+    expect(TodoSchema.parse(res.body)).toEqual({
+      id: 4,
+      title: "Вздремнуть",
+      done: false,
+    });
+  });
+
+  it("перечисляет все проблемы тела запроса", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: " ", done: "yes" })
+      .expect(400);
+    const body: ErrorBody = res.body;
+    expect(body).toEqual({
+      error: "title is required, done must be true or false",
+    });
+  });
+
+  it("отвечает 404 на несуществующую задачу", async () => {
+    const res = await api.get("/todos/99").expect(404);
+    expect(res.body).toEqual({ error: "Todo not found" });
+  });
+
+  it("скрывает подробности, когда падает база данных", async () => {
+    const broken: TodoRepository = {
+      ...createMemoryRepository(),
+      list: async () => {
+        throw new Error("База данных упала");
+      },
+    };
+    const res = await request(createApp(broken)).get("/todos");
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: "Something went wrong" });
+  });
+
+  // TODO 3: замените их настоящими тестами
+  it.todo("PATCH меняет только присланные поля");
+  it.todo("DELETE отвечает 204, и задачи больше нет");
+});`}
+  tests={[
+    { name: "Все тесты проходят, и it.todo не осталось", check: `__vitest.failed === 0 && __vitest.skipped === 0 && __vitest.passed >= 7` },
+    { name: "Ваш тест PATCH ловит обновление, которое сбрасывает неприсланные поля", check: `(await __retest([['const updated: Todo = { ...todo, ...patch };', 'const updated: Todo = { ...todo, title: "", done: false, ...patch };']])).failed > 0` },
+    { name: "Ваш тест DELETE ловит remove, который ничего не удаляет", check: `(await __retest([['return todos.delete(id);', 'return todos.has(id);']])).failed > 0` },
+    { name: "Ваш тест DELETE ловит 200 вместо 204", check: `(await __retest([['res.sendStatus(204);', 'res.json(result);']])).failed > 0` },
+    { name: "parseTodoPatch принимает любой корректный набор полей и перечисляет все проблемы", check: `(() => { const same = (x, y) => JSON.stringify(Object.entries(x).sort()) === JSON.stringify(Object.entries(y).sort()); const p = (v) => parseTodoPatch(v); const a = p({}); const b = p({ title: '  Nap now ', id: 7 }); const c = p({ done: false }); const d = p({ title: 'Ship', done: true, extra: 1 }); const bad = p({ title: '  ', done: 'yes' }); const t = p({ title: 5 }); return a.ok && same(a.value, {}) && b.ok && same(b.value, { title: 'Nap now' }) && c.ok && same(c.value, { done: false }) && d.ok && same(d.value, { title: 'Ship', done: true }) && !bad.ok && bad.error.join('|') === 'title is required|done must be true or false' && !t.ok && t.error.join('|') === 'title is required' && [null, [], 'x', 3].every((v) => { const r = p(v); return !r.ok && r.error.join('|') === 'body must be a JSON object'; }); })()` },
+    { name: "PATCH /todos/:id меняет только присланное, проверяет его и отвечает 404 на неизвестный id", check: `await (async () => { const api = require('supertest')(createApp(createMemoryRepository())); const a = await api.patch('/todos/2').send({ done: true, id: 50 }); const b = await api.patch('/todos/2').send({ title: '  Build the to-do app ' }); const bad = await api.patch('/todos/2').send({ title: '', done: 1 }); const missing = await api.patch('/todos/9').send({ done: 'nope' }); const after = (await api.get('/todos/2')).body; return a.status === 200 && JSON.stringify(a.body) === '{"id":2,"title":"Build the movie app","done":true}' && b.status === 200 && b.body.title === 'Build the to-do app' && b.body.done === true && bad.status === 400 && bad.body.error === 'title is required, done must be true or false' && missing.status === 404 && missing.body.error === 'Todo not found' && JSON.stringify(after) === '{"id":2,"title":"Build the to-do app","done":true}'; })()` },
+    { name: "DELETE /todos/:id отвечает 204, и задачи больше нет", check: `await (async () => { const api = require('supertest')(createApp(createMemoryRepository())); const d = await api.delete('/todos/1'); const g = await api.get('/todos/1'); const again = await api.delete('/todos/1'); const list = await api.get('/todos'); const next = await api.post('/todos').send({ title: 'Next' }); return d.status === 204 && d.text === '' && g.status === 404 && again.status === 404 && again.body.error === 'Todo not found' && list.body.length === 2 && next.body.id === 4; })()` },
+    { name: "Ваш сервер отвечает на каждый запрос точно так же, как учебный API", check: `await (async () => { const ours = require('supertest')(createApp(createMemoryRepository())); const steps = [['GET', '/todos'], ['POST', '/todos', { title: '  Ship it ' }], ['POST', '/todos', { title: '' }], ['PATCH', '/todos/2', { done: true }], ['PATCH', '/todos/2', { title: 'Build the to-do app' }], ['PATCH', '/todos/2', { title: '  ' }], ['PATCH', '/todos/9', { title: '' }], ['GET', '/todos/2'], ['DELETE', '/todos/1'], ['GET', '/todos/1'], ['DELETE', '/todos/1'], ['GET', '/todos']]; for (const [method, path, body] of steps) { let test = ours[method.toLowerCase()](path); if (body) test = test.send(body); const a = await test; const res = await fetch('https://api.pandadev.test' + path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined }); const text = await res.text(); const mine = a.status === 204 ? null : a.body; const theirs = text ? JSON.parse(text) : null; if (a.status !== res.status || JSON.stringify(mine) !== JSON.stringify(theirs)) return false; } return true; })()` },
+  ]}
+>
+
+Закончите API задач. В заготовке есть всё из этого урока, от `shared/` до тестов. Нажмите **«Запустить»**: TypeScript уже знает, чего не хватает.
+
+1. **`parseTodoPatch(input)`** в `server/parse.ts`: как `parseNewTodo`, но **все** поля необязательны. Проверяйте только присутствующие поля (с помощью `checkTitle` и `checkDone`) и возвращайте только их, так что `{}` — корректный патч. Собирайте все проблемы, сначала про название; всё, что не является объектом, даёт только `"body must be a JSON object"`.
+2. **Последние два маршрута.** Теперь `createApp` подключает весь `TodosApi`, и TypeScript сообщает, что не хватает двух обработчиков:
+   - `PATCH /todos/:id`: найдите задачу (404, если её нет), **затем** разберите тело с помощью `parseOrThrow(parseTodoPatch, body)` и верните обновлённую задачу. Именно в таком порядке работает учебный API: неизвестный id — это 404, даже если тело тоже плохое.
+   - `DELETE /todos/:id`: найдите задачу (404), удалите её и верните `null`, который `mountApi` превращает в 204.
+3. **Два теста** вместо строк `it.todo`:
+   - «PATCH меняет только присланные поля»: `PATCH /todos/2` с `{ done: true }` отвечает 200 с `{ id: 2, title: "Build the movie app", done: true }`, а последующий `GET /todos/2` возвращает ту же задачу.
+   - «DELETE отвечает 204, и задачи больше нет»: `DELETE /todos/3` отвечает 204, а затем `GET /todos/3` отвечает 404.
+
+Проверки подкладывают баги в готовый репозиторий и в `mountApi`, чтобы убедиться, что ваши тесты их ловят. Последняя проверка отправляет одни и те же запросы вашему серверу и учебному API: каждый код ответа и каждое тело должны совпасть.
+
+<Hint>
+
+1. Начните как в `parseNewTodo`, затем `const patch: TodoPatch = {};`. Для каждого поля: `if (input.title !== undefined) { const title = checkTitle(input.title, errors); if (title !== undefined) patch.title = title; }`, и то же самое для `done` с `checkDone`. В конце: `errors.length > 0 ? { ok: false, error: errors } : { ok: true, value: patch }`.
+2. `"PATCH /todos/:id": async ({ params, body }) => { const todo = await findTodo(params.id); const patch = parseOrThrow(parseTodoPatch, body); return (await repo.update(todo.id, patch)) ?? todo; }`. Для `DELETE` — `await repo.remove(todo.id)` после `findTodo`, затем `return null;`.
+3. `await api.delete("/todos/3").expect(204);` проверяет код ответа одной строкой; `toEqual` сравнивает тела целиком.
+
+</Hint>
+
+<Solution>
+
+```ts
+import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+  type Router,
+} from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ========== shared/schemas.ts ==========
+// Библиотека схем из урока «Валидация во время выполнения»
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// Что присылает сервер: тип Todo выводится из схемы
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+
+// ========== shared/contract.ts ==========
+// Что присылают клиенты
+type NewTodo = { title: string; done?: boolean };
+type TodoPatch = Partial<NewTodo>;
+
+// Любой ответ с ошибкой, например { "error": "title is required" }
+interface ErrorBody {
+  error: string;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "GET /todos/:id": { params: { id: string }; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: TodoPatch;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ========== server/parse.ts ==========
+// Каждая проверка возвращает чистое значение
+// или добавляет сообщение в errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  errors.push("title is required");
+  return undefined;
+}
+
+function checkDone(
+  value: unknown,
+  errors: string[],
+): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  errors.push("done must be true or false");
+  return undefined;
+}
+
+function parseNewTodo(input: unknown): Result<NewTodo, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  let done: boolean | undefined;
+  if (input.done !== undefined) done = checkDone(input.done, errors);
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  // Копируем только известные поля: остальное отбрасываем
+  const todo: NewTodo = { title };
+  if (done !== undefined) todo.done = done;
+  return { ok: true, value: todo };
+}
+
+function parseTodoPatch(input: unknown): Result<TodoPatch, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const patch: TodoPatch = {};
+  if (input.title !== undefined) {
+    const title = checkTitle(input.title, errors);
+    if (title !== undefined) patch.title = title;
+  }
+  if (input.done !== undefined) {
+    const done = checkDone(input.done, errors);
+    if (done !== undefined) patch.done = done;
+  }
+  if (errors.length > 0) return { ok: false, error: errors };
+  return { ok: true, value: patch };
+}
+
+// ========== server/errors.ts ==========
+type ErrorStatus = 400 | 404 | 500;
+
+class HttpError extends Error {
+  readonly status: ErrorStatus;
+  constructor(status: ErrorStatus, message: string) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+// Плохое тело — это 400 со списком всех проблем
+function parseOrThrow<T>(
+  parse: (input: unknown) => Result<T, string[]>,
+  input: unknown,
+): T {
+  const result = parse(input);
+  if (!result.ok) throw new HttpError(400, result.error.join(", "));
+  return result.value;
+}
+
+// Ошибки самого Express (например, битый JSON) несут статус 4xx
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+function errorHandler(
+  err: unknown,
+  req: Request,
+  res: Response<ErrorBody>,
+  _next: NextFunction,
+): void {
+  if (err instanceof HttpError || isClientError(err)) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  console.error("Unexpected:", String(err));
+  res.status(500).json({ error: "Something went wrong" });
+}
+
+// ========== server/repository.ts ==========
+// Что маршрутам нужно от хранилища (асинхронно, как у БД)
+interface TodoRepository {
+  list(): Promise<Todo[]>;
+  get(id: number): Promise<Todo | undefined>;
+  create(input: NewTodo): Promise<Todo>;
+  update(id: number, patch: TodoPatch): Promise<Todo | undefined>;
+  remove(id: number): Promise<boolean>;
+}
+
+// Те же три задачи, с которых начинает учебный API
+const STARTER_TODOS: Todo[] = [
+  { id: 1, title: "Learn fetch", done: true },
+  { id: 2, title: "Build the movie app", done: false },
+  { id: 3, title: "Eat some bamboo", done: false },
+];
+
+function createMemoryRepository(
+  start: Todo[] = STARTER_TODOS,
+): TodoRepository {
+  const todos = new Map<number, Todo>();
+  for (const todo of start) todos.set(todo.id, { ...todo });
+  let nextId = Math.max(0, ...todos.keys()) + 1;
+  return {
+    async list() {
+      return [...todos.values()];
+    },
+    async get(id) {
+      return todos.get(id);
+    },
+    async create(input) {
+      const todo: Todo = {
+        id: nextId++,
+        title: input.title,
+        done: input.done ?? false,
+      };
+      todos.set(todo.id, todo);
+      return todo;
+    },
+    async update(id, patch) {
+      const todo = todos.get(id);
+      if (!todo) return undefined;
+      const updated: Todo = { ...todo, ...patch };
+      todos.set(id, updated);
+      return updated;
+    },
+    async remove(id) {
+      return todos.delete(id);
+    },
+  };
+}
+
+// ========== server/mount-api.ts (из модуля про Node) ==========
+type RawRequest = { params: Record<string, string>; body: unknown };
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+
+function register(
+  router: Router,
+  method: string,
+  path: string,
+  handler: RequestHandler,
+): void {
+  if (method === "GET") router.get(path, handler);
+  else if (method === "POST") router.post(path, handler);
+  else if (method === "PATCH") router.patch(path, handler);
+  else if (method === "DELETE") router.delete(path, handler);
+  else throw new Error(`Unsupported method: ${method}`);
+}
+
+// POST отвечает 201, результат null — 204, всё остальное — 200
+function mountApi<Api extends Record<keyof Api, Endpoint>>(
+  router: Router,
+  handlers: Handlers<Api>,
+): void {
+  for (const route of Object.keys(handlers) as (keyof Api & string)[]) {
+    const [method, path] = route.split(" ");
+    const handler = handlers[route];
+    register(router, method, path, async (req, res) => {
+      const { params, body } = req;
+      const result = await handler({ params, body });
+      if (result === null) {
+        res.sendStatus(204);
+        return;
+      }
+      res.status(method === "POST" ? 201 : 200).json(result);
+    });
+  }
+}
+
+// ========== server/app.ts ==========
+function createApp(
+  repo: TodoRepository = createMemoryRepository(),
+): Application {
+  async function findTodo(idText: string): Promise<Todo> {
+    const todo = await repo.get(Number(idText));
+    if (!todo) throw new HttpError(404, "Todo not found");
+    return todo;
+  }
+
+  const router = express.Router();
+  mountApi<TodosApi>(router, {
+    "GET /todos": () => repo.list(),
+    "POST /todos": async ({ body }) =>
+      repo.create(parseOrThrow(parseNewTodo, body)),
+    "GET /todos/:id": ({ params }) => findTodo(params.id),
+    "PATCH /todos/:id": async ({ params, body }) => {
+      const todo = await findTodo(params.id);
+      const patch = parseOrThrow(parseTodoPatch, body);
+      return (await repo.update(todo.id, patch)) ?? todo;
+    },
+    "DELETE /todos/:id": async ({ params }) => {
+      const todo = await findTodo(params.id);
+      await repo.remove(todo.id);
+      return null;
+    },
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use(router);
+  app.use((req, res: Response<ErrorBody>) => {
+    res.status(404).json({ error: "Not found" });
+  });
+  app.use(errorHandler);
+  return app;
+}
+
+// ========== server/todos.test.ts ==========
+describe("API задач", () => {
+  let api: ReturnType<typeof request>;
+
+  beforeEach(() => {
+    api = request(createApp(createMemoryRepository()));
+  });
+
+  it("отдаёт стартовые задачи, как в контракте", async () => {
+    const res = await api.get("/todos").expect(200);
+    const todos = array(TodoSchema).parse(res.body); // Todo[]
+    expect(todos.map((t) => t.title)).toEqual([
+      "Learn fetch",
+      "Build the movie app",
+      "Eat some bamboo",
+    ]);
+  });
+
+  it("создаёт задачу с обрезанным названием", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: "  Вздремнуть  " })
+      .expect(201);
+    expect(TodoSchema.parse(res.body)).toEqual({
+      id: 4,
+      title: "Вздремнуть",
+      done: false,
+    });
+  });
+
+  it("перечисляет все проблемы тела запроса", async () => {
+    const res = await api
+      .post("/todos")
+      .send({ title: " ", done: "yes" })
+      .expect(400);
+    const body: ErrorBody = res.body;
+    expect(body).toEqual({
+      error: "title is required, done must be true or false",
+    });
+  });
+
+  it("отвечает 404 на несуществующую задачу", async () => {
+    const res = await api.get("/todos/99").expect(404);
+    expect(res.body).toEqual({ error: "Todo not found" });
+  });
+
+  it("скрывает подробности, когда падает база данных", async () => {
+    const broken: TodoRepository = {
+      ...createMemoryRepository(),
+      list: async () => {
+        throw new Error("База данных упала");
+      },
+    };
+    const res = await request(createApp(broken)).get("/todos");
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: "Something went wrong" });
+  });
+
+  it("PATCH меняет только присланные поля", async () => {
+    const res = await api.patch("/todos/2").send({ done: true });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      id: 2,
+      title: "Build the movie app",
+      done: true,
+    });
+    const saved = await api.get("/todos/2");
+    expect(saved.body).toEqual(res.body);
+  });
+
+  it("DELETE отвечает 204, и задачи больше нет", async () => {
+    await api.delete("/todos/3").expect(204);
+    await api.get("/todos/3").expect(404);
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- **Проектную записку** для API задач, выведенную из поведения существующего API.
+- **Общие схемы**, где `Todo` выводится из `TodoSchema`, и **контракт** (`NewTodo`, `TodoPatch`, `ErrorBody`, `TodosApi`), который импортируют и сервер, и веб-приложение.
+- **Парсеры**, которые превращают неизвестные тела запросов в типизированные данные: обрезают названия, отбрасывают неизвестные поля и перечисляют все проблемы.
+- Express-сервер с **типизированными ошибками** и одним обработчиком ошибок, **репозиторием за интерфейсом** и маршрутами, которые `mountApi` сверяет с контрактом.
+- **Тесты**, которые сверяют каждый ответ с общей схемой, и фейковый репозиторий, доказывающий, что сбои остаются вежливыми.
+- Сервер, который отвечает **точно** как учебный API, так что в [части 2](/learn/typescript/the-typed-client) вы можете строить клиент на учебном API, зная, что с вашим сервером он работал бы точно так же.
