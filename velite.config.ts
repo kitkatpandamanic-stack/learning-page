@@ -386,6 +386,9 @@ export default defineConfig({
     // file, which only that lesson's page loads (src/lib/lesson-body.ts);
     // lessons.json keeps the light metadata every other page needs.
     for (const lesson of lessons) {
+      // In watch mode Velite reuses unchanged lessons from the last build,
+      // whose body was already written (and removed below): keep that file.
+      if (typeof lesson.body !== "string") continue;
       writeIfChanged(
         bodyFile(lesson),
         JSON.stringify(compactBody(lesson.body)),
