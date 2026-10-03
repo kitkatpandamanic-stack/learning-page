@@ -1,0 +1,882 @@
+---
+title: Типизированные API на Express
+description: Типизируем маршруты Express как в реальных проектах — с выводом параметров маршрута, типизированными телами, query и ответами, роутерами, async-обработчиками, req.user и тестами на supertest.
+duration: 18
+xp: 25
+---
+
+Express — самый популярный способ написать веб-API на Node, и почти каждый новый проект на Express сегодня пишут на TypeScript. Код выглядит так же, как Express на JavaScript, но теперь компилятор знает, что лежит в `req.params`, что каждому маршруту разрешено отправить в ответ и что ваш middleware добавил в запрос. У него есть и одно знаменитое слепое пятно — `req.body`, и умение работать с типизированным Express во многом состоит в том, чтобы точно знать, где типы говорят правду, а где только догадываются. 🚂
+
+## Express, теперь с типами
+
+Если Express для вас в новинку, [урок по Express в курсе JavaScript](/learn/javascript/node-and-express-basics) объясняет его с нуля. Коротко: `express()` создаёт приложение, `app.get(path, handler)` добавляет маршрут (route), а обработчик получает запрос (request) `req` и ответ (response) `res`. На PandaDev `request(app)` из supertest отправляет запросы в приложение без сети, так что целый API и его клиент помещаются в один фрагмент кода:
+
+<CodeExample output={`200 2
+200 { id: 2, title: 'Nap', pinned: false }
+404 { error: 'Note not found' }`}>
+
+```ts
+import express from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+  pinned: boolean;
+}
+
+const notes: Note[] = [
+  { id: 1, title: "Buy bamboo", pinned: true },
+  { id: 2, title: "Nap", pinned: false },
+];
+
+const app = express();
+
+app.get("/api/notes", (req, res) => {
+  res.json(notes);
+});
+
+app.get("/api/notes/:id", (req, res) => {
+  const id = Number(req.params.id); // params: { id: string }
+  const note = notes.find((n) => n.id === id);
+  if (note === undefined) {
+    res.status(404).json({ error: "Note not found" });
+    return;
+  }
+  res.json(note);
+});
+
+const list = await request(app).get("/api/notes");
+console.log(list.status, list.body.length);
+const one = await request(app).get("/api/notes/2");
+console.log(one.status, one.body);
+const missing = await request(app).get("/api/notes/9");
+console.log(missing.status, missing.body);
+```
+
+</CodeExample>
+
+Ни у `req`, ни у `res` нет ни одной аннотации типа, но оба полностью типизированы. Как и колбэки, которые вы передавали в `map` и `filter` в уроке [Стрелочные функции и колбэки](/learn/typescript/arrow-functions-and-callbacks), обработчик, написанный прямо в вызове, получает типы параметров **из контекста**: `app.get` сообщает, какую функцию ожидает, поэтому TypeScript знает, что `req` — это `Request` из Express, а `res` — `Response`.
+
+Сам Express написан на JavaScript. Его типы лежат в отдельном пакете **`@types/express`**, который описывает библиотеку для компилятора. На вашем компьютере типизированный проект на Express начинается так:
+
+```bash
+npm install express
+npm install -D typescript tsx @types/node @types/express
+npm install -D vitest supertest @types/supertest
+npx tsx watch src/server.ts   # запустить сервер, перезапускать при сохранении
+npx tsc --noEmit              # проверить типы во всём проекте (и в CI)
+```
+
+Держите `@types/express` на той же мажорной версии, что и Express (5 с 5). Свежие версии Node умеют и напрямую запускать файл `.ts` командой `node src/server.ts`: Node просто вырезает типы, но не проверяет их. Поэтому `tsc --noEmit` остаётся в вашем рабочем процессе.
+
+## Параметры маршрута берутся из пути
+
+Посмотрите на комментарий в примере: `req.params` — это `{ id: string }`. Типы Express читают **строку пути** `"/api/notes/:id"`, находят в ней каждый `:name` и строят из них тип параметров. Опечатка в имени параметра ловится сразу:
+
+```ts
+app.get("/api/notes/:id", (req, res) => {
+  const note = notes.find((n) => n.id === Number(req.params.noteId));
+  // ❌ Error: Property 'noteId' does not exist on type '{ id: string; }'.
+});
+```
+
+Несколько параметров тоже работают: в `app.get("/users/:userId/notes/:noteId", …)` у `req.params` тип `{ userId: string; noteId: string }`. (Это сделано с помощью **шаблонных литеральных типов** (template literal types), которые вы сами разберёте на Уровне 3.)
+
+Обратите внимание на тип каждого параметра: всегда `string`. URL — это текст, поэтому `/api/notes/2` даёт `"2"`, а не число `2`, и TypeScript не даст притвориться, что это не так:
+
+```ts
+app.get("/api/notes/:id", (req, res) => {
+  const id: number = req.params.id;
+  // ❌ Error: Type 'string' is not assignable to type 'number'.
+});
+```
+
+Преобразуйте его через `Number(...)`, как в примере. `Number("abc")` — это `NaN`, который не совпадёт ни с одной заметкой, так что бессмысленный id просто закончится ответом 404.
+
+## Типизируем ответы
+
+По умолчанию `res.json()` принимает что угодно, поэтому ничто не мешает маршруту отправить ответ не той формы. У настоящих API есть **контракт** (contract): этот маршрут отвечает `Note` или телом ошибки, и больше ничем. Запишите это, аннотировав `res` как **`Response<Body>`**; `req` сохраняет выведенный тип:
+
+```ts
+import { type Response } from "express";
+
+type ErrorBody = { error: string };
+
+app.get("/api/notes/:id", (req, res: Response<Note | ErrorBody>) => {
+  const note = notes.find((n) => n.id === Number(req.params.id));
+  if (!note) {
+    res.status(404).json({ message: "Note not found" });
+    // ❌ Error: Object literal may only specify known properties, and 'message' does not exist in type 'Note | ErrorBody'.
+    return;
+  }
+  res.json({ id: note.id, title: note.title });
+  // ❌ Error: Argument of type '{ id: number; title: string; }' is not assignable to parameter of type 'Note | ErrorBody | undefined'.
+});
+```
+
+Вторая ошибка — та самая, что выручает в реальных проектах: кто-то добавляет `pinned` в `Note`, и каждый маршрут, собирающий заметки вручную, загорается красным, вместо того чтобы тихо отправлять неполные данные в приложение на вашем телефоне.
+
+### Не пишите `return res.json(...)`
+
+В Express на JavaScript повсюду встречается `return res.status(404).json(...)` — короткий способ ответить и остановиться. С типами Express 5 это ошибка:
+
+```ts
+app.get("/api/notes/:id", (req, res) => {
+  const note = notes.find((n) => n.id === Number(req.params.id));
+  if (!note) {
+    return res.status(404).json({ error: "Note not found" });
+  }
+  res.json(note);
+});
+// ❌ Error: Type 'Response<any, Record<string, any>>' is not assignable to type 'void | Promise<void>'.
+```
+
+Тип обработчика говорит, что он возвращает `void` (или `Promise<void>`, если он `async`), а `res.json()` возвращает объект ответа. Express игнорирует то, что возвращает обработчик, поэтому типы просят выразиться явно: ответьте на одной строке, а на следующей напишите `return;` — как во всех примерах здесь.
+
+### Четыре аргумента типа
+
+`Request` и `Response` — обобщённые типы. Их аргументы типа всегда идут в одном порядке:
+
+| Тип | Что описывает |
+| --- | --- |
+| `Request<Params, ResBody, ReqBody, Query>` | параметры маршрута, тело ответа, тело запроса, строку запроса |
+| `Response<ResBody>` | что принимают `res.json()` и `res.send()` |
+| `RequestHandler<Params, ResBody, ReqBody, Query>` | функцию-обработчик целиком |
+
+Больше всего они нужны, когда обработчик написан **не** прямо в вызове. У отдельно объявленной функции нет контекста, поэтому её параметры были бы неявно `any`. Дайте ей тип:
+
+```ts
+import { type RequestHandler } from "express";
+
+const getNote: RequestHandler<{ id: string }, Note | ErrorBody> = (
+  req,
+  res,
+) => {
+  // req.params: { id: string }, res: Response<Note | ErrorBody>
+};
+
+app.get("/api/notes/:id", getNote);
+```
+
+## `req.body` — это `any`
+
+Теперь о слепом пятне. Когда клиент отправляет JSON, `express.json()` разбирает его в `req.body`, и тип у него — **`any`**. TypeScript понятия не имеет, что пришлёт клиент, а `any` полностью отключает проверку, поэтому вот это компилируется без единого слова и тихо даёт `undefined`:
+
+```ts
+app.post("/api/notes", (req, res) => {
+  const title: string = req.body.titel; // опечатка — и никакой ошибки!
+});
+```
+
+Третий аргумент типа у `Request` типизирует тело. С `req: Request<{}, Note, NewNote>` (`{}`, потому что у этого маршрута нет параметров) опечатка вроде `titel` ловится. Но посмотрите, что будет, если клиент пришлёт `title`, который не является строкой:
+
+<CodeExample output={`201 { id: 1, title: 'Buy bamboo', pinned: false }
+500 Internal Server Error`}>
+
+```ts
+import express, { type Request } from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+  pinned: boolean;
+}
+interface NewNote {
+  title: string;
+  pinned?: boolean;
+}
+
+const notes: Note[] = [];
+let nextId = 1;
+
+const app = express();
+app.use(express.json());
+
+// ReqBody (третий аргумент типа) = NewNote
+app.post("/api/notes", (req: Request<{}, Note, NewNote>, res) => {
+  const note: Note = {
+    id: nextId++,
+    title: req.body.title.trim(), // title: string, говорит TypeScript
+    pinned: req.body.pinned ?? false,
+  };
+  notes.push(note);
+  res.status(201).json(note);
+});
+
+const good = await request(app)
+  .post("/api/notes")
+  .send({ title: " Buy bamboo " });
+console.log(good.status, good.body);
+
+const bad = await request(app).post("/api/notes").send({ title: 42 });
+console.log(bad.status, bad.text);
+```
+
+</CodeExample>
+
+TypeScript обещал, что `title` — строка, клиент прислал `42`, `42.trim()` упал, и сервер ответил 500. Типы удаляются до запуска кода, поэтому `Request<{}, Note, NewNote>` ничего не может проверить во время выполнения.
+
+<Callout type="danger" title="Тип тела — это обещание, а не проверка">
+
+Указать `NewNote` типом тела — ровно то же самое, что написать `req.body as NewNote`: вы велите компилятору доверять данным, пришедшим из интернета. Любой может вызвать ваш API через `curl` и прислать что угодно. Используйте такие типы только для данных, которые вы **уже проверили**.
+
+</Callout>
+
+Честный тип для данных извне — **`unknown`**: тогда TypeScript заставляет доказать, что это такое, прежде чем к ним прикасаться. Вы уже делали это с помощью [защитников типа](/learn/typescript/type-guards-and-unknown) на Уровне 1, и с `req.body` это тоже работает:
+
+<CodeExample output={`201 { id: 1, title: 'Nap', pinned: false }
+400 { error: 'Invalid note' }
+400 { error: 'Invalid note' }`}>
+
+```ts
+import express, { type Request } from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+  pinned: boolean;
+}
+interface NewNote {
+  title: string;
+  pinned?: boolean;
+}
+type ErrorBody = { error: string };
+
+function isNewNote(value: unknown): value is NewNote {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("title" in value) || typeof value.title !== "string") {
+    return false;
+  }
+  if ("pinned" in value && typeof value.pinned !== "boolean") {
+    return false;
+  }
+  return true;
+}
+
+const notes: Note[] = [];
+let nextId = 1;
+
+const app = express();
+app.use(express.json());
+
+app.post(
+  "/api/notes",
+  (req: Request<{}, Note | ErrorBody, unknown>, res) => {
+    const input = req.body; // unknown: обязаны проверить
+    if (!isNewNote(input) || input.title.trim() === "") {
+      res.status(400).json({ error: "Invalid note" });
+      return;
+    }
+    const note: Note = {
+      id: nextId++,
+      title: input.title.trim(), // здесь input — NewNote
+      pinned: input.pinned ?? false,
+    };
+    notes.push(note);
+    res.status(201).json(note);
+  },
+);
+
+for (const body of [{ title: "Nap" }, { title: 42 }, {}]) {
+  const res = await request(app).post("/api/notes").send(body);
+  console.log(res.status, res.body);
+}
+```
+
+</CodeExample>
+
+С `unknown` забытая проверка — это ошибка компиляции (`'req.body' is of type 'unknown'.`), а не 500 в продакшене. В следующем уроке это превратится в полноценную систему: с валидацией, которая перечисляет все проблемы, и одним местом, где форматируются все ошибки.
+
+## Строки запроса — это не просто строки
+
+`req.query` хранит строку запроса (query string): для `/api/notes?search=bamboo` это `{ search: "bamboo" }`. Можно ожидать, что `req.query.search` — это `string`, но его тип гораздо шире:
+
+```ts
+app.get("/api/notes", (req, res) => {
+  const text = req.query.search.toLowerCase();
+  // ❌ Error: 'req.query.search' is possibly 'undefined'.
+  // ❌ Error: Property 'toLowerCase' does not exist on type 'string | ParsedQs | string[] | ParsedQs[]'.
+});
+```
+
+Типы осторожничают не зря. URL контролирует клиент: параметра может не быть, он может повторяться (`?search=a&search=b` даёт **массив**), а некоторые парсеры строки запроса даже строят вложенные объекты (`ParsedQs`). Сужайте его, как любое другое объединение:
+
+<CodeExample output={`search = bamboo
+[ 1, 2 ]
+search = [ 'nap', 'bamboo' ]
+[ 1, 2, 3 ]
+search = undefined
+[ 1, 2, 3 ]`}>
+
+```ts
+import express, { type Response } from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+}
+
+const notes: Note[] = [
+  { id: 1, title: "Buy bamboo" },
+  { id: 2, title: "Bamboo recipes" },
+  { id: 3, title: "Nap" },
+];
+
+const app = express();
+
+app.get("/api/notes", (req, res: Response<Note[]>) => {
+  const search = req.query.search;
+  console.log("search =", search);
+  if (typeof search !== "string") {
+    res.json(notes); // нет, повторяется или вложен: игнорируем
+    return;
+  }
+  const text = search.toLowerCase(); // здесь search — string
+  res.json(notes.filter((n) => n.title.toLowerCase().includes(text)));
+});
+
+for (const url of [
+  "/api/notes?search=bamboo",
+  "/api/notes?search=nap&search=bamboo",
+  "/api/notes",
+]) {
+  const res = await request(app).get(url);
+  console.log(res.body.map((n: Note) => n.id));
+}
+```
+
+</CodeExample>
+
+Четвёртый аргумент типа, `Request<{}, any, any, { search?: string }>`, тоже убирает ошибку, но это такое же обещание вместо проверки, как и тип тела: повторённый `?search=` из примера выше всё равно придёт массивом. Сужение стоит одного `if` и никогда не лжёт.
+
+## Роутеры, async-обработчики и репозиторий
+
+Настоящие API группируют маршруты через `express.Router()` и прячут хранилище за **репозиторием** — объектом с методами вроде `list` и `get`, чтобы маршрутам было всё равно, лежат заметки в `Map` или в базе данных. TypeScript добавляет недостающую деталь: **интерфейс** для репозитория. Подходит любое хранилище с этими методами, а маршруты проверяются по нему:
+
+<CodeExample output={`[ { id: 1, title: 'Buy bamboo' } ]
+{ id: 1, title: 'Buy bamboo' }
+404`}>
+
+```ts
+import express, { type Application, type Response } from "express";
+import request from "supertest";
+
+interface Note {
+  id: number;
+  title: string;
+}
+type ErrorBody = { error: string };
+
+// Что маршрутам нужно от хранилища: асинхронно, как у базы данных
+interface NotesRepository {
+  list(): Promise<Note[]>;
+  get(id: number): Promise<Note | undefined>;
+}
+
+function createMemoryRepository(start: Note[]): NotesRepository {
+  const notes = new Map(start.map((n) => [n.id, n]));
+  return {
+    async list() {
+      return [...notes.values()];
+    },
+    async get(id) {
+      return notes.get(id);
+    },
+  };
+}
+
+function createApp(notes: NotesRepository): Application {
+  const router = express.Router();
+
+  router.get("/", async (req, res: Response<Note[]>) => {
+    res.json(await notes.list());
+  });
+
+  router.get("/:id", async (req, res: Response<Note | ErrorBody>) => {
+    const note = await notes.get(Number(req.params.id));
+    if (!note) {
+      res.status(404).json({ error: "Note not found" });
+      return;
+    }
+    res.json(note);
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use("/api/notes", router);
+  return app;
+}
+
+const app = createApp(
+  createMemoryRepository([{ id: 1, title: "Buy bamboo" }]),
+);
+console.log((await request(app).get("/api/notes")).body);
+console.log((await request(app).get("/api/notes/1")).body);
+console.log((await request(app).get("/api/notes/7")).status);
+```
+
+</CodeExample>
+
+На что обратить внимание:
+
+- **Маршруты роутера тоже выводят параметры.** Внутри роутера `"/:id"` даёт `req.params.id: string`, хотя полный URL — `/api/notes/:id`.
+- **Async-обработчики — это нормально.** `async`-обработчик возвращает `Promise<void>`, а это ровно то, что разрешает тип обработчика. В Express 5, если он выбросит исключение или `await` завершится отказом, ошибка попадёт в ваш middleware для ошибок (следующий урок).
+- **Методы репозитория возвращают промисы.** `notes.get` даёт `Promise<Note | undefined>`, поэтому после `await` TypeScript заставляет обработать отсутствующую заметку до `res.json(note)`.
+- **`createApp` получает свои зависимости параметром.** Тесты передают репозиторий в памяти, настоящий сервер — репозиторий поверх базы данных. Интерфейс гарантирует, что у обоих одинаковые методы.
+
+## Добавляем `req.user` через `declare global`
+
+Middleware аутентификации обычно проверяет токен и **добавляет пользователя** в запрос, чтобы последующие обработчики могли читать `req.user`. Но у `Request` нет свойства `user`, поэтому TypeScript его отвергает. Решение — **слияние объявлений** (declaration merging), с которым вы познакомились в уроке [Модули и файлы объявлений](/learn/typescript/modules-and-declaration-files): типы Express намеренно кладут `Request` в глобальное пространство имён `Express`, чтобы ваш проект мог добавлять в него поля:
+
+<CodeExample output={`200 { name: 'Mei' }
+401 { error: 'Sign in first' }`}>
+
+```ts
+import express, { type RequestHandler } from "express";
+import request from "supertest";
+
+interface User {
+  id: number;
+  name: string;
+}
+
+// Слияние объявлений: теперь у каждого Request из Express есть user?: User
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+    }
+  }
+}
+
+const users = new Map<string, User>([
+  ["token-mei", { id: 1, name: "Mei" }],
+]);
+
+// Читает "Authorization: Bearer <token>" и заполняет req.user
+const authenticate: RequestHandler = (req, res, next) => {
+  const token = req.get("Authorization")?.replace("Bearer ", "");
+  req.user = token === undefined ? undefined : users.get(token);
+  next();
+};
+
+const app = express();
+app.use(authenticate);
+
+app.get("/api/me", (req, res) => {
+  if (!req.user) {
+    res.status(401).json({ error: "Sign in first" });
+    return;
+  }
+  res.json({ name: req.user.name }); // здесь req.user — User
+});
+
+const me = await request(app)
+  .get("/api/me")
+  .set("Authorization", "Bearer token-mei");
+console.log(me.status, me.body);
+const anonymous = await request(app).get("/api/me");
+console.log(anonymous.status, anonymous.body);
+```
+
+</CodeExample>
+
+`?` в `user?: User` важен. Объявление **глобальное**: оно добавляет `user` в каждый запрос приложения, включая маршруты, которые работают без `authenticate`. Поэтому TypeScript считает, что его может не быть, и заставляет каждый маршрут проверять:
+
+```ts
+app.get("/api/me", (req, res) => {
+  res.json({ name: req.user.name });
+  // ❌ Error: 'req.user' is possibly 'undefined'.
+});
+```
+
+<Callout type="note" title="Где живёт объявление">
+
+В реальном проекте вынесите блок `declare global` в отдельный файл, например `src/types/express.d.ts`, и убедитесь, что ваш `tsconfig.json` его включает. Это объявление только для типов: во время выполнения от него ничего нет, поэтому middleware всё равно должен на самом деле установить `req.user`. Некоторые команды предпочитают вообще не трогать глобальный тип и передают пользователя явно, например через помощник `requireUser(req)`, который возвращает `User` или выбрасывает 401.
+
+</Callout>
+
+## Тестируем типизированные маршруты
+
+Тесты выглядят так же, как на JavaScript: новое приложение на каждый тест, supertest для запросов, `expect` для деталей. Одна тонкость с типами: `res.body` в supertest — это `any` (он не может знать, что отправляет ваш API), поэтому дайте ему тип там, где это помогает, или просто сравнивайте через `toEqual`:
+
+<CodeExample output={`✓ GET /api/notes/:id > возвращает заметку
+✓ GET /api/notes/:id > отвечает 404 с ErrorBody
+
+Tests  2 passed (2)`}>
+
+```ts
+import express, { type Application, type Response } from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+interface Note {
+  id: number;
+  title: string;
+}
+type ErrorBody = { error: string };
+
+function createApp(start: Note[]): Application {
+  const notes = [...start];
+  const app = express();
+  app.get("/api/notes/:id", (req, res: Response<Note | ErrorBody>) => {
+    const note = notes.find((n) => n.id === Number(req.params.id));
+    if (!note) {
+      res.status(404).json({ error: "Note not found" });
+      return;
+    }
+    res.json(note);
+  });
+  return app;
+}
+
+describe("GET /api/notes/:id", () => {
+  let api: ReturnType<typeof request>;
+
+  beforeEach(() => {
+    api = request(createApp([{ id: 1, title: "Nap" }]));
+  });
+
+  it("возвращает заметку", async () => {
+    const res = await api.get("/api/notes/1").expect(200);
+    const note: Note = res.body; // res.body — any
+    expect(note).toEqual({ id: 1, title: "Nap" });
+  });
+
+  it("отвечает 404 с ErrorBody", async () => {
+    const res = await api.get("/api/notes/2").expect(404);
+    const body: ErrorBody = res.body;
+    expect(body).toEqual({ error: "Note not found" });
+  });
+});
+```
+
+</CodeExample>
+
+`ReturnType<typeof request>` — [утилитный тип](/learn/typescript/utility-types), который означает «то, что возвращает `request(app)`», поэтому переменная `api` типизирована без импорта внутренних имён типов supertest. Аннотация `res.body` ничего не проверяет (это `any`), а вот `toEqual` проверяет, а аннотация даёт автодополнение, пока вы пишете тест.
+
+<Quiz
+  question="Маршрут зарегистрирован как app.get('/shops/:shopId/items/:itemId', (req, res) => { ... }). Какой тип у req.params?"
+  options={["{ shopId: number; itemId: number }", "{ shopId: string; itemId: string }", "Record<string, string>", "any"]}
+  answer={1}
+  explanation="Типы Express читают каждый :name в пути и строят из него тип параметров. Значения из URL — всегда текст, поэтому оба имеют тип string; преобразуйте их через Number() сами."
+/>
+
+<Quiz
+  question="Обработчик типизирован как (req: Request<{}, Note, NewNote>, res) => { ... }, а клиент отправляет { title: 42 }. Что произойдёт?"
+  options={["TypeScript отклонит запрос с ошибкой компиляции", "Express автоматически ответит 400", "Обработчик выполнится с req.body.title, равным 42, хотя по типу это string", "req.body.title будет преобразован в строку '42'"]}
+  answer={2}
+  explanation="Типы стираются до запуска кода, поэтому тип тела — лишь обещание компилятору. Обработчик видит то, что прислал клиент. Типизируйте тело как unknown и проверяйте его, иначе первый же вызванный строковый метод упадёт."
+/>
+
+<Exercise
+  title="Типизированный API закладок"
+  language="typescript"
+  starter={`import express, {
+  type Application,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from "express";
+import request from "supertest";
+
+interface Bookmark {
+  id: number;
+  url: string;
+  title: string;
+  tags: string[];
+  addedBy: string;
+}
+interface NewBookmark {
+  url: string;
+  title: string;
+  tags?: string[];
+}
+type ErrorBody = { error: string };
+
+interface User {
+  name: string;
+}
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+    }
+  }
+}
+
+// ---------- готовая часть: не меняйте её ----------
+
+const sessions = new Map<string, User>([
+  ["token-mei", { name: "Mei" }],
+  ["token-sam", { name: "Sam" }],
+]);
+
+const authenticate: RequestHandler = (req, res, next) => {
+  const token = req.get("Authorization")?.replace("Bearer ", "");
+  req.user = token === undefined ? undefined : sessions.get(token);
+  next();
+};
+
+const starterBookmarks: Bookmark[] = [
+  { id: 1, url: "https://typescriptlang.org", title: "TypeScript",
+    tags: ["ts", "docs"], addedBy: "Mei" },
+  { id: 2, url: "https://expressjs.com", title: "Express",
+    tags: ["node", "docs"], addedBy: "Sam" },
+  { id: 3, url: "https://vitest.dev", title: "Vitest",
+    tags: ["ts", "testing"], addedBy: "Mei" },
+];
+
+// ---------- ваш код ----------
+
+// TODO 3a: возвращайте true только для корректного NewBookmark
+function isNewBookmark(value: unknown): value is NewBookmark {
+  return false;
+}
+
+function createApp(): Application {
+  const bookmarks = starterBookmarks.map((b) => ({ ...b }));
+  let nextId = 4;
+
+  // TODO 1: дайте этому обработчику тип, затем исправьте то,
+  //         что найдёт TypeScript
+  function getBookmark(req, res) {
+    const id = Number(req.params.bookmarkId);
+    const bookmark = bookmarks.find((b) => b.id === id);
+    if (!bookmark) {
+      return res.status(404).json({ error: "Bookmark not found" });
+    }
+    res.json(bookmark);
+  }
+
+  const router = express.Router();
+
+  router.get("/", (req, res: Response<Bookmark[]>) => {
+    // TODO 2: фильтр по ?tag= (один тег или несколько)
+    res.json(bookmarks);
+  });
+
+  router.get("/:id", getBookmark);
+
+  router.post(
+    "/",
+    (req: Request<{}, Bookmark | ErrorBody, unknown>, res) => {
+      // TODO 3b: 401 без пользователя, 400 для некорректного тела,
+      //          иначе сохраните закладку и ответьте 201
+    },
+  );
+
+  const app = express();
+  app.use(express.json());
+  app.use(authenticate);
+  app.use("/api/bookmarks", router);
+  return app;
+}
+
+const api = request(createApp());
+const docs = await api.get("/api/bookmarks?tag=docs");
+console.log(docs.body.map((b: Bookmark) => b.title));
+const created = await api
+  .post("/api/bookmarks")
+  .set("Authorization", "Bearer token-sam")
+  .send({ url: "https://nodejs.org", title: " Node.js " });
+console.log(created.status, created.body);
+`}
+  tests={[
+    { name: "GET /api/bookmarks/:id возвращает закладку или 404", check: `await (async () => { const api = require('supertest')(createApp()); const a = await api.get('/api/bookmarks/2'); const b = await api.get('/api/bookmarks/9'); return a.status === 200 && a.body.title === 'Express' && a.body.addedBy === 'Sam' && b.status === 404 && b.body.error === 'Bookmark not found'; })()` },
+    { name: "?tag= оставляет закладки с этим тегом", check: `await (async () => { const api = require('supertest')(createApp()); const t = (q) => api.get('/api/bookmarks' + q).then((r) => r.body.map((b) => b.id).join(',')); return (await t('')) === '1,2,3' && (await t('?tag=docs')) === '1,2' && (await t('?tag=testing')) === '3' && (await t('?tag=rust')) === ''; })()` },
+    { name: "Повторённый ?tag= оставляет закладки, у которых есть все теги", check: `await (async () => { const api = require('supertest')(createApp()); const t = (q) => api.get('/api/bookmarks' + q).then((r) => r.body.map((b) => b.id).join(',')); return (await t('?tag=ts&tag=docs')) === '1' && (await t('?tag=docs&tag=node')) === '2' && (await t('?tag=ts&tag=node')) === ''; })()` },
+    { name: "isNewBookmark принимает корректные данные и отвергает всё остальное", check: `isNewBookmark({ url: 'https://a.dev', title: 'A' }) && isNewBookmark({ url: 'https://a.dev', title: 'A', tags: ['x', 'y'] }) && ![null, 'https://a.dev', {}, { url: 'https://a.dev' }, { url: 'http://a.dev', title: 'A' }, { url: 42, title: 'A' }, { url: 'https://a.dev', title: '   ' }, { url: 'https://a.dev', title: 7 }, { url: 'https://a.dev', title: 'A', tags: 'x' }, { url: 'https://a.dev', title: 'A', tags: ['x', 3] }].some((v) => isNewBookmark(v))` },
+    { name: "POST без вошедшего пользователя отвечает 401 и ничего не сохраняет", check: `await (async () => { const api = require('supertest')(createApp()); const a = await api.post('/api/bookmarks').send({ url: 'https://a.dev', title: 'A' }); const b = await api.post('/api/bookmarks').set('Authorization', 'Bearer nope').send({ url: 'https://a.dev', title: 'A' }); const list = await api.get('/api/bookmarks'); return a.status === 401 && a.body.error === 'Sign in first' && b.status === 401 && list.body.length === 3; })()` },
+    { name: "POST с некорректным телом отвечает 400 и ничего не сохраняет", check: `await (async () => { const api = require('supertest')(createApp()); const bad = await api.post('/api/bookmarks').set('Authorization', 'Bearer token-mei').send({ url: 'ftp://a.dev', title: 'A' }); const none = await api.post('/api/bookmarks').set('Authorization', 'Bearer token-mei'); const list = await api.get('/api/bookmarks'); return bad.status === 400 && bad.body.error === 'Invalid bookmark' && none.status === 400 && list.body.length === 3; })()` },
+    { name: "POST создаёт закладку (201) с addedBy и тегами по умолчанию", check: `await (async () => { const api = require('supertest')(createApp()); const r = await api.post('/api/bookmarks').set('Authorization', 'Bearer token-mei').send({ url: 'https://deno.com', title: '  Deno ', tags: ['ts'], id: 99, addedBy: 'Hacker' }); const r2 = await api.post('/api/bookmarks').set('Authorization', 'Bearer token-sam').send({ url: 'https://bun.sh', title: 'Bun' }); const ts = (await api.get('/api/bookmarks?tag=ts')).body.map((b) => b.id).join(','); const one = (await api.get('/api/bookmarks/5')).body; const b = r.body; return r.status === 201 && b.id === 4 && b.url === 'https://deno.com' && b.title === 'Deno' && JSON.stringify(b.tags) === '["ts"]' && b.addedBy === 'Mei' && Object.keys(b).length === 5 && r2.status === 201 && r2.body.id === 5 && r2.body.addedBy === 'Sam' && JSON.stringify(r2.body.tags) === '[]' && ts === '1,3,4' && one.title === 'Bun'; })()` },
+  ]}
+>
+
+API закладок одной команды наполовину типизирован и наполовину не дописан. Нажмите **«Запустить»**: TypeScript пока отказывается его запускать. Сделайте его типобезопасным и законченным:
+
+1. **Исправьте типы.** `getBookmark` объявлен отдельно, поэтому его `req` и `res` неявно `any`. Дайте ему тип через `RequestHandler<Params, ResBody>`: параметры маршрута `/:id` и `Bookmark | ErrorBody` как тело ответа. Затем исправьте две проблемы, которые TypeScript обнаружит внутри.
+2. **Фильтр по тегу.** `GET /api/bookmarks?tag=docs` возвращает только закладки с этим тегом. Параметр может повторяться: `?tag=ts&tag=docs` возвращает закладки, у которых есть **все** эти теги. Без `tag` верните всё.
+3. **Создание закладок.** Сначала напишите `isNewBookmark(value)`: `url` должен быть строкой, начинающейся с `"https://"`, `title` — строкой, непустой после обрезки пробелов, а `tags`, если есть, — массивом строк. Затем доделайте `POST /api/bookmarks`:
+   - нет вошедшего пользователя (`req.user` отсутствует): **401** `{ error: "Sign in first" }`;
+   - некорректное тело: **400** `{ error: "Invalid bookmark" }`;
+   - иначе: **201** с новой закладкой `{ id, url, title, tags, addedBy }`. id берётся из `nextId`, название обрезается, `tags` по умолчанию `[]`, а `addedBy` — имя вошедшего пользователя. Собирайте закладку из ожидаемых полей, чтобы клиент не мог подсунуть свои `id` или `addedBy`.
+
+<Hint>
+
+1. `const getBookmark: RequestHandler<{ id: string }, Bookmark | ErrorBody> = (req, res) => { ... };` Затем используйте `req.params.id` и замените `return res.status(404)...` ответом на одной строке и `return;` на следующей.
+2. `req.query.tag` имеет тип `string | string[] | ParsedQs | ParsedQs[] | undefined`. Превратите его в `string[]` нужных тегов: `[tag]`, если `typeof tag === "string"`; строки из него, если `Array.isArray(tag)`; иначе `[]`. Затем оставьте закладки, для которых `wanted.every((t) => b.tags.includes(t))`.
+3. В защитнике типа начните с `typeof value !== "object" || value === null`, затем используйте `"url" in value && typeof value.url === "string"` и так далее. Для тегов: `Array.isArray(value.tags) && value.tags.every((t) => typeof t === "string")`. В маршруте сначала проверьте `req.user`, затем `isNewBookmark(req.body)`; после этого оба сужены.
+
+</Hint>
+
+<Solution>
+
+```ts
+import express, {
+  type Application,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from "express";
+import request from "supertest";
+
+interface Bookmark {
+  id: number;
+  url: string;
+  title: string;
+  tags: string[];
+  addedBy: string;
+}
+interface NewBookmark {
+  url: string;
+  title: string;
+  tags?: string[];
+}
+type ErrorBody = { error: string };
+
+interface User {
+  name: string;
+}
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+    }
+  }
+}
+
+// ---------- готовая часть: не меняйте её ----------
+
+const sessions = new Map<string, User>([
+  ["token-mei", { name: "Mei" }],
+  ["token-sam", { name: "Sam" }],
+]);
+
+const authenticate: RequestHandler = (req, res, next) => {
+  const token = req.get("Authorization")?.replace("Bearer ", "");
+  req.user = token === undefined ? undefined : sessions.get(token);
+  next();
+};
+
+const starterBookmarks: Bookmark[] = [
+  { id: 1, url: "https://typescriptlang.org", title: "TypeScript",
+    tags: ["ts", "docs"], addedBy: "Mei" },
+  { id: 2, url: "https://expressjs.com", title: "Express",
+    tags: ["node", "docs"], addedBy: "Sam" },
+  { id: 3, url: "https://vitest.dev", title: "Vitest",
+    tags: ["ts", "testing"], addedBy: "Mei" },
+];
+
+// ---------- ваш код ----------
+
+function isNewBookmark(value: unknown): value is NewBookmark {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("url" in value) || typeof value.url !== "string" ||
+      !value.url.startsWith("https://")) {
+    return false;
+  }
+  if (!("title" in value) || typeof value.title !== "string" ||
+      value.title.trim() === "") {
+    return false;
+  }
+  if ("tags" in value && value.tags !== undefined) {
+    if (!Array.isArray(value.tags)) return false;
+    return value.tags.every((tag) => typeof tag === "string");
+  }
+  return true;
+}
+
+function createApp(): Application {
+  const bookmarks = starterBookmarks.map((b) => ({ ...b }));
+  let nextId = 4;
+
+  const getBookmark: RequestHandler<
+    { id: string },
+    Bookmark | ErrorBody
+  > = (req, res) => {
+    const id = Number(req.params.id);
+    const bookmark = bookmarks.find((b) => b.id === id);
+    if (!bookmark) {
+      res.status(404).json({ error: "Bookmark not found" });
+      return;
+    }
+    res.json(bookmark);
+  };
+
+  const router = express.Router();
+
+  router.get("/", (req, res: Response<Bookmark[]>) => {
+    const tag = req.query.tag;
+    let wanted: string[] = [];
+    if (typeof tag === "string") {
+      wanted = [tag];
+    } else if (Array.isArray(tag)) {
+      wanted = tag.filter((t) => typeof t === "string");
+    }
+    res.json(
+      bookmarks.filter((b) => wanted.every((t) => b.tags.includes(t))),
+    );
+  });
+
+  router.get("/:id", getBookmark);
+
+  router.post(
+    "/",
+    (req: Request<{}, Bookmark | ErrorBody, unknown>, res) => {
+      if (!req.user) {
+        res.status(401).json({ error: "Sign in first" });
+        return;
+      }
+      const input = req.body;
+      if (!isNewBookmark(input)) {
+        res.status(400).json({ error: "Invalid bookmark" });
+        return;
+      }
+      const bookmark: Bookmark = {
+        id: nextId++,
+        url: input.url,
+        title: input.title.trim(),
+        tags: input.tags ?? [],
+        addedBy: req.user.name,
+      };
+      bookmarks.push(bookmark);
+      res.status(201).json(bookmark);
+    },
+  );
+
+  const app = express();
+  app.use(express.json());
+  app.use(authenticate);
+  app.use("/api/bookmarks", router);
+  return app;
+}
+
+const api = request(createApp());
+const docs = await api.get("/api/bookmarks?tag=docs");
+console.log(docs.body.map((b: Bookmark) => b.title));
+const created = await api
+  .post("/api/bookmarks")
+  .set("Authorization", "Bearer token-sam")
+  .send({ url: "https://nodejs.org", title: " Node.js " });
+console.log(created.status, created.body);
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Обработчики, написанные прямо в вызове, получают типы `req` и `res` **из контекста**. Отдельно объявленным обработчикам нужен тип: `RequestHandler<Params, ResBody, ReqBody, Query>`.
+- **Параметры маршрута выводятся из пути**: `"/notes/:id"` даёт `req.params: { id: string }`. Это всегда строки; преобразуйте их сами.
+- Аннотируйте `res: Response<Note | ErrorBody>`, чтобы каждый маршрут мог отправлять только формы из своего контракта. Ответьте, затем `return;`, а не `return res.json(...)`.
+- **`req.body` — это `any`**, а тип тела вроде `Request<{}, Note, NewNote>` — обещание, а не проверка. Типизируйте его как `unknown` и проверяйте защитником типа.
+- Значений в `req.query` может не быть, они могут повторяться (массивы) или быть вложенными: сужайте их через `typeof` и `Array.isArray`.
+- Прячьте хранилище за **интерфейсом** репозитория с асинхронными методами и передавайте его в `createApp`, чтобы тесты могли использовать репозиторий в памяти.
+- Добавляйте `req.user` через `declare global { namespace Express { interface Request { user?: User } } }` и проверяйте его перед использованием.
+- Тестируйте через Vitest + supertest; `res.body` — это `any`, так что аннотируйте его там, где это помогает, а проверку оставьте `toEqual`.

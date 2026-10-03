@@ -1,0 +1,539 @@
+---
+title: Как работает компилятор
+description: Проследите путь кода через сканер, парсер, связыватель, проверщик и эмиттер и узнайте, зачем инструментам, стирающим типы, нужны isolatedModules, verbatimModuleSyntax и erasableSyntaxOnly.
+duration: 22
+xp: 25
+---
+
+Три загадки, с которыми рано или поздно сталкивается любая команда на TypeScript. Vite спокойно запускает приложение, а `tsc` сообщает о пяти ошибках типов. Node.js запускает `server.ts` напрямую — пока кто-нибудь не добавит `enum`, после чего сервер отказывается стартовать. А esbuild собирает весь проект за полсекунды, тогда как проверка типов в CI идёт четыре минуты. ⚙️
+
+У всех трёх одно объяснение, и senior-разработчику стоит держать его в голове: что именно компилятор (compiler) делает с вашим кодом, какие его части дорогие и какие части пропускают другие инструменты. Этот модуль — про устройство этой машины. В этом уроке мы разберём компилятор по частям, в следующем ускорим проверку типов, а в последнем опубликуем пакет.
+
+## Пять этапов от текста до JavaScript
+
+`tsc` пропускает код через пять этапов. У каждого своя задача, и их же названия вы увидите в отчётах о производительности:
+
+```text
+source text ──scanner──▶ tokens ──parser──▶ syntax tree (AST)
+syntax tree ──binder───▶ symbols and scopes
+symbols     ──checker──▶ types and errors
+syntax tree ──emitter──▶ .js, .d.ts and .map files
+```
+
+**1. Сканер (scanner)** читает текст символ за символом и нарезает его на **токены** (tokens): ключевые слова, имена, знаки препинания, литералы. Для `const total: number = price * 2;` это ключевое слово `const`, имя `total`, `:`, ключевое слово `number`, `=`, имя `price`, `*`, число `2` и `;`. Пробелы и комментарии токенами не считаются (комментарии сохраняются отдельно, чтобы их можно было скопировать в результат).
+
+**2. Парсер (parser)** превращает токены в дерево — **абстрактное синтаксическое дерево** (abstract syntax tree, AST). Каждая конструкция становится узлом с дочерними узлами:
+
+```text
+SourceFile
+  VariableStatement
+    VariableDeclarationList (const)
+      VariableDeclaration
+        Identifier: total
+        NumberKeyword            ← аннотация типа
+        BinaryExpression
+          Identifier: price
+          AsteriskToken
+          NumericLiteral: 2
+```
+
+Синтаксические ошибки вроде `';' expected.` возникают именно здесь. Движки JavaScript начинают так же (см. [Как движки выполняют код](/learn/javascript/how-engines-run-code)), как и все инструменты из этого урока: Babel, esbuild и swc сначала разбирают файл в собственное дерево.
+
+**3. Связыватель (binder)** обходит каждое дерево и создаёт **символ** (symbol) для каждого объявления: каждой переменной, функции, класса, интерфейса, псевдонима типа и параметра, — раскладывая их по областям видимости. Ещё он объединяет одноимённые объявления, например два блока `interface Window`, и отмечает, что у одного имени может быть одновременно **значение** (value meaning) и **тип** (type meaning) — это вам скоро пригодится. Наконец, он строит **граф потока управления** (control-flow graph) из `if`, `return` и циклов, которым потом пользуется сужение типов. Связывание работает быстро и, как и парсинг, обрабатывает по одному файлу за раз.
+
+**4. Проверщик (checker)** снова и снова отвечает на один вопрос: «какой у этого тип?» Для каждого выражения, вызова, присваивания и `return` он выводит типы, подставляет параметры дженериков, выбирает перегрузки, сужает объединения и сравнивает типы на совместимость. Работает он лениво — вычисляет тип, только когда его кто-то запрашивает, — и кэширует каждый ответ. Проверщик — самая большая часть компилятора, и почти всё время уходит именно на него. Кроме того, ему **нужна вся программа целиком**: чтобы проверить `import { total } from "./prices"`, он должен понять `prices.ts`, всё, что импортирует `prices.ts`, стандартную библиотеку и типы ваших npm-пакетов.
+
+**5. Эмиттер (emitter)** записывает результат: JavaScript (типы удалены, новый синтаксис переписан под ваш `target`, `import`/`export` переписаны под настройку `module`), **файлы объявлений** (`.d.ts`) и source maps. Одна деталь многих удивляет: `tsc` записывает JavaScript **даже при ошибках типов**, если не включить `noEmitOnError`.
+
+### Те же этапы из кода
+
+npm-пакет `typescript` открывает всё это как **API компилятора** (compiler API) — на нём построены typescript-eslint, кодмоды и генераторы кода. В редакторе PandaDev это не запустится, но на вашем компьютере такой скрипт проведёт код через весь конвейер:
+
+```ts title="compile.ts"
+import ts from "typescript";
+
+const program = ts.createProgram(["src/prices.ts"], {
+  strict: true,
+  declaration: true,
+  outDir: "dist",
+});
+
+// createProgram разобрал все файлы; теперь спросим проверщика
+const checker = program.getTypeChecker();
+for (const d of ts.getPreEmitDiagnostics(program)) {
+  console.log(ts.flattenDiagnosticMessageText(d.messageText, "\n"));
+}
+
+// Что проверщик вывел для total()?
+const file = program.getSourceFile("src/prices.ts")!;
+const fn = file.statements[0] as ts.FunctionDeclaration;
+const signature = checker.getSignatureFromDeclaration(fn)!;
+console.log(checker.signatureToString(signature));
+
+// Эмиттер записывает dist/prices.js и dist/prices.d.ts
+program.emit();
+```
+
+```ts title="src/prices.ts"
+export function total(prices: number[]) {
+  return prices.reduce((sum, p) => sum + p, 0);
+}
+const t: string = total([1, 2]);
+```
+
+```bash
+$ npx tsx compile.ts
+Type 'number' is not assignable to type 'string'.
+(prices: number[]): number
+```
+
+Проверщик вывел возвращаемый тип `number` (его никто не писал), сообщил о неверном присваивании, а эмиттер всё равно записал оба файла.
+
+## Что приходится записывать эмиттеру
+
+Большая часть TypeScript **стираемая** (erasable): удалите аннотации типов, интерфейсы и псевдонимы типов — и останется обычный JavaScript, который означает ровно то же самое. Но несколько возможностей TypeScript **генерируют код**. Запустите этот пример и посмотрите, что существует во время выполнения:
+
+<CodeExample output={`{ '0': 'Debug', '1': 'Info', '2': 'Warn', Debug: 0, Info: 1, Warn: 2 }
+2 Warn
+Panda { name: 'Mei' } u1`}>
+
+```ts
+// Стираются: существуют только для проверщика
+interface User {
+  name: string;
+}
+type UserId = string;
+
+// Не стираются: каждое из этого становится настоящим JavaScript
+enum Level {
+  Debug,
+  Info,
+  Warn,
+}
+
+class Panda {
+  constructor(readonly name: string) {}
+}
+
+const id: UserId = "u1";
+const user: User = { name: "Mei" };
+
+console.log(Level);
+console.log(Level.Warn, Level[2]);
+console.log(new Panda(user.name), id);
+```
+
+</CodeExample>
+
+От `User` и `UserId` не осталось и следа. А вот `Level` — настоящий объект с **обратным отображением** (reverse mapping) из чисел обратно в имена, а конструктор `Panda` копирует `name` в поле, которого никто не объявлял. Вот что `tsc` выдаёт для этих двух конструкций:
+
+```js
+var Level;
+(function (Level) {
+    Level[Level["Debug"] = 0] = "Debug";
+    Level[Level["Info"] = 1] = "Info";
+    Level[Level["Warn"] = 2] = "Warn";
+})(Level || (Level = {}));
+
+class Panda {
+    name;
+    constructor(name) {
+        this.name = name;
+    }
+}
+```
+
+Полный список возможностей, генерирующих код, короткий: **перечисления** (enums, включая `const enum`), **пространства имён** (namespaces), содержащие значения, **параметры-свойства** (parameter properties), доступные только в CommonJS `import x = require("x")` и `export =`, а также старые `experimentalDecorators` с `emitDecoratorMetadata`, которые даже записывают информацию о типах в JavaScript. Всё остальное стирается. Запомните этот список — это ключ ко всему остальному уроку.
+
+## Инструменты, которые только транспилируют
+
+`tsc` — не единственная программа, которая читает TypeScript. Чаще всего код на самом деле запускает или собирает инструмент **только для транспиляции** (transpile-only) — тот, что превращает TypeScript в JavaScript **без проверки типов**:
+
+- **esbuild** (написан на Go) и **swc** (написан на Rust): используются внутри Vite, Next.js, tsup, Vitest и многих других.
+- **Babel** с `@babel/preset-typescript` — встречается в старых проектах и в React Native.
+- **Сам Node.js**: в современных версиях (22.18 и новее) `node server.ts` работает из коробки. Node заменяет типы пробелами и выполняет то, что осталось.
+- **Sucrase** — его использует редактор PandaDev. Сначала редактор проверяет типы настоящим компилятором TypeScript (он работает прямо в вашем браузере), а потом передаёт код Sucrase, чтобы стереть типы и выполнить его. Это то же разделение, что и `tsc` плюс Vite в реальном проекте.
+
+Они гораздо быстрее `tsc` (это ответ на третью загадку) по двум причинам: они полностью пропускают проверщик и смотрят **на один файл за раз**, поэтому никогда не загружают остальную программу и могут обрабатывать файлы параллельно. У обоих упрощений есть последствия.
+
+**Они не сообщают об ошибках типов.** Инструмент только для транспиляции молча превратит в JavaScript файл, полный ошибок типов. Это ответ на первую загадку: Vite запускает приложение, потому что никто не просил его что-то проверять. Как вы видели в уроке [tsconfig и компилятор](/learn/typescript/tsconfig-and-the-compiler), проверщик запускается отдельно — в редакторе и в CI:
+
+```bash
+npx tsc --noEmit    # проверить всё, ничего не записывать
+```
+
+**Они не видят другие файлы.** Когда инструмент, работающий с одним файлом за раз, читает `export { User } from "./user"`, он не может понять, интерфейс ли `User` (строку надо удалить) или функция (строку надо оставить), не открыв `user.ts`, — а этого он никогда не делает. Вы уже сталкивались с этой проблемой при импорте в уроке [Модули и файлы объявлений](/learn/typescript/modules-and-declaration-files); решение — прямо сказать об этом в коде с помощью `type`.
+
+**Некоторые отказываются генерировать код.** Node только стирает типы, а код не генерирует. Это ответ на вторую загадку:
+
+```text
+$ node src/levels.ts
+SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript enum is not supported in strip-only mode
+```
+
+С параметрами-свойствами и пространствами имён происходит то же самое (`TypeScript parameter property is not supported in strip-only mode`), как и со старым стилем утверждения типа `<number>value` (Node предлагает вместо него `value as number`).
+
+<Callout type="warning" title="Два инструмента — две задачи">
+
+В современном проекте один инструмент **запускает** код (Vite, Vitest, Node, tsx), а другой его **проверяет** (`tsc --noEmit` или ваш редактор). Если в CI подключён только первый, ошибки типов доберутся до продакшена. Зелёный `vite build` ничего не доказывает о типах.
+
+</Callout>
+
+## Флаги, которые сохраняют файлы независимыми
+
+Три настройки `tsconfig.json` заставляют проверщик предупреждать о коде, который инструмент, работающий с одним файлом за раз, обработал бы неправильно. Они не меняют того, что считается допустимым TypeScript, — они делают проверщик **строже**, чтобы вы узнали о проблеме в редакторе, а не во время выполнения.
+
+**`isolatedModules`** сообщает обо всём, что нельзя скомпилировать, глядя только на один файл, например о реэкспорте типа без явного указания:
+
+```ts title="src/index.ts"
+export { User } from "./user.js";
+// ❌ Error: Re-exporting a type when 'isolatedModules' is enabled requires using 'export type'.
+```
+
+```ts title="src/index.ts"
+export type { User } from "./user.js"; // ✅ удаляется из JavaScript
+```
+
+**`verbatimModuleSyntax`** — более новое и простое правило, которое сейчас используют вместо него большинство проектов (оно включает проверки `isolatedModules`): импорт или экспорт **без** `type` сохраняется ровно в том виде, в каком написан, а **с** `type` — удаляется. Никаких догадок ни в одну сторону. Это даже определяет, будет ли модуль вообще загружен:
+
+```ts
+import type { Point } from "./geometry.js";
+// результат: ничего
+
+import { type Point } from "./geometry.js";
+// результат: import {} from "./geometry.js";
+// (geometry.js всё равно выполнится — вдруг у него побочные эффекты)
+```
+
+**`erasableSyntaxOnly`** (TypeScript 5.8 и новее), с которым вы коротко познакомились в уроке про tsconfig, запрещает возможности из списка выше, генерирующие код, чтобы любой файл можно было просто очистить от типов, а не компилировать:
+
+```ts
+enum Level { Debug, Info }
+// ❌ Error: This syntax is not allowed when 'erasableSyntaxOnly' is enabled.
+```
+
+Сообщение для всех них одинаковое. Вот что писать вместо них:
+
+| Вместо | Пишите |
+| --- | --- |
+| `enum Level { … }` | объект `as const` плюс объединение типов (см. ниже) |
+| `namespace` со значениями | модуль (отдельный файл) или обычный объект |
+| `constructor(private name: string)` | поле и присваивание в конструкторе |
+| `<number>value` | `value as number` |
+| `import fs = require("fs")` и `export =` | ES-`import` и `export` |
+
+Пространства имён, содержащие только типы, и `declare enum` по-прежнему допустимы: в них нечего стирать.
+
+### Замена для enum
+
+Стандартная замена перечисления — объект с пометкой `as const` плюс тип **с тем же именем**. Это те самые «два значения» имени из рассказа о связывателе: у одного имени есть значение и тип, и TypeScript всегда понимает по месту использования, что вы имеете в виду.
+
+<CodeExample output={`true
+{ Debug: 'debug', Info: 'info', Warn: 'warn' }
+false`}>
+
+```ts
+// Значение: обычный объект, только для чтения благодаря as const
+const Level = {
+  Debug: "debug",
+  Info: "info",
+  Warn: "warn",
+} as const;
+
+// Тип с тем же именем: "debug" | "info" | "warn"
+type Level = (typeof Level)[keyof typeof Level];
+
+const LEVELS: readonly string[] = Object.values(Level);
+
+function isLevel(value: string): value is Level {
+  return LEVELS.includes(value);
+}
+
+const fromConfig: string = "warn"; // например, из JSON-файла
+if (isLevel(fromConfig)) {
+  const level: Level = fromConfig; // сужен: всё в порядке
+  console.log(level === Level.Warn);
+}
+console.log(Level);
+console.log(isLevel("verbose"));
+```
+
+</CodeExample>
+
+Вы сохраняете `Level.Warn` для читаемого кода и получаете то, чего enum не даёт: обычные строки из JSON подходят под тип. С enum это не так, поэтому каждое значение из внешнего мира требует приведения:
+
+```ts
+enum Level { Debug = "debug", Info = "info", Warn = "warn" }
+
+const fromConfig: Level = "warn";
+// ❌ Error: Type '"warn"' is not assignable to type 'Level'.
+```
+
+### У параметров-свойств есть и вторая проблема
+
+В уроке [Классы и модификаторы доступа](/learn/typescript/classes-and-access-modifiers) вам обещали объяснить, почему некоторые инструменты отвергают параметры-свойства. Помимо того, что это сгенерированный код, они ещё и выполняются в неожиданный **момент**. Инициализаторы полей класса выполняются **до** тела конструктора, а сгенерированное `this.service = service` находится в теле конструктора:
+
+```ts
+class Logger {
+  private readonly prefix = `[${this.service}]`;
+  // ❌ Error: Property 'service' is used before its initialization.
+  constructor(private readonly service: string) {}
+}
+```
+
+Эту ошибку проверщик ловит, и это удача: сгенерированный JavaScript без проблем построил бы префикс `[undefined]`. Явные поля ставят каждое присваивание туда, где его видно, в том порядке, в котором оно выполняется:
+
+```ts
+class Logger {
+  private readonly prefix: string;
+
+  constructor(service: string) {
+    this.prefix = `[${service}]`;
+  }
+}
+```
+
+### tsconfig для прямого запуска TypeScript
+
+Если код запускается через `node file.ts`, вот комбинация, при которой редактор предупредит обо всём, что отверг бы Node:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true
+  }
+}
+```
+
+`allowImportingTsExtensions` позволяет писать `import { total } from "./prices.ts"` — именно это нужно Node, когда нет шага сборки, создающего файлы `.js`.
+
+<Callout type="tip" title="Стоит ли команде запретить enum?">
+
+Зависит от того, где выполняется код. Если он идёт через удаление типов в Node или вы хотите везде принцип «что видите, то и есть JavaScript» — да: включите `erasableSyntaxOnly` и используйте объекты `as const`. Если всё проходит через `tsc`, esbuild или swc, обычные enum компилируются без проблем, и существующую кодовую базу, полную перечислений, не стоит переписывать одним махом. В новом коде большинство команд сегодня склоняются к объединениям строковых литералов: они стираемые, подходят для JSON и печатаются в логах как читаемые строки.
+
+</Callout>
+
+<Quiz
+  question="Ваше приложение на Vite запускается и работает, хотя npx tsc --noEmit сообщает о трёх ошибках типов. Почему?"
+  options={[
+    "Vite использует старую версию TypeScript, которая допускает эти ошибки",
+    "Vite стирает типы файл за файлом и никогда не запускает проверку типов",
+    "Vite проверяет типы только в продакшен-сборках",
+    "Пока не включён строгий режим, эти ошибки — лишь предупреждения",
+  ]}
+  answer={1}
+  explanation="Vite передаёт каждый файл инструменту только для транспиляции, который удаляет типы, не проверяя их. Проверка типов — отдельная задача, её выполняет tsc --noEmit или редактор, поэтому её нужно отдельно включить в CI."
+/>
+
+## Файлам объявлений тоже нужен проверщик
+
+Вспомните файлы `.d.ts` из урока [Модули и файлы объявлений](/learn/typescript/modules-and-declaration-files): при включённом `declaration` эмиттер записывает такой файл рядом с каждым `.js`, и именно через них пользователи библиотеки получают её типы. Их запись — единственная часть генерации, которая не сводится к простому удалению. Посмотрите на эту функцию:
+
+```ts
+export function double(p: Point) {
+  return { x: p.x * 2, y: p.y * 2 };
+}
+```
+
+Файл объявлений должен сообщить, что возвращает `double`, а этого никто не написал. Вычислить `{ x: number; y: number }` может только проверщик — поэтому быстрые инструменты умели стирать типы, но не умели создавать файлы `.d.ts`. **`isolatedDeclarations`** (TypeScript 5.5 и новее) решает это так же, как `isolatedModules` решил задачу для JavaScript: каждый экспорт должен содержать достаточно аннотаций, чтобы файл объявлений можно было написать по одному этому файлу — любым инструментом и параллельно:
+
+```ts
+export function double(p: Point) {
+  return { x: p.x * 2, y: p.y * 2 };
+  // ❌ Error: Expression type can't be inferred with --isolatedDeclarations.
+}
+
+export function double(p: Point): Point { // ✅
+  return { x: p.x * 2, y: p.y * 2 };
+}
+```
+
+Простые случаи по-прежнему разрешены без аннотаций (`export const VERSION = "1.0.0"` — очевидно строка). По-настоящему вы примените этот флаг в уроке 3, когда будете публиковать пакет.
+
+## TypeScript 7: тот же компилятор, но на Go
+
+Компилятор, о котором вы читали, написан на TypeScript и работает на Node. **TypeScript 7** (кодовое имя **Project Corsa**) — его **нативный порт** на Go. Именно порт, а не переписывание: те же сканер, парсер, связыватель, проверщик и эмиттер, переведённые файл за файлом, чтобы сообщать о тех же ошибках. Нативный код и настоящий параллелизм (разбор и проверка нескольких файлов одновременно с общей памятью) делают его радикально быстрее: команда TypeScript сообщает примерно о десятикратном ускорении на больших кодовых базах.
+
+**TypeScript 6**, на котором работает этот сайт (6.0.3), — мост между ними: последняя версия, написанная на TypeScript. Она меняет некоторые значения по умолчанию (`strict` теперь включён по умолчанию) и объявляет устаревшими старые настройки, которые TypeScript 7 убирает, — с ошибкой, которая прямо об этом говорит:
+
+```text
+error TS5101: Option 'baseUrl' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '"ignoreDeprecations": "6.0"' to silence this error.
+```
+
+Одно практическое отличие: в TypeScript 7 изначально нет JavaScript-API компилятора из начала этого урока. Инструменты, построенные на нём, — правила линтера, учитывающие типы, кодмоды и генераторы кода, — не могут просто взять и перейти на новую версию, и это одна из причин, по которым TypeScript 6 продолжает жить рядом с ней. Ваш код, ваш `tsconfig.json` и всё в этом курсе работают одинаково в обеих версиях.
+
+<Quiz
+  question="Из-за какой строки Node.js откажется запускать файл .ts в режиме по умолчанию, когда типы только стираются?"
+  options={[
+    "const n = input as number;",
+    "import type { User } from './user.ts';",
+    "constructor(private name: string) {}",
+    "function isUser(x: unknown): x is User { return true; }",
+  ]}
+  answer={2}
+  explanation="Параметр-свойство генерирует код (поле и присваивание в конструкторе), поэтому его нельзя просто удалить. Остальные три варианта — чистый синтаксис типов: приведения через as, импорты только типов и предикаты типов полностью исчезают при стирании типов."
+/>
+
+<Exercise
+  title="Сделайте логгер стираемым"
+  language="typescript"
+  starter={`enum Level {
+  Debug,
+  Info,
+  Warn,
+  Error,
+}
+
+class Logger {
+  private readonly prefix = \`[\${this.service}]\`;
+  private lines: string[] = [];
+
+  constructor(
+    private readonly service: string,
+    private readonly minLevel: Level,
+  ) {}
+
+  log(level: Level, message: string): void {
+    if (level < this.minLevel) return;
+    const name = Level[level].toUpperCase();
+    this.lines.push(\`\${this.prefix} \${name}: \${message}\`);
+  }
+
+  history(): readonly string[] {
+    return this.lines;
+  }
+}
+
+// Тесты типов: функция не вызывается, только проверяется.
+// Строка под комментарием expect-error ДОЛЖНА быть ошибкой.
+function typeTests(logger: Logger): void {
+  // Уровни приходят обычными строками из JSON-конфига
+  const fromConfig: Level = "warn";
+  logger.log("error", "Диск заполнен");
+  // Именованные константы должны работать и дальше
+  logger.log(Level.Info, "Сервер запущен");
+  // @ts-expect-error: "verbose" — не уровень
+  logger.log("verbose", "Нет");
+}
+
+const logger = new Logger("api", "info");
+logger.log("debug", "Подключаемся к базе данных");
+logger.log("info", "Слушаем порт 3000");
+logger.log("error", "Диск заполнен");
+console.log(logger.history());
+`}
+  tests={[
+    { name: "Level — обычный объект с четырьмя именами уровней по порядку", check: 'JSON.stringify(Object.values(Level)) === JSON.stringify(["debug", "info", "warn", "error"])' },
+    { name: "Именованные константы работают (Level.Warn равно \"warn\")", check: 'Level.Warn === "warn" && Level.Error === "error" && Level.Debug === "debug"' },
+    { name: "Логгер уровня warn пропускает info и сохраняет warn и error", check: '(() => { const l = new Logger("db", "warn"); l.log("info", "a"); l.log("warn", "b"); l.log("error", "c"); return JSON.stringify(l.history()) === JSON.stringify(["[db] WARN: b", "[db] ERROR: c"]); })()' },
+    { name: "Логгер уровня debug сохраняет всё", check: '(() => { const l = new Logger("jobs", "debug"); l.log("debug", "tick"); return JSON.stringify(l.history()) === JSON.stringify(["[jobs] DEBUG: tick"]); })()' },
+    { name: "Логгер уровня error отбрасывает всё ниже error", check: '(() => { const l = new Logger("x", "error"); l.log("warn", "w"); l.log("debug", "d"); return l.history().length === 0; })()' },
+  ]}
+>
+
+Ваша команда переводит этот сервис на `node server.ts` с включённым `erasableSyntaxOnly`, а логгер использует обе возможности, которые Node не умеет стирать. Перепишите его так, чтобы он стал **стираемым** и продолжал работать:
+
+1. Замените числовой `enum Level` объектом `as const` (`Debug: "debug"`, `Info: "info"`, `Warn: "warn"`, `Error: "error"`) плюс типом `Level` с тем же именем.
+2. Замените параметры-свойства явными полями, которые присваиваются в конструкторе. Заодно это исправит ошибку с `prefix` из урока.
+3. Уровни теперь строки, поэтому `level < this.minLevel` больше не сравнивает важность. Задайте им ранги, например с помощью `Record<Level, number>`.
+
+Строки лога остаются прежними: `[api] INFO: Слушаем порт 3000`. **Тесты типов** в `typeTests()` описывают цель: строки из конфига вроде `"warn"` должны подходить под `Level` (с enum это не так), `Level.Info` должен работать и дальше, а `"verbose"` по-прежнему должен отвергаться — так что `type Level = string` не подойдёт (`Unused '@ts-expect-error' directive.`).
+
+<Hint>
+
+Шаблон из урока:
+
+```ts
+const Level = {
+  Debug: "debug",
+  // …
+} as const;
+
+type Level = (typeof Level)[keyof typeof Level];
+
+const SEVERITY: Record<Level, number> = {
+  debug: 0,
+  // …
+};
+```
+
+С `Record<Level, number>` TypeScript пожалуется, если какого-то уровня нет в таблице. В `log` сравнивайте `SEVERITY[level]` с `SEVERITY[this.minLevel]`, а имя уровня — это просто `level.toUpperCase()`. В классе объявите поля `private readonly prefix: string;` и `private readonly minLevel: Level;` и присвойте оба в конструкторе.
+
+</Hint>
+
+<Solution>
+
+```ts
+const Level = {
+  Debug: "debug",
+  Info: "info",
+  Warn: "warn",
+  Error: "error",
+} as const;
+
+type Level = (typeof Level)[keyof typeof Level];
+
+// Record<Level, number>: TypeScript проверит, что у каждого уровня есть ранг
+const SEVERITY: Record<Level, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
+
+class Logger {
+  private readonly prefix: string;
+  private readonly minLevel: Level;
+  private lines: string[] = [];
+
+  constructor(service: string, minLevel: Level) {
+    this.prefix = `[${service}]`;
+    this.minLevel = minLevel;
+  }
+
+  log(level: Level, message: string): void {
+    if (SEVERITY[level] < SEVERITY[this.minLevel]) return;
+    const name = level.toUpperCase();
+    this.lines.push(`${this.prefix} ${name}: ${message}`);
+  }
+
+  history(): readonly string[] {
+    return this.lines;
+  }
+}
+
+// Тесты типов: функция не вызывается, только проверяется.
+// Строка под комментарием expect-error ДОЛЖНА быть ошибкой.
+function typeTests(logger: Logger): void {
+  // Уровни приходят обычными строками из JSON-конфига
+  const fromConfig: Level = "warn";
+  logger.log("error", "Диск заполнен");
+  // Именованные константы должны работать и дальше
+  logger.log(Level.Info, "Сервер запущен");
+  // @ts-expect-error: "verbose" — не уровень
+  logger.log("verbose", "Нет");
+}
+
+const logger = new Logger("api", "info");
+logger.log("debug", "Подключаемся к базе данных");
+logger.log("info", "Слушаем порт 3000");
+logger.log("error", "Диск заполнен");
+console.log(logger.history());
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- `tsc` работает в пять этапов: **сканер** создаёт токены, **парсер** строит AST, **связыватель** создаёт символы и области видимости, **проверщик** вычисляет каждый тип (самая дорогая часть и единственная, которой нужна вся программа), а **эмиттер** записывает `.js`, `.d.ts` и source maps — даже при ошибках типов.
+- Большая часть TypeScript **стираемая**. Enum, пространства имён со значениями, параметры-свойства, `import = require` / `export =` и метаданные устаревших декораторов **генерируют код**.
+- **Инструменты только для транспиляции** (esbuild, swc, Babel, Sucrase, удаление типов в Node) быстрые, потому что пропускают проверку и видят по одному файлу за раз. Поэтому запускайте `tsc --noEmit` отдельно, помечайте импорты и экспорты только типов с помощью `type` и помните, что Node отвергает синтаксис, генерирующий код.
+- `isolatedModules` и `verbatimModuleSyntax` предупреждают о коде, для компиляции которого нужны другие файлы; `erasableSyntaxOnly` запрещает синтаксис, генерирующий код. Заменяйте enum объектом `as const` плюс одноимённым объединением типов.
+- Для генерации объявлений проверщик нужен ради выведенных типов; `isolatedDeclarations` требует аннотаций на экспортах, чтобы файлы `.d.ts` мог написать любой инструмент.
+- **TypeScript 7** (Project Corsa) — тот же компилятор, портированный на Go, примерно в 10 раз быстрее и без старого JavaScript-API компилятора. TypeScript 6 — переходный релиз, который объявляет устаревшим то, что убирает 7.

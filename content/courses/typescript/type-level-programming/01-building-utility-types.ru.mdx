@@ -1,0 +1,667 @@
+---
+title: "Пишем собственные утилитные типы"
+description: "Строим DeepReadonly, DeepPartial, PickByValue, RequireAtLeastOne, UnionToIntersection и Simplify, проверяем их тестами типов и разбираемся, когда рекурсивные типы обходятся слишком дорого."
+duration: 24
+xp: 25
+---
+
+В модуле [«Продвинутые типы»](/learn/typescript/mapped-types) вы заново написали `Partial`, `Pick` и `Mutable` и научились фильтровать ключи по типу значения. В реальных проектах быстро нужно больше: переопределения настроек, которые добираются до глубоко вложенных объектов, формы поиска, где нужен **хотя бы один** фильтр, системы плагинов, чьи API сливаются в один объект. В этом уроке вы напишете **утилитные типы** (utility types) для таких задач — так, как это делают библиотеки вроде `type-fest`: у каждого типа рядом лежат **тесты типов** (type tests), а каждое проектное решение записано. 🧰
+
+Сначала — предупреждение из практики. В одной команде файл `types/helpers.ts` разросся до 400 строк хитрых типов без единого теста. После обновления TypeScript два из них незаметно поменяли смысл, половина «типобезопасного» API превратилась в `any`, и целый месяц этого никто не замечал. Утилитные типы — это код. Тестируйте их, делайте их маленькими и вовремя останавливайтесь.
+
+## Верстак: типы с тестами
+
+Два помощника вы знаете из урока [«Тестирование типов»](/learn/typescript/testing-types): `Equal<A, B>` равен `true`, только когда два типа идентичны, а `Expect` превращает `false` в ошибку компиляции. У каждого типа в этом уроке будет список `type cases = [...]` — и он должен быть у каждого утилитного типа, который вы пишете на работе.
+
+Тесты не только ловят регрессии. Они заставляют **решить**, что тип должен делать в неудобных случаях. Что «глубокий partial» делает с массивом? С функцией? С `Date`? Единственно верного ответа нет, но ответ должен быть **записан**, и лучшее место для него — тестовый случай.
+
+## Вглубь: `DeepReadonly`
+
+`Readonly<T>` работает поверхностно: `config.server` заменить нельзя, а `config.server.port` — можно. **Глубокая** версия должна вызывать саму себя для каждого свойства, а чтобы решить, что делать с каждым видом значения, нужен **условный тип** (conditional type):
+
+```ts
+type DeepReadonly<T> =
+  T extends (...args: any[]) => unknown ? T // функции: оставляем
+  : T extends object
+    ? { readonly [K in keyof T]: DeepReadonly<T[K]> } // рекурсия
+    : T; // примитивы: готово
+```
+
+В этих строках спрятаны три решения:
+
+1. **Функции остаются как есть.** Функция — тоже `object`, и сопоставление её ключей выбросило бы сигнатуру вызова, так что `config.log("hi")` перестал бы компилироваться.
+2. **Массивы и кортежи** проходят через ветку объекта. Гомоморфный **сопоставленный тип** (mapped type) обходит массив поэлементно, поэтому `string[]` становится `readonly string[]`, а кортеж остаётся кортежем.
+3. **Примитивы** завершают рекурсию. Без этого выхода тип никогда бы не досчитался.
+
+Теперь TypeScript защищает всё дерево:
+
+```ts
+interface AppConfig {
+  server: { host: string; port: number };
+  features: string[];
+  log: (message: string) => void;
+}
+
+declare const config: DeepReadonly<AppConfig>;
+
+config.server.port = 80;
+// ❌ Error: Cannot assign to 'port' because it is a read-only property.
+config.features.push("beta");
+// ❌ Error: Property 'push' does not exist on type 'readonly string[]'.
+config.log("функции по-прежнему работают"); // ✅
+```
+
+(`declare const` описывает значение, не создавая его, — удобно в примерах только про типы, как этот.) Помните, что это лишь **тип**: сам объект по-прежнему может изменить код, который этот тип не использует. Если это важно, добавьте `Object.freeze`; глубокую заморозку вы напишете в упражнении.
+
+## `DeepPartial` и глубокое слияние
+
+Чаще всего глубокие типы нужны для **конфигурации**: разумные значения по умолчанию плюс небольшие переопределения для каждого окружения. Переопределение может затронуть любое свойство на любой глубине. Это `DeepPartial`, и на этот раз решение для массивов намеренно другое: большинство систем конфигурации **заменяют** массивы целиком, а не сливают их поэлементно, — и тип делает так же:
+
+<CodeExample output={`{ url: 'postgres://localhost/dev', pool: { min: 1, max: 50 } }
+3000 [ 'search' ]`}>
+
+```ts
+type DeepPartial<T> =
+  T extends (...args: any[]) => unknown ? T
+  : T extends readonly unknown[] ? T // массивы заменяются целиком
+  : T extends object ? { [K in keyof T]?: DeepPartial<T[K]> }
+  : T;
+
+interface Config {
+  server: { host: string; port: number };
+  db: { url: string; pool: { min: number; max: number } };
+  features: string[];
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function deepMerge<T>(base: T, patch: DeepPartial<T>): T {
+  if (!isPlainObject(base) || !isPlainObject(patch)) {
+    return (patch === undefined ? base : patch) as T;
+  }
+  const result: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) result[key] = deepMerge(base[key], value);
+  }
+  return result as T;
+}
+
+const defaults: Config = {
+  server: { host: "localhost", port: 3000 },
+  db: { url: "postgres://localhost/dev", pool: { min: 1, max: 5 } },
+  features: [],
+};
+
+const production = deepMerge(defaults, {
+  db: { pool: { max: 50 } },
+  features: ["search"],
+});
+
+console.log(production.db);
+console.log(production.server.port, production.features);
+```
+
+</CodeExample>
+
+Слияние во время выполнения обходит объекты со значениями `unknown`, поэтому ему нужны два приведения; а вызывающий код видит **сигнатуру**, и она точная. Неверные типы и опечатки в ключах ловятся на любой глубине:
+
+```ts
+deepMerge(defaults, { db: { pool: { max: "50" } } });
+// ❌ Error: Type 'string' is not assignable to type 'number'.
+deepMerge(defaults, { db: { pol: { max: 50 } } });
+// ❌ Error: Object literal may only specify known properties, but 'pol' does not exist in type '{ url?: string | undefined; pool?: { min?: number | undefined; max?: number | undefined; } | undefined; }'. Did you mean to write 'pool'?
+```
+
+<Callout type="warning" title="Глубокие типы и встроенные объекты">
+
+Для глубокого типа `Date` — просто объект с методами. `DeepPartial<{ publishedAt: Date }>` делает каждый из этих методов необязательным, поэтому `{ publishedAt: {} }` спокойно компилируется, а `.getTime()` потом падает. То же самое происходит с `Map`, `Set`, `RegExp` и экземплярами классов. Промышленные версии держат список типов, которые нужно оставить в покое (`T extends Date | RegExp | Map<unknown, unknown> | ... ? T`), и этот список — одна из причин взять хорошо протестированную библиотеку вместо своей.
+
+</Callout>
+
+## Фильтр по значению: `PickByValue` и `OmitByValue`
+
+В уроке [«Сопоставленные типы»](/learn/typescript/mapped-types) вы выбирали ключи по типу их значения с помощью `as ... ? K : never`. Оберните это в две утилиты, `PickByValue` и `OmitByValue`, — и первый же тест обнаружит ловушку: **необязательные свойства**. В режиме `strict` у `bio?: string` тип `string | undefined`, а `string | undefined extends string` — ложь. Наивная версия молча выбрасывает все необязательные поля:
+
+```ts
+type NaivePickByValue<T, V> = {
+  [K in keyof T as T[K] extends V ? K : never]: T[K];
+};
+
+interface Profile {
+  id: number;
+  name: string;
+  bio?: string;
+  city?: string;
+  verified: boolean;
+}
+
+type Texts = NaivePickByValue<Profile, string>;
+// { name: string }: bio и city пропали!
+```
+
+Решение — сравнивать тип значения **без** `undefined`, который добавляет `?`. Это решение стоит закрепить тестовым случаем:
+
+<CodeExample output={`{ id: 1, name: 'Mei', bio: 'Любит панд', verified: true }`}>
+
+```ts
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+// Необязательные свойства учитываются по типу их значения
+type PickByValue<T, V> = {
+  [K in keyof T as Exclude<T[K], undefined> extends V ? K : never]:
+    T[K];
+};
+type OmitByValue<T, V> = {
+  [K in keyof T as Exclude<T[K], undefined> extends V ? never : K]:
+    T[K];
+};
+
+interface Profile {
+  id: number;
+  name: string;
+  bio?: string;
+  city?: string;
+  verified: boolean;
+}
+
+type cases = [
+  Expect<Equal<
+    PickByValue<Profile, string>,
+    { name: string; bio?: string; city?: string }
+  >>,
+  Expect<Equal<
+    OmitByValue<Profile, string>,
+    { id: number; verified: boolean }
+  >>,
+];
+
+type TextField = keyof PickByValue<Profile, string>;
+
+function cleanText(profile: Profile): Profile {
+  const fields: TextField[] = ["name", "bio", "city"];
+  const copy = { ...profile };
+  for (const field of fields) {
+    const value = copy[field];
+    if (value !== undefined) copy[field] = value.trim();
+  }
+  return copy;
+}
+
+const mei: Profile = {
+  id: 1,
+  name: " Mei ",
+  bio: "Любит панд  ",
+  verified: true,
+};
+console.log(cleanText(mei));
+```
+
+</CodeExample>
+
+Добавьте в `Profile` поле `nickname?: string` — и `TextField` вырастет вместе с ним. А если кто-то «упростит» `PickByValue` обратно до наивной версии, первый тестовый случай упадёт с ошибкой **"Type 'false' does not satisfy the constraint 'true'."**
+
+<Quiz
+  question="Режим strict включён, interface Item { title: string; note?: string }. Какие ключи оставит { [K in keyof Item as Item[K] extends string ? K : never]: Item[K] }?"
+  options={[
+    "Только title, потому что тип note — string | undefined",
+    "title и note, потому что оба — строки",
+    "Только note, потому что он необязательный",
+    "Никакие: необязательные свойства ломают сопоставленные типы",
+  ]}
+  answer={0}
+  explanation="? добавляет undefined к типу свойства, а string | undefined не расширяет string, поэтому note отфильтровывается. Чтобы сохранить необязательные свойства, сравнивайте Exclude<Item[K], undefined>."
+/>
+
+## `RequireAtLeastOne`
+
+Поиск пользователей принимает id, email или имя, а также необязательный `limit`. Все поля необязательные, поэтому `findUsers({})` проходит проверку типов и возвращает... всех? Объединение (union) выражает то, что вы на самом деле имеете в виду: «хотя бы одно из этих трёх». Выписывать такое объединение вручную долго, так что выведем его:
+
+<CodeExample output={`[ 'u1', 'u3' ]
+[ 'u1' ]
+[ 'u2' ]`}>
+
+```ts
+type RequireAtLeastOne<T, Keys extends keyof T = keyof T> =
+  Omit<T, Keys> &
+  {
+    [K in Keys]-?: Required<Pick<T, K>> &
+      Partial<Pick<T, Exclude<Keys, K>>>;
+  }[Keys];
+
+interface UserQuery {
+  id?: string;
+  email?: string;
+  name?: string;
+  limit?: number;
+}
+
+type UserSearch = RequireAtLeastOne<UserQuery, "id" | "email" | "name">;
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+}
+
+const users: User[] = [
+  { id: "u1", email: "mei@panda.dev", name: "Mei" },
+  { id: "u2", email: "sam@panda.dev", name: "Sam" },
+  { id: "u3", email: "mei.l@panda.dev", name: "Mei" },
+];
+
+function findUsers(search: UserSearch): User[] {
+  const found = users.filter(
+    (u) =>
+      (search.id === undefined || u.id === search.id) &&
+      (search.email === undefined || u.email === search.email) &&
+      (search.name === undefined || u.name === search.name),
+  );
+  return found.slice(0, search.limit ?? 10);
+}
+
+console.log(findUsers({ name: "Mei" }).map((u) => u.id));
+console.log(findUsers({ name: "Mei", limit: 1 }).map((u) => u.id));
+console.log(findUsers({ email: "sam@panda.dev" }).map((u) => u.id));
+```
+
+</CodeExample>
+
+Этот трюк — приём, который стоит знать по имени: **«сопоставь, потом проиндексируй»** (map, then index). Сопоставленный тип строит объект, **значения** которого — варианты, по одному на ключ:
+
+```ts
+// {
+//   id:    { id: string }    & { email?: string; name?: string };
+//   email: { email: string } & { id?: string; name?: string };
+//   name:  { name: string }  & { id?: string; email?: string };
+// }
+```
+
+Индексация через `[Keys]` собирает эти значения в **объединение**, а `Omit<T, Keys>` возвращает свойства, которые в сделке не участвовали (`limit`). `-?` здесь важен: без него варианты для необязательных ключей включали бы `undefined`, и объединение пропустило бы `{}`.
+
+Теперь пустой поиск — ошибка компиляции. Но посмотрите внимательно на сообщение для второго вызова:
+
+```ts
+findUsers({});
+// ❌ Error: Argument of type '{}' is not assignable to parameter of type 'UserSearch'.
+findUsers({ limit: 5 });
+// ❌ Error: Argument of type '{ limit: number; }' is not assignable to parameter of type 'UserSearch'.
+//   ...
+//   Property 'name' is missing in type '{ limit: number; }' but required in type 'Required<Pick<UserQuery, "name">>'.
+```
+
+"Property 'name' is missing" формально верно, но на практике сбивает с толку: `id` или `email` подошли бы ничуть не хуже. TypeScript сообщает об ошибке относительно **одного** члена объединения, обычно последнего. Это скрытая цена хитрых типов: их сообщения об ошибках написаны на языке их реализации. Дайте типу хорошее имя (`UserSearch`) и комментарий, чтобы следующий разработчик понял, что на самом деле значит ошибка.
+
+## `UnionToIntersection`
+
+Системы плагинов часто объединяют несколько объектов в один. Если плагины — это `{ log }`, `{ price }` и `{ shout }`, у результата должны быть все три: это **пересечение** (intersection). Но список плагинов даёт **объединение** их типов (`P[number]`). Превращение одного в другое — знаменитый маленький тип:
+
+<CodeExample output={`[log] готово
+£19.99 СКИДКА`}>
+
+```ts
+type UnionToIntersection<U> =
+  (U extends unknown ? (arg: U) => void : never) extends
+  (arg: infer I) => void
+    ? I
+    : never;
+
+type Plugin = Record<string, (...args: any[]) => unknown>;
+
+function combine<P extends Plugin[]>(
+  ...plugins: P
+): UnionToIntersection<P[number]> {
+  return Object.assign({}, ...plugins);
+}
+
+const logger = { log: (msg: string) => `[log] ${msg}` };
+const money = {
+  price: (cents: number) => `£${(cents / 100).toFixed(2)}`,
+};
+const text = { shout: (s: string) => s.toUpperCase() };
+
+const kit = combine(logger, money, text);
+console.log(kit.log("готово"));
+console.log(kit.price(1999), kit.shout("скидка"));
+```
+
+</CodeExample>
+
+Как это работает? В два шага:
+
+1. `U extends unknown ? (arg: U) => void : never` **распределяется** по объединению (как вы видели в уроке [«Условные типы»](/learn/typescript/conditional-types-and-infer)) и даёт объединение функций: `((arg: Logger) => void) | ((arg: Money) => void) | ...`.
+2. Затем `infer I` спрашивает: «какой единственный тип параметра позволил бы этому быть **любой** из этих функций?» Переданное значение должно подходить каждой из них, значит, оно должно быть `Logger`, **и** `Money`, **и** `Text`. TypeScript выводит пересечение.
+
+Шаг 2 работает потому, что параметры функций проверяются «задом наперёд» (они **контравариантны**, contravariant) — это как раз тема [следующего урока](/learn/typescript/variance-and-inference). Прежде чем пользоваться этим типом, узнайте его острые углы:
+
+```ts
+type A = UnionToIntersection<{ a: 1 } | { b: 2 }>;
+// { a: 1 } & { b: 2 }
+type B = UnionToIntersection<"draft" | "live">; // never
+type C = UnionToIntersection<boolean>; // never: true & false
+```
+
+Пересечение двух разных литералов (или `true` и `false`) невозможно, поэтому оно схлопывается в `never`. Это правильно, но неожиданно, когда в объединение параметров пробирается `boolean`. Используйте `UnionToIntersection` для объединений **объектных** типов, в коде библиотек, за типом с понятным именем.
+
+## `Simplify`: читаемые результаты
+
+Наведите курсор на `kit` в редакторе — и вы увидите `{ log: ... } & { price: ... } & { shout: ... }`. Правильно, но читать тяжело, а с десятью плагинами — невозможно. **`Simplify`** (в некоторых проектах его называют `Prettify`) копирует свойства в один плоский объектный тип:
+
+```ts
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+type WithId = { id: string };
+type WithTimestamps = { createdAt: string; updatedAt: string };
+type Post = WithId & WithTimestamps & { title: string };
+
+type Flat = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  title: string;
+};
+
+type cases = [
+  Expect<Equal<Simplify<Post>, Flat>>, // ✅
+  Expect<Equal<Post, Flat>>,
+  // ❌ Error: Type 'false' does not satisfy the constraint 'true'.
+];
+```
+
+Основную работу делает сопоставленный тип; `& {}` — подсказка, из-за которой редакторы показывают развёрнутый результат, а не имя псевдонима. Обратите внимание на второй тестовый случай: `Equal` считает пересечение и плоский объект **разными** типами, хотя им подходят одни и те же значения (тот самый сюрприз из урока [«Тестирование типов»](/learn/typescript/testing-types)). Так что `Simplify` полезен дважды: читаемые подсказки и точные тесты типов. Оборачивайте им результаты, собранные из пересечений: `Simplify<UnionToIntersection<P[number]>>`, `Simplify<RequireAtLeastOne<...>>`.
+
+## Пределы рекурсии и цена компиляции
+
+Пределы вы знаете из урока [«Условные типы»](/learn/typescript/conditional-types-and-infer): около 1000 уровней для хвостово-рекурсивных типов, около 50 для остальных, а дальше — **"Type instantiation is excessively deep and possibly infinite."** Именно на глубоких утилитных типах реальные проекты встречают это сообщение, часто далеко от места, где проблема. Вот случай, который подкосил команду, применившую `DeepReadonly` из начала урока к рекурсивному типу JSON:
+
+```ts
+type Json =
+  | string
+  | number
+  | boolean
+  | null
+  | Json[]
+  | { [key: string]: Json };
+
+type FrozenJson = DeepReadonly<Json>;
+// ❌ Error: Type instantiation is excessively deep and possibly infinite.
+```
+
+Данные тут совсем не глубокие; бесконечен **тип**, и сопоставленный тип над `Json[]` продолжает его разворачивать. Отдельная ветка для массивов с именованным дженериком `ReadonlyArray` даёт TypeScript тип, на котором можно остановиться и использовать его повторно:
+
+```ts
+type DeepReadonly<T> =
+  T extends (...args: any[]) => unknown ? T
+  : T extends readonly (infer E)[] ? ReadonlyArray<DeepReadonly<E>>
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+  : T;
+
+type FrozenJson = DeepReadonly<Json>; // ✅ теперь всё в порядке
+```
+
+У каждого исправления есть цена: в этой версии кортеж `[string, number]` превращается в `readonly (string | number)[]`. Выберите компромисс, который нужен вашим данным, и **напишите для него тестовый случай**.
+
+Даже если тип компилируется, он стоит времени. TypeScript вычисляет каждую новую **инстанциацию** (instantiation) — каждый `DeepPartial<X>` для нового `X` — и кеширует её. Один `DeepPartial<Config>` — пустяк. `DeepPartial` от схемы API на 300 эндпоинтов, использованный в 500 файлах, может добавлять секунды к каждому нажатию клавиши в редакторе. Чтобы увидеть, сколько стоят ваши типы, спросите компилятор:
+
+```bash
+npx tsc --noEmit --extendedDiagnostics
+# ...
+# Instantiations:      1843921   ← следите, как растёт это число
+# Check time:            11.84s
+```
+
+Привычки, которые сохраняют скорость:
+
+- **Применяйте глубокие типы на границах** (загрузчик конфигурации, фабрика тестовых данных), а не в каждой внутренней функции.
+- **Давайте имена промежуточным результатам** (`type UserSearch = ...`), чтобы они вычислялись один раз и легко читались.
+- **Аннотируйте возвращаемые типы** функций, которые возвращают большие выведенные типы, чтобы TypeScript не выводил их заново для каждого вызова.
+
+<Callout type="tip" title="Сначала поищите библиотеку">
+
+Каждый тип из этого урока есть — проверенный в бою — в **type-fest**: `PartialDeep`, `ReadonlyDeep`, `ConditionalPick`, `RequireAtLeastOne`, `UnionToIntersection`, `Simplify` и многие другие. Они учитывают встроенные объекты, кортежи и крайние случаи, на которые вы ещё не наткнулись. `npm i -D type-fest` и `import type { PartialDeep } from "type-fest"` ничего не стоят во время выполнения: пакет содержит только типы. Пишите свой тип, когда вам нужна другая семантика, — и тестируйте его так же тщательно, как это делает библиотека.
+
+</Callout>
+
+Когда **не** стоит писать свой тип? Когда обычный тип, выписанный вручную, получится короче. Когда он нужен только в одном месте. Когда его сообщения об ошибках запутают команду сильнее, чем баг, от которого он защищает. Файл утилитных типов у Senior-разработчика — короткий, протестированный и скучный.
+
+<Quiz
+  question="Зачем в type DeepReadonly<T> = T extends (...args: any[]) => unknown ? T : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T отдельная ветка для функций?"
+  options={[
+    "Функции — примитивы, так что они и так завершили бы рекурсию",
+    "Сопоставление ключей функции потеряло бы её сигнатуру вызова, и её больше нельзя было бы вызвать",
+    "Функции в JavaScript не могут быть только для чтения",
+    "Так тип работает быстрее, но результат тот же",
+  ]}
+  answer={1}
+  explanation="Функция — это объект, поэтому без этой ветки она прошла бы через сопоставленный тип, который сохраняет только её свойства (вроде length и name) и выбрасывает сигнатуру вызова. config.log('hi') перестал бы компилироваться."
+/>
+
+<Exercise
+  title="Ваш набор утилит"
+  language="typescript"
+  starter={`// ===== Помощники для тестов типов: не меняйте =====
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+// 1. Только для чтения на любой глубине. Функции остаются
+//    как есть, массивы становятся массивами только для чтения.
+type DeepReadonly<T> = T;
+
+// 2. Ключи T, значения которых можно присвоить V
+type KeysByValue<T, V> = keyof T;
+
+// 3. T, но хотя бы один из Keys должен присутствовать
+type RequireAtLeastOne<T, Keys extends keyof T = keyof T> = T;
+
+// 4. Заморозить value и каждый объект и массив внутри,
+//    затем вернуть его
+function freezeDeep<T>(value: T): DeepReadonly<T> {
+  return value;
+}
+
+// 5. Сумма одного числового свойства по всем строкам
+function sumBy<T>(
+  rows: readonly T[],
+  key: KeysByValue<T, number>,
+): number {
+  return 0;
+}
+
+// ===== Тесты типов: не меняйте их =====
+interface Settings {
+  theme: { name: string; colours: string[] };
+  fontSize: number;
+  lineHeight: number;
+  onChange: (key: string) => void;
+}
+
+type cases = [
+  Expect<Equal<DeepReadonly<Settings>, {
+    readonly theme: {
+      readonly name: string;
+      readonly colours: readonly string[];
+    };
+    readonly fontSize: number;
+    readonly lineHeight: number;
+    readonly onChange: (key: string) => void;
+  }>>,
+  Expect<Equal<
+    KeysByValue<Settings, number>,
+    "fontSize" | "lineHeight"
+  >>,
+];
+
+interface Contact {
+  email?: string;
+  phone?: string;
+  note?: string;
+}
+type Reachable = RequireAtLeastOne<Contact, "email" | "phone">;
+const _c1: Reachable = { email: "mei@panda.dev" };
+const _c2: Reachable = { phone: "0123", note: "по вечерам" };
+// @ts-expect-error: нужен email или телефон
+const _c3: Reachable = { note: "со мной не связаться" };
+
+// ===== Попробуйте =====
+const settings = freezeDeep({
+  theme: { name: "forest", colours: ["green", "brown"] },
+  fontSize: 16,
+  lineHeight: 24,
+});
+console.log(Object.isFrozen(settings.theme.colours));
+
+const week = [
+  { day: "Mon", minutes: 30, pages: 12 },
+  { day: "Tue", minutes: 45, pages: 20 },
+];
+console.log(sumBy(week, "minutes"), sumBy(week, "pages"));
+`}
+  tests={[
+    { name: "freezeDeep замораживает объект и всё внутри него", check: "(() => { const o = { a: { b: [1, { c: 2 }] }, d: 'x' }; const r = freezeDeep(o); return r === o && Object.isFrozen(o) && Object.isFrozen(o.a) && Object.isFrozen(o.a.b) && Object.isFrozen(o.a.b[1]); })()" },
+    { name: "freezeDeep возвращает примитивы и null без изменений", check: "freezeDeep(5) === 5 && freezeDeep(null) === null && freezeDeep('hi') === 'hi'" },
+    { name: "Функции внутри по-прежнему работают", check: "(() => { const f = () => 1; const o = { f, n: { m: 1 } }; freezeDeep(o); return o.f() === 1 && Object.isFrozen(o.n); })()" },
+    { name: "sumBy складывает одно свойство", check: "sumBy([{ a: 1, b: 'x' }, { a: 2.5, b: 'y' }, { a: -1, b: 'z' }], 'a') === 2.5 && sumBy([{ a: 1, n: 7 }], 'n') === 7" },
+    { name: "sumBy для пустого списка строк равен 0", check: "sumBy([], 'a') === 0" },
+  ]}
+>
+
+Соберите небольшой набор утилит — вместе с тестами типов. Типы в заготовке — заглушки, поэтому тесты типов не проходят и код не запустится, пока все три типа не будут правильными. Строка с `// @ts-expect-error` — тоже тест типов: он проходит, только когда эта строка **является** ошибкой.
+
+1. **`DeepReadonly<T>`**: каждое свойство на любой глубине — `readonly`; функции остаются как есть, массивы становятся массивами только для чтения.
+2. **`KeysByValue<T, V>`**: объединение ключей `T`, значения которых можно присвоить `V` (для `Settings` и `number`: `"fontSize" | "lineHeight"`).
+3. **`RequireAtLeastOne<T, Keys>`**: как `T`, но хотя бы один из `Keys` обязан присутствовать.
+
+Затем заставьте работать две функции:
+
+4. **`freezeDeep(value)`** замораживает `value` с помощью `Object.freeze` — и каждый объект и массив внутри на любой глубине, — а затем возвращает **то же самое** значение. Примитивы и `null` возвращаются без изменений; функции внутри не трогаются.
+5. **`sumBy(rows, key)`** складывает `row[key]` по всем строкам (0, если строк нет).
+
+<Hint>
+
+**Типы:** `DeepReadonly` — тот, что из урока (подойдёт любая версия). Для `KeysByValue` используйте «сопоставь, потом проиндексируй»: `{ [K in keyof T]-?: T[K] extends V ? K : never }[keyof T]` — или возьмите `keyof` от фильтрующего сопоставленного типа. `RequireAtLeastOne` — ровно та версия, что в уроке.
+
+**freezeDeep:** если `typeof value === "object" && value !== null`, вызовите `Object.freeze(value)`, затем пройдите циклом по `Object.values(value)` и вызовите `freezeDeep` для каждого дочернего значения (массивы тоже подойдут, а функции пропускаются, потому что их `typeof` — `"function"`). TypeScript не может проследить рекурсию, поэтому закончите одним приведением: `return value as DeepReadonly<T>;`.
+
+**sumBy:** цикл `for...of` с `total += row[key] as number;` (внутри дженерик-функции TypeScript не видит, что отфильтрованный ключ всегда указывает на число).
+
+</Hint>
+
+<Solution>
+
+```ts
+// ===== Помощники для тестов типов: не меняйте =====
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+type DeepReadonly<T> =
+  T extends (...args: any[]) => unknown ? T
+  : T extends readonly (infer E)[] ? ReadonlyArray<DeepReadonly<E>>
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+  : T;
+
+type KeysByValue<T, V> = {
+  [K in keyof T]-?: T[K] extends V ? K : never;
+}[keyof T];
+
+type RequireAtLeastOne<T, Keys extends keyof T = keyof T> =
+  Omit<T, Keys> &
+  {
+    [K in Keys]-?: Required<Pick<T, K>> &
+      Partial<Pick<T, Exclude<Keys, K>>>;
+  }[Keys];
+
+function freezeDeep<T>(value: T): DeepReadonly<T> {
+  if (typeof value === "object" && value !== null) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) {
+      freezeDeep(child);
+    }
+  }
+  // Единственное приведение: TypeScript не может проследить рекурсию
+  return value as DeepReadonly<T>;
+}
+
+function sumBy<T>(
+  rows: readonly T[],
+  key: KeysByValue<T, number>,
+): number {
+  let total = 0;
+  for (const row of rows) {
+    total += row[key] as number;
+  }
+  return total;
+}
+
+// ===== Тесты типов: не меняйте их =====
+interface Settings {
+  theme: { name: string; colours: string[] };
+  fontSize: number;
+  lineHeight: number;
+  onChange: (key: string) => void;
+}
+
+type cases = [
+  Expect<Equal<DeepReadonly<Settings>, {
+    readonly theme: {
+      readonly name: string;
+      readonly colours: readonly string[];
+    };
+    readonly fontSize: number;
+    readonly lineHeight: number;
+    readonly onChange: (key: string) => void;
+  }>>,
+  Expect<Equal<
+    KeysByValue<Settings, number>,
+    "fontSize" | "lineHeight"
+  >>,
+];
+
+interface Contact {
+  email?: string;
+  phone?: string;
+  note?: string;
+}
+type Reachable = RequireAtLeastOne<Contact, "email" | "phone">;
+const _c1: Reachable = { email: "mei@panda.dev" };
+const _c2: Reachable = { phone: "0123", note: "по вечерам" };
+// @ts-expect-error: нужен email или телефон
+const _c3: Reachable = { note: "со мной не связаться" };
+
+// ===== Попробуйте =====
+const settings = freezeDeep({
+  theme: { name: "forest", colours: ["green", "brown"] },
+  fontSize: 16,
+  lineHeight: 24,
+});
+console.log(Object.isFrozen(settings.theme.colours));
+
+const week = [
+  { day: "Mon", minutes: 30, pages: 12 },
+  { day: "Tue", minutes: 45, pages: 20 },
+];
+console.log(sumBy(week, "minutes"), sumBy(week, "pages"));
+// true
+// 75 32
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Относитесь к утилитным типам как к коду: пишите рядом с ними **тесты типов** (`Expect<Equal<...>>`), а неудобные случаи используйте, чтобы решить и зафиксировать, что тип должен делать.
+- **Глубокие типы** (`DeepReadonly`, `DeepPartial`) рекурсивно проходят через условный тип: функции оставляйте как есть, решите, что делать с массивами, останавливайтесь на примитивах и помните о встроенных объектах вроде `Date`.
+- **`PickByValue` / `OmitByValue`** фильтруют ключи по типу значения; сравнивайте `Exclude<T[K], undefined>`, иначе необязательные свойства молча исчезнут.
+- **`RequireAtLeastOne`** строит объединение вариантов приёмом «сопоставь, потом проиндексируй»; хитрые объединения дают запутанные сообщения об ошибках, поэтому давайте им имена и документируйте их.
+- **`UnionToIntersection`** превращает `A | B` в `A & B` через контравариантный `infer`; литералы и `boolean` схлопываются в `never`.
+- **`Simplify`** разворачивает пересечения ради читаемых подсказок и точных тестов типов.
+- Рекурсивные типы могут упереться в **"excessively deep"** на бесконечных типах вроде `Json` и замедлить большой проект: дайте массивам отдельную ветку, применяйте глубокие типы на границах, измеряйте с `--extendedDiagnostics` и, прежде чем писать свой тип, загляните в **type-fest**.

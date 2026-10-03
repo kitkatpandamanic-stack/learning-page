@@ -1,0 +1,630 @@
+---
+title: "Брендированные типы и типобезопасные API"
+description: "Брендированные типы и умные конструкторы против путаницы id и единиц; выбор между перегрузками, дженериками и объединениями; состояние в параметрах типа; запрет некорректных состояний."
+duration: 25
+xp: 30
+---
+
+Однажды команда платежей выпустила функцию возврата денег, которая принимала id заказа и id пользователя — обе обычные строки. После рефакторинга в одном месте вызова аргументы поменялись местами. Все тесты по-прежнему проходили: в тестовых данных случайно оказалось одно и то же значение для обоих id. Два дня возвраты искались не по тем записям. Другая команда хранила цены в одном сервисе в фунтах, а в другом — в пенсах: платёж на £49.99 ушёл как £4999.
+
+TypeScript не поймал ни одну из этих ошибок — и не мог поймать: для структурной системы типов строка есть строка, а число есть число. В этом уроке вы научите его различать такие значения с помощью **брендированных типов** (branded types), а затем примените ту же идею, чтобы проектировать API, в которых неправильный вызов просто не компилируется: умные конструкторы, фантомные типы, типобезопасные билдеры и правильный выбор между перегрузками, дженериками и объединениями. 🏷️
+
+## Когда структурная типизация слишком снисходительна
+
+Псевдоним типа (type alias) — это всего лишь **прозвище**. `UserId` и `OrderId` ниже — оба просто `string`, поэтому TypeScript спокойно принимает их в любом порядке:
+
+<CodeExample output="Возврат по заказу u_42 пользователю o_1001">
+
+```ts
+type UserId = string;
+type OrderId = string;
+
+function refund(orderId: OrderId, userId: UserId): string {
+  return `Возврат по заказу ${orderId} пользователю ${userId}`;
+}
+
+const userId: UserId = "u_42";
+const orderId: OrderId = "o_1001";
+console.log(refund(userId, orderId)); // перепутаны — и никакой ошибки!
+```
+
+</CodeExample>
+
+Имена помогают людям, но компилятор видит `refund(string, string)`. Чтобы TypeScript различал эти два типа, они должны отличаться **структурой**.
+
+## Брендированные типы
+
+**Брендированный тип** добавляет свойство, которое существует только в системе типов: «бренд» (brand), которого нет ни у одной обычной строки.
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type UserId = Brand<string, "UserId">;
+type OrderId = Brand<string, "OrderId">;
+```
+
+Разберём построчно:
+
+- `declare const brand: unique symbol` описывает символ, **не создавая его**: он существует только в типах, поэтому во время выполнения ни у одного значения не может быть такого ключа, и он не засоряет автодополнение, как засорял бы строковый ключ.
+- `T & { readonly [brand]: Name }` означает «`T`, который вдобавок несёт этот бренд». `UserId` по-прежнему строка: у него можно вызвать `.toUpperCase()`, его можно напечатать и передать туда, где ожидается `string`.
+- Разные имена дают разные бренды, поэтому `UserId` и `OrderId` больше не взаимозаменяемы.
+
+Во время выполнения ничего не меняется: бренд стирается вместе с остальными типами, так что брендированные значения не стоят ровным счётом ничего. Зато обе ошибки из начала урока теперь — ошибки компиляции:
+
+```ts
+refund(userId, orderId);
+// ❌ Error: Argument of type 'UserId' is not assignable to parameter of type 'OrderId'.
+refund("o_1001", userId);
+// ❌ Error: Argument of type 'string' is not assignable to parameter of type 'OrderId'.
+```
+
+В кодовых базах часто встречается вариант попроще — `string & { readonly __brand: "UserId" }`. Работает он так же; просто версия с `unique symbol` не может конфликтовать с настоящим свойством `__brand`. А библиотеки вроде zod (`.brand<"UserId">()`) и Effect поставляют собственные хелперы.
+
+## Умные конструкторы: единственный вход
+
+Если обычная строка — не `UserId`, то как его получить? Через **умный конструктор** (smart constructor): функцию, которая проверяет значение и брендирует его, только если проверка пройдена. Тогда бренд означает больше, чем «это строка, похожая на email». Он означает **«эта строка прошла проверку»**:
+
+<CodeExample output={`Приветственное письмо для mei@panda.dev поставлено в очередь
+Ошибка: "not-an-email" — не email`}>
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type Email = Brand<string, "Email">;
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// ЕДИНСТВЕННОЕ место, где можно создать Email
+function parseEmail(input: string): Result<Email, string> {
+  const email = input.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { ok: false, error: `"${input}" — не email` };
+  }
+  return { ok: true, value: email as Email };
+}
+
+// Код внутри может доверять типу: повторно проверять не нужно
+function sendWelcome(to: Email): string {
+  return `Приветственное письмо для ${to} поставлено в очередь`;
+}
+
+for (const input of ["  Mei@Panda.dev ", "not-an-email"]) {
+  const parsed = parseEmail(input);
+  if (parsed.ok) {
+    console.log(sendWelcome(parsed.value));
+  } else {
+    console.log(`Ошибка: ${parsed.error}`);
+  }
+}
+```
+
+</CodeExample>
+
+Эту идею часто формулируют так: **«парсите, а не валидируйте»** (parse, don't validate). Функция, которая проверяет значение и возвращает `boolean`, забывает, что узнала: каждому вызывающему приходится проверять заново или верить, что кто-то уже проверил. Функция, которая **парсит**, возвращает более точный тип, и доказательство путешествует вместе со значением. Вызвать `sendWelcome` с непроверенной строкой больше нельзя:
+
+```ts
+sendWelcome("mei@panda.dev");
+// ❌ Error: Argument of type 'string' is not assignable to parameter of type 'Email'.
+```
+
+<Callout type="warning" title="Бренд честен ровно настолько, насколько честны его конструкторы">
+
+`"anything" as Email` компилируется где угодно, и каждое такое приведение — поддельный сертификат. Держите `as` внутри умного конструктора, сразу после проверки, которая его оправдывает, и больше нигде. На код-ревью считайте `as Email` за пределами этой функции ошибкой. Данные из базы данных или JSON тоже должны проходить через конструктор (или через маппер, которому вы доверяете так же). Если бренды подделывают походя, они хуже, чем их отсутствие: непроверенные данные начинают **выглядеть** проверенными.
+
+</Callout>
+
+## Единицы измерения: центы — не фунты
+
+Бренды работают и с числами, и деньги — классический пример. Хранить цены в фунтах в виде чисел с плавающей точкой — значит напрашиваться на ошибки округления (`0.1 + 0.2` равно `0.30000000000000004`), поэтому платёжные системы используют целые **центы** (или пенсы). Бренд `Cents` гарантирует, что никто случайно не передаст фунты:
+
+<CodeExample output={`1999 400
+£23.99
+Некорректная сумма: "19.9"`}>
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type Cents = Brand<number, "Cents">;
+
+function cents(amount: number): Cents {
+  if (!Number.isSafeInteger(amount)) {
+    throw new RangeError(`${amount} — не целое число центов`);
+  }
+  return amount as Cents;
+}
+
+// "19.99" → 1999: разбираем как текст, без дробной арифметики
+function fromPounds(text: string): Cents {
+  const match = /^(\d+)(?:\.(\d{2}))?$/.exec(text);
+  if (!match) throw new RangeError(`Некорректная сумма: "${text}"`);
+  return cents(Number(match[1]) * 100 + Number(match[2] ?? 0));
+}
+
+function add(a: Cents, b: Cents): Cents {
+  return (a + b) as Cents;
+}
+
+function format(amount: Cents): string {
+  return `£${(amount / 100).toFixed(2)}`;
+}
+
+const price = fromPounds("19.99");
+const shipping = fromPounds("4");
+console.log(price, shipping);
+console.log(format(add(price, shipping)));
+try {
+  fromPounds("19.9");
+} catch (error) {
+  console.log((error as Error).message);
+}
+```
+
+</CodeExample>
+
+Обратите внимание, что арифметика делает с брендом: `price + price` — это обычный `number`. И это не баг, а фича. Компилятор не может знать, имеет ли смысл `price * price` (бессмыслица) или `price * 2` (нормально), поэтому он отбрасывает бренд и заставляет вас явно подтвердить результат через хелпер вроде `add`:
+
+```ts
+format(19.99);
+// ❌ Error: Argument of type 'number' is not assignable to parameter of type 'Cents'.
+format(price * 2);
+// ❌ Error: Argument of type 'number' is not assignable to parameter of type 'Cents'.
+```
+
+Как далеко заходить? Брендируйте значения, которые пересекают **границы** и приводят к дорогим путаницам: id разных сущностей, деньги, проверенные email и URL, единицы измерения (миллисекунды против секунд — классика). Не брендируйте каждую строку в приложении: каждому бренду нужны конструкторы и хелперы, а бренд, который никому не был нужен, — просто лишнее трение.
+
+<Quiz
+  question="type Cents = number & { readonly [brand]: 'Cents' }. Даны a: Cents и b: Cents. Какой тип у a + b?"
+  options={[
+    "Cents, потому что оба операнда — Cents",
+    "number, потому что арифметика не сохраняет бренды",
+    "never, потому что бренд нельзя складывать",
+    "Складывать брендированные числа — ошибка типов",
+  ]}
+  answer={1}
+  explanation="Оператор + для двух числовых значений всегда даёт number; бренд есть только у операндов. Так задумано: TypeScript не может знать, остаётся ли результат корректной суммой, поэтому вы заново брендируете его через хелпер вроде add(a, b)."
+/>
+
+## Фантомные типы
+
+**Фантомный параметр типа** (phantom type parameter) описывает значение, но никогда в нём не хранится: `Distance<"km">` против `Distance<"mi">`, `Form<"draft">` против `Form<"validated">`. Вот ловушка, в которую почти все попадают в первый раз:
+
+```ts
+interface User { name: string }
+interface Order { total: number }
+
+type Id<Entity> = string; // Entity нигде не используется...
+const userId: Id<User> = "u1";
+const orderId: Id<Order> = userId; // ...поэтому это компилируется!
+```
+
+TypeScript сравнивает **структуры**, а параметр типа, который не появляется в структуре, ни на что не влияет: `Id<User>` и `Id<Order>` — оба просто `string`. Фантомный параметр работает, только если он **где-то** встречается в типе, и бренд — идеальное место для него:
+
+<CodeExample output="21.1">
+
+```ts
+type Unit = "km" | "mi";
+
+// Единица живёт только в типе: во время выполнения ничего лишнего
+type Distance<U extends Unit> = number & { readonly unit: U };
+
+function km(value: number): Distance<"km"> {
+  return value as Distance<"km">;
+}
+function mi(value: number): Distance<"mi"> {
+  return value as Distance<"mi">;
+}
+
+function toKm(d: Distance<"mi">): Distance<"km"> {
+  return km(d * 1.609344);
+}
+
+function add<U extends Unit>(
+  a: Distance<U>,
+  b: NoInfer<Distance<U>>,
+): Distance<U> {
+  return (a + b) as Distance<U>;
+}
+
+const run = km(5);
+const ride = mi(10);
+console.log(add(run, toKm(ride)).toFixed(1));
+```
+
+</CodeExample>
+
+`NoInfer` здесь не для красоты. Без него оба аргумента — места вывода типа, и `add(km(5), mi(10))` спокойно выводит `U` как `"km" | "mi"` — ровно та ошибка, которую тип должен был предотвращать. С ним `U` берётся только из первого аргумента (почему так — вы видели в уроке [Вариантность и вывод типов](/learn/typescript/variance-and-inference)):
+
+```ts
+add(run, ride);
+// ❌ Error: Argument of type 'Distance<"mi">' is not assignable to parameter of type 'Distance<"km">'.
+```
+
+Отсюда общий урок про хитроумные типы: **тестируйте случаи ошибок**, а не только «счастливый путь». Строка `// @ts-expect-error` над `add(run, ride)` сразу поймала бы отсутствие `NoInfer`.
+
+## Типобезопасные билдеры
+
+Фантомные параметры умеют отслеживать и **прогресс**. Билдер (builder) запросов не должен позволять вызвать `build()`, пока не заданы URL и метод. Каждый шаг возвращает билдер, параметры типа которого записывают, что уже сделано, а `build` объявляет (через параметр `this`), что работает только с завершённым билдером:
+
+<CodeExample output={`{
+  headers: { Accept: 'application/json' },
+  url: 'https://api.pandadev.test/todos',
+  method: 'GET'
+}`}>
+
+```ts
+type Method = "GET" | "POST" | "DELETE";
+
+interface HttpRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+}
+
+class RequestBuilder<HasUrl = false, HasMethod = false> {
+  // Только для типов: делает два флага частью структуры
+  declare private readonly steps: [HasUrl, HasMethod];
+
+  private constructor(private readonly draft: Partial<HttpRequest>) {}
+
+  static create(): RequestBuilder {
+    return new RequestBuilder({ headers: {} });
+  }
+
+  url(url: string): RequestBuilder<true, HasMethod> {
+    return new RequestBuilder({ ...this.draft, url });
+  }
+
+  method(method: Method): RequestBuilder<HasUrl, true> {
+    return new RequestBuilder({ ...this.draft, method });
+  }
+
+  header(
+    name: string,
+    value: string,
+  ): RequestBuilder<HasUrl, HasMethod> {
+    const headers = { ...this.draft.headers, [name]: value };
+    return new RequestBuilder({ ...this.draft, headers });
+  }
+
+  // Можно вызвать, только когда заданы и url, и method
+  build(this: RequestBuilder<true, true>): HttpRequest {
+    return this.draft as HttpRequest;
+  }
+}
+
+const request = RequestBuilder.create()
+  .url("https://api.pandadev.test/todos")
+  .header("Accept", "application/json")
+  .method("GET")
+  .build();
+console.log(request);
+```
+
+</CodeExample>
+
+Пропустите шаг — и ошибку поймают там, где вы её допустили:
+
+```ts
+RequestBuilder.create().url("/todos").build();
+// ❌ Error: The 'this' context of type 'RequestBuilder<true, false>' is not assignable to method's 'this' of type 'RequestBuilder<true, true>'.
+```
+
+Строка `declare private readonly steps` — снова урок о фантомных типах. `declare` сообщает TypeScript, что поле существует, но не создаёт его (поэтому во время выполнения оно ничего не стоит). Удалите эту строку, и код по-прежнему скомпилируется, но `build()` тихо заработает на **любом** билдере, потому что `HasUrl` и `HasMethod` перестанут появляться в структуре.
+
+Стоит ли билдер усилий? Посмотрите на сообщение об ошибке выше: оно точное, но на его расшифровку нужно время. Обычная функция с **обязательным объектом параметров**, `createRequest({ method: "GET", url })`, даёт ту же гарантию безо всяких хитростей, а сообщение TypeScript («Property 'method' is missing») понятно мгновенно. Билдеры оправдывают себя, когда необязательных шагов много, важен порядок или билдер — публичное лицо библиотеки (построители запросов вроде Kysely, построители схем вроде zod). В коде приложения начинайте с объекта параметров.
+
+## Перегрузки, дженерики или объединения
+
+Проектирование API на TypeScript постоянно ставит вопрос: как **возвращаемый тип** должен зависеть от **аргументов**? Инструментов три, и порядок предпочтения простой:
+
+1. **Параметр-объединение**, когда результат не зависит от того, что именно пришло: `function len(x: string | readonly unknown[]): number`. Одна сигнатура, и её легко вызвать со значением, которое может быть и тем, и другим.
+2. **Дженерик**, когда тип результата прямо следует за типом входа: `first<T>(items: readonly T[]): T | undefined`.
+3. **Перегрузки** (overloads), когда результат зависит от входа в нескольких отдельных случаях, которые можно перечислить:
+
+<CodeExample output="450 [ 120, 99 ]">
+
+```ts
+function toCents(text: string): number;
+function toCents(texts: readonly string[]): number[];
+function toCents(input: string | readonly string[]): number | number[] {
+  if (typeof input === "string") {
+    return Math.round(Number(input) * 100);
+  }
+  return input.map((text) => toCents(text));
+}
+
+const one = toCents("4.50"); // number
+const many = toCents(["1.20", "0.99"]); // number[]
+console.log(one, many);
+```
+
+</CodeExample>
+
+Вызывающий код получает точные типы, но у перегрузок есть известная слабость: каждый вызов должен подходить под **одну** перегрузку, поэтому значение, которое может быть и тем, и другим, не подходит ни под одну:
+
+```ts
+declare const fromForm: string | string[];
+toCents(fromForm);
+// ❌ Error: No overload matches this call.
+```
+
+Понадобилась бы третья перегрузка — для объединения. Альтернатива, дженерик с условным возвращаемым типом (`T extends string ? number : number[]`), красиво читается в месте вызова, но реализовать её без приведений типа нельзя: TypeScript не умеет проверять условный возвращаемый тип внутри тела функции:
+
+```ts
+function toCents<T extends string | readonly string[]>(
+  input: T,
+): T extends string ? number : number[] {
+  if (typeof input === "string") {
+    return Math.round(Number(input) * 100);
+    // ❌ Error: Type 'number' is not assignable to type 'T extends string ? number : number[]'.
+  }
+  return input.map((text) => Math.round(Number(text) * 100));
+  // ❌ Error: Type 'number[]' is not assignable to type 'T extends string ? number : number[]'.
+}
+```
+
+Отсюда эмпирическое правило: выбирайте **объединение**, если возвращаемый тип один и тот же; **дженерик**, если результат просто повторяет вход; **перегрузки** — для небольшого фиксированного набора отдельных случаев, и добавьте последней перегрузку для объединения, если у вызывающих может оказаться любое из значений. Условные возвращаемые типы оставьте для внутренностей библиотек, где вы будете их тщательно тестировать.
+
+## Делайте некорректные состояния непредставимыми на границе
+
+Всё в этом модуле ведёт к одной привычке проектирования: размещайте строгость на **краях** API, чтобы внутри всё было просто. Чек-лист для функции или модуля, которые вызывают другие люди:
+
+- **Парсите на границе.** Данные приходят как `unknown` или обычные строки; умные конструкторы превращают их в `Email`, `UserId`, `Cents`. Внутри никто ничего не проверяет повторно (о целых объектах — в уроке [Валидация во время выполнения](/learn/typescript/runtime-validation)).
+- **Состояния — размеченные объединения**, а не флаги: `{ status: "paid"; paidAt: string }` вместо `paid: boolean; paidAt?: string` ([Размеченные объединения](/learn/typescript/discriminated-unions)).
+- **Варианты «или-или»** — объединение с `never` на другой стороне, чтобы передать оба было ошибкой (пример ниже).
+- **«Хотя бы одно из»** — с помощью `RequireAtLeastOne` из [первого урока](/learn/typescript/building-utility-types).
+- **Именованные поля для значений одного типа.** Бренд не помешает перепутать два `AccountId`. А `transfer({ from, to, amount })` помешает, потому что каждое значение подписано в месте вызова.
+
+Вот шаблон «или-или». Свойство типа `never` можно только опустить (или сделать `undefined`), поэтому каждый вариант запрещает ключ другого:
+
+```ts
+type Lookup =
+  | { id: string; email?: never }
+  | { email: string; id?: never };
+declare function findUser(by: Lookup): void;
+
+findUser({ id: "u1" }); // ✅
+findUser({ id: "u1", email: "mei@panda.dev" });
+// ❌ Error: Argument of type '{ id: string; email: string; }' is not assignable to parameter of type 'Lookup'.
+```
+
+Без частей с `never` тип `{ id: string } | { email: string }` принял бы объект с обоими ключами: он подходит под первый вариант, а лишний `email` разрешён вторым.
+
+И знайте, когда остановиться. Внутри одного небольшого модуля с одним автором и хорошими тестами `string` — вполне нормально. Брендированные типы, билдеры и фантомные параметры окупаются там, где API вызывает много людей, где ошибки дороги (деньги, права доступа, чужие данные) или где такая путаница уже однажды случалась. Если тип усложняет использование API сильнее, чем мешает баг, который он предотвращает, — это неправильный тип.
+
+<Quiz
+  question="type Id<Entity> = string. Почему const orderId: Id<Order> = userId (это Id<User>) компилируется?"
+  options={[
+    "Потому что Id — псевдоним типа, а псевдонимы всегда взаимозаменяемы",
+    "Потому что Entity не появляется в структуре, так что Id<User> и Id<Order> — оба просто string",
+    "Потому что User и Order — оба объектные типы",
+    "Это не компилируется: разные аргументы типа дают разные типы",
+  ]}
+  answer={1}
+  explanation="TypeScript сравнивает структуры. Неиспользуемый (фантомный) параметр типа ничего не меняет в структуре, поэтому оба типа — string. Поместите параметр в бренд, например string & { readonly entity: Entity }, и типы станут разными."
+/>
+
+<Exercise
+  title="Брендированные денежные переводы"
+  language="typescript"
+  starter={`declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type Result<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string };
+
+// ТИПЫ: сделайте их брендами, чтобы непроверенные значения
+// не могли проскочить
+type AccountId = string;
+type Cents = number;
+
+// "acc_", а за ним от 4 до 12 строчных латинских букв или цифр
+function parseAccountId(input: string): Result<AccountId> {
+  return { ok: false, error: "TODO" };
+}
+
+// Целое число центов из текста вроде "12.50" или "7"
+// (цифры, затем, возможно, точка и ровно две цифры)
+function parseCents(input: string): Result<Cents> {
+  return { ok: false, error: "TODO" };
+}
+
+function addCents(a: Cents, b: Cents): Cents {
+  return 0;
+}
+
+// 1250 → "£12.50"
+function formatCents(amount: Cents): string {
+  return "";
+}
+
+interface Transfer {
+  from: AccountId;
+  to: AccountId;
+  amount: Cents;
+}
+
+// Отклоняйте переводы на тот же счёт и суммы, равные 0
+function createTransfer(transfer: Transfer): Result<Transfer> {
+  return { ok: false, error: "TODO" };
+}
+
+// ===== Тесты типов: не меняйте их =====
+function _typeTests(id: AccountId, amount: Cents) {
+  createTransfer({ from: id, to: id, amount });
+  // @ts-expect-error: обычная строка — не проверенный id счёта
+  createTransfer({ from: "acc_mei01", to: id, amount });
+  // @ts-expect-error: обычное число — не проверенная сумма
+  createTransfer({ from: id, to: id, amount: 500 });
+  // @ts-expect-error: + даёт обычный number; используйте addCents
+  const _total: Cents = amount + amount;
+}
+
+// ===== Попробуйте =====
+const from = parseAccountId("acc_mei01");
+const to = parseAccountId("acc_sam42");
+const price = parseCents("12.50");
+const tip = parseCents("2");
+if (from.ok && to.ok && price.ok && tip.ok) {
+  const total = addCents(price.value, tip.value);
+  console.log(formatCents(total));
+  console.log(
+    createTransfer({ from: from.value, to: to.value, amount: total }),
+  );
+  console.log(
+    createTransfer({ from: from.value, to: from.value, amount: total }),
+  );
+}
+console.log(parseCents("12.5"));
+console.log(parseAccountId("ACC_MEI"));
+`}
+  tests={[
+    { name: "parseAccountId принимает корректные id", check: "(() => { const a = parseAccountId('acc_mei01'); const b = parseAccountId('acc_x9y8z7w6v5u4'); return a.ok && a.value === 'acc_mei01' && b.ok && b.value === 'acc_x9y8z7w6v5u4'; })()" },
+    { name: "parseAccountId отклоняет всё остальное с сообщением", check: "['acc_', 'acc_abc', 'ACC_MEI01', 'acc_Mei01', 'usr_mei01', 'acc_mei-01', 'acc_x9y8z7w6v5u4t', ' acc_mei01', ''].every((s) => { const r = parseAccountId(s); return r.ok === false && typeof r.error === 'string' && r.error.length > 0; })" },
+    { name: "parseCents превращает текст в целые центы", check: "(() => { const ok = (s, n) => { const r = parseCents(s); return r.ok && r.value === n; }; return ok('12.50', 1250) && ok('7', 700) && ok('0.05', 5) && ok('0.29', 29) && ok('1000000.01', 100000001) && ok('0', 0); })()" },
+    { name: "parseCents отклоняет неправильно записанные суммы", check: "['12.5', '1.234', '-3', '3.', '.50', 'abc', '', '1,50', ' 2'].every((s) => { const r = parseCents(s); return r.ok === false && typeof r.error === 'string' && r.error.length > 0; })" },
+    { name: "addCents и formatCents работают", check: "addCents(1250, 75) === 1325 && formatCents(1250) === '£12.50' && formatCents(5) === '£0.05' && formatCents(0) === '£0.00' && formatCents(123456) === '£1234.56'" },
+    { name: "createTransfer принимает корректный перевод", check: "(() => { const t = createTransfer({ from: 'acc_aaaa', to: 'acc_bbbb', amount: 100 }); return t.ok === true && t.value.from === 'acc_aaaa' && t.value.to === 'acc_bbbb' && t.value.amount === 100; })()" },
+    { name: "createTransfer отклоняет тот же счёт и нулевые суммы", check: "(() => { const same = createTransfer({ from: 'acc_aaaa', to: 'acc_aaaa', amount: 100 }); const zero = createTransfer({ from: 'acc_aaaa', to: 'acc_bbbb', amount: 0 }); return same.ok === false && zero.ok === false && same.error.length > 0 && zero.error.length > 0; })()" },
+  ]}
+>
+
+Соберите ядро небольшого платёжного модуля, в котором непроверенный id или сумма даже не могут попасть в перевод. Тесты типов внизу не проходят, пока `AccountId` и `Cents` не станут настоящими брендами (каждый `// @ts-expect-error` проходит, только если строка под ним **является** ошибкой).
+
+1. **Типы:** сделайте `AccountId` и `Cents` брендами с помощью хелпера `Brand`.
+2. **`parseAccountId(input)`**: корректный id — это `"acc_"`, за которым следуют от 4 до 12 строчных латинских букв или цифр, и больше ничего (без обрезки пробелов, без заглавных букв). Верните `{ ok: true, value }` с брендированным id или `{ ok: false, error }` с понятным сообщением.
+3. **`parseCents(input)`**: цифры, за которыми может идти точка и **ровно две** цифры (`"12.50"` → `1250`, `"7"` → `700`). Всё остальное — ошибка. Собирайте число из двух частей как из целых чисел; не умножайте дробное число на 100.
+4. **`addCents(a, b)`** складывает две суммы; **`formatCents(amount)`** возвращает `"£12.50"` для `1250` и `"£0.05"` для `5`.
+5. **`createTransfer(transfer)`** возвращает ошибку для перевода на тот же счёт или суммы `0` и `{ ok: true, value: transfer }` в остальных случаях. (Функция нарочно принимает объект: бренды не помешают перепутать `from` и `to`, а именованные поля — помешают.)
+
+<Hint>
+
+Типы: `type AccountId = Brand<string, "AccountId">;` и `type Cents = Brand<number, "Cents">;`. Приведения через `as` допустимы только в функциях парсинга и в `addCents`, сразу после проверок.
+
+`parseAccountId`: `/^acc_[a-z0-9]{4,12}$/.test(input)`.
+
+`parseCents`: `const match = /^(\d+)(?:\.(\d{2}))?$/.exec(input);`, а затем `Number(match[1]) * 100 + Number(match[2] ?? "0")`.
+
+`formatCents`: `Math.floor(amount / 100)` — для фунтов и `String(amount % 100).padStart(2, "0")` — для пенсов.
+
+</Hint>
+
+<Solution>
+
+```ts
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+type Result<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string };
+
+type AccountId = Brand<string, "AccountId">;
+type Cents = Brand<number, "Cents">;
+
+function parseAccountId(input: string): Result<AccountId> {
+  if (!/^acc_[a-z0-9]{4,12}$/.test(input)) {
+    return { ok: false, error: `Некорректный id счёта: "${input}"` };
+  }
+  return { ok: true, value: input as AccountId };
+}
+
+function parseCents(input: string): Result<Cents> {
+  const match = /^(\d+)(?:\.(\d{2}))?$/.exec(input);
+  if (!match) {
+    return { ok: false, error: `Некорректная сумма: "${input}"` };
+  }
+  // только целые числа: никаких сюрпризов с плавающей точкой
+  const cents = Number(match[1]) * 100 + Number(match[2] ?? "0");
+  if (!Number.isSafeInteger(cents)) {
+    return { ok: false, error: `Слишком большая сумма: "${input}"` };
+  }
+  return { ok: true, value: cents as Cents };
+}
+
+function addCents(a: Cents, b: Cents): Cents {
+  return (a + b) as Cents;
+}
+
+function formatCents(amount: Cents): string {
+  const pounds = Math.floor(amount / 100);
+  const pence = String(amount % 100).padStart(2, "0");
+  return `£${pounds}.${pence}`;
+}
+
+interface Transfer {
+  from: AccountId;
+  to: AccountId;
+  amount: Cents;
+}
+
+function createTransfer(transfer: Transfer): Result<Transfer> {
+  if (transfer.from === transfer.to) {
+    return { ok: false, error: "Нельзя перевести на тот же счёт" };
+  }
+  if (transfer.amount === 0) {
+    return { ok: false, error: "Сумма должна быть больше 0" };
+  }
+  return { ok: true, value: transfer };
+}
+
+// ===== Тесты типов: не меняйте их =====
+function _typeTests(id: AccountId, amount: Cents) {
+  createTransfer({ from: id, to: id, amount });
+  // @ts-expect-error: обычная строка — не проверенный id счёта
+  createTransfer({ from: "acc_mei01", to: id, amount });
+  // @ts-expect-error: обычное число — не проверенная сумма
+  createTransfer({ from: id, to: id, amount: 500 });
+  // @ts-expect-error: + даёт обычный number; используйте addCents
+  const _total: Cents = amount + amount;
+}
+
+// ===== Попробуйте =====
+const from = parseAccountId("acc_mei01");
+const to = parseAccountId("acc_sam42");
+const price = parseCents("12.50");
+const tip = parseCents("2");
+if (from.ok && to.ok && price.ok && tip.ok) {
+  const total = addCents(price.value, tip.value);
+  console.log(formatCents(total));
+  console.log(
+    createTransfer({ from: from.value, to: to.value, amount: total }),
+  );
+  console.log(
+    createTransfer({ from: from.value, to: from.value, amount: total }),
+  );
+}
+console.log(parseCents("12.5"));
+console.log(parseAccountId("ACC_MEI"));
+// £14.50
+// {
+//   ok: true,
+//   value: { from: 'acc_mei01', to: 'acc_sam42', amount: 1450 }
+// }
+// { ok: false, error: 'Нельзя перевести на тот же счёт' }
+// { ok: false, error: 'Некорректная сумма: "12.5"' }
+// { ok: false, error: 'Некорректный id счёта: "ACC_MEI"' }
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Псевдоним типа — всего лишь прозвище; структурная типизация не отличит `UserId` от `OrderId`, пока их **структуры** не станут разными.
+- **Брендированный тип** (`T & { readonly [brand]: Name }`) добавляет маркер, существующий только в типах: нулевая цена во время выполнения, а путаница становится ошибкой компиляции.
+- **Умные конструкторы** — единственный вход: сначала проверка, потом бренд («парсите, а не валидируйте»). Держите все `as` внутри них; поддельный бренд хуже, чем никакой.
+- Брендируйте **единицы измерения** вроде `Cents`: арифметика нарочно отбрасывает бренд, и вы заново брендируете результат через хелперы.
+- **Фантомный параметр типа** должен присутствовать в структуре (обычно в бренде), иначе TypeScript его игнорирует; используйте `NoInfer`, чтобы не проскакивали объединения, и пишите тесты типов для случаев ошибок.
+- **Типобезопасные билдеры** отслеживают прогресс в параметрах типа и ограничивают `build` параметром `this`; объект параметров с обязательными полями часто оказывается проще.
+- Выбирайте **объединения**, когда возвращаемый тип один и тот же, **дженерики** — когда результат повторяет вход, и **перегрузки** — для нескольких отдельных случаев (аргументы-объединения они отвергают, если не добавить для них перегрузку).
+- Делайте некорректные состояния непредставимыми **на границе**: парсите в брендированные типы, моделируйте состояния объединениями, используйте `never` для вариантов «или-или» и именованные поля для значений одного типа — и остановитесь, когда тип обходится дороже, чем баг, который он предотвращает.
+
+🎉 Модуль «Программирование на уровне типов» пройден. Теперь вы умеете создавать и тестировать собственные утилитные типы, точно рассуждать о совместимости и выводе типов и проектировать API, в которых неправильный вызов не компилируется.

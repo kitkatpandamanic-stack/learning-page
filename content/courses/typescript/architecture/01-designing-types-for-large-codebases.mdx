@@ -1,0 +1,937 @@
+---
+title: Designing Types for Large Codebases
+description: Separate domain types, DTOs and persistence types, keep unknown at the edges, pick an error strategy per layer, stop any from spreading, and give each feature a small public API.
+duration: 24
+xp: 25
+---
+
+In a small app, one `User` interface does everything: it's the database row, the thing your business logic works with and the JSON your API sends. That feels efficient, until it isn't. One team I worked with had exactly that `User` type, used in 300 files. Someone added `resetToken` to it so the password-reset flow could read it from the database. Because the API sent the same `User`, every `GET /users/:id` response included a live reset token for three weeks before anyone noticed. TypeScript never complained, because nothing was wrong with the types. The **design** of the types was wrong. 🏗️
+
+This lesson is about that design: which types a large codebase needs, where data gets checked, how errors travel, how to keep `any` from spreading, and how to draw boundaries between features so that 50 developers can work in one repository without stepping on each other. If clean architecture's layers are new to you, the [JavaScript lesson on clean architecture](/learn/javascript/clean-architecture) introduces them; here we look at them through types.
+
+## One concept, three types
+
+Data about a user exists in at least three places, and each has different needs:
+
+| Type | Lives in | Shaped by | Example |
+| --- | --- | --- | --- |
+| **Persistence type** | The repository / database adapter | The database: snake_case columns, numbers for timestamps, nullable columns | `UserRow` |
+| **Domain type** | Business logic | The business: `Date`, unions for states, invariants | `User` |
+| **DTO** (data transfer object) | The API edge | The clients: JSON-safe values, no secrets, stable over time | `UserDto` |
+
+They look similar on day one, but they change for **different reasons**. A DBA renames a column, product adds a "suspended" status, a mobile client needs `createdAt` as a string: with one shared type, every one of those changes ripples through the whole codebase. With three types and two small **mapping functions** between them, each change stays in one place:
+
+<CodeExample output={`active 2026
+{
+  id: 'u1',
+  email: 'mei@pandadev.test',
+  displayName: 'Mei',
+  createdAt: '2026-01-01T00:00:00.000Z'
+}`}>
+
+```ts
+// persistence: what the database stores
+interface UserRow {
+  id: string;
+  email: string;
+  display_name: string;
+  password_hash: string;
+  created_at: number; // milliseconds since 1970
+  deleted_at: number | null;
+}
+
+// domain: what the business rules work with
+interface User {
+  id: string;
+  email: string;
+  displayName: string;
+  passwordHash: string;
+  createdAt: Date;
+  status: "active" | "deleted";
+}
+
+// DTO: what the API sends (JSON-safe, no secrets)
+interface UserDto {
+  id: string;
+  email: string;
+  displayName: string;
+  createdAt: string; // ISO 8601
+}
+
+function rowToUser(row: UserRow): User {
+  return {
+    id: row.id,
+    email: row.email,
+    displayName: row.display_name,
+    passwordHash: row.password_hash,
+    createdAt: new Date(row.created_at),
+    status: row.deleted_at === null ? "active" : "deleted",
+  };
+}
+
+function toUserDto(user: User): UserDto {
+  return {
+    id: user.id,
+    email: user.email,
+    displayName: user.displayName,
+    createdAt: user.createdAt.toISOString(),
+  };
+}
+
+const row: UserRow = {
+  id: "u1",
+  email: "mei@pandadev.test",
+  display_name: "Mei",
+  password_hash: "pbkdf2$1000$9f2c…",
+  created_at: 1767225600000,
+  deleted_at: null,
+};
+
+const user = rowToUser(row);
+console.log(user.status, user.createdAt.getUTCFullYear());
+console.log(toUserDto(user));
+```
+
+</CodeExample>
+
+The domain never sees `deleted_at`: it sees a `status` union, which is what the business actually talks about. The DTO never sees `passwordHash`, and that's guaranteed by `toUserDto`, a function you can read in ten seconds and test in one line.
+
+### Annotations don't filter
+
+Here's the trap that bit the team in the intro. You might think a function that takes a `PublicProfile` can only ever send public fields. It can't, because TypeScript is **structural**: a `User` has every property a `PublicProfile` needs, so it's accepted, extra properties and all:
+
+<CodeExample output={`{"id":"u1","displayName":"Mei","passwordHash":"pbkdf2$1000$9f2c"}
+{"id":"u1","displayName":"Mei"}`}>
+
+```ts
+interface User {
+  id: string;
+  displayName: string;
+  passwordHash: string;
+}
+
+interface PublicProfile {
+  id: string;
+  displayName: string;
+}
+
+function sendJson(body: PublicProfile): void {
+  console.log(JSON.stringify(body));
+}
+
+const user: User = {
+  id: "u1",
+  displayName: "Mei",
+  passwordHash: "pbkdf2$1000$9f2c",
+};
+
+sendJson(user); // compiles: User has everything PublicProfile needs
+
+function toPublicProfile(user: User): PublicProfile {
+  return { id: user.id, displayName: user.displayName };
+}
+sendJson(toPublicProfile(user));
+```
+
+</CodeExample>
+
+The **excess property check** from [Variance & Inference](/learn/typescript/variance-and-inference) only fires for a **fresh** literal written right there, like `sendJson({ id: "u1", displayName: "Mei", passwordHash: "x" })`. A variable that already holds a bigger object sails through. Types describe the **minimum** a value has; they never remove anything at runtime. Only code does that, and the mapping function is that code.
+
+The same idea decides how you derive DTO types. `type UserDto = Omit<User, "passwordHash">` is a **denylist**: when someone adds `mfaSecret` to `User` next year, the DTO quietly grows a new field. `Pick<User, "id" | "email">` or a separate interface is an **allowlist**: new fields stay private until someone deliberately exposes them. For anything that crosses a trust boundary, prefer allowlists.
+
+<Callout type="warning" title="Don't split types you don't need yet">
+
+Three types per concept is a cost: more names, more mapping code, more tests. For an internal admin tool where the table **is** the API, one type (maybe with an `Omit` for the password) is fine. Split when the shapes start to differ: a column rename you don't want clients to see, a secret field, a JSON-unfriendly value like `Date` or `bigint`, or a second client with different needs. The mapping functions are cheap to add later if the domain code never touches rows directly.
+
+</Callout>
+
+## `unknown` at the edges, validated types inside
+
+An **edge** is anywhere data enters your program that TypeScript didn't create: HTTP request bodies and query strings, `JSON.parse`, `res.json()` from `fetch`, `localStorage`, environment variables, messages from a queue, files, third-party SDKs that return `any`. At every edge the honest type is `unknown`, as you saw in [Type Guards & unknown](/learn/typescript/type-guards-and-unknown) and [Typed Fetch](/learn/typescript/typed-fetch).
+
+The rule for a large codebase is simple to say: **check data once, at the edge, and convert it into a type that proves it was checked.** Code inside then never re-validates and never sees `unknown`. This is often called **"parse, don't validate"**: a validator answers "is this OK?" and throws the answer away, while a parser returns a *new, more precise value*. A [branded](/learn/typescript/branded-types-and-type-safe-apis) `Email` type (a `string` that has passed the email check) makes the proof visible in every signature:
+
+<CodeExample output={`Pandas: 5 seats, owner mei@pandadev.test
+[ 'name', 'owner', 'seats' ]
+{
+  ok: false,
+  error: [
+    'name is required',
+    'owner must be an email',
+    'seats must be a whole number ≥ 1'
+  ]
+}
+{ ok: false, error: [ 'body must be an object' ] }`}>
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// A string that has passed validation (a branded type)
+type Email = string & { readonly __brand: "Email" };
+
+interface NewTeam {
+  name: string;
+  owner: Email;
+  seats: number;
+}
+
+// Small parsers: unknown in, a checked value or null out
+function parseEmail(value: unknown): Email | null {
+  if (typeof value !== "string") return null;
+  const email = value.trim().toLowerCase();
+  const valid = /^[^@\s]+@[^@\s]+$/.test(email);
+  return valid ? (email as Email) : null; // the only cast
+}
+
+function parseName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return value.trim() === "" ? null : value.trim();
+}
+
+function parseSeats(value: unknown): number | null {
+  if (typeof value !== "number") return null;
+  return Number.isInteger(value) && value >= 1 ? value : null;
+}
+
+// The edge: unknown in, a NewTeam or a list of issues out
+function parseNewTeam(input: unknown): Result<NewTeam, string[]> {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: ["body must be an object"] };
+  }
+  const name = parseName("name" in input ? input.name : undefined);
+  const owner = parseEmail("owner" in input ? input.owner : undefined);
+  const seats = parseSeats("seats" in input ? input.seats : 5);
+
+  const issues: string[] = [];
+  if (name === null) issues.push("name is required");
+  if (owner === null) issues.push("owner must be an email");
+  if (seats === null) issues.push("seats must be a whole number ≥ 1");
+  if (name === null || owner === null || seats === null) {
+    return { ok: false, error: issues };
+  }
+  // A fresh object with known fields only: extra keys never get in
+  return { ok: true, value: { name, owner, seats } };
+}
+
+// The inside: only accepts data that has been through the edge
+function welcome(team: NewTeam): string {
+  return `${team.name}: ${team.seats} seats, owner ${team.owner}`;
+}
+
+const body: unknown = JSON.parse(
+  '{"name":" Pandas ","owner":"MEI@pandadev.test","isAdmin":true}',
+);
+const parsed = parseNewTeam(body);
+if (parsed.ok) {
+  console.log(welcome(parsed.value));
+  console.log(Object.keys(parsed.value));
+}
+console.log(parseNewTeam({ name: " ", owner: "mei", seats: 0 }));
+console.log(parseNewTeam("hello"));
+```
+
+</CodeExample>
+
+Three details make this production-grade:
+
+- **The parser builds a fresh object.** The request smuggled in `"isAdmin": true`; it's simply not copied. Spreading the body (`{ ...body }`) into a domain object is how "mass assignment" bugs happen, where users promote themselves to admin by adding a field.
+- **The only `as` is inside `parseEmail`**, right after the check that justifies it. A branded type should have exactly one way in. Anywhere else, `"mei@pandadev.test"` is just a `string`, so `welcome({ name: "Pandas", owner: "mei@pandadev.test", seats: 3 })` is an error: *Type 'string' is not assignable to type 'Email'.*
+- **It reports every issue at once**, not just the first, so a form can highlight all the bad fields in one round trip.
+
+In a real project you'd write the same thing with a schema library such as **Zod** or **Valibot**, the grown-up versions of the one you built in [Runtime Validation](/learn/typescript/runtime-validation). They build the parser and the type from one definition (and strip unknown keys by default):
+
+```ts
+import { z } from "zod";
+
+const NewTeam = z.object({
+  name: z.string().trim().min(1),
+  owner: z.email().brand<"Email">(),
+  seats: z.number().int().min(1).default(5),
+});
+type NewTeam = z.infer<typeof NewTeam>;
+
+const parsed = NewTeam.safeParse(req.body);
+if (!parsed.success) {
+  res.status(400).json({ issues: parsed.error.issues });
+  return;
+}
+createTeam(parsed.data); // NewTeam, checked
+```
+
+Which library doesn't matter much. What matters is the **architecture**: one parser per edge, `unknown` before it, precise types after it.
+
+## An error strategy, not just error handling
+
+In [Typed Fetch](/learn/typescript/typed-fetch) and [Validation & Error Handling](/learn/typescript/validation-and-errors) you compared throwing with returning a `Result`. In a big codebase the question isn't "which is better" but "which one **where**", decided once and written down. A strategy that works well for most backends:
+
+- **Expected failures are values.** Invalid input, "name already taken", "plan limit reached": these are part of normal life, callers must handle them, and each one gets a tag in a discriminated union. The use case returns `Result<Team, CreateTeamError>`.
+- **Unexpected failures are exceptions.** The database is down, a bug threw a `TypeError`. No caller can do anything useful about them, so they bubble up to **one** place (Express's error middleware, a job runner's catch) that logs, alerts and answers `500`.
+- **The edge translates.** Only the HTTP adapter knows about status codes; the domain only knows `"name-taken"`.
+
+<CodeExample output={`201 { id: 't1', name: 'Pandas' }
+400 { error: 'name is required' }
+409 { error: '"Pandas" is already taken' }
+201 { id: 't2', name: 'Otters' }
+403 { error: 'your plan allows 2 teams' }
+ALERT: connection refused
+500 { error: 'Something went wrong' }`}>
+
+```ts
+import express from "express";
+import type { Request, Response, NextFunction } from "express";
+import request from "supertest";
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+interface Team {
+  id: string;
+  name: string;
+}
+
+// Every EXPECTED way creating a team can fail, as data
+type CreateTeamError =
+  | { kind: "invalid"; issues: string[] }
+  | { kind: "name-taken"; name: string }
+  | { kind: "over-limit"; limit: number };
+
+interface TeamRepository {
+  findByName(name: string): Promise<Team | null>;
+  count(): Promise<number>;
+  save(team: Team): Promise<void>;
+}
+
+// Use case: expected failures are returned, bugs and outages throw
+async function createTeam(
+  input: unknown,
+  teams: TeamRepository,
+): Promise<Result<Team, CreateTeamError>> {
+  const name =
+    typeof input === "object" && input !== null && "name" in input
+      ? input.name
+      : undefined;
+  if (typeof name !== "string" || name.trim() === "") {
+    return fail({ kind: "invalid", issues: ["name is required"] });
+  }
+  if (await teams.findByName(name.trim())) {
+    return fail({ kind: "name-taken", name: name.trim() });
+  }
+  const count = await teams.count();
+  if (count >= 2) {
+    return fail({ kind: "over-limit", limit: 2 });
+  }
+  const team = { id: `t${count + 1}`, name: name.trim() };
+  await teams.save(team);
+  return { ok: true, value: team };
+}
+
+function fail(error: CreateTeamError): Result<never, CreateTeamError> {
+  return { ok: false, error };
+}
+
+// The HTTP edge maps every kind. satisfies checks the list is
+// complete without widening the object's type
+const statusFor = {
+  invalid: 400,
+  "name-taken": 409,
+  "over-limit": 403,
+} satisfies Record<CreateTeamError["kind"], number>;
+
+function message(error: CreateTeamError): string {
+  switch (error.kind) {
+    case "invalid":
+      return error.issues.join("; ");
+    case "name-taken":
+      return `"${error.name}" is already taken`;
+    case "over-limit":
+      return `your plan allows ${error.limit} teams`;
+  }
+}
+
+function createApp(teams: TeamRepository) {
+  const app = express();
+  app.use(express.json());
+  app.post("/teams", async (req, res) => {
+    const result = await createTeam(req.body, teams);
+    if (result.ok) {
+      res.status(201).json(result.value);
+      return;
+    }
+    res
+      .status(statusFor[result.error.kind])
+      .json({ error: message(result.error) });
+  });
+  // Anything thrown is unexpected: log it, answer 500
+  app.use(
+    (err: unknown, req: Request, res: Response, next: NextFunction) => {
+      console.log("ALERT:", err instanceof Error ? err.message : err);
+      res.status(500).json({ error: "Something went wrong" });
+    },
+  );
+  return app;
+}
+
+const rows = new Map<string, Team>();
+let databaseUp = true;
+const teams: TeamRepository = {
+  async findByName(name) {
+    if (!databaseUp) throw new Error("connection refused");
+    return [...rows.values()].find((t) => t.name === name) ?? null;
+  },
+  async count() {
+    return rows.size;
+  },
+  async save(team) {
+    rows.set(team.id, team);
+  },
+};
+
+const api = request(createApp(teams));
+for (const name of ["Pandas", "", "Pandas", "Otters", "Koalas"]) {
+  const res = await api.post("/teams").send({ name });
+  console.log(res.status, res.body);
+}
+databaseUp = false;
+const res = await api.post("/teams").send({ name: "Lemurs" });
+console.log(res.status, res.body);
+```
+
+</CodeExample>
+
+`fail` returns `Result<never, CreateTeamError>`: a result whose success side can never exist, which is assignable to a `Result` of **any** success type. Now watch what happens when product adds a fourth failure, `{ kind: "owner-suspended" }`. The compiler walks you to both places that must change:
+
+```ts
+} satisfies Record<CreateTeamError["kind"], number>;
+// ❌ Error: Type '{ invalid: number; "name-taken": number; "over-limit": number; }' does not satisfy the expected type 'Record<"invalid" | "name-taken" | "over-limit" | "owner-suspended", number>'.
+
+function message(error: CreateTeamError): string {
+// ❌ Error: Function lacks ending return statement and return type does not include 'undefined'.
+```
+
+That's the real payoff of errors-as-values in a large codebase: the list of failures is **data the compiler can count**. With thrown errors, a new `OwnerSuspendedError` class compiles everywhere and shows up as a `500` in production.
+
+The anti-patterns are at both extremes. Teams that throw everything end up with `catch (e) { if (e.message.includes("taken")) … }` string matching. Teams that wrap **everything** in `Result`, including "the database is down", make every caller write `if (!result.ok) return result;` four times per function, which is just a slower way to throw. And whichever you choose, **don't mix them in one layer**: a repository that sometimes throws `NotFound` and sometimes returns `null` forces every caller to handle both.
+
+<Callout type="tip" title="Write the strategy down">
+
+Put the rules in a short `CONTRIBUTING.md` or architecture decision record: "use cases return `Result` with a `kind` union; repositories return `null` for not found and throw for infrastructure errors; only `http/` knows status codes". New colleagues follow written rules; they can't follow a convention that only lives in three senior heads.
+
+</Callout>
+
+## Stopping `any` from spreading
+
+`any` is not just one unchecked value. It's **contagious**: every property you read from it is `any`, every function that returns it returns `any`, and every variable inferred from that is `any` too. One missing annotation can switch off type checking far away from where it started:
+
+<CodeExample output={`night NaN
+true`}>
+
+```ts
+// settings.ts: no return type, so it's inferred... as any
+function loadSettings(text: string) {
+  return JSON.parse(text);
+}
+
+// three files away, nobody can tell
+const settings = loadSettings('{"theme":"night"}');
+const theme: string = settings.theme; // any → string, no check
+const size = settings.fontSize;      // any spreads to size
+const doubled = size * 2;            // and to doubled
+
+console.log(theme, doubled);
+try {
+  console.log(settings.layout.columns);
+} catch (error) {
+  console.log(error instanceof TypeError); // crashed at runtime
+}
+```
+
+</CodeExample>
+
+No errors, a `NaN` and a crash. The fix is the edge rule again: `JSON.parse` returns `any`, so the function that calls it must **stop** the `any` by returning a checked type (here with sensible defaults):
+
+<CodeExample output={`{ theme: 'night', fontSize: 16 }
+{ theme: 'bamboo', fontSize: 16 }
+{ theme: 'bamboo', fontSize: 16 }`}>
+
+```ts
+interface Settings {
+  theme: "bamboo" | "night";
+  fontSize: number;
+}
+
+const defaults: Settings = { theme: "bamboo", fontSize: 16 };
+
+// unknown in, Settings out: the any stops here
+function loadSettings(text: string): Settings {
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return defaults;
+  }
+  if (typeof data !== "object" || data === null) return defaults;
+  const theme = "theme" in data ? data.theme : undefined;
+  const fontSize = "fontSize" in data ? data.fontSize : undefined;
+  return {
+    theme: theme === "night" || theme === "bamboo"
+      ? theme
+      : defaults.theme,
+    fontSize: typeof fontSize === "number"
+      ? fontSize
+      : defaults.fontSize,
+  };
+}
+
+console.log(loadSettings('{"theme":"night"}'));
+console.log(loadSettings('{"fontSize":"huge"}'));
+console.log(loadSettings("not json"));
+```
+
+</CodeExample>
+
+In a codebase with many contributors, discipline isn't enough; you want the build to fail. That's the job of **typescript-eslint**. Its type-aware rules don't just ban writing `any`, they track `any` values **flowing** through code: `no-unsafe-assignment` flags `const theme: string = settings.theme`, `no-unsafe-member-access` flags `settings.layout`, `no-unsafe-return` flags returning `JSON.parse(text)`:
+
+```js title="eslint.config.mjs"
+import { defineConfig } from "eslint/config";
+import js from "@eslint/js";
+import tseslint from "typescript-eslint";
+
+export default defineConfig(
+  js.configs.recommended,
+  // includes no-explicit-any and the no-unsafe-* family
+  tseslint.configs.recommendedTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: { projectService: true },
+    },
+    rules: {
+      // exported functions must declare what they return
+      "@typescript-eslint/explicit-module-boundary-types": "error",
+    },
+  },
+);
+```
+
+A few more habits that keep `any` out:
+
+- **Annotate return types of exported functions.** Inside a module, inference is great. At a module's boundary, an explicit return type is a contract: it stops an accidental `any` (or an accidentally huge inferred type) from leaking to every caller. Libraries can turn on the compiler option `isolatedDeclarations`, which requires it for every export (so tools can write `.d.ts` files without running the type checker, as you saw in [How the Compiler Works](/learn/typescript/how-the-compiler-works)).
+- **Wrap untyped libraries once.** If an SDK returns `any`, write one adapter module that converts its results into your own types, and import the adapter everywhere instead of the SDK.
+- **Treat `as` like `any`.** `as Settings` on parsed JSON is an `any` in disguise. Allow casts only inside smart constructors like `parseEmail`, and make reviewers ask about every other one.
+- **When `any` is truly needed** (rare: a generic helper's internals, a migration in progress), keep it local, comment why, and use `// eslint-disable-next-line` so it shows up in a search.
+
+## Module boundaries and public APIs
+
+The last design decision is about **where** types live and who may import them. Large codebases are usually organised **by feature first**, by layer second, so everything about billing sits together and can be owned by one team:
+
+```text
+src/
+├── features/
+│   ├── billing/
+│   │   ├── index.ts          ← the feature's public API
+│   │   ├── billing.ts        createBilling(), the Billing interface
+│   │   ├── invoice.ts        domain types and rules
+│   │   ├── stripe-adapter.ts the only file that imports stripe
+│   │   └── billing.test.ts
+│   └── teams/
+│       ├── index.ts
+│       └── ...same shape...
+├── shared/                   Result, branded ids, logger
+└── main.ts                   wires features together
+```
+
+Each feature exposes a **small, explicitly typed public API**, and everything else is private. In TypeScript the cheapest way to enforce "private" is an annotated return type: callers see the interface, not whatever the implementation happens to return:
+
+<CodeExample output={`[
+  { id: 'inv-1', customerId: 'c1', totalCents: 4500 },
+  { id: 'inv-3', customerId: 'c1', totalCents: 990 }
+]`}>
+
+```ts
+// ---- features/billing/billing.ts (inside the feature) ----
+interface Invoice {
+  id: string;
+  customerId: string;
+  totalCents: number;
+}
+
+// The feature's public API: what other features may use
+interface Billing {
+  createInvoice(customerId: string, totalCents: number): Invoice;
+  invoicesFor(customerId: string): readonly Invoice[];
+}
+
+function createBilling(): Billing {
+  const invoices = new Map<string, Invoice>();
+  return {
+    createInvoice(customerId, totalCents) {
+      const invoice = {
+        id: `inv-${invoices.size + 1}`,
+        customerId,
+        totalCents,
+      };
+      invoices.set(invoice.id, invoice);
+      return invoice;
+    },
+    invoicesFor(customerId) {
+      return [...invoices.values()].filter(
+        (invoice) => invoice.customerId === customerId,
+      );
+    },
+  };
+}
+
+// ---- features/orders/checkout.ts (another feature) ----
+const billing = createBilling();
+billing.createInvoice("c1", 4_500);
+billing.createInvoice("c2", 1_200);
+billing.createInvoice("c1", 990);
+console.log(billing.invoicesFor("c1"));
+```
+
+</CodeExample>
+
+Without `: Billing`, the return type would be **inferred** from whatever the object literal contains. If someone added `invoices` to it "for debugging", the raw `Map` would become part of the public API, a reporting feature would start reading it, and a year later you couldn't change the storage without breaking another team. With the annotation, that same change is an error: *Object literal may only specify known properties, and 'invoices' does not exist in type 'Billing'.* The `readonly Invoice[]` return type says the same thing about the list: callers may read it, not `push` to it.
+
+### Barrels and their cost
+
+The `index.ts` that re-exports a folder's public names is called a **barrel**:
+
+```ts title="src/features/billing/index.ts"
+export { createBilling } from "./billing";
+export type { Billing, Invoice } from "./billing";
+```
+
+Other features import `from "@/features/billing"` and never from `@/features/billing/stripe-adapter`. Used like this, at a **boundary**, a barrel is the public API made visible, and you can enforce it with ESLint:
+
+```js
+// in eslint.config.mjs
+{
+  rules: {
+    "no-restricted-imports": ["error", {
+      patterns: [{
+        group: ["@/features/*/*"],
+        message: "Import other features through their index.ts",
+      }],
+    }],
+  },
+}
+```
+
+Barrels get expensive when they're everywhere. Watch out for:
+
+- **Loading everything.** `import { formatCents } from "@/shared"` makes the runtime load **every** module that `shared/index.ts` re-exports, and everything they import. Bundlers can tree-shake that away in production builds, but test runners and dev servers usually can't: teams have seen Vitest suites spend most of their time importing barrels, and dev servers make hundreds of extra requests. (Next.js even has an `optimizePackageImports` option to rewrite barrel imports from big packages.)
+- **Circular imports.** Barrels make cycles easy: `billing/invoice.ts` imports from `@/shared`, and `shared/index.ts` re-exports a helper that imports from `@/features/billing`. TypeScript compiles it happily, then at runtime one module sees the other half-initialised: `ReferenceError: Cannot access 'createBilling' before initialization`, or an `undefined` that only appears in one import order.
+- **`export *`.** `export * from "./billing"` re-exports everything, including the internals you meant to keep private, so the "public API" is whatever happens to be exported today. Name the exports explicitly, and use `export type` for types, so the barrel itself documents the API.
+
+The rule of thumb: **one barrel per boundary** (a feature, a package), explicit named exports, and inside a feature, import files directly.
+
+<Quiz
+  question="The API's response type is type UserDto = Omit<User, 'passwordHash'>, and handlers do const { passwordHash, ...dto } = user; res.json(dto). Next month someone adds mfaSecret: string to User. What happens?"
+  options={[
+    "The compiler reports an error in every handler until UserDto is updated",
+    "Everything compiles, and responses now include mfaSecret",
+    "mfaSecret is removed automatically because it isn't in UserDto",
+    "Omit throws at runtime because the keys changed",
+  ]}
+  answer={1}
+  explanation="Omit and the rest pattern are both denylists: UserDto now includes mfaSecret, and ...dto copies it. Nothing fails to compile, because the denylist is still satisfied. An allowlist (Pick or a separate interface) plus a mapping function that builds a fresh object keeps new fields private until someone exposes them on purpose."
+/>
+
+<Quiz
+  question="Following this lesson's error strategy, what should happen when the database connection drops in the middle of the createTeam use case?"
+  options={[
+    "createTeam returns { ok: false, error: { kind: 'database-down' } } so every caller handles it",
+    "The repository returns null, so createTeam treats the team name as free",
+    "The repository throws, the error bubbles up to the error middleware, which logs it and answers 500",
+    "The HTTP handler catches it and answers 400 so the client retries",
+  ]}
+  answer={2}
+  explanation="An outage is unexpected and no caller can fix it, so it's an exception that travels to one central handler. Returning null would be dangerous (a wrong answer instead of no answer), and turning it into a Result kind only makes every caller pass it along by hand."
+/>
+
+<Exercise
+  title="Boundaries for a sign-up feature"
+  language="typescript"
+  starter={`type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// ---------- persistence (done) ----------
+interface UserRow {
+  id: string;
+  email: string;
+  display_name: string;
+  password_hash: string;
+  created_at: number; // milliseconds since 1970
+  deleted_at: number | null;
+}
+
+// ---------- domain (done) ----------
+type Email = string & { readonly __brand: "Email" };
+
+interface User {
+  id: string;
+  email: Email;
+  displayName: string;
+  passwordHash: string;
+  createdAt: Date;
+  status: "active" | "deleted";
+}
+
+interface Signup {
+  email: Email;
+  displayName: string;
+  password: string;
+}
+
+// ---------- API (done) ----------
+interface UserDto {
+  id: string;
+  email: string;
+  displayName: string;
+  createdAt: string; // ISO 8601
+}
+
+// ---------- TODO 1: the edge ----------
+// unknown in; a Signup or ALL the issues (in this order) out:
+//   "body must be an object"   (alone, if it's not an object)
+//   "email must be a valid email address"
+//   "displayName must be 1-40 characters"
+//   "password must be at least 8 characters"
+function parseSignup(input: any): any {
+  return { ok: true, value: input };
+}
+
+// ---------- TODO 2: persistence → domain ----------
+function rowToUser(row: any): any {
+  return row;
+}
+
+// ---------- TODO 3: domain → API ----------
+function toUserDto(user: any): any {
+  return user;
+}
+
+// ---------- type tests (don't change them) ----------
+// Each @ts-expect-error line must BE an error. If a type is
+// too loose (any), TypeScript reports an unused directive.
+function typeTests(row: UserRow, user: User): void {
+  const parsed = parseSignup({});
+  // @ts-expect-error: check parsed.ok before reading value
+  console.log(parsed.value);
+  // @ts-expect-error: rows don't go straight into the domain
+  rowToUser(user);
+  // @ts-expect-error: dates in the domain are Dates
+  rowToUser(row).createdAt.toUpperCase();
+  // @ts-expect-error: the DTO never has a password hash
+  console.log(toUserDto(user).passwordHash);
+}
+
+// ---------- try it ----------
+const result = parseSignup({
+  email: " Mei@PandaDev.test ",
+  displayName: "Mei",
+  password: "bamboo-forever",
+  isAdmin: true,
+});
+console.log(result);
+console.log(parseSignup({ email: "mei", password: "short" }));
+
+const user = rowToUser({
+  id: "u1",
+  email: "mei@pandadev.test",
+  display_name: "Mei",
+  password_hash: "pbkdf2$1000$9f2c",
+  created_at: 1767225600000,
+  deleted_at: null,
+});
+console.log(toUserDto(user));
+`}
+  tests={[
+    { name: "The type tests compile (no unused @ts-expect-error)", check: `true` },
+    { name: "parseSignup returns a normalised Signup with known fields only", check: `(() => { const r = parseSignup({ email: "  Kim@Example.COM", displayName: "  Kim  ", password: "12345678", role: "admin" }); return r.ok === true && r.value.email === "kim@example.com" && r.value.displayName === "Kim" && r.value.password === "12345678" && Object.keys(r.value).sort().join() === "displayName,email,password"; })()` },
+    { name: "parseSignup collects every issue, in order", check: `(() => { const r = parseSignup({ email: "no-at-sign", displayName: "x".repeat(41), password: 1234567890 }); const r2 = parseSignup({ email: "a@b.test", displayName: "", password: "long enough" }); return r.ok === false && JSON.stringify(r.error) === JSON.stringify(["email must be a valid email address", "displayName must be 1-40 characters", "password must be at least 8 characters"]) && r2.ok === false && JSON.stringify(r2.error) === JSON.stringify(["displayName must be 1-40 characters"]); })()` },
+    { name: "parseSignup rejects bodies that aren't objects", check: `[null, "hi", 42, undefined].every((x) => { const r = parseSignup(x); return r.ok === false && r.error.length === 1 && r.error[0] === "body must be an object"; })` },
+    { name: "rowToUser maps columns, dates and the status", check: `(() => { const u = rowToUser({ id: "u9", email: "z@z.test", display_name: "Zed", password_hash: "h", created_at: 0, deleted_at: 5 }); const a = rowToUser({ id: "u1", email: "a@a.test", display_name: "A", password_hash: "h", created_at: 1, deleted_at: null }); return u.id === "u9" && u.email === "z@z.test" && u.displayName === "Zed" && u.passwordHash === "h" && u.createdAt instanceof Date && u.createdAt.getTime() === 0 && u.status === "deleted" && !("display_name" in u) && a.status === "active"; })()` },
+    { name: "toUserDto sends exactly four fields, even from a bigger object", check: `(() => { const d = toUserDto({ id: "u2", email: "b@b.test", displayName: "Bo", passwordHash: "secret", createdAt: new Date(86400000), status: "active", mfaSecret: "hidden" }); return Object.keys(d).sort().join() === "createdAt,displayName,email,id" && d.createdAt === "1970-01-02T00:00:00.000Z" && d.displayName === "Bo" && !JSON.stringify(d).includes("secret") && !JSON.stringify(d).includes("hidden"); })()` },
+  ]}
+>
+
+A sign-up feature has all three kinds of types, and right now the code between them is `any` all the way through. The types (`UserRow`, `User`, `Signup`, `UserDto`) are done. Replace the three `any` functions:
+
+1. **`parseSignup(input: unknown): Result<Signup, string[]>`**, the edge. If `input` isn't an object (or is `null`), return just `["body must be an object"]`. Otherwise check every field and collect **all** the issues, in this order: `email` must be a string that, after trimming and lower-casing, matches `/^[^@\s]+@[^@\s]+$/` (`"email must be a valid email address"`); `displayName` must be a string of 1–40 characters after trimming (`"displayName must be 1-40 characters"`); `password` must be a string of at least 8 characters, not trimmed (`"password must be at least 8 characters"`). On success, return a **fresh** object with the three normalised fields only.
+2. **`rowToUser(row: UserRow): User`**: map the columns, turn `created_at` into a `Date`, and set `status` to `"deleted"` when `deleted_at` isn't `null`. Stored emails were validated when they were saved, so a cast to `Email` is acceptable here.
+3. **`toUserDto(user: User): UserDto`**: an allowlist. Exactly `id`, `email`, `displayName` and `createdAt` as an ISO string, even if the object passed in carries more.
+
+The `typeTests` function is never called; its `@ts-expect-error` lines are **type tests**: each one passes only when that line really is an error, so they fail while your functions use `any`.
+
+<Hint>
+
+Copy the shape of `parseNewTeam` from "unknown at the edges": one small parser per field (`parseEmail`, `parseDisplayName`, `parsePassword`, each `unknown` → value or `null`), read fields with `"email" in input ? input.email : undefined`, push the issues, and return `{ ok: false, error: issues }` if any parser returned `null`. After that `if`, TypeScript knows all three are non-null. `rowToUser` and `toUserDto` are the mapping functions from "One concept, three types", with the `Email` cast on `row.email`.
+
+</Hint>
+
+<Solution>
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// ---------- persistence (done) ----------
+interface UserRow {
+  id: string;
+  email: string;
+  display_name: string;
+  password_hash: string;
+  created_at: number; // milliseconds since 1970
+  deleted_at: number | null;
+}
+
+// ---------- domain (done) ----------
+type Email = string & { readonly __brand: "Email" };
+
+interface User {
+  id: string;
+  email: Email;
+  displayName: string;
+  passwordHash: string;
+  createdAt: Date;
+  status: "active" | "deleted";
+}
+
+interface Signup {
+  email: Email;
+  displayName: string;
+  password: string;
+}
+
+// ---------- API (done) ----------
+interface UserDto {
+  id: string;
+  email: string;
+  displayName: string;
+  createdAt: string; // ISO 8601
+}
+
+// ---------- the edge ----------
+function parseEmail(value: unknown): Email | null {
+  if (typeof value !== "string") return null;
+  const email = value.trim().toLowerCase();
+  const valid = /^[^@\s]+@[^@\s]+$/.test(email);
+  return valid ? (email as Email) : null;
+}
+
+function parseDisplayName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const name = value.trim();
+  return name.length >= 1 && name.length <= 40 ? name : null;
+}
+
+function parsePassword(value: unknown): string | null {
+  return typeof value === "string" && value.length >= 8
+    ? value
+    : null;
+}
+
+function parseSignup(input: unknown): Result<Signup, string[]> {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: ["body must be an object"] };
+  }
+  const email = parseEmail("email" in input ? input.email : undefined);
+  const displayName = parseDisplayName(
+    "displayName" in input ? input.displayName : undefined,
+  );
+  const password = parsePassword(
+    "password" in input ? input.password : undefined,
+  );
+
+  const issues: string[] = [];
+  if (email === null) {
+    issues.push("email must be a valid email address");
+  }
+  if (displayName === null) {
+    issues.push("displayName must be 1-40 characters");
+  }
+  if (password === null) {
+    issues.push("password must be at least 8 characters");
+  }
+  if (email === null || displayName === null || password === null) {
+    return { ok: false, error: issues };
+  }
+  return { ok: true, value: { email, displayName, password } };
+}
+
+// ---------- persistence → domain ----------
+function rowToUser(row: UserRow): User {
+  return {
+    id: row.id,
+    email: row.email as Email, // stored emails were validated
+    displayName: row.display_name,
+    passwordHash: row.password_hash,
+    createdAt: new Date(row.created_at),
+    status: row.deleted_at === null ? "active" : "deleted",
+  };
+}
+
+// ---------- domain → API ----------
+function toUserDto(user: User): UserDto {
+  return {
+    id: user.id,
+    email: user.email,
+    displayName: user.displayName,
+    createdAt: user.createdAt.toISOString(),
+  };
+}
+
+// ---------- type tests (don't change them) ----------
+// Each @ts-expect-error line must BE an error. If a type is
+// too loose (any), TypeScript reports an unused directive.
+function typeTests(row: UserRow, user: User): void {
+  const parsed = parseSignup({});
+  // @ts-expect-error: check parsed.ok before reading value
+  console.log(parsed.value);
+  // @ts-expect-error: rows don't go straight into the domain
+  rowToUser(user);
+  // @ts-expect-error: dates in the domain are Dates
+  rowToUser(row).createdAt.toUpperCase();
+  // @ts-expect-error: the DTO never has a password hash
+  console.log(toUserDto(user).passwordHash);
+}
+
+// ---------- try it ----------
+const result = parseSignup({
+  email: " Mei@PandaDev.test ",
+  displayName: "Mei",
+  password: "bamboo-forever",
+  isAdmin: true,
+});
+console.log(result);
+console.log(parseSignup({ email: "mei", password: "short" }));
+
+const user = rowToUser({
+  id: "u1",
+  email: "mei@pandadev.test",
+  display_name: "Mei",
+  password_hash: "pbkdf2$1000$9f2c",
+  created_at: 1767225600000,
+  deleted_at: null,
+});
+console.log(toUserDto(user));
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- One concept often needs three types: a **persistence type** shaped by the database, a **domain type** shaped by the business, and a **DTO** shaped by clients. Small mapping functions connect them, so each change stays in one place. Don't split until the shapes differ.
+- Types describe a **minimum**; they never strip properties. Only a mapping function that builds a fresh object keeps secrets out of responses. Derive public types with allowlists (`Pick`, separate interfaces), not `Omit`.
+- Data from outside is `unknown` at the **edge**. Parse it once into a precise type (a branded `Email`, a `NewTeam`), copy known fields only, and let the inside trust its parameters. Zod or Valibot do the same with less code.
+- Choose an **error strategy per layer** and write it down: expected failures as `Result` with a `kind` union (the compiler counts them, `satisfies Record<Kind, …>` maps them), unexpected ones thrown to one central handler. Don't mix both in one layer.
+- `any` is contagious. Stop it where it enters (`JSON.parse`, SDKs, `req.body`), annotate exported functions' return types, treat `as` like `any`, and let typescript-eslint's `no-unsafe-*` rules fail the build.
+- Organise by **feature**, give each feature a small, explicitly typed public API, and use **one barrel per boundary** with explicit named exports. Barrels everywhere cost load time and invite circular imports.

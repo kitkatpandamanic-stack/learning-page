@@ -1,0 +1,771 @@
+---
+title: Ревью кода на TypeScript
+description: "Ревьюйте TypeScript на честность и точность типов: any, as и !, широкие типы и флаги, неисчерпывающие switch, перемудрённые типы, добрые комментарии и правила typescript-eslint."
+duration: 25
+xp: 30
+---
+
+Пул-реквест зелёный: он компилируется, тесты проходят, линтер молчит. Можно одобрять? В кодовой базе на TypeScript у этого вопроса есть подвох. Компилятор доказывает, что типы **согласованы** друг с другом. Но он не может доказать, что они **правдивы** (действительно ли в этом JSON лежит `User`?) или **точны** (правда ли `status` может быть вообще любой строкой?). Эти два вопроса — ваша работа как ревьюера, и именно там прячутся дорогие баги. Этот урок — набор инструментов ревьюера для TypeScript: на что смотреть, как об этом сказать и какую часть передать typescript-eslint. 🔍
+
+Общее ремесло код-ревью (code review) — зачем оно нужно, Conventional Comments, маленькие пул-реквесты, дизайн-документы — разобрано в уроке курса JavaScript [Код-ревью и техническое лидерство](/learn/javascript/code-review-and-leadership). Здесь мы сосредоточимся на типах.
+
+## На что смотреть в diff на TypeScript
+
+Читайте изменение на TypeScript, держа в голове два вопроса:
+
+1. **Честны ли типы?** Описывает ли каждый тип то, что действительно есть во время выполнения, или кто-то просто *так сказал*?
+2. **Точны ли типы?** Допускают ли они только те значения, которые допускает предметная область, или гораздо больше?
+
+Большинство проблем укладываются в несколько шаблонов. Немного практики — и вы будете замечать их, просто прокручивая diff:
+
+| В diff | Чем вредит | Что предложить |
+| --- | --- | --- |
+| `any` — явный или из `JSON.parse`, `res.json()`, `catch (e: any)` | выключает проверку для всего, чего касается, далеко за пределами этой строки | `unknown` плюс защитник типа или схема |
+| `as Order` на внешних данных, `{} as User` | обещание, которое никто не проверяет | валидация или сборка объекта целиком с аннотацией |
+| `x!` | переносит падение в другое место, с худшим сообщением | обработать случай отсутствия значения или `assert` с понятным сообщением |
+| `// @ts-ignore` | скрывает эту ошибку и любую будущую ошибку в этой строке | исправить или `@ts-expect-error` с причиной и тикетом |
+| `status: string // "placed" or "shipped"` | опечатки компилируются; комментарий — это тип, который никто не проверяет | объединение строковых литералов |
+| `isLoading`, `hasError`, `data?` рядом друг с другом | невозможные комбинации компилируются | размеченное объединение |
+| `switch` с универсальным `default` | новый вариант молча проваливается в него | исчерпывающая проверка через `never` |
+| `?` на каждом свойстве, `Partial<T>` повсюду | каждый читающий должен обрабатывать `undefined`; часто означает «я ещё не решил» | обязательные поля плюс, если нужно, отдельный тип черновика |
+| условный тип на 30 строк в коде приложения | никто другой не может его поменять, а его ошибки озадачивают | более простой тип или тесты типов и владелец |
+| новый обобщённый помощник без тестов типов | его типы могут сломаться, и ни один тест не упадёт | тесты типов с `@ts-expect-error` и `Equal` |
+
+Ничто из этого не заменяет обычное ревью (корректность, архитектура, тесты, безопасность). Это дополнительный слой, и он окупается, потому что ошибки в типах **распространяются**: один `any` в общей функции тихо выключает проверку в каждом файле, который её вызывает, — вы видели это в уроке [Проектируем типы для больших кодовых баз](/learn/typescript/designing-types-for-large-codebases).
+
+## «Аварийные люки» прячутся на виду
+
+`any`, `as` и `!` вы уже знаете из урока [Защитники типов и unknown](/learn/typescript/type-guards-and-unknown). На ревью их легко пропустить, потому что каждый — всего несколько символов в строке, которая выглядит совершенно разумно. Вот пример, который проскальзывает через множество ревью:
+
+<CodeExample output={`Cannot read properties of undefined (reading 'toLowerCase')
+Hi Mei <mei@x.io>`}>
+
+```ts
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+
+// В diff: «заполню ниже»
+const user = {} as User;
+user.id = "u1";
+user.name = "Mei";
+// ...и никто не замечает, что email так и не задан
+
+function greeting(user: User): string {
+  return `Hi ${user.name} <${user.email.toLowerCase()}>`;
+}
+
+try {
+  console.log(greeting(user));
+} catch (error) {
+  if (error instanceof Error) console.log(error.message);
+}
+
+// Тот же объект, собранный целиком и с аннотацией
+const checked: User = { id: "u1", name: "Mei", email: "MEI@x.io" };
+console.log(greeting(checked));
+```
+
+</CodeExample>
+
+`{} as User` говорит компилятору: «этот пустой объект — полноценный пользователь», и компилятор верит. Если вместо этого собрать объект целиком с аннотацией, забытое поле будет поймано прямо на месте:
+
+```ts
+const user: User = { id: "u1", name: "Mei" };
+// ❌ Error: Property 'email' is missing in type '{ id: string; name: string; }' but required in type 'User'.
+```
+
+На что смотреть, строка за строкой:
+
+- **`await res.json()`** и **`JSON.parse(text)`** оба дают `any`. Если результат сразу попадает в типизированную переменную или получает `as`, его никто не проверил. Спросите, где валидация (защитник типа или схема, как в уроке [Проверка во время выполнения](/learn/typescript/runtime-validation)).
+- **Экспортируемые функции без типа возвращаемого значения.** Если тело возвращает что-то, построенное из `any`, функция тоже возвращает `any`, и это наследует каждый вызывающий.
+- **`as` где угодно за пределами валидатора.** Спросите: «что делает это утверждение правдой?». Иногда хороший ответ есть (значение проверили двумя строками выше, но TypeScript не может это отследить). Часто честный ответ — «так ошибка исчезла».
+- **`!`**: спросите, что произойдёт, если значения *действительно* нет. «Такого не может быть» заслуживает комментария или `assert` с сообщением.
+- **`@ts-ignore`**: он заглушает *любую* ошибку в следующей строке, включая те, которые ещё никто не написал. `@ts-expect-error` с причиной лучше: когда проблему исправят, TypeScript сообщит «Unused '@ts-expect-error' directive.», и подавление не сможет устареть незаметно.
+
+<Callout type="tip" title="Этот «аварийный люк» допустим?">
+
+Не каждый `as` — баг. Приведение типа оправдано, когда оно находится **внутри** маленькой протестированной функции, вся задача которой — что-то проверить (валидатор, «умный конструктор» вроде `parseEmail`), а остальной код получает правильно типизированное значение. Приведение посреди бизнес-логики — совсем другое дело. Задайте вопрос: «если это приведение неверно, кто об этом узнает и когда?»
+
+</Callout>
+
+## Типы шире предметной области
+
+Широкий тип пропускает всё, что допускает предметная область, плюс много того, чего она не допускает. Два шаблона встречаются почти в каждой кодовой базе.
+
+**Строка с комментарием, перечисляющим её значения.** Комментарий — это тип, который компилятор не умеет читать. Превратите его в объединение, и опечатки перестанут компилироваться:
+
+```ts
+type Status = "placed" | "shipped" | "delivered" | "cancelled";
+
+const s: Status = "canceled";
+// ❌ Error: Type '"canceled"' is not assignable to type 'Status'. Did you mean '"cancelled"'?
+```
+
+Со `status: string` эта опечатка скомпилировалась бы, и каждое `if (status === "cancelled")` для неё молча давало бы false.
+
+**Логические флаги рядом с необязательными данными.** Каждый флаг удваивает число возможных состояний, а большинство комбинаций не имеют смысла:
+
+<CodeExample output={`Loading…
+0 results
+2 results
+Error: Timed out`}>
+
+```ts
+// До: два флага и два необязательных поля = 16 комбинаций
+interface SearchStateFlags {
+  isLoading: boolean;
+  hasError: boolean;
+  error?: string;
+  results?: string[];
+}
+
+// Всё это компилируется. Какое из состояний «правда»?
+const confused: SearchStateFlags = {
+  isLoading: true,
+  hasError: false,
+  error: "Timed out",
+  results: ["Dune"],
+};
+
+function viewFlags(state: SearchStateFlags): string {
+  if (state.isLoading) return "Loading…";
+  if (state.error) return `Error: ${state.error}`;
+  return `${state.results?.length ?? 0} results`;
+}
+console.log(viewFlags(confused));
+console.log(viewFlags({ isLoading: false, hasError: true }));
+
+// После: одно поле говорит, в каком мы состоянии
+type SearchState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "error"; error: string }
+  | { status: "done"; results: string[] };
+
+function view(state: SearchState): string {
+  switch (state.status) {
+    case "idle":
+      return "Type to search";
+    case "loading":
+      return "Loading…";
+    case "error":
+      return `Error: ${state.error}`;
+    case "done":
+      return `${state.results.length} results`;
+  }
+}
+console.log(view({ status: "done", results: ["Dune", "Heat"] }));
+console.log(view({ status: "error", error: "Timed out" }));
+```
+
+</CodeExample>
+
+Версия с флагами показывает «Loading…» для поиска, у которого есть и ошибка, и результаты, и «0 results» для поиска, который завершился ошибкой. Версия с объединением такие состояния даже выразить не может. Это идея из урока [Размеченные объединения](/learn/typescript/discriminated-unions): сделайте невозможные состояния невозможными.
+
+Всегда ли стоит этого требовать? **Зависит от охвата.** Общий тип, который сохраняется, передаётся по сети или читается в двадцати компонентах, заслуживает точной версии — это блокирующий комментарий. Флаг в приватном помощнике, который читают две строки, — максимум предложение.
+
+## Switch, который не заметит новый вариант
+
+Ветка `default` кажется защитной мерой. С объединением она делает обратное: молча **ловит варианты, которые вы ещё не написали**. Этот switch написали до того, как появился `"delivered"`. Когда кто-нибудь добавит его в `Status`, всё по-прежнему скомпилируется, а доставленные заказы будут показывать «Updated»:
+
+```ts
+function label(status: Status): string {
+  switch (status) {
+    case "placed":
+      return "Order received";
+    case "shipped":
+      return "On its way";
+    case "cancelled":
+      return "Cancelled";
+    default:
+      return "Updated"; // "delivered" молча попадает сюда
+  }
+}
+```
+
+Попросите вместо этого исчерпывающую проверку. В ветке `default` значение должно иметь тип `never`; `satisfies never` (или знакомый вам помощник `assertNever`) превращает забытый вариант в ошибку компиляции, которая указывает на нужную строку:
+
+```ts
+    default:
+      status satisfies never;
+      // ❌ Error: Type '"delivered"' does not satisfy the expected type 'never'.
+      throw new Error(`Unknown status: ${status}`);
+```
+
+`throw` по-прежнему защищает вас во время выполнения от значений, которые проскользнули мимо типов (старые данные, более новый сервер). Универсальный `default` уместен, когда вход действительно открытый, например `string` из URL, но на объединении он прячет ровно то изменение, о котором вы хотели бы узнать.
+
+## Перемудрённые типы
+
+Система типов TypeScript может вычислить почти что угодно, и некоторые разработчики не могут устоять. В одной команде разработчик написал помощника, чтобы `get(config, "db.pool.max")` проверял строку пути и возвращал правильный тип. Это было по-настоящему остроумно, и какое-то время работало хорошо:
+
+```ts
+type Paths<T> = T extends object
+  ? {
+      [K in keyof T & string]: K | `${K}.${Paths<T[K]>}`;
+    }[keyof T & string]
+  : never;
+
+// ...плюс PathValue<T, P>, ещё восемь строк
+function get<T, P extends Paths<T>>(obj: T, path: P): PathValue<T, P>;
+
+get(config, "db.pool.mx");
+// ❌ Error: Argument of type '"db.pool.mx"' is not assignable to parameter of type '"db.pool.max" | "db" | "cache" | "db.host" | "db.pool" | "db.pool.min" | "cache.ttl"'.
+```
+
+Через несколько месяцев кто-то добавил в конфигурацию магазина настройку `rootCategory: Category`, где у `Category` есть необязательное поле `parent: Category`. Внезапно каждый вызов `get(...)` в приложении, включая никак не связанный `get(config, "db.pool.max")`, стал падать с ошибкой:
+
+```ts
+const max = get(config, "db.pool.max");
+// ❌ Error: Type of property 'parent' circularly references itself in mapped type '{ [K in "name" | "parent"]: K | `${K}.${Paths<Category[K]>}`; }'.
+```
+
+Никто, кроме автора, не мог это прочитать, а автор уже перешёл в другую команду. Исправление — удалить помощника и писать `config.db.pool.max`, что TypeScript и так проверял с самого начала. 🙃
+
+Вот шаблон, за которым стоит следить: хитрый тип экономит немного набора в каждом месте вызова и берёт проценты каждый раз, когда кому-то нужно его поменять. Когда такой тип встречается на ревью, честно взвесьте:
+
+| Сложность оправдана, когда… | Скорее нет, когда… |
+| --- | --- |
+| выигрывают многие места вызова (библиотека, помощник, используемый сто раз) | он обслуживает два места вызова в одной фиче |
+| он ловит ошибки, которые люди реально совершают | он кодирует правила, в которых никто не ошибается |
+| ошибки в месте вызова читаемы | ошибки указывают во внутренности типа |
+| у него есть тесты типов и владелец | его понимает только автор |
+| редактор остаётся быстрым | при наведении показывается тип на сорок строк |
+
+Если тип остаётся, попросите **тесты типов** (строки с `@ts-expect-error` и `Expect<Equal<…>>` из урока [Тестирование типов](/learn/typescript/testing-types)), чтобы следующий человек мог менять его без страха. А если автор — вы: побеждает самый простой тип, который ловит реальные ошибки.
+
+## Пишем комментарии о типах на ревью
+
+В комментариях о типах легко ошибиться с тоном. «Не используйте `any`» звучит как правило из стайлгайда и ничего не говорит о том, чего этот `any` стоит здесь. Вот пул-реквест:
+
+```ts
+// PR #388: «Загрузка настроек пользователя»
+export async function loadPrefs(userId: any) {
+  const res = await fetch(`/api/users/${userId}/prefs`);
+  return (await res.json()) as Prefs;
+}
+
+export interface Prefs {
+  theme: string; // "light" | "dark" | "system"
+  emailDigest: boolean;
+  digestDay?: string; // только когда emailDigest равен true
+}
+```
+
+А вот комментарии на ревью, которые помогают, с метками в стиле Conventional Comments:
+
+- **issue (blocking):** `as Prefs` утверждает, что ответ проверен, но его ничто не проверяет, и `res.ok` тоже не проверяется. Тело ответа 404 `{ "error": "Not found" }` дошло бы до страницы настроек с типом `Prefs`. Может, разберём его как `unknown` нашей `prefsSchema` и вернём `Result`?
+- **issue (blocking):** `userId: any` пропускает не то: `SettingsPage` вызывает `loadPrefs(user)`, и запрос уходит на `/api/users/[object Object]/prefs`. С `userId: UserId` такой вызов не скомпилировался бы.
+- **suggestion:** Комментарий у `theme` уже перечисляет значения. Если записать `theme: "light" | "dark" | "system"`, их проверит компилятор.
+- **question:** Может ли `digestDay` быть задан, когда `emailDigest` равен false? Если нет, `digest: { enabled: false } | { enabled: true; day: Weekday }` делает это состояние невозможным. Готов оставить как есть, если это читает только эта страница.
+- **nit (non-blocking):** Явный тип возвращаемого значения у экспортируемой функции задокументировал бы контракт: `Promise<Result<Prefs, PrefsError>>`.
+- **praise:** Приятно, что `Prefs` экспортируется из одного места, а не объявляется заново в компоненте. 👍
+
+Что делает такие комментарии удачными именно для типов:
+
+| Вместо… | Попробуйте… | Почему |
+| --- | --- | --- |
+| «Не используйте any.» | «`userId: any` позволяет скомпилироваться `loadPrefs(user)`, и запрос уходит на `/users/[object Object]`.» | Показывает **конкретную** цену в этом коде |
+| «Этот тип слишком сложный.» | «Мне было трудно разобраться в `DeepKeys<T>`. Может, тест типов покажет, что он выдаёт, или `keyof Settings` хватит для наших двух мест вызова?» | Говорит о вашем опыте и предлагает путь вперёд |
+| «Используйте объединение.» | Вставьте ошибку, которую дало бы объединение: «Did you mean '"cancelled"'?» | Компилятор приводит аргумент за вас |
+| «Добавьте типы.» | «Можно к защитнику типа добавить тест для тела ответа 404?» | Просит **доказательство**, а не больше аннотаций |
+
+GitHub и GitLab позволяют прикрепить к комментарию **suggestion** — несколько строк замены, которые автор может применить одним кликом. Для небольших исправлений типов (объединение, тип возвращаемого значения) это часто добрее, чем абзац объяснений.
+
+<Callout type="note" title="Это разговор">
+
+Автор может знать то, чего не знаете вы. Возможно, API действительно может вернуть любую строку темы, потому что пользователи умеют устанавливать собственные темы. «Может ли `theme` быть чем-то ещё?» — лучшее начало, чем «это должно быть объединением». Твёрдые мнения о типах — но без цепляния за них.
+
+</Callout>
+
+## Пусть скучную часть делает typescript-eslint
+
+Если вы написали один и тот же комментарий на ревью три раза, он должен стать **правилом линтера**. **typescript-eslint** запускает правила ESLint, которые видят типы, поэтому находит шаблоны из этого урока в каждом файле при каждом пуше, и никому не приходится быть плохим парнем. Хорошая отправная точка:
+
+```js title="eslint.config.mjs"
+import { defineConfig } from "eslint/config";
+import js from "@eslint/js";
+import tseslint from "typescript-eslint";
+
+export default defineConfig(
+  js.configs.recommended,
+  // правила с информацией о типах, включая строгие
+  tseslint.configs.strictTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: { projectService: true },
+    },
+    rules: {
+      // нет ни в одном пресете: включите сами
+      "@typescript-eslint/switch-exhaustiveness-check": "error",
+      // запрещает `{} as User`; приведения других значений остаются возможными
+      "@typescript-eslint/consistent-type-assertions": [
+        "error",
+        { assertionStyle: "as", objectLiteralTypeAssertions: "never" },
+      ],
+    },
+  },
+);
+```
+
+Вот что он говорит о небольшом модуле, который `tsc` принимает без единой ошибки (вывод сокращён и перенесён по строкам, чтобы поместиться):
+
+```bash
+npx eslint src/orders.ts
+
+src/orders.ts
+  10:9   error  Unsafe assignment of an `any` value         @typescript-eslint/no-unsafe-assignment
+  11:21  error  Unsafe member access .id on an `any` value  @typescript-eslint/no-unsafe-member-access
+  15:11  error  Switch is not exhaustive. Cases not matched: "delivered"
+                                                            @typescript-eslint/switch-exhaustiveness-check
+  31:3   error  Promises must be awaited, end with a call to .catch, end with a call to .then
+                with a rejection handler or be explicitly marked as ignored with the `void` operator
+                                                            @typescript-eslint/no-floating-promises
+  35:10  error  Forbidden non-null assertion                @typescript-eslint/no-non-null-assertion
+```
+
+Правила, которые заслуживают места в конфигурации команды, и комментарий на ревью, который заменяет каждое из них:
+
+| Правило | Что ловит | Пресет |
+| --- | --- | --- |
+| `no-explicit-any`, `no-unsafe-assignment`, `no-unsafe-member-access`, `no-unsafe-call`, `no-unsafe-return`, `no-unsafe-argument` | `any`, написанный явно, и `any`, **текущий** из `JSON.parse` или нетипизированной библиотеки | recommended (правила `no-unsafe-*` — type-checked) |
+| `no-floating-promises`, `no-misused-promises` | забытый `await`; `async`-колбэк там, где ожидается обычный (`forEach`, `onClick`) | recommended (type-checked) |
+| `restrict-template-expressions` | `${user}`, который печатает `[object Object]` | recommended (type-checked) |
+| `ban-ts-comment` | `@ts-ignore`; `@ts-expect-error` без причины | recommended |
+| `no-non-null-assertion` | `!` | strict |
+| `no-unnecessary-condition` | проверка, которая никогда не бывает ложной, — часто признак неверного типа | strict (type-checked) |
+| `no-deprecated` | вызовы API, помеченных `@deprecated` | strict (type-checked) |
+| `switch-exhaustiveness-check` | `switch` по объединению, в котором пропущен вариант | нет: включите сами |
+| `consistent-type-assertions` с `objectLiteralTypeAssertions: "never"` | `{} as User` | нет: настройте сами |
+
+Правилам «type-checked» нужна информация о типах — её и даёт `projectService: true`. Они медленнее обычных правил линтера (от секунд до минут на большой кодовой базе), поэтому запускайте их в CI и в редакторе, а не в pre-commit-хуке. Для совсем нового проекта начните со `strictTypeChecked`; для существующего — с `recommendedTypeChecked` и ужесточайте шаг за шагом. Следующий урок, [Внедрение TypeScript в команде](/learn/typescript/leading-typescript-adoption), — о том, как вводить более строгие настройки, не останавливая команду.
+
+<Callout type="warning" title="Линтер не проверяет смысл">
+
+Линтер находит `as` и `any`. Он не скажет вам, что `status: string` должен быть объединением, что два флага описывают одно состояние или что хитрый тип того не стоит. Это вопросы суждения, и для них-то и нужны ревьюеры. Отдайте механическую часть инструментам, чтобы ваше внимание доставалось той части, которую может сделать только человек.
+
+</Callout>
+
+<Quiz
+  question="Пул-реквест добавляет поле status: string с комментарием // active, paused or closed, и каждая проверка сравнивает его со строковым литералом. Какой комментарий на ревью поможет больше всего?"
+  options={[
+    "nit: пожалуйста, не используйте комментарии для документации",
+    "suggestion: сделайте его объединением \"active\" | \"paused\" | \"closed\", чтобы опечатка вроде \"pased\" перестала компилироваться, а не молча никогда не совпадала",
+    "issue (blocking): никогда не используйте строки в типах",
+    "Никакого комментария: всё компилируется и тесты проходят",
+  ]}
+  answer={1}
+  explanation="Комментарий уже перечисляет значения; объединение превращает его в то, что проверяет компилятор. Хороший комментарий на ревью конкретен (какой тип), объясняет почему (опечатки компилируются, а сравнения молча не срабатывают) и помечен с правильным весом."
+/>
+
+<Quiz
+  question="Почему многие команды запрещают // @ts-ignore, но разрешают // @ts-expect-error с указанием причины?"
+  options={[
+    "@ts-expect-error не скрывает ошибку, а только превращает её в предупреждение",
+    "@ts-ignore работает только в файлах JavaScript",
+    "@ts-expect-error сообщает Unused '@ts-expect-error' directive, как только в строке больше нет ошибки, поэтому подавления не могут незаметно устареть, а причина документирует, зачем оно здесь",
+    "@ts-expect-error ещё и исправляет ошибку во время выполнения",
+  ]}
+  answer={2}
+  explanation="Обе директивы подавляют ошибку в следующей строке. Разница в том, что @ts-expect-error падает, когда подавлять больше нечего, так что исправленная проблема заставляет вас убрать директиву. Правило ban-ts-comment из typescript-eslint это обеспечивает и по умолчанию требует описание."
+/>
+
+<Exercise
+  title="Ревью и исправление: уведомления о заказах"
+  language="typescript"
+  starter={`import { describe, it, expect } from "vitest";
+
+// PR #431: «Сообщать покупателям об изменениях заказа»
+// Склад присылает нам обновления заказов текстом в формате JSON.
+
+type Order = {
+  id: string;
+  status: string; // placed, shipped, delivered или cancelled
+  total: number; // в пенсах: 1250 — это £12.50
+  trackingCode?: string; // отправленные заказы
+  reason?: string; // отменённые заказы
+};
+
+type ParseResult =
+  | { ok: true; order: Order }
+  | { ok: false; error: string };
+
+// Из общих утилит команды (с этим всё в порядке)
+function isObject(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+function pounds(pence: number): string {
+  return \`£\${(pence / 100).toFixed(2)}\`;
+}
+
+function parseOrder(json: string): ParseResult {
+  const order = JSON.parse(json) as Order;
+  return { ok: true, order };
+}
+
+function notification(order: Order): string {
+  const { id } = order;
+  switch (order.status) {
+    case "placed":
+      return \`Order \${id} received: \${pounds(order.total)}\`;
+    case "shipped":
+      return \`Order \${id} shipped, tracking \${order.trackingCode!}\`;
+    case "canceled":
+      return \`Order \${id} cancelled: \${order.reason}\`;
+    default:
+      return \`Order \${id} updated\`;
+  }
+}
+
+function totalsByStatus(orders: any[]): any {
+  const totals: any = {};
+  for (const order of orders) {
+    totals[order.status] = (totals[order.status] || 0) + order.total;
+  }
+  return totals;
+}
+
+// ---- Тесты (не меняйте их) ----
+const json = (fields: object) =>
+  JSON.stringify({ id: "o1", total: 1250, ...fields });
+
+describe("parseOrder", () => {
+  it("принимает заказы любого вида", () => {
+    // Склад присылает ещё и внутренние поля вроде "shelf"
+    const placed = json({ status: "placed", shelf: "B4" });
+    expect(parseOrder(placed)).toEqual({
+      ok: true,
+      order: { id: "o1", status: "placed", total: 1250 },
+    });
+    const shipped = json({ status: "shipped", trackingCode: "RM1" });
+    const cancelled = json({ status: "cancelled", reason: "no stock" });
+    expect(parseOrder(shipped).ok).toBe(true);
+    expect(parseOrder(json({ status: "delivered" })).ok).toBe(true);
+    expect(parseOrder(cancelled).ok).toBe(true);
+  });
+
+  it("говорит, что не так с неверным заказом", () => {
+    const cases = [
+      [json({ status: "lost" }), "status"],
+      [json({ status: "placed", total: "1250" }), "total"],
+      [json({ status: "placed", id: 42 }), "id"],
+      [json({ status: "shipped" }), "trackingCode"],
+      [json({ status: "cancelled" }), "reason"],
+      ["[1, 2]", "object"],
+      ["{ oops", "JSON"],
+    ];
+    for (const [text, problem] of cases) {
+      expect(parseOrder(text)).toEqual({
+        ok: false,
+        error: expect.stringContaining(problem),
+      });
+    }
+  });
+});
+
+describe("notification", () => {
+  it("есть сообщение для каждого статуса", () => {
+    const messages = [
+      "placed|Order o1 received: £12.50",
+      "shipped|Order o1 shipped, tracking RM1",
+      "delivered|Order o1 delivered",
+      "cancelled|Order o1 cancelled: no stock",
+    ];
+    for (const line of messages) {
+      const [status, message] = line.split("|");
+      const result = parseOrder(json({
+        status, trackingCode: "RM1", reason: "no stock",
+      }));
+      if (!result.ok) throw new Error(result.error);
+      expect(notification(result.order)).toBe(message);
+    }
+  });
+});
+
+describe("totalsByStatus", () => {
+  it("суммирует итоги по каждому статусу", () => {
+    const orders: Order[] = [
+      { id: "a", status: "placed", total: 500 },
+      { id: "b", status: "placed", total: 250 },
+      { id: "c", status: "delivered", total: 1000 },
+    ];
+    expect(totalsByStatus(orders)).toEqual({
+      placed: 750, shipped: 0, delivered: 1000, cancelled: 0,
+    });
+  });
+});
+
+// ---- Тесты типов (не меняйте их) ----
+// Строка под @ts-expect-error ДОЛЖНА быть ошибкой типа.
+function typeTests(order: Order) {
+  // @ts-expect-error: "lost" — не статус заказа
+  const lost: Order = { id: "o1", status: "lost", total: 100 };
+  // @ts-expect-error: отправленному заказу нужен код отслеживания
+  const noCode: Order = { id: "o2", status: "shipped", total: 100 };
+  // @ts-expect-error: причина есть только у отменённых заказов
+  const why = order.reason;
+  // @ts-expect-error: по одному итогу на статус, и только на них
+  const lostTotal = totalsByStatus([]).lost;
+
+  // ...а эти строки должны компилироваться
+  const shipped: Order = {
+    id: "o3", status: "shipped", total: 100, trackingCode: "RM2",
+  };
+  const delivered: number = totalsByStatus([shipped]).delivered;
+}
+`}
+  tests={[
+    { name: "Все 4 теста в файле проходят", check: "__vitest.failed === 0 && __vitest.passed === 4" },
+    { name: "Тесты типов на месте, все четыре", check: `typeof typeTests === "function" && typeTests.toString().split("@ts-expect-error").length === 5` },
+    { name: "parseOrder возвращает только собственные поля заказа, и для других заказов тоже", check: `(() => { const r = parseOrder(JSON.stringify({ id: "x9", status: "shipped", total: 99, trackingCode: "ZX", dock: 4 })); return r.ok && r.order.status === "shipped" && r.order.id === "x9" && r.order.total === 99 && r.order.trackingCode === "ZX" && !("dock" in r.order); })()` },
+    { name: "parseOrder отклоняет и другой неверный ввод, не выбрасывая исключений", check: `["null", "42", '"placed"', JSON.stringify({ status: "placed", id: "a" }), JSON.stringify({ status: "Placed", id: "a", total: 1 })].every((text) => { const r = parseOrder(text); return r.ok === false && typeof r.error === "string"; })` },
+    { name: "notification работает и для других заказов", check: `notification({ id: "B7", status: "placed", total: 5 }) === "Order B7 received: £0.05" && notification({ id: "B8", status: "cancelled", total: 5, reason: "address unknown" }) === "Order B8 cancelled: address unknown" && notification({ id: "B9", status: "delivered", total: 5 }) === "Order B9 delivered" && notification({ id: "C1", status: "shipped", total: 5, trackingCode: "QQ7" }) === "Order C1 shipped, tracking QQ7"` },
+    { name: "totalsByStatus работает и для других заказов", check: `JSON.stringify(totalsByStatus([{ id: "q", status: "cancelled", total: 30, reason: "x" }, { id: "r", status: "shipped", total: 20, trackingCode: "T" }, { id: "s", status: "shipped", total: 5, trackingCode: "U" }])) === JSON.stringify({ placed: 0, shipped: 25, delivered: 0, cancelled: 30 })` },
+  ]}
+>
+
+Пул-реквест коллеги превращает обновления со склада в сообщения для покупателей. Вы провели ревью, и вдвоём договорились, что модуль должен делать: эта договорённость — **тесты и тесты типов** внизу файла. Теперь исправьте модуль так, чтобы все они проходили. Тесты не меняйте.
+
+Что должен делать модуль:
+
+- **`Order`**: у отправленного заказа **обязательно** есть `trackingCode`, у отменённого **обязательно** есть `reason`, а у остальных статусов нет ни того, ни другого. `status` — один из `"placed"`, `"shipped"`, `"delivered"`, `"cancelled"`, и больше ничего. `total` — в пенсах.
+- **`parseOrder(json)`** никогда не выбрасывает исключений. Для корректного заказа возвращает `{ ok: true, order }`, где `order` содержит только собственные поля заказа (склад присылает ещё и внутренние поля вроде `shelf`). Иначе возвращает `{ ok: false, error }`, где `error` называет проблему: неверное поле (`id`, `total`, `status`, `trackingCode` или `reason`), слово `object`, если JSON не объект, или `JSON`, если текст — некорректный JSON.
+- **`notification(order)`** имеет сообщение для каждого статуса: `Order o1 received: £12.50`, `Order o1 shipped, tracking RM1`, `Order o1 delivered`, `Order o1 cancelled: no stock`. Если позже добавить пятый статус, здесь должна быть ошибка компиляции, пока его не обработают.
+- **`totalsByStatus(orders)`** возвращает сумму `total` для **каждого** статуса, с `0` для статусов без заказов.
+
+Стартовый код пока не компилируется: строки с `@ts-expect-error` — это **тесты типов**, и они проходят, только когда строка под ними **является** ошибкой типа. «Unused '@ts-expect-error' directive.» означает, что тип всё ещё слишком широкий. Сначала исправьте типы, тогда запустятся тесты и покажут оставшиеся баги.
+
+<Hint>
+
+Комментарии на ревью, которые вы могли бы оставить:
+
+1. `status: string` плюс необязательные поля: сделайте `Order` размеченным объединением с одним членом на каждый статус, где `trackingCode` и `reason` обязательны в своих членах. Массив `STATUSES` с `as const` заодно даст вам тип `Status`.
+2. `JSON.parse(json) as Order`: приведение ничего не проверяет, а `JSON.parse` выбрасывает исключение на неверном тексте. Разберите в `let data: unknown` внутри `try`/`catch`, используйте `isObject`, проверьте `id` и `total` через `typeof`, затем `switch (status)`: каждая ветка собирает **новый** объект только с полями этого статуса (`{ status, id, total, trackingCode }`), а `default` возвращает ошибку.
+3. `case "canceled"` — опечатка, которая компилируется только потому, что `status` — это `string`; `"delivered"` пропущен, а `default` прячет и то, и другое. С объединением обработайте все четыре и поставьте `order satisfies never;` в `default`.
+4. `totalsByStatus(orders: any[]): any`: принимайте `readonly Order[]`, возвращайте `Record<Status, number>` и начинайте с объекта, где все четыре статуса равны `0`.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect } from "vitest";
+
+// PR #431: «Сообщать покупателям об изменениях заказа»
+// Склад присылает нам обновления заказов текстом в формате JSON.
+
+const STATUSES = [
+  "placed",
+  "shipped",
+  "delivered",
+  "cancelled",
+] as const;
+type Status = (typeof STATUSES)[number];
+
+// У каждого статуса ровно те поля, которые ему нужны
+type Order =
+  | { status: "placed"; id: string; total: number }
+  | {
+      status: "shipped";
+      id: string;
+      total: number; // в пенсах: 1250 — это £12.50
+      trackingCode: string;
+    }
+  | { status: "delivered"; id: string; total: number }
+  | { status: "cancelled"; id: string; total: number; reason: string };
+
+type ParseResult =
+  | { ok: true; order: Order }
+  | { ok: false; error: string };
+
+// Из общих утилит команды (с этим всё в порядке)
+function isObject(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+function pounds(pence: number): string {
+  return `£${(pence / 100).toFixed(2)}`;
+}
+
+function fail(error: string): ParseResult {
+  return { ok: false, error };
+}
+
+function parseOrder(json: string): ParseResult {
+  let data: unknown;
+  try {
+    data = JSON.parse(json);
+  } catch {
+    return fail("not valid JSON");
+  }
+  if (!isObject(data)) return fail("expected an object");
+
+  const { id, status, total } = data;
+  if (typeof id !== "string") return fail("invalid id");
+  if (typeof total !== "number") return fail("invalid total");
+
+  // Собираем свежий объект: неизвестные лишние поля остаются снаружи
+  switch (status) {
+    case "placed":
+    case "delivered":
+      return { ok: true, order: { status, id, total } };
+    case "shipped": {
+      const { trackingCode } = data;
+      if (typeof trackingCode !== "string") {
+        return fail("shipped order without a trackingCode");
+      }
+      return { ok: true, order: { status, id, total, trackingCode } };
+    }
+    case "cancelled": {
+      const { reason } = data;
+      if (typeof reason !== "string") {
+        return fail("cancelled order without a reason");
+      }
+      return { ok: true, order: { status, id, total, reason } };
+    }
+    default:
+      return fail(`unknown status ${JSON.stringify(status)}`);
+  }
+}
+
+function notification(order: Order): string {
+  const { id } = order;
+  switch (order.status) {
+    case "placed":
+      return `Order ${id} received: ${pounds(order.total)}`;
+    case "shipped":
+      return `Order ${id} shipped, tracking ${order.trackingCode}`;
+    case "delivered":
+      return `Order ${id} delivered`;
+    case "cancelled":
+      return `Order ${id} cancelled: ${order.reason}`;
+    default:
+      order satisfies never; // новый статус не скомпилируется, пока его не обработают
+      throw new Error("Unknown order status");
+  }
+}
+
+function totalsByStatus(
+  orders: readonly Order[],
+): Record<Status, number> {
+  const totals: Record<Status, number> = {
+    placed: 0,
+    shipped: 0,
+    delivered: 0,
+    cancelled: 0,
+  };
+  for (const order of orders) {
+    totals[order.status] += order.total;
+  }
+  return totals;
+}
+
+// ---- Тесты (не меняйте их) ----
+const json = (fields: object) =>
+  JSON.stringify({ id: "o1", total: 1250, ...fields });
+
+describe("parseOrder", () => {
+  it("принимает заказы любого вида", () => {
+    // Склад присылает ещё и внутренние поля вроде "shelf"
+    const placed = json({ status: "placed", shelf: "B4" });
+    expect(parseOrder(placed)).toEqual({
+      ok: true,
+      order: { id: "o1", status: "placed", total: 1250 },
+    });
+    const shipped = json({ status: "shipped", trackingCode: "RM1" });
+    const cancelled = json({ status: "cancelled", reason: "no stock" });
+    expect(parseOrder(shipped).ok).toBe(true);
+    expect(parseOrder(json({ status: "delivered" })).ok).toBe(true);
+    expect(parseOrder(cancelled).ok).toBe(true);
+  });
+
+  it("говорит, что не так с неверным заказом", () => {
+    const cases = [
+      [json({ status: "lost" }), "status"],
+      [json({ status: "placed", total: "1250" }), "total"],
+      [json({ status: "placed", id: 42 }), "id"],
+      [json({ status: "shipped" }), "trackingCode"],
+      [json({ status: "cancelled" }), "reason"],
+      ["[1, 2]", "object"],
+      ["{ oops", "JSON"],
+    ];
+    for (const [text, problem] of cases) {
+      expect(parseOrder(text)).toEqual({
+        ok: false,
+        error: expect.stringContaining(problem),
+      });
+    }
+  });
+});
+
+describe("notification", () => {
+  it("есть сообщение для каждого статуса", () => {
+    const messages = [
+      "placed|Order o1 received: £12.50",
+      "shipped|Order o1 shipped, tracking RM1",
+      "delivered|Order o1 delivered",
+      "cancelled|Order o1 cancelled: no stock",
+    ];
+    for (const line of messages) {
+      const [status, message] = line.split("|");
+      const result = parseOrder(json({
+        status, trackingCode: "RM1", reason: "no stock",
+      }));
+      if (!result.ok) throw new Error(result.error);
+      expect(notification(result.order)).toBe(message);
+    }
+  });
+});
+
+describe("totalsByStatus", () => {
+  it("суммирует итоги по каждому статусу", () => {
+    const orders: Order[] = [
+      { id: "a", status: "placed", total: 500 },
+      { id: "b", status: "placed", total: 250 },
+      { id: "c", status: "delivered", total: 1000 },
+    ];
+    expect(totalsByStatus(orders)).toEqual({
+      placed: 750, shipped: 0, delivered: 1000, cancelled: 0,
+    });
+  });
+});
+
+// ---- Тесты типов (не меняйте их) ----
+// Строка под @ts-expect-error ДОЛЖНА быть ошибкой типа.
+function typeTests(order: Order) {
+  // @ts-expect-error: "lost" — не статус заказа
+  const lost: Order = { id: "o1", status: "lost", total: 100 };
+  // @ts-expect-error: отправленному заказу нужен код отслеживания
+  const noCode: Order = { id: "o2", status: "shipped", total: 100 };
+  // @ts-expect-error: причина есть только у отменённых заказов
+  const why = order.reason;
+  // @ts-expect-error: по одному итогу на статус, и только на них
+  const lostTotal = totalsByStatus([]).lost;
+
+  // ...а эти строки должны компилироваться
+  const shipped: Order = {
+    id: "o3", status: "shipped", total: 100, trackingCode: "RM2",
+  };
+  const delivered: number = totalsByStatus([shipped]).delivered;
+}
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Компилятор доказывает, что типы **согласованы**; ревьюер TypeScript спрашивает, **честны** ли они (правдивы во время выполнения) и **точны** ли (не шире предметной области).
+- Ищите в diff «аварийные люки»: `any` из `JSON.parse`/`res.json()`, `as` за пределами валидаторов, `{} as T`, `!`, `@ts-ignore`. Спрашивайте: «если это неверно, кто об этом узнает и когда?»
+- Предлагайте объединения вместо строк с комментарием, размеченные объединения вместо флагов и исчерпывающие `switch` (`satisfies never`) вместо универсальных `default` на объединениях. Насколько настаивать, зависит от того, как далеко распространяется тип.
+- Хитрые типы должны окупаться: много мест вызова, реальные пойманные ошибки, читаемые сообщения, тесты типов и владелец. Иначе побеждает простота.
+- Делайте комментарии о типах конкретными: показывайте конкретный баг, вставляйте ошибку компилятора, задавайте вопросы, помечайте вес и хвалите хорошие типы.
+- Если вы написали комментарий три раза, сделайте из него правило **typescript-eslint**: семейство `no-unsafe-*`, `no-floating-promises`, `ban-ts-comment`, `no-non-null-assertion`, `switch-exhaustiveness-check`. Человеческое ревью оставьте для смысла.

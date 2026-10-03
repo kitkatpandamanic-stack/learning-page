@@ -1,0 +1,667 @@
+---
+title: "Variance & Inference"
+description: "Learn when one type fits another: excess property checks, covariant arrays, contravariant parameters and unsound methods. Then steer inference with NoInfer, const and satisfies."
+duration: 24
+xp: 25
+---
+
+Most days you don't think about why a `Dog` fits where an `Animal` is expected. It just works. But the bugs that get past a strict TypeScript codebase tend to live in the corners of these rules: an event handler that type-checks and still crashes, a misspelt config key that compiles, a generic function that "helpfully" accepts a value it should reject. In this lesson you'll learn the rules of **assignability** precisely, see where TypeScript bends them on purpose, and then learn to steer **inference** with `NoInfer`, `const` type parameters and `satisfies`. ⚖️
+
+## Assignability is about shape
+
+TypeScript compares types by their **structure**, as you saw in [Structural Typing](/learn/typescript/structural-typing-and-class-design): a value fits a type if it has everything the type requires. Extra properties are fine, and they stay in the object:
+
+<CodeExample output={`(3, 4)
+{ x: 3, y: 4, label: 'Home' }
+(0, 0)`}>
+
+```ts
+interface Point {
+  x: number;
+  y: number;
+}
+
+function formatPoint(p: Point): string {
+  return `(${p.x}, ${p.y})`;
+}
+
+const pin = { x: 3, y: 4, label: "Home" };
+console.log(formatPoint(pin)); // fine: pin has x and y
+console.log(pin); // the extra label is still there
+
+const origin: Point = { x: 0, y: 0 };
+console.log(formatPoint(origin));
+```
+
+</CodeExample>
+
+So why does this fail?
+
+```ts
+const home: Point = { x: 3, y: 4, label: "Home" };
+// ❌ Error: Object literal may only specify known properties, and 'label' does not exist in type 'Point'.
+```
+
+That's the **excess property check**, and it's a deliberate exception. It only applies to a **fresh** object literal written right where a type is expected. Nobody could ever read `label` through a `Point`, so writing it there is almost always a typo or a misunderstanding. Once the object is stored in a variable, it may legitimately be used as other types too, so the check is off. Spreading (`{ ...pin }`) also turns it off, which is a common way extra data slips through.
+
+Two more edge cases are worth knowing. A **weak type** has only optional properties, so structurally almost anything would fit it. TypeScript therefore requires at least one property in common, which catches the classic misspelt option:
+
+```ts
+interface SaveOptions {
+  overwrite?: boolean;
+  backup?: boolean;
+}
+function save(name: string, options: SaveOptions) {}
+
+const opts = { overwrit: true };
+save("notes.txt", opts);
+// ❌ Error: Type '{ overwrit: boolean; }' has no properties in common with type 'SaveOptions'.
+```
+
+And **`{}` is not "an empty object"**. It means "any value except `null` and `undefined`", so `const n: {} = "hello"` compiles. For "any non-primitive" use `object`, and for "anything at all" use `unknown`.
+
+## Variance: when containers follow the rules
+
+The interesting question isn't whether `Dog` fits `Animal`. It's whether a **container** of dogs fits a container of animals: is `Box<Dog>` assignable to `Box<Animal>`? The answer depends on what the container **does** with its contents, and it's called **variance**:
+
+| Variance | Meaning | Typical example |
+| --- | --- | --- |
+| **Covariant** | `Box<Dog>` fits `Box<Animal>` (same direction) | things you only **read**: return types, `readonly Dog[]`, `Promise<Dog>` |
+| **Contravariant** | `Box<Animal>` fits `Box<Dog>` (reversed) | things you only **write into**: function parameters |
+| **Invariant** | neither direction | things you read **and** write |
+| **Bivariant** | both directions (unsound) | method parameters, see below |
+
+The rule of thumb: **reading is covariant, writing is contravariant, both is invariant.** Let's see where TypeScript follows it, and where it doesn't.
+
+## Arrays are covariant, and that's unsound
+
+A mutable array is something you read **and** write, so by the rule above it should be invariant. TypeScript makes arrays covariant anyway, because code like "pass my `Dog[]` to a function that takes `Animal[]`" is everywhere. The price is a real hole:
+
+<CodeExample output={`Woof!
+Tom: dog.bark is not a function`}>
+
+```ts
+interface Animal {
+  name: string;
+}
+interface Dog extends Animal {
+  bark(): string;
+}
+interface Cat extends Animal {
+  meow(): string;
+}
+
+const dogs: Dog[] = [{ name: "Rex", bark: () => "Woof!" }];
+const animals: Animal[] = dogs; // allowed: arrays are covariant
+const tom: Cat = { name: "Tom", meow: () => "Meow" };
+animals.push(tom); // allowed too...
+
+for (const dog of dogs) {
+  try {
+    console.log(dog.bark());
+  } catch (error) {
+    console.log(`${dog.name}: ${(error as Error).message}`);
+  }
+}
+```
+
+</CodeExample>
+
+`animals` and `dogs` are the **same** array, so a cat ended up in the dog list without a single type error. In real code this hides inside a helper like `addDefaults(items: Item[])` that pushes into whatever array you give it. The fix is to say what the function really does: if it only **reads**, take a `readonly` array. Read-only arrays are covariant **soundly**, because nobody can write a cat into them:
+
+```ts
+const someAnimals: readonly Animal[] = dogs; // ✅ safe
+someAnimals.push(tom);
+// ❌ Error: Property 'push' does not exist on type 'readonly Animal[]'.
+```
+
+## Function parameters are contravariant
+
+Now the reverse direction. A **handler** is a promise: "give me a dog and I'll deal with it". A function that can handle **any** animal keeps that promise, so it's allowed wherever a dog handler is needed:
+
+<CodeExample output={`Hi, Rex
+Woof!`}>
+
+```ts
+interface Animal {
+  name: string;
+}
+interface Dog extends Animal {
+  bark(): string;
+}
+
+type Handler<T> = (value: T) => void;
+
+const logName: Handler<Animal> = (a) => console.log(`Hi, ${a.name}`);
+const playFetch: Handler<Dog> = (d) => console.log(d.bark());
+
+// Both can handle a dog: logName handles ANY animal
+const dogHandlers: Handler<Dog>[] = [logName, playFetch];
+
+const rex: Dog = { name: "Rex", bark: () => "Woof!" };
+for (const handle of dogHandlers) {
+  handle(rex);
+}
+```
+
+</CodeExample>
+
+The other way round would break the promise: an animal handler list might be called with a cat, and `playFetch` would crash. TypeScript says no:
+
+```ts
+const animalHandlers: Handler<Animal>[] = [playFetch];
+// ❌ Error: Type 'Handler<Dog>' is not assignable to type 'Handler<Animal>'.
+```
+
+So `Handler<T>` is **contravariant** in `T`: the arrow flips. Return types go the normal way (a function returning a `Dog` fits where one returning an `Animal` is expected), so a function type is contravariant in its parameters and covariant in its result.
+
+## Methods are bivariant, on purpose
+
+Here's the hole that surprises even experienced developers. Write the same idea with **method syntax** in an interface, and the check disappears:
+
+<CodeExample output={`Rex says Woof!
+dog.bark is not a function`}>
+
+```ts
+interface Animal {
+  name: string;
+}
+interface Dog extends Animal {
+  bark(): string;
+}
+
+// Method syntax: admit(animal: Animal): void
+interface Shelter {
+  admit(animal: Animal): void;
+}
+
+const dogsOnly: Shelter = {
+  // Accepted, although it only handles dogs!
+  admit(dog: Dog) {
+    console.log(`${dog.name} says ${dog.bark()}`);
+  },
+};
+
+const rex: Dog = { name: "Rex", bark: () => "Woof!" };
+const tom: Animal = { name: "Tom" };
+
+dogsOnly.admit(rex);
+try {
+  dogsOnly.admit(tom); // any animal is fine, says the type
+} catch (error) {
+  console.log((error as Error).message);
+}
+```
+
+</CodeExample>
+
+The `strictFunctionTypes` flag (part of `strict`) makes **function-typed properties** contravariant, but it deliberately leaves **method** parameters **bivariant**: checked in either direction, so a narrower parameter slips through. Why keep a known hole? Because of arrays. `Array<T>` declares `push(...items: T[])` as a method; if methods were checked strictly, `Dog[]` would no longer fit `Animal[]`, and a mountain of existing code would break.
+
+For your own interfaces, you can opt into the sound check by writing callbacks as **properties**:
+
+```ts
+interface Shelter {
+  admit: (animal: Animal) => void; // property syntax
+}
+
+const dogsOnly: Shelter = {
+  admit(dog: Dog) {
+    console.log(`${dog.name} says ${dog.bark()}`);
+  },
+};
+// ❌ Error: Type '(dog: Dog) => void' is not assignable to type '(animal: Animal) => void'.
+```
+
+<Callout type="tip" title="Make it a lint rule">
+
+Use property syntax for callbacks and handlers in interfaces you design (`onChange: (value: T) => void`), and let the linter enforce it: typescript-eslint's `method-signature-style` rule with the `"property"` option rewrites method signatures for you. Classes are a different story: their methods are still compared bivariantly, which is one more reason to pass plain functions around rather than objects with methods.
+
+</Callout>
+
+<Quiz
+  question="type Listener<T> = (value: T) => void. Dog extends Animal. Which assignment compiles under strict?"
+  options={[
+    "const a: Listener<Animal> = dogListener (a Listener<Dog>)",
+    "const d: Listener<Dog> = animalListener (a Listener<Animal>)",
+    "Both, because Dog and Animal are related",
+    "Neither, because listeners are invariant",
+  ]}
+  answer={1}
+  explanation="Function parameters are contravariant: a listener that accepts any Animal can safely receive a Dog, so Listener<Animal> fits where Listener<Dog> is needed. The other direction would let a Cat reach a Dog-only listener."
+/>
+
+## Variance annotations: `in` and `out`
+
+TypeScript normally **measures** a generic type's variance from its structure. Since TypeScript 4.7 you can also **declare** it on the type parameter: `out T` for covariant (T only comes out), `in T` for contravariant (T only goes in), and `in out T` for invariant:
+
+```ts
+interface Producer<out T> {
+  get: () => T;
+}
+interface Consumer<in T> {
+  accept: (value: T) => void;
+}
+interface Cell<in out T> {
+  get(): T;
+  set(value: T): void;
+}
+
+declare const dogCell: Cell<Dog>;
+const animalCell: Cell<Animal> = dogCell;
+// ❌ Error: Type 'Cell<Dog>' is not assignable to type 'Cell<Animal>'.
+```
+
+Annotations are **checked** against the structure, so a wrong one is an error rather than a lie:
+
+```ts
+interface Wrong<out T> {
+// ❌ Error: Type 'Wrong<sub-T>' is not assignable to type 'Wrong<super-T>' as implied by variance annotation.
+  accept: (value: T) => void;
+}
+```
+
+Notice `Cell`: its methods alone would be bivariant (so `Cell<Dog>` would fit `Cell<Animal>`), and `in out` makes it properly invariant. When are annotations worth it?
+
+- To **document intent** on a public generic type that people will read: `Consumer<in T>` says a lot in two letters.
+- To **fix** method bivariance on a type you own, as with `Cell`.
+- For **performance and precision** on big recursive types, where measuring variance is slow or gives up. The TypeScript team added them partly for this reason.
+
+Don't sprinkle them everywhere: for ordinary types, the measured variance is right, and an annotation is one more thing to keep in sync.
+
+## How TypeScript infers type arguments
+
+When you call `pickOne(a, b)` without writing `<T>`, TypeScript has to work `T` out. Every place `T` appears in a parameter's type is an **inference site**, and each argument there gives a **candidate**. Then TypeScript combines the candidates:
+
+```ts
+function pickOne<T>(a: T, b: T): T {
+  return Math.random() < 0.5 ? a : b;
+}
+
+const n = pickOne(1, 2); // T is 1 | 2: same kind, combined
+declare const name: string;
+declare const age: number;
+pickOne(name, age);
+// ❌ Error: Argument of type 'number' is not assignable to parameter of type 'string'.
+```
+
+Candidates that fit together (two number literals) are combined; unrelated ones are not. TypeScript picks one (here the first) and reports the rest as errors. It never invents `string | number` on its own; if you want that, write `pickOne<string | number>(name, age)`. Callback arguments are special: when an argument is a function whose parameters have no annotations, TypeScript infers from the **other** arguments first, then uses the result to type the callback's parameters. That's why `items.map((item) => ...)` knows what `item` is.
+
+Most of the time, this is exactly what you want. Sometimes an inference site is one you **don't** want TypeScript to learn from.
+
+### `NoInfer`: "check this, don't learn from it"
+
+A traffic light takes its colours and an initial colour. The initial colour should be **one of** the colours, but it's also an inference site, so a typo becomes a new colour:
+
+```ts
+function createLight<C extends string>(colours: C[], initial: C) {
+  // ...
+}
+
+createLight(["red", "amber", "green"], "blue"); // no error!
+// C is "red" | "amber" | "green" | "blue"
+```
+
+Wrapping the parameter in **`NoInfer<C>`** (TypeScript 5.4) removes that site. `C` is inferred from `colours` alone, and `initial` is merely **checked** against it:
+
+<CodeExample output={`amber
+red`}>
+
+```ts
+function createLight<C extends string>(
+  colours: C[],
+  initial: NoInfer<C>,
+) {
+  let current = initial;
+  return {
+    show: () => current,
+    next() {
+      const i = colours.indexOf(current);
+      current = colours[(i + 1) % colours.length];
+    },
+  };
+}
+
+const light = createLight(["red", "amber", "green"], "red");
+light.next();
+console.log(light.show());
+light.next();
+light.next();
+console.log(light.show());
+```
+
+</CodeExample>
+
+```ts
+createLight(["red", "amber", "green"], "blue");
+// ❌ Error: Argument of type '"blue"' is not assignable to parameter of type '"red" | "amber" | "green"'.
+```
+
+Reach for `NoInfer` whenever one argument **defines** a set and another should **pick from** it: a default value, an initial state, a fallback route. Before 5.4, people used a second type parameter (`<C extends string, D extends C>`) for the same effect.
+
+### `const` type parameters: keep the literals
+
+The opposite problem: TypeScript **widens** literals when it infers, so `["/", "/courses"]` becomes `string[]`, and every string is a valid route. Callers could write `as const`, but they forget. A **`const` type parameter** (TypeScript 5.0) asks for the narrow type on the caller's behalf:
+
+<CodeExample output={`https://panda.dev/courses
+[ '/', '/courses', '/pricing' ]`}>
+
+```ts
+function defineRoutes<const T extends readonly string[]>(paths: T) {
+  return {
+    paths,
+    link: (path: T[number]) => `https://panda.dev${path}`,
+  };
+}
+
+const routes = defineRoutes(["/", "/courses", "/pricing"]);
+console.log(routes.link("/courses"));
+console.log(routes.paths);
+```
+
+</CodeExample>
+
+```ts
+routes.link("/cources");
+// ❌ Error: Argument of type '"/cources"' is not assignable to parameter of type '"/" | "/courses" | "/pricing"'.
+```
+
+One catch: `const` only affects literals **written in the call**. Pass a variable declared as `const list = ["/", "/courses"]`, and it's already `string[]` before the function ever sees it.
+
+## `satisfies` vs annotation vs `as const`
+
+You met `satisfies` for test fixtures in [Dependency Injection & Fakes](/learn/typescript/dependency-injection-and-fakes). Now you can see what it really does to inference. There are three ways to give an object literal a type, and they're not interchangeable:
+
+<CodeExample output={`1500
+5
+[ 'free', 'team' ]`}>
+
+```ts
+interface Plan {
+  priceCents: number;
+  seats: number | "unlimited";
+}
+
+// 1. Annotation: checked, but the details are forgotten
+const annotated: Record<string, Plan> = {
+  free: { priceCents: 0, seats: 1 },
+  team: { priceCents: 1500, seats: "unlimited" },
+};
+
+// 2. satisfies: checked, and the details are kept
+const plans = {
+  free: { priceCents: 0, seats: 1 },
+  team: { priceCents: 1500, seats: "unlimited" },
+} satisfies Record<string, Plan>;
+
+type PlanName = keyof typeof plans; // "free" | "team"
+
+function upgradeCost(from: PlanName, to: PlanName): number {
+  return plans[to].priceCents - plans[from].priceCents;
+}
+
+console.log(upgradeCost("free", "team"));
+console.log(plans.free.seats + 4); // seats is number here
+console.log(Object.keys(annotated));
+```
+
+</CodeExample>
+
+The annotation makes the **declared** type win. TypeScript checks the literal against `Record<string, Plan>`, then forgets everything else. The keys are now "any string", so a typo compiles and crashes at runtime, and `seats` is back to `number | "unlimited"` even where you wrote `1`:
+
+```ts
+annotated.fre.priceCents; // compiles! (crashes when it runs)
+annotated.free.seats + 4;
+// ❌ Error: Operator '+' cannot be applied to types 'string | number' and 'number'.
+```
+
+With `satisfies`, the **inferred** type wins, and the check still happens:
+
+```ts
+plans.fre;
+// ❌ Error: Property 'fre' does not exist on type '{ free: { priceCents: number; seats: number; }; team: { priceCents: number; seats: "unlimited"; }; }'. Did you mean 'free'?
+const broken = {
+  free: { priceCents: 0, seat: 1 },
+} satisfies Record<string, Plan>;
+// ❌ Error: Object literal may only specify known properties, but 'seat' does not exist in type 'Plan'. Did you mean to write 'seats'?
+```
+
+`as const` is the third tool: it checks **nothing**, but makes everything `readonly` and keeps every literal (`priceCents: 1500`, not `number`). Combine them as `as const satisfies Record<string, Plan>` for a lookup table that is checked, exact and frozen in the type system.
+
+| You write | Checked? | Type you get |
+| --- | --- | --- |
+| `const x: T = ...` | ✅ | `T` (details lost) |
+| `const x = ... satisfies T` | ✅ | the inferred type (details kept) |
+| `const x = ... as const` | ❌ | read-only literals |
+| `as const satisfies T` | ✅ | read-only literals |
+
+A good default: **annotate** function parameters, return types and anything public (the declared type is the contract), and use **`satisfies`** for configuration objects and lookup tables, where the exact keys are the useful part.
+
+<Quiz
+  question="const themes = { light: { bg: '#fff' }, dark: { bg: '#000' } } satisfies Record<string, { bg: string }>. What is keyof typeof themes?"
+  options={[
+    "string",
+    "'light' | 'dark'",
+    "'bg'",
+    "never, because satisfies hides the keys",
+  ]}
+  answer={1}
+  explanation="satisfies checks the object against Record<string, { bg: string }> but keeps the inferred type, so the keys stay 'light' | 'dark'. With an annotation (const themes: Record<string, ...>) they would widen to string."
+/>
+
+<Exercise
+  title="A sound size picker"
+  language="typescript"
+  starter={`interface SizeInfo {
+  label: string;
+  chestCm: number;
+}
+
+// FIX 1: keep the exact keys, and still check every entry
+const sizes: Record<string, SizeInfo> = {
+  s: { label: "Small", chestCm: 90 },
+  m: { label: "Medium", chestCm: 100 },
+  l: { label: "Large", chestCm: 110 },
+};
+type Size = keyof typeof sizes;
+
+// FIX 2: make TypeScript check listeners soundly
+interface Listener<T> {
+  onChange(value: T): void;
+}
+
+interface Select<T extends string> {
+  readonly value: T;
+  choose(option: string): boolean;
+  subscribe(listener: Listener<T>): () => void;
+}
+
+// FIX 3: initial must be one of the options (it mustn't
+// add a new option to T)
+function createSelect<T extends string>(
+  options: readonly T[],
+  initial: T,
+): Select<T> {
+  let value = initial;
+  const listeners = new Set<Listener<T>>();
+  return {
+    get value() {
+      return value;
+    },
+    choose(option) {
+      // TODO: return false if option isn't one of the options.
+      // Otherwise make it the value, tell every listener
+      // (only if the value changed) and return true.
+      return false;
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+}
+
+// FIX 4: accept read-only arrays, and never change the input
+function sortLabels(labels: string[]): string[] {
+  return labels.sort();
+}
+
+// ===== Type tests: don't change these =====
+// @ts-expect-error: there's no "xl" size
+const _xl: Size = "xl";
+function _typeTests() {
+  // @ts-expect-error: "xl" isn't one of the options
+  createSelect(["s", "m", "l"], "xl");
+  const smallOnly: Listener<"s"> = { onChange: () => {} };
+  // @ts-expect-error: a listener for "s" can't handle any size
+  const _any: Listener<Size> = smallOnly;
+  const fixedOrder = ["b", "a"] as const;
+  const _sorted: string[] = sortLabels(fixedOrder);
+}
+
+// ===== Try it =====
+const size = createSelect(["s", "m", "l"], "m");
+const stop = size.subscribe({
+  onChange: (v) => console.log(\`Size: \${sizes[v].label}\`),
+});
+size.choose("l");
+size.choose("l"); // no change, so no message
+console.log(size.choose("xxl"));
+stop();
+size.choose("s");
+console.log(size.value);
+console.log(sortLabels(Object.values(sizes).map((s) => s.label)));
+`}
+  tests={[
+    { name: "choose switches to a known option", check: "(() => { const s = createSelect(['a', 'b', 'c'], 'a'); return s.value === 'a' && s.choose('c') === true && s.value === 'c'; })()" },
+    { name: "choose refuses unknown options", check: "(() => { const s = createSelect(['a', 'b'], 'a'); return s.choose('zzz') === false && s.choose('') === false && s.value === 'a'; })()" },
+    { name: "Listeners hear only real changes", check: "(() => { const s = createSelect(['a', 'b'], 'a'); const seen = []; s.subscribe({ onChange: (v) => seen.push(v) }); s.choose('b'); s.choose('b'); s.choose('nope'); s.choose('a'); return seen.join(',') === 'b,a'; })()" },
+    { name: "Unsubscribing stops one listener only", check: "(() => { const s = createSelect(['a', 'b'], 'a'); const seen = []; const stop = s.subscribe({ onChange: (v) => seen.push(v) }); const other = []; s.subscribe({ onChange: (v) => other.push(v) }); s.choose('b'); stop(); s.choose('a'); return seen.join(',') === 'b' && other.join(',') === 'b,a'; })()" },
+    { name: "sortLabels sorts a copy", check: "(() => { const input = ['pear', 'apple', 'fig']; const out = sortLabels(input); return out.join(',') === 'apple,fig,pear' && input.join(',') === 'pear,apple,fig'; })()" },
+  ]}
+>
+
+A clothes shop's size picker has four type holes, each one from this lesson. The type tests at the bottom fail until all four are fixed (a `// @ts-expect-error` test passes only when the line below it **is** an error):
+
+1. **`sizes`** is annotated, so `Size` is just `string`. Keep the exact keys while still checking every entry against `SizeInfo`.
+2. **`Listener`** uses method syntax, so a listener for `"s"` only is accepted where any size can arrive. Make the check sound (adding a variance annotation is a nice touch).
+3. **`createSelect`** learns `T` from `initial` too, so a typo like `"xl"` silently becomes a new option. Infer `T` from `options` only.
+4. **`sortLabels`** only reads its input, but its type demands a mutable array, and `.sort()` quietly changes the caller's array. Accept read-only arrays and return a sorted **copy**.
+
+Then finish **`choose(option)`**: it receives a plain `string` (say, from a URL), so return `false` for anything that isn't one of the options. Otherwise make it the value and return `true`, telling every listener (`listener.onChange(value)`) only if the value actually **changed**.
+
+<Hint>
+
+1. Replace the annotation with `} satisfies Record<string, SizeInfo>;`.
+2. `interface Listener<in T> { onChange: (value: T) => void; }`.
+3. `initial: NoInfer<T>`.
+4. `labels: readonly string[]` and `return [...labels].sort();` (or `labels.toSorted()`).
+
+For `choose`, you need to narrow a `string` to `T`. `options.includes(option)` won't compile, because `includes` on a `readonly T[]` wants a `T`. But read-only arrays are covariant, so `const known: readonly string[] = options;` is safe and needs no cast. Use it in a type guard: `const isOption = (o: string): o is T => known.includes(o);`.
+
+</Hint>
+
+<Solution>
+
+```ts
+interface SizeInfo {
+  label: string;
+  chestCm: number;
+}
+
+const sizes = {
+  s: { label: "Small", chestCm: 90 },
+  m: { label: "Medium", chestCm: 100 },
+  l: { label: "Large", chestCm: 110 },
+} satisfies Record<string, SizeInfo>;
+type Size = keyof typeof sizes;
+
+// Property syntax: parameters are checked contravariantly
+// (`in T` documents that a Listener only consumes T)
+interface Listener<in T> {
+  onChange: (value: T) => void;
+}
+
+interface Select<T extends string> {
+  readonly value: T;
+  choose(option: string): boolean;
+  subscribe(listener: Listener<T>): () => void;
+}
+
+function createSelect<T extends string>(
+  options: readonly T[],
+  initial: NoInfer<T>,
+): Select<T> {
+  let value = initial;
+  const listeners = new Set<Listener<T>>();
+  // readonly arrays are covariant: widening to string is safe
+  const known: readonly string[] = options;
+  const isOption = (option: string): option is T =>
+    known.includes(option);
+
+  return {
+    get value() {
+      return value;
+    },
+    choose(option) {
+      if (!isOption(option)) return false;
+      if (option !== value) {
+        value = option;
+        for (const listener of listeners) listener.onChange(value);
+      }
+      return true;
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+}
+
+function sortLabels(labels: readonly string[]): string[] {
+  return [...labels].sort();
+}
+
+// ===== Type tests: don't change these =====
+// @ts-expect-error: there's no "xl" size
+const _xl: Size = "xl";
+function _typeTests() {
+  // @ts-expect-error: "xl" isn't one of the options
+  createSelect(["s", "m", "l"], "xl");
+  const smallOnly: Listener<"s"> = { onChange: () => {} };
+  // @ts-expect-error: a listener for "s" can't handle any size
+  const _any: Listener<Size> = smallOnly;
+  const fixedOrder = ["b", "a"] as const;
+  const _sorted: string[] = sortLabels(fixedOrder);
+}
+
+// ===== Try it =====
+const size = createSelect(["s", "m", "l"], "m");
+const stop = size.subscribe({
+  onChange: (v) => console.log(`Size: ${sizes[v].label}`),
+});
+size.choose("l");
+size.choose("l"); // no change, so no message
+console.log(size.choose("xxl"));
+stop();
+size.choose("s");
+console.log(size.value);
+console.log(sortLabels(Object.values(sizes).map((s) => s.label)));
+// Size: Large
+// false
+// s
+// [ 'Large', 'Medium', 'Small' ]
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Assignability is **structural**: extra properties are fine, except in a **fresh object literal** (excess property check) and for **weak types** with only optional properties. `{}` means "anything but `null`/`undefined`".
+- **Variance** says how a container's assignability follows its contents: reading is **covariant**, writing is **contravariant**, both is **invariant**.
+- Mutable **arrays are covariant**, which is unsound; take `readonly` arrays when you only read.
+- **Function parameters are contravariant** under `strictFunctionTypes`, but **method parameters are bivariant**. Write callbacks in interfaces with property syntax (and lint for it).
+- **`in` / `out` annotations** declare variance; they're checked, document intent, can fix method bivariance, and help with big recursive types.
+- TypeScript infers type arguments from **inference sites**. `NoInfer<T>` removes a site (defaults, initial values), and a **`const` type parameter** keeps literals narrow.
+- **Annotation** = the declared type wins; **`satisfies`** = checked, and the inferred type wins; **`as const`** = read-only literals, unchecked; `as const satisfies` gives you both.

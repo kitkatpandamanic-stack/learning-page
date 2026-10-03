@@ -1,0 +1,660 @@
+---
+title: Проектирование API и миграции
+description: "Проектируйте API на TypeScript с хорошим выводом типов, объектами опций и перегрузками, знайте, какие изменения типов ломают пользователей, и поэтапно переводите код с JavaScript."
+duration: 25
+xp: 30
+---
+
+Одна знакомая команда поддерживала внутренний HTTP-клиент, которым пользовались около 40 сервисов. В минорном релизе они поменяли `getUser(id)`: вместо `Promise<User>` функция стала возвращать `Promise<User | undefined>`. Это было честно — пользователя действительно могло не оказаться, — и JavaScript при этом не изменился вовсе. В понедельник утром 40 сборок упали с `'user' is possibly 'undefined'.` Никто не сломал никакой **код**; сломали **тип**, а в TypeScript типы — часть вашего API. 🧭
+
+Этот урок — о долгой жизни кода на TypeScript, от которого зависят другие люди: как проектировать API, которые приятно вызывать, как понять, какие изменения типов ломают пользователей, как объявлять что-то устаревшим без драмы и как перевести существующую кодовую базу с JavaScript на TypeScript, не останавливая работу над фичами.
+
+## Проектируйте под место вызова
+
+Лучший типизированный API — тот, где пользователям **никогда не приходится писать аргумент типа**. Они передают обычные значения, а TypeScript выводит из них всё остальное. Для этого источники вывода должны быть в аргументах, которые пользователи пишут в любом случае, а компилятору нужно сказать, какие аргументы для вывода **не** использовать.
+
+Вот маленькая библиотека конечных автоматов. Пользователи один раз описывают состояния и события обычным объектом и получают автомат, чей `send` принимает только настоящие события:
+
+<CodeExample output={`closed true false
+locked locked
+closed opened`}>
+
+```ts
+// Библиотека: пользователи никогда не пишут аргумент типа
+interface MachineConfig<S extends string, E extends string> {
+  initial: NoInfer<S>;
+  states: Record<S, Partial<Record<E, NoInfer<S>>>>;
+}
+
+interface Machine<S extends string, E extends string> {
+  readonly state: S;
+  send(event: E): S;
+  can(event: E): boolean;
+}
+
+function createMachine<S extends string, E extends string>(
+  config: MachineConfig<S, E>,
+): Machine<S, E> {
+  let state = config.initial;
+  return {
+    get state() {
+      return state;
+    },
+    send(event) {
+      state = config.states[state][event] ?? state;
+      return state;
+    },
+    can(event) {
+      return config.states[state][event] !== undefined;
+    },
+  };
+}
+
+// Код пользователя: каждое имя ниже проверяется
+const door = createMachine({
+  initial: "closed",
+  states: {
+    closed: { open: "opened", lock: "locked" },
+    opened: { close: "closed" },
+    locked: { unlock: "closed" },
+  },
+});
+
+console.log(door.state, door.can("open"), door.can("unlock"));
+console.log(door.send("lock"), door.send("open"));
+console.log(door.send("unlock"), door.send("open"));
+```
+
+</CodeExample>
+
+Параметры типа `S` (состояния) и `E` (события) выводятся из **ключей** `states` и каждого вложенного объекта, поэтому ошибки в коде пользователя получают точные сообщения:
+
+```ts
+door.send("kick");
+// ❌ Error: Argument of type '"kick"' is not assignable to parameter of type '"open" | "lock" | "close" | "unlock"'.
+
+const job = createMachine({
+  initial: "idle",
+  states: {
+    idle: { start: "runing" },
+    // ❌ Error: Type '"runing"' is not assignable to type '"idle" | "running" | undefined'. Did you mean '"running"'?
+    running: { stop: "idle" },
+  },
+});
+```
+
+Хорошими эти ошибки делают два проектных решения:
+
+- **`NoInfer<S>`** (из урока [Вариантность и вывод типов](/learn/typescript/variance-and-inference)) на `initial` и на каждом целевом состоянии говорит: «не выводи `S` отсюда, только сверяйся с ним». Без него опечатка `"runing"` стала бы новым **состоянием** в объединении, а ошибка появилась бы на строке, которая на самом деле правильная: `Object literal may only specify known properties, but 'running' does not exist in type 'Record<"idle" | "runing", …>'`. Пользователи смотрели бы на `running`, не понимая, что с ним не так.
+- **Именованный тип возвращаемого значения** (`Machine<S, E>`) означает, что при наведении пользователи видят `Machine<"closed" | "opened" | "locked", "open" | …>`, а не стену выведенного объектного типа. Как и интерфейс `Billing` из первого урока этого модуля, это ещё и контракт (contract): вы можете менять реализацию, не меняя того, что видят пользователи.
+
+Ещё несколько правил, которым следуют опытные авторы библиотек:
+
+- **Параметр типа должен встречаться хотя бы дважды**, например в параметре и в типе возвращаемого значения. `function parse<T>(json: string): T` использует `T` один раз: это приведение типа с более приятным синтаксисом, и вызывающий доверяет вам вслепую (та самая «проблема честности» из урока [Типизированный fetch](/learn/typescript/typed-fetch)). Возвращайте `unknown` или принимайте парсер.
+- **Давайте значения по умолчанию параметрам типа, которые могут передавать явно**: `createEmitter<Events = Record<string, unknown>>()` подходит и для быстрых скриптов, и для пользователей, которые расписывают свою карту событий.
+- **Используйте `const`-параметры типа**, когда важны литеральные типы, как `defineSchema` в прошлом уроке, — тогда пользователям не придётся писать `as const`.
+- **Не перемудрите.** Если выведенный тип при наведении занимает целый экран, пользователи не смогут отладить собственные ошибки. Чуть менее точный тип с понятными ошибками обычно выигрывает.
+
+## Объекты опций, перегрузки и объединения
+
+Позиционные параметры хороши для одного-двух обязательных значений. Дальше места вызова перестают объяснять сами себя. Что делает этот код?
+
+```ts
+paginate(items, 2, 10, true);
+```
+
+Знаменитая **ловушка логического параметра** (boolean trap): никто из читающих не знает, что означает `true`, а если поменять местами `2` и `10`, код всё равно скомпилируется. **Объект опций** (options object) даёт имя каждому значению, упрощает необязательные значения и — что особенно важно для библиотек — может расти: добавление нового **необязательного** свойства никогда не ломает существующие вызовы.
+
+Когда функция принимает значения разной формы, у вас три инструмента. Выбирайте, спросив себя, как **тип возвращаемого значения** зависит от входа:
+
+- **Один и тот же тип возвращаемого значения для любого входа** → **параметр-объединение**: `format(value: string | number): string`.
+- **Тип возвращаемого значения следует за типом входа** → **дженерик**: `first<T>(items: readonly T[]): T | undefined`.
+- **Тип возвращаемого значения зависит от того, какую форму вы передали**, в нескольких отдельных случаях → **перегрузки** (overloads).
+
+<CodeExample output={`Kim [ 'Mei', 'Ana' ]
+[ 'Mei', 'Ana', 'Kim' ]
+[ 'Kim', 'Ana' ]`}>
+
+```ts
+interface User {
+  id: string;
+  name: string;
+  joined: number; // год
+}
+
+const users = new Map<string, User>([
+  ["u1", { id: "u1", name: "Mei", joined: 2021 }],
+  ["u2", { id: "u2", name: "Kim", joined: 2024 }],
+  ["u3", { id: "u3", name: "Ana", joined: 2023 }],
+]);
+
+// Перегрузки: тип возвращаемого значения зависит от формы аргумента
+function getUsers(id: string): User | undefined;
+function getUsers(ids: readonly string[]): User[];
+function getUsers(
+  idOrIds: string | readonly string[],
+): User | undefined | User[] {
+  if (typeof idOrIds === "string") return users.get(idOrIds);
+  return idOrIds.flatMap((id) => users.get(id) ?? []);
+}
+
+// Объект опций: с именами, необязательный, легко расширить потом
+interface ListOptions {
+  newestFirst?: boolean;
+  limit?: number;
+}
+
+function listUsers(options: ListOptions = {}): string[] {
+  const { newestFirst = false, limit = Infinity } = options;
+  return [...users.values()]
+    .sort((a, b) =>
+      newestFirst ? b.joined - a.joined : a.joined - b.joined,
+    )
+    .slice(0, limit)
+    .map((user) => user.name);
+}
+
+const one = getUsers("u2");   // User | undefined
+const many = getUsers(["u1", "u3", "u9"]); // User[]
+console.log(one?.name, many.map((user) => user.name));
+console.log(listUsers());
+console.log(listUsers({ newestFirst: true, limit: 2 }));
+```
+
+</CodeExample>
+
+Вызывающие видят только две сигнатуры перегрузок; третья, **сигнатура реализации** (implementation signature), снаружи невидима. У перегрузок есть одно большое ограничение: они проверяются по одной, поэтому вызывающий, у которого на руках `string | string[]`, вообще не может вызвать `getUsers`:
+
+```ts
+declare const input: string | string[];
+getUsers(input);
+// ❌ Error: No overload matches this call.
+```
+
+Если у вызывающих часто будет именно объединение, добавьте для них третью перегрузку `(idOrIds: string | readonly string[]): User | User[] | undefined` или переосмыслите API (две функции, `getUser` и `getUsers`, часто понятнее одной хитроумной).
+
+## Semver для типов
+
+Семантическое версионирование (semantic versioning) говорит: **мажорная** версия — для ломающих изменений, **минорная** — для новых возможностей, **патч** — для исправлений. Для библиотеки на TypeScript «ломающие» включают изменения, из-за которых корректный код пользователя **перестаёт компилироваться**. Ломает ли изменение что-то, зависит от **направления**, в котором течёт тип, — это та же ковариантность и контравариантность, что вы встречали в уроке [Вариантность и вывод типов](/learn/typescript/variance-and-inference):
+
+| Изменение | Ломающее? |
+| --- | --- |
+| Удалить или переименовать экспортируемое значение **или тип** | Да |
+| Добавить **обязательное** свойство во входной тип / тип опций | Да |
+| Добавить **необязательное** свойство в тип опций | Нет |
+| Сделать тип параметра **уже** (`string \| number` → `string`) | Да |
+| Сделать тип параметра **шире** (`string` → `string \| number`) | Нет |
+| Сделать тип возвращаемого значения **шире** (`User` → `User \| undefined`) | Да |
+| Сделать тип возвращаемого значения **уже** | Обычно нет |
+| Добавить член в интерфейс, который пользователи **реализуют** | Да |
+| Добавить член в интерфейс, который пользователи только **читают** | Нет |
+| Добавить вариант в объединение, которое пользователи **получают** (статус, вид события) | На практике да: это ломает исчерпывающие switch |
+| Добавить параметр типа **без** значения по умолчанию | Да (со значением по умолчанию — нет) |
+| Требовать более новую версию TypeScript | Да, если только вы не опубликовали политику поддержки |
+
+Вот как три из этих изменений выглядят в коде пользователя, который прекрасно компилировался с версией 1:
+
+```ts
+// в v2 в интерфейс Plugin добавили teardown()
+const logger: Plugin = { name: "logger", setup(app) { /* … */ } };
+// ❌ Error: Property 'teardown' is missing in type '{ name: string; setup(app: App): void; }' but required in type 'Plugin'.
+
+// v2: findUser теперь возвращает User | null
+const user = findUser("u1");
+console.log(user.name.toUpperCase());
+// ❌ Error: 'user' is possibly 'null'.
+
+// в v2 в Status добавили "suspended"
+default:
+  return assertNever(status);
+// ❌ Error: Argument of type '"suspended"' is not assignable to parameter of type 'never'.
+```
+
+Последний случай вызывает больше всего споров. С точки зрения библиотеки новый вариант объединения — «просто новая возможность», но каждый пользователь, который следовал хорошей практике и написал исчерпывающий `switch`, получает ошибку компиляции. Одни библиотеки считают это ломающим изменением; другие заранее документируют: «в минорных версиях могут появляться новые виды событий, обрабатывайте неизвестные виды». Подходит любой вариант; важно **принять решение и записать его**. Спецификация сообщества на semver-ts.org подробно расписывает эти правила, включая то, как поддерживать разные версии TypeScript.
+
+<Callout type="tip" title="Сделайте ломающие изменения видимыми на ревью">
+
+Инструменты могут поймать такие изменения до релиза. **API Extractor** записывает весь публичный интерфейс типов вашего пакета в файл отчёта (`etc/my-lib.api.md`), который коммитится в репозиторий, так что любое изменение публичных типов появляется в пул-реквесте как diff, и ревьюер спрашивает: «это ломающее изменение?». **Тесты типов** (type tests; урок [Тестирование типов](/learn/typescript/testing-types)) фиксируют, что должно компилироваться, а что нет. Вместе они превращают «мы случайно сломали 40 сборок» в красную проверку в CI.
+
+</Callout>
+
+## Объявляем устаревшим, ничего не ломая
+
+Удаление API — это процесс из **трёх шагов**, растянутый на несколько релизов:
+
+1. **Добавить** замену (минорный релиз). Работают оба варианта.
+2. **Объявить устаревшим** старый (минорный релиз): JSDoc-тег `@deprecated`, предупреждение во время выполнения **один раз**, строчка в changelog, в идеале — кодмод (codemod).
+3. **Удалить** его (следующий мажорный релиз) вместе с руководством по миграции.
+
+Здесь клиентская библиотека переименовывает `makeClient(url, timeout)` в `createClient({ baseUrl, timeoutMs })`. Старая функция остаётся, делегирует работу новой и подсказывает вызывающим, как перейти:
+
+<CodeExample output={`DeprecationWarning: makeClient(url, timeout) is now createClient({ baseUrl })
+https://api.pandadev.test, timeout 5000 ms
+https://api.pandadev.test, timeout 1000 ms
+https://api.pandadev.test, timeout 5000 ms`}>
+
+```ts
+interface ClientOptions {
+  baseUrl: string;
+  timeoutMs?: number;
+}
+
+interface Client {
+  describe(): string;
+}
+
+// v3.2: новый API
+function createClient(options: ClientOptions): Client {
+  const { baseUrl, timeoutMs = 5_000 } = options;
+  return { describe: () => `${baseUrl}, timeout ${timeoutMs} ms` };
+}
+
+const warned = new Set<string>();
+function deprecate(id: string, message: string): void {
+  if (warned.has(id)) return; // один раз на процесс, а не на каждый вызов
+  warned.add(id);
+  console.warn(`DeprecationWarning: ${message}`);
+}
+
+/**
+ * @deprecated Используйте `createClient({ baseUrl, timeoutMs })`.
+ * makeClient будет удалён в v4.0.
+ */
+function makeClient(baseUrl: string, timeoutMs?: number): Client {
+  deprecate(
+    "makeClient",
+    "makeClient(url, timeout) is now createClient({ baseUrl })",
+  );
+  return createClient({ baseUrl, timeoutMs });
+}
+
+// Старый код продолжает работать и один раз узнаёт, как перейти
+const a = makeClient("https://api.pandadev.test");
+const b = makeClient("https://api.pandadev.test", 1_000);
+const c = createClient({ baseUrl: "https://api.pandadev.test" });
+console.log(a.describe());
+console.log(b.describe());
+console.log(c.describe());
+```
+
+</CodeExample>
+
+Тег `@deprecated` понимает сам TypeScript: редакторы показывают `makeClient` зачёркнутым в каждом месте вызова, с сообщением при наведении, а правило **`no-deprecated`** из typescript-eslint превращает его в ошибку линтера, которую можно включить, когда вы готовы завершить миграцию. Он работает и на **отдельной перегрузке**, так что можно объявить устаревшим один старый стиль вызова, сохранив саму функцию. Предупреждение во время выполнения — для пользователей JavaScript и для кода, который никто никогда не открывает в редакторе; предупреждайте **один раз**, а не при каждом вызове, иначе логи пользователей переполнятся и они его заглушат. (В Node для этого есть встроенный `util.deprecate(fn, message)`.)
+
+## Переводим JavaScript на TypeScript
+
+Этот раздел — технический план действий; как вести за собой людей в таком переходе, разбирается в уроке [Внедрение TypeScript в команде](/learn/typescript/leading-typescript-adoption). Переписывания больших кодовых баз на JavaScript «одним махом» (big-bang rewrite) редко доходят до конца: фичи продолжают попадать в старый код, пока ветка с переписыванием гниёт. Успешные миграции **инкрементальны**, выкатываются каждый день и измеряются. Обычный путь:
+
+**1. Добавьте TypeScript, не меняя ни одного файла.** Конфигурация tsconfig, в которой `.js` и `.ts` живут вместе, и `tsc --noEmit` в CI с первого дня:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "strict": true,
+    "module": "nodenext",
+    "target": "es2022"
+  },
+  "include": ["src"]
+}
+```
+
+`allowJs` позволяет файлам TypeScript импортировать файлы JavaScript (и даёт им выведенные типы). `checkJs: false` означает, что типы в файлах JavaScript пока не проверяются, поэтому CI зелёный с первого дня.
+
+**2. Проверяйте файлы JavaScript по одному** с комментарием `// @ts-check` в начале и добавляйте типы через **JSDoc**. Это ловит настоящие баги ещё до того, как переименован хоть один файл. Вот настоящий вывод `tsc` для этого файла:
+
+```js title="src/cart.js"
+// @ts-check
+
+/**
+ * @typedef {object} LineItem
+ * @property {string} sku
+ * @property {number} cents
+ * @property {number} [qty] defaults to 1
+ */
+
+/**
+ * @param {LineItem[]} items
+ * @returns {number}
+ */
+export function total(items) {
+  return items.reduce(
+    (sum, item) => sum + item.cent * (item.qty ?? 1),
+    0,
+  );
+}
+
+total([{ sku: "tea", cents: "450" }]);
+```
+
+```text
+src/cart.js(16,31): error TS2551: Property 'cent' does not exist on type 'LineItem'. Did you mean 'cents'?
+src/cart.js(21,22): error TS2322: Type 'string' is not assignable to type 'number'.
+```
+
+Почему бы не включить `checkJs: true` сразу для всего? Потому что со `strict` каждый нетипизированный параметр в каждом старом файле становится ошибкой (`error TS7006: Parameter 'a' implicitly has an 'any' type.`), их тысячи, и уже на второй день команда учится игнорировать проверку типов.
+
+**3. Переименовывайте файлы в `.ts`, начиная с листьев.** Начните с модулей, которые ничего из вашего кода не импортируют (утилиты, доменные правила), затем переходите к коду, который их использует. Каждый переведённый файл даёт своим вызывающим настоящие типы, так что работа накапливается. Держите каждый пул-реквест маленьким и **чистым**: переименование плюс типы, никаких изменений поведения, чтобы ревьюеры могли быстро его одобрить.
+
+**4. Закручивайте строгость постепенно.** Если `strict` поначалу слишком тяжёл, начните без него и включайте флаги по одному (`noImplicitAny`, затем `strictNullChecks` — самый большой, затем остальные). Или включите `strict` для всего и заглушите существующие ошибки комментариями, чтобы **новый** код был строгим с первого дня. Инструменты вроде ts-migrate (от Airbnb) делают это механически: переводят файлы, добавляют `any` и комментарии `@ts-expect-error`, пока всё не скомпилируется, а уборку оставляют на потом.
+
+**5. Ведите бюджет «аварийных люков».** Во время миграции предпочитайте `@ts-expect-error`, а не `@ts-ignore`: когда кто-то исправит исходную проблему, сам `@ts-expect-error` станет ошибкой (*Unused '@ts-expect-error' directive.*), так что бюджет может только уменьшаться. Заставьте каждое подавление объяснять себя с помощью typescript-eslint:
+
+```js
+// в eslint.config.mjs
+rules: {
+  "@typescript-eslint/ban-ts-comment": ["error", {
+    "ts-ignore": true,
+    "ts-expect-error": "allow-with-description",
+  }],
+},
+```
+
+**6. Используйте кодмоды для однообразных изменений.** Переименовать API в 600 файлах или заменить устаревший вызов — работа для скрипта, а не для людей. **ts-morph** оборачивает API компилятора, так что кодмод понимает типы и ссылки, а не только текст:
+
+```ts title="scripts/rename-make-client.ts"
+import { Project } from "ts-morph";
+
+const project = new Project({ tsConfigFilePath: "tsconfig.json" });
+const file = project.getSourceFileOrThrow("src/client.ts");
+
+// Переименовывает объявление И каждую ссылку на него, как F2 в VS Code
+file.getFunctionOrThrow("makeClient").rename("createClient");
+await project.save();
+```
+
+Библиотеки выпускают такие кодмоды вместе с мажорными релизами (`npx @my-lib/codemod v4`), и ломающее изменение превращается из недели работы в проверенный на ревью diff.
+
+## Измеряем прогресс
+
+Миграции нужны цифры — и чтобы знать, что вы движетесь, и чтобы показать их тем, кто за это платит. Полезные метрики: доля файлов на TypeScript, количество `any` (или процент **покрытия типами** (type coverage) из пакета `type-coverage`, который считает идентификаторы с типом `any`), количество комментариев `@ts-expect-error` и то, какие флаги `strict` включены. Двигаться в правильную сторону их заставляет приём под названием **храповик** (ratchet): CI хранит базовую линию и падает, если какая-то цифра стала **хуже**, а когда цифра улучшается, базовая линия обновляется, чтобы она не могла потихоньку откатиться назад:
+
+<CodeExample output={`{ jsFiles: 2, anys: 2, expectErrors: 1 }
+[]
+[ 'anys went up: 2 → 3' ]`}>
+
+```ts
+interface Metrics {
+  jsFiles: number;
+  anys: number;
+  expectErrors: number;
+}
+
+// Крошечная замена репозитория: путь → исходный код
+const repo: Record<string, string> = {
+  "src/cart.ts": "export function total(items: Item[]) { /*…*/ }",
+  "src/legacy/report.js": "module.exports = function report(x) {}",
+  "src/api.ts": [
+    "const data = (await res.json()) as any;",
+    "// @ts-expect-error: old SDK types are wrong",
+    "sdk.connect(options);",
+  ].join("\n"),
+  "src/legacy/csv.js": "export function parseCsv(text) {}",
+  "src/user.ts": "function load(raw: any): User { /*…*/ }",
+};
+
+function count(text: string, pattern: RegExp): number {
+  return text.match(pattern)?.length ?? 0;
+}
+
+function measure(files: Record<string, string>): Metrics {
+  const sources = Object.entries(files);
+  return {
+    jsFiles: sources.filter(([path]) => path.endsWith(".js")).length,
+    anys: sources.reduce(
+      (n, [, text]) => n + count(text, /\bany\b/g),
+      0,
+    ),
+    expectErrors: sources.reduce(
+      (n, [, text]) => n + count(text, /@ts-expect-error/g),
+      0,
+    ),
+  };
+}
+
+// Храповик: цифры могут уменьшаться, но никогда не расти
+function ratchet(baseline: Metrics, now: Metrics): string[] {
+  // Object.keys возвращает string[]; здесь это собственные ключи Metrics
+  const keys = Object.keys(baseline) as (keyof Metrics)[];
+  return keys
+    .filter((key) => now[key] > baseline[key])
+    .map((key) => `${key} went up: ${baseline[key]} → ${now[key]}`);
+}
+
+const baseline: Metrics = { jsFiles: 3, anys: 2, expectErrors: 1 };
+const now = measure(repo);
+console.log(now);
+console.log(ratchet(baseline, now)); // [] → CI проходит
+
+// Кто-то добавляет быстрый фикс с any…
+repo["src/cart.ts"] += "\nconst discount: any = getDiscount();";
+console.log(ratchet(baseline, measure(repo))); // CI падает
+```
+
+</CodeExample>
+
+Регулярное выражение — инструмент грубый (оно посчитало бы и «any» в комментарии), но для храповика это неважно: одно и то же правило измеряет и базовую линию, и сегодняшнее состояние. Инструменты вроде **Betterer** делают это как следует для настоящих репозиториев. И знайте, когда остановиться: цель — меньше багов в продакшене и более безопасные рефакторинги, а не 100% на дашборде. Какой-то старый, стабильный, редко изменяемый код может годами оставаться на JavaScript с JSDoc.
+
+<Callout type="warning" title="Не совмещайте миграцию и рефакторинг">
+
+Самый частый способ провалить миграцию: «раз уж я перевожу этот файл, заодно и почищу его». Теперь изменение типов и изменение поведения смешаны в одном diff, баг проскальзывает через ревью, и команда решает, что «TypeScript вызвал аварию». Сначала переведите — без изменений поведения и с зелёными тестами; рефакторьте в отдельном пул-реквесте, когда компилятор уже на вашей стороне.
+
+</Callout>
+
+<Quiz
+  question="Библиотека экспортирует interface Plugin { name: string; setup(app: App): void }, и пользователи пишут собственные объекты-плагины этого типа. Версия 2.4.0 добавляет в Plugin обязательный метод teardown(): void. Что произойдёт?"
+  options={[
+    "Ничего не сломается: добавление члена — это новая возможность, так что минорная версия подходит",
+    "Плагины всех пользователей перестанут компилироваться, потому что в них нет teardown, так что нужна мажорная версия (или teardown должен быть необязательным)",
+    "Затронуты только пользователи JavaScript, потому что пользователи TypeScript получают teardown по умолчанию",
+    "Ничего не сломается, пока пользователь не вызовет teardown",
+  ]}
+  answer={1}
+  explanation="Пользователи создают значения Plugin, так что для них Plugin — входной тип, которому они обязаны соответствовать. Новый обязательный член делает их существующие объекты неполными. Добавить его необязательным (teardown?(): void) — способ выпустить это в минорной версии, ничего не сломав. Если бы пользователи только читали значения Plugin, которые создаёт ваша библиотека, новый член был бы безвреден."
+/>
+
+<Quiz
+  question="Почему при миграциях для подавления существующих ошибок предпочитают // @ts-expect-error, а не // @ts-ignore?"
+  options={[
+    "@ts-expect-error быстрее для компилятора",
+    "@ts-ignore не работает в файлах .ts",
+    "@ts-expect-error сам становится ошибкой, как только в строке больше нет ошибки, поэтому исправленные подавления удаляются и бюджет только уменьшается",
+    "@ts-expect-error ещё и отключает ESLint для этой строки",
+  ]}
+  answer={2}
+  explanation="@ts-ignore остаётся навсегда, даже после исправления проблемы, и молча скрывает любую новую ошибку в этой строке. @ts-expect-error сообщает 'Unused @ts-expect-error directive', поэтому каждое исправление убирает свой комментарий, и их число уменьшается."
+/>
+
+<Exercise
+  title="Версия 2, не ломающая версию 1"
+  language="typescript"
+  starter={`// ---------- помощники (готово) ----------
+type Currency = "EUR" | "USD" | "GBP";
+
+const SYMBOLS: Record<Currency, string> = {
+  EUR: "€",
+  USD: "$",
+  GBP: "£",
+};
+
+function isCurrency(code: string): code is Currency {
+  return code in SYMBOLS;
+}
+
+const warned = new Set<string>();
+function deprecate(id: string, message: string): void {
+  if (warned.has(id)) return;
+  warned.add(id);
+  console.warn(\`DeprecationWarning: \${message}\`);
+}
+
+const OLD_STYLE =
+  "formatMoney(cents, currency, symbol) is deprecated: " +
+  "use formatMoney(cents, { currency, symbol })";
+
+// ---------- v1: от этого зависят тысячи вызовов ----------
+// TODO: превратите это в v2, не сломав ни один из них
+function formatMoney(
+  cents: number,
+  currency: string,
+  symbol = true,
+): string {
+  const amount = (cents / 100).toFixed(2);
+  if (symbol && isCurrency(currency)) {
+    return SYMBOLS[currency] + amount;
+  }
+  return amount + " " + currency;
+}
+
+// ---------- тесты типов (не меняйте их) ----------
+function typeTests(): void {
+  formatMoney(100); // v2 со значениями по умолчанию
+  formatMoney(100, { currency: "USD" });
+  formatMoney(100, { symbol: false });
+  formatMoney(100, "CHF", false); // вызовы v1 по-прежнему компилируются
+  formatMoney(100, "EUR");
+  // @ts-expect-error: v2 принимает только известные валюты
+  formatMoney(100, { currency: "CHF" });
+  // @ts-expect-error: опечатка в имени опции
+  formatMoney(100, { curency: "USD" });
+  // @ts-expect-error: symbol передаётся внутри объекта опций
+  formatMoney(100, { currency: "USD" }, false);
+  // @ts-expect-error: ни одна сигнатура не принимает четыре аргумента
+  formatMoney(100, "EUR", true, "extra");
+}
+
+// ---------- попробуйте ----------
+console.log(formatMoney(1250));
+console.log(formatMoney(1250, { currency: "USD" }));
+console.log(formatMoney(1250, { currency: "GBP", symbol: false }));
+console.log(formatMoney(1250, "EUR")); // старый код
+console.log(formatMoney(1250, "CHF", true)); // снова старый код
+`}
+  tests={[
+    { name: "Тесты типов компилируются (нет неиспользованных @ts-expect-error)", check: `true` },
+    { name: "v2: объект опций со значениями по умолчанию (EUR, с символом)", check: `formatMoney(1250) === "€12.50" && formatMoney(99, {}) === "€0.99" && formatMoney(500, { currency: "GBP" }) === "£5.00" && formatMoney(1, { currency: "USD", symbol: false }) === "0.01 USD" && formatMoney(1999, { symbol: false }) === "19.99 EUR"` },
+    { name: "Вызовы v1 ведут себя точно так же, как раньше", check: `formatMoney(1250, "USD") === "$12.50" && formatMoney(300, "EUR", false) === "3.00 EUR" && formatMoney(1250, "CHF") === "12.50 CHF" && formatMoney(1250, "CHF", true) === "12.50 CHF" && formatMoney(7, "GBP", true) === "£0.07"` },
+    { name: "Вызовы в старом стиле предупреждают один раз; в новом — никогда", check: `(() => { warned.clear(); formatMoney(100, { currency: "USD" }); formatMoney(100); const quiet = warned.size === 0; formatMoney(100, "USD"); formatMoney(200, "EUR", false); return quiet && warned.size === 1; })()` },
+  ]}
+>
+
+`formatMoney(cents, currency, symbol)` вызывается в компании тысячи раз, а её позиционные логические параметры постоянно приводят к багам. Спроектируйте **версию 2** её API, не сломав ни одного вызова версии 1:
+
+1. Добавьте **`interface FormatOptions`** с необязательными `currency` (типа `Currency`, по умолчанию `"EUR"`) и `symbol` (по умолчанию `true`).
+2. Превратите `formatMoney` в **две перегрузки** плюс реализацию: сначала новая `formatMoney(cents: number, options?: FormatOptions): string`, затем старая `formatMoney(cents: number, currency: string, symbol?: boolean): string` с JSDoc-комментарием **`@deprecated`**. Оставьте у старой `currency: string`: сужение типа параметра — ломающее изменение, поэтому старые вызовы с `"CHF"` должны по-прежнему компилироваться и выводить `"12.50 CHF"`.
+3. В реализации, когда второй аргумент — строка, вызовите `deprecate("formatMoney-positional", OLD_STYLE)` перед форматированием; помощник позаботится о том, чтобы предупреждение появилось только один раз. Вызовы в новом стиле никогда не должны предупреждать.
+
+Форматирование не меняется: с символом и известной валютой — `"€12.50"`, иначе — `"12.50 CHF"`. Тесты типов внизу проверяют форму API: вызовы v1 должны компилироваться, а неизвестные валюты, опечатки в опциях и смешение двух стилей — нет.
+
+<Hint>
+
+Напишите две сигнатуры перегрузок (без тел), затем реализацию: `function formatMoney(cents: number, currencyOrOptions: string | FormatOptions = {}, symbol = true): string`. Для старого стиля сузьте тип через `typeof currencyOrOptions === "string"`. Для нового стиля деструктурируйте со значениями по умолчанию: `const { currency = "EUR", symbol: showSymbol = true } = currencyOrOptions;` (с переименованием, потому что `symbol` уже занят параметром). Вынесите старый код форматирования в маленький помощник, чтобы им пользовались оба пути.
+
+</Hint>
+
+<Solution>
+
+```ts
+// ---------- помощники (готово) ----------
+type Currency = "EUR" | "USD" | "GBP";
+
+const SYMBOLS: Record<Currency, string> = {
+  EUR: "€",
+  USD: "$",
+  GBP: "£",
+};
+
+function isCurrency(code: string): code is Currency {
+  return code in SYMBOLS;
+}
+
+const warned = new Set<string>();
+function deprecate(id: string, message: string): void {
+  if (warned.has(id)) return;
+  warned.add(id);
+  console.warn(`DeprecationWarning: ${message}`);
+}
+
+const OLD_STYLE =
+  "formatMoney(cents, currency, symbol) is deprecated: " +
+  "use formatMoney(cents, { currency, symbol })";
+
+// ---------- v2 ----------
+interface FormatOptions {
+  /** По умолчанию "EUR". */
+  currency?: Currency;
+  /** Показывать "€12.50" (true, по умолчанию) или "12.50 EUR". */
+  symbol?: boolean;
+}
+
+function formatMoney(cents: number, options?: FormatOptions): string;
+/**
+ * @deprecated Используйте `formatMoney(cents, { currency, symbol })`.
+ * Будет удалено в v3.0.
+ */
+function formatMoney(
+  cents: number,
+  currency: string,
+  symbol?: boolean,
+): string;
+function formatMoney(
+  cents: number,
+  currencyOrOptions: string | FormatOptions = {},
+  symbol = true,
+): string {
+  if (typeof currencyOrOptions === "string") {
+    deprecate("formatMoney-positional", OLD_STYLE);
+    return format(cents, currencyOrOptions, symbol);
+  }
+  const { currency = "EUR", symbol: showSymbol = true } =
+    currencyOrOptions;
+  return format(cents, currency, showSymbol);
+}
+
+function format(cents: number, currency: string, symbol: boolean) {
+  const amount = (cents / 100).toFixed(2);
+  if (symbol && isCurrency(currency)) {
+    return SYMBOLS[currency] + amount;
+  }
+  return amount + " " + currency;
+}
+
+// ---------- тесты типов (не меняйте их) ----------
+function typeTests(): void {
+  formatMoney(100); // v2 со значениями по умолчанию
+  formatMoney(100, { currency: "USD" });
+  formatMoney(100, { symbol: false });
+  formatMoney(100, "CHF", false); // вызовы v1 по-прежнему компилируются
+  formatMoney(100, "EUR");
+  // @ts-expect-error: v2 принимает только известные валюты
+  formatMoney(100, { currency: "CHF" });
+  // @ts-expect-error: опечатка в имени опции
+  formatMoney(100, { curency: "USD" });
+  // @ts-expect-error: symbol передаётся внутри объекта опций
+  formatMoney(100, { currency: "USD" }, false);
+  // @ts-expect-error: ни одна сигнатура не принимает четыре аргумента
+  formatMoney(100, "EUR", true, "extra");
+}
+
+// ---------- попробуйте ----------
+console.log(formatMoney(1250));
+console.log(formatMoney(1250, { currency: "USD" }));
+console.log(formatMoney(1250, { currency: "GBP", symbol: false }));
+console.log(formatMoney(1250, "EUR")); // старый код
+console.log(formatMoney(1250, "CHF", true)); // снова старый код
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Проектируйте под **место вызова**: пользователям не должны быть нужны аргументы типа. Выводите типы из аргументов, которые они пишут и так, используйте `NoInfer` там, где значение нужно проверять, а не выводить из него тип, давайте имена типам возвращаемых значений и следите, чтобы каждый параметр типа встречался хотя бы дважды.
+- Предпочитайте **объекты опций** длинным спискам позиционных параметров и логическим флагам; добавление необязательного свойства никогда не ломает вызывающих. Выбирайте между объединением, дженериком и **перегрузками** по тому, как тип возвращаемого значения зависит от входа, и помните, что перегрузки не принимают объединения своих типов параметров.
+- **Типы — это API.** Сужение входов, расширение выходов, добавление обязательных членов в типы, которые реализуют пользователи, удаление экспортов и добавление вариантов в объединения, по которым пользователи делают switch, — всё это ломает пользователей. Определите политику, запишите её и ловите изменения с помощью отчётов API и тестов типов.
+- Объявляйте устаревшим в три шага: добавьте замену, пометьте старое через `@deprecated` + однократное предупреждение во время выполнения + кодмод, удалите в следующем мажорном релизе.
+- Переводите JavaScript **инкрементально**: сначала `allowJs` и `tsc --noEmit` в CI, `// @ts-check` + JSDoc по файлу, сначала переименовывайте листья, постепенно закручивайте строгость, ведите бюджет подавлений через `@ts-expect-error` и используйте кодмоды для однообразных изменений.
+- **Измеряйте** прогресс храповиком (файлы JS, количество `any`, подавления, покрытие типами), который может только улучшаться, и не смешивайте миграцию с рефакторингом.

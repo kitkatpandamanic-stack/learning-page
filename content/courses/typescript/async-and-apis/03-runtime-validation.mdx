@@ -1,0 +1,1115 @@
+---
+title: Runtime Validation
+description: Types vanish when your code runs, so check outside data for real. Build a tiny schema library whose schemas give you both the check and the type, then meet zod and valibot.
+duration: 20
+xp: 30
+---
+
+In the last lesson you kept outside data `unknown` and checked it with hand-written type guards. That works, but it doesn't scale: a real API has dozens of shapes, and every guard is one more place to keep in sync with its type. In this lesson you'll build a tiny **schema library**, where one definition gives you **both** the runtime check and the TypeScript type. It's exactly how popular libraries like zod work, and at the end you'll use it in a typed API client. 🛡️
+
+## Types vanish at runtime
+
+TypeScript checks your code, then **strips the types** and runs plain JavaScript. This TypeScript:
+
+```ts
+type Movie = { title: string; year: number };
+
+function nextYear(movie: Movie): number {
+  return movie.year + 1;
+}
+```
+
+runs as this JavaScript, with no trace of `Movie` left:
+
+```js
+function nextYear(movie) {
+  return movie.year + 1;
+}
+```
+
+So nothing checks data that arrives while the program runs. If the server sends the year as a string, your `number` is a string, and TypeScript can't help:
+
+<CodeExample output={`string
+20191`}>
+
+```ts
+type Movie = { title: string; year: number };
+
+// Imagine this text arrived from a server
+const json = '{ "title": "The Bamboo Heist", "year": "2019" }';
+const movie: Movie = JSON.parse(json); // no error: parse gives any
+
+console.log(typeof movie.year); // TypeScript thinks: number
+console.log(movie.year + 1); // "next year"?
+```
+
+</CodeExample>
+
+`"2019" + 1` is `"20191"`: string concatenation, not maths. No crash, no error, just a wrong number on someone's screen. Types describe what you **expect**; only runtime code can check what you **got**.
+
+## Hand-written guards drift
+
+A type guard is real runtime code, so it does check. But it lives **next to** the type, not inside it, and the two can drift apart:
+
+<CodeExample output={`Looks like a movie!
+undefined`}>
+
+```ts
+type Movie = {
+  title: string;
+  year: number;
+  rating: number; // added last week
+};
+
+// Written before rating existed, and never updated
+function isMovie(value: unknown): value is Movie {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "title" in value &&
+    typeof value.title === "string" &&
+    "year" in value &&
+    typeof value.year === "number"
+  );
+}
+
+const data: unknown = JSON.parse('{"title":"Code Red","year":2018}');
+
+if (isMovie(data)) {
+  console.log("Looks like a movie!");
+  console.log(data.rating); // data.rating: number... or is it?
+}
+```
+
+</CodeExample>
+
+TypeScript **trusts** a type predicate: it can't check that the body really proves `value is Movie`. Someone added `rating` to the type, forgot the guard, and now `data.rating` is "a number" that is `undefined`. Hand-written guards have two more problems: they're long, and when they fail they only say `false`, never **which** field was wrong.
+
+## A schema: one definition, two jobs
+
+The fix is to flip things around. Instead of writing a type and then a guard for it, we write a **schema**: a runtime value that knows how to check data, and let TypeScript **derive** the type from it. One source of truth, so they can't drift.
+
+Our schema is just an object with a `parse` method. It takes `unknown` data and either returns it as a `T` or throws a `ValidationError` that says where and why. Let's start with strings and numbers:
+
+<CodeExample output={`43
+age: expected a number, got "42"
+age: expected a number, got null
+BAMBOO`}>
+
+```ts
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+// A schema turns unknown data into a T (or refuses)
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value; // value: T, thanks to the type predicate
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+
+const age = number().parse(JSON.parse("42")); // age: number
+console.log(age + 1);
+
+for (const input of ['"42"', "null"]) {
+  try {
+    number().parse(JSON.parse(input), "age");
+  } catch (error) {
+    if (error instanceof ValidationError) console.log(error.message);
+  }
+}
+console.log(string().parse("bamboo").toUpperCase());
+```
+
+</CodeExample>
+
+`primitive` is a small generic factory: give it a description and a type guard, and it gives back a `Schema<T>` for that type. The guards here are one-liners that can't really be wrong, and every bigger schema will be **built** from these small, trusted pieces.
+
+### Getting the type back out: `Infer`
+
+Here's the trick that makes schemas worth it. A `Schema<T>`'s `parse` returns a `T`, so `ReturnType` of `parse` **is** `T`. With the indexed access type `S["parse"]` from [Generic Functions](/learn/typescript/generic-functions), that's one line:
+
+```ts
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+const AgeSchema = number();
+type Age = Infer<typeof AgeSchema>; // number
+```
+
+Read `Infer<typeof AgeSchema>` as "the type of data that `AgeSchema` lets through". You never write that type by hand; it follows the schema.
+
+## Objects and arrays
+
+Real data is nested: objects with arrays of objects inside. Two more building blocks cover that:
+
+- **`array(item)`** checks that the value is an array, then parses **each** element with the item schema, adding `[0]`, `[1]`… to the path so errors point at the right element.
+- **`object(shape)`** takes an object of schemas, like `{ title: string(), year: number() }`, checks each key with its schema and builds a clean result with only those keys.
+
+The type of `object`'s result is the interesting part. For a shape `S`, it's `{ [K in keyof S]: Infer<S[K]> }`: "for every key `K` of the shape, the type that key's schema produces". That's a **mapped type**, a loop over keys at the type level. You'll study them properly in Level 3; for now, read it as that sentence.
+
+Here is the whole library, about 70 lines, followed by a movie schema:
+
+<CodeExample output={`Code Red 2019
+year: expected a number, got "2018"
+genres[1]: expected a string, got 7
+title: expected a string, got undefined
+value: expected an object, got ["Code Red"]`}>
+
+```ts
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// One schema: the runtime check AND the type
+const MovieSchema = object({
+  title: string(),
+  year: number(),
+  genres: array(string()),
+});
+type Movie = Infer<typeof MovieSchema>;
+// { title: string; year: number; genres: string[] }
+
+const good = MovieSchema.parse(
+  JSON.parse('{"title":"Code Red","year":2018,"genres":["action"]}'),
+);
+console.log(good.title, good.year + 1); // good: Movie
+
+const broken = [
+  '{"title":"Code Red","year":"2018","genres":[]}',
+  '{"title":"Code Red","year":2018,"genres":["action",7]}',
+  '{"year":2018,"genres":[]}',
+  '["Code Red"]',
+];
+for (const json of broken) {
+  try {
+    MovieSchema.parse(JSON.parse(json));
+  } catch (error) {
+    if (error instanceof ValidationError) console.log(error.message);
+  }
+}
+```
+
+</CodeExample>
+
+Look at what you got for one definition of `MovieSchema`:
+
+- A **type**, `Movie`, which your editor shows as `{ title: string; year: number; genres: string[] }`. Add `rating: number()` to the schema and the type grows a `rating` too; there's nothing else to update.
+- A **check** with useful messages: the path (`genres[1]`), what was expected and what arrived. Log those and a broken deploy is diagnosed in minutes.
+- **Clean data**: `object` copies only the keys in the shape, so extra fields the server sends don't leak into your app.
+
+And because `Movie` comes from the schema, the compiler catches mistakes against the **real** shape:
+
+```ts
+function show(movie: Movie) {
+  return movie.rating;
+  // ❌ Error: Property 'rating' does not exist on type '{ title: string; year: number; genres: string[]; }'.
+}
+```
+
+<Callout type="note" title="The one cast, in one place">
+
+`object` ends with `return result as { ... }`. That's a cast, but an honest one: the loop just checked **every** key with its schema, which TypeScript can't follow on its own. The difference from `as Movie` in app code is where it lives: in a tiny library function, written once, tested once, instead of sprinkled over every fetch call. Real libraries like zod contain the same kind of cast inside.
+
+</Callout>
+
+## Validating API responses
+
+Now the `getJson` from the last lesson can be honest **without** hand-written guards: the type parameter `T` is inferred from the schema you pass in, and the data really is checked before anyone sees it:
+
+<CodeExample output={`Paris: 17°C, Sunny
+[ 'Mon 18°', 'Tue 16°', 'Wed 23°' ]
+city: expected a string, got undefined`}>
+
+```ts
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+const API = "https://api.pandadev.test";
+
+// The honest getJson: T comes from the schema, not from a promise
+async function getJson<T>(url: string, schema: Schema<T>): Promise<T> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+  return schema.parse(await res.json());
+}
+
+const WeatherSchema = object({
+  city: string(),
+  temperature: number(),
+  condition: string(),
+});
+
+const ForecastSchema = object({
+  city: string(),
+  forecast: array(object({ day: string(), high: number() })),
+});
+
+const now = await getJson(`${API}/weather?city=Paris`, WeatherSchema);
+console.log(`${now.city}: ${now.temperature}°C, ${now.condition}`);
+
+const week = await getJson(
+  `${API}/weather?city=Paris&days=3`,
+  ForecastSchema,
+);
+console.log(week.forecast.map((d) => `${d.day} ${d.high}°`));
+
+// The wrong schema for this URL: caught at the edge
+try {
+  await getJson(`${API}/movies/1`, WeatherSchema);
+} catch (error) {
+  if (error instanceof ValidationError) console.log(error.message);
+}
+```
+
+</CodeExample>
+
+Notice how small `WeatherSchema` is: it lists only the fields this screen uses. Your schema doesn't have to mirror the whole API response, just the part you rely on. That also makes your app more robust: the API can add fields without breaking you.
+
+<Callout type="tip" title="Validate at the edges, trust inside">
+
+Validate data where it **enters** your program: API responses, request bodies on a server, `localStorage`, files, URL parameters, environment variables, messages from other windows or workers. After that point, the data has a real, checked type, so the rest of your code can trust it without checking again. This idea is often summed up as **"parse, don't validate"**: don't just answer yes or no, turn `unknown` into a typed value once, at the boundary.
+
+</Callout>
+
+## Testing with a fake `fetch`
+
+How do you test that your code rejects bad data, when the practice API always sends good data? **Inject** `fetch`: take it as a parameter, defaulting to the real one, and pass a fake in tests. Its type is simply `typeof fetch`, and Vitest's `vi.fn<typeof fetch>(...)` makes sure your fake really behaves like `fetch` (it must return a `Promise<Response>`). The static method `Response.json(data)` builds a JSON response in one line. (PandaDev runs Vitest right in the editor: `describe` groups tests, `it` defines one, `expect` checks a value, and a report is printed at the end.)
+
+<CodeExample output={`✓ getTemperature > reads the practice API
+✓ getTemperature > refuses data without a numeric temperature
+
+Tests  2 passed (2)`}>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+const API = "https://api.pandadev.test";
+
+async function getTemperature(
+  city: string,
+  fetchFn: typeof fetch = fetch, // inject it, default to the real one
+): Promise<number> {
+  const res = await fetchFn(`${API}/weather?city=${city}`);
+  const data: unknown = await res.json();
+  if (
+    typeof data === "object" && data !== null &&
+    "temperature" in data && typeof data.temperature === "number"
+  ) {
+    return data.temperature;
+  }
+  throw new Error("Unexpected weather data");
+}
+
+describe("getTemperature", () => {
+  it("reads the practice API", async () => {
+    expect(await getTemperature("Cairo")).toBe(31);
+  });
+
+  it("refuses data without a numeric temperature", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({ temperature: "hot" }),
+    );
+    await expect(getTemperature("Cairo", fakeFetch)).rejects.toThrow(
+      "Unexpected weather data",
+    );
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+</CodeExample>
+
+If the fake returned a plain object instead of a `Response`, TypeScript would stop you before the test even ran:
+
+```ts
+const fakeFetch = vi.fn<typeof fetch>(async () => ({ temperature: 31 }));
+// ❌ Error: Type '{ temperature: number; }' is missing the following properties from type 'Response': headers, ok, redirected, status, and 12 more.
+```
+
+You'll go much deeper into typed tests, fakes and mocks in the next module, [Testing Typed Code](/learn/typescript/testing-typed-code).
+
+<Quiz
+  question="const MovieSchema = object({ title: string(), year: number() }); type Movie = Infer<typeof MovieSchema>; Later you add rating: number() to the schema. What else must you change so that Movie has a rating?"
+  options={[
+    "Add rating: number to the Movie type by hand",
+    "Nothing: Movie is derived from the schema, so it gains rating automatically",
+    "Write a new type guard for rating",
+    "Cast the parsed data with as Movie"
+  ]}
+  answer={1}
+  explanation="Infer reads the type out of the schema, so the schema is the single source of truth. Change the schema and the type follows, which is exactly what stops the check and the type drifting apart."
+/>
+
+## What real projects use: zod and valibot
+
+Our library is about 70 lines and missing lots of things: optional fields, unions, literal values, minimum lengths, emails, dates, transforms, friendly error lists. In real projects you'd use a battle-tested library that has all of that, built on exactly the ideas you just implemented. The most popular is **zod**:
+
+```ts
+import { z } from "zod"; // npm i zod
+
+const Movie = z.object({
+  id: z.number().int(),
+  title: z.string().min(1),
+  year: z.number().int().min(1888),
+  genres: z.array(z.string()),
+  rating: z.number().min(0).max(10).optional(),
+});
+type Movie = z.infer<typeof Movie>; // like our Infer
+
+const movie = Movie.parse(await res.json()); // throws a ZodError
+
+const result = Movie.safeParse(await res.json()); // never throws
+if (result.success) {
+  console.log(result.data.title); // result.data: Movie
+} else {
+  console.log(result.error.issues); // every problem, with its path
+}
+```
+
+**valibot** has the same ideas with a different style: small separate functions instead of methods, so bundlers can drop everything you don't use, which makes it much smaller in a browser bundle:
+
+```ts
+import * as v from "valibot"; // npm i valibot
+
+const Movie = v.object({
+  id: v.number(),
+  title: v.pipe(v.string(), v.minLength(1)),
+  genres: v.array(v.string()),
+});
+type Movie = v.InferOutput<typeof Movie>;
+
+const movie = v.parse(Movie, await res.json());
+```
+
+Which one? It depends. zod is the most widely used, with the most examples and integrations (forms, tRPC, OpenAPI generators); valibot wins when bundle size matters, for example in a small front-end. Both (and others like ArkType) implement **Standard Schema**, a shared interface, so many tools accept any of them. What matters most is the habit: **no outside data enters your app without going through a schema.**
+
+<Callout type="warning" title="Don't validate the same data twice">
+
+Validation costs time, and checking every object everywhere "just in case" clutters your code. Validate once at the edge, then pass the typed value around. If you find yourself writing `isMovie(movie)` in the middle of your app, the data probably skipped validation where it came in.
+
+</Callout>
+
+<Quiz
+  question="Why does const movie: Movie = JSON.parse(text) compile even when text holds { title: 5 }?"
+  options={[
+    "Because TypeScript checks JSON at runtime and converts 5 to a string",
+    "Because JSON.parse returns any and types are erased before the code runs, so nothing compares the data with Movie",
+    "Because Movie is an interface, not a type",
+    "It doesn't compile: TypeScript reads the text and reports an error"
+  ]}
+  answer={1}
+  explanation="JSON.parse is typed to return any, which can be assigned to anything, and at runtime there are no types left to check against. Only runtime code, like a schema's parse, can check the data."
+/>
+
+<Exercise
+  title="Mini-project: Typed API client"
+  language="typescript"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ---- The schema library from this lesson (don't change) ----
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// ---- Results and errors (don't change) ----
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+type MovieSearch = {
+  search?: string;
+  genre?: string;
+  page?: number;
+  limit?: number;
+};
+
+function moviesPath(options: MovieSearch = {}): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined) params.set(key, String(value));
+  }
+  const query = params.toString();
+  return query ? \`/movies?\${query}\` : "/movies";
+}
+
+// ---- 1. Schemas: the types come from them ----
+const MovieSchema = object({
+  id: number(),
+  title: string(),
+  // TODO: year, director, genres (strings), rating, minutes
+});
+type Movie = Infer<typeof MovieSchema>;
+
+// TODO: MoviePageSchema: { page, totalPages, total, results }
+//       (results is an array of movies) and type MoviePage
+
+// TODO: TodoSchema: { id, title, done } and type Todo
+
+type NewTodo = { title: string; done?: boolean };
+
+// ---- 2. The client ----
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function createClient(options: ClientOptions = {}) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  async function request<T>(
+    path: string,
+    schema: Schema<T>,
+    init: RequestInit = {},
+  ): Promise<Result<T, ApiError>> {
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? \`HTTP \${res.status}\`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    // TODO: data is unknown, not T. Validate it with the schema;
+    // a ValidationError becomes { kind: "invalid", message }
+    return { ok: true, value: data };
+  }
+
+  return {
+    getMovie(id: number): Promise<Result<Movie, ApiError>> {
+      return request(\`/movies/\${id}\`, MovieSchema);
+    },
+    // TODO: searchMovies(search) -> GET moviesPath(search)
+    // TODO: createTodo(input: NewTodo) -> POST /todos with JSON
+  };
+}
+
+// ---- 3. Tests ----
+const goodMovie = {
+  id: 1,
+  title: "The Bamboo Heist",
+  year: 2019,
+  director: "Mei Lin",
+  genres: ["comedy", "crime"],
+  rating: 7.8,
+  minutes: 104,
+};
+
+describe("api client", () => {
+  it("gets a movie from the practice API", async () => {
+    const result = await createClient().getMovie(1);
+    expect(result).toEqual({ ok: true, value: goodMovie });
+  });
+
+  it("turns a 404 into an http error", async () => {
+    const result = await createClient().getMovie(99);
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Movie not found" },
+    });
+  });
+
+  it("reports network errors", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createClient({ fetch: offline }).getMovie(1);
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+    expect(offline).toHaveBeenCalledWith(
+      "https://api.pandadev.test/movies/1",
+      {},
+    );
+  });
+
+  // TODO: "rejects a movie whose year is a string": a fake fetch
+  // answers Response.json({ ...goodMovie, year: "2019" }), and
+  // getMovie gives an "invalid" error with the exact message
+});
+
+// ---- Type tests (don't change) ----
+async function typeTests() {
+  const client = createClient();
+  const movie = await client.getMovie(1);
+  if (movie.ok) {
+    const title: string = movie.value.title;
+    const year: number = movie.value.year;
+    // @ts-expect-error: a movie's year is a number, not a string
+    const wrong: string = movie.value.year;
+  }
+  const page = await client.searchMovies({ search: "panda" });
+  if (page.ok) {
+    const first: Movie | undefined = page.value.results[0];
+  }
+  const todo = await client.createTodo({ title: "Test" });
+  if (todo.ok) {
+    const done: boolean = todo.value.done;
+  }
+  // @ts-expect-error: check ok before reading value
+  todo.value;
+}
+`}
+  tests={[
+    { name: "getMovie returns a validated movie", check: `(async () => { const r = await createClient().getMovie(1); return r.ok === true && r.value.title === "The Bamboo Heist" && r.value.year === 2019 && r.value.genres.length === 2 && r.value.minutes === 104; })()` },
+    { name: "getMovie turns a 404 into an http error", check: `(async () => { const r = await createClient().getMovie(99); return r.ok === false && r.error.kind === "http" && r.error.status === 404 && r.error.message === "Movie not found"; })()` },
+    { name: "searchMovies sends the query and returns a validated page", check: `(async () => { const r = await createClient().searchMovies({ genre: "comedy", limit: 2 }); return r.ok === true && r.value.total === 4 && r.value.totalPages === 2 && r.value.results.length === 2 && r.value.results[1].title === "The Last Dumpling" && __requests.at(-1).url.endsWith("/movies?genre=comedy&limit=2"); })()` },
+    { name: "createTodo POSTs JSON and returns the validated todo", check: `(async () => { const r = await createClient().createTodo({ title: "Write tests" }); const sent = __requests.at(-1); return r.ok === true && r.value.title === "Write tests" && typeof r.value.id === "number" && r.value.done === false && sent.method === "POST" && sent.body?.title === "Write tests" && /json/.test(sent.headers["content-type"] ?? ""); })()` },
+    { name: "createTodo turns a 400 into an http error", check: `(async () => { const r = await createClient().createTodo({ title: "" }); return r.ok === false && r.error.kind === "http" && r.error.status === 400 && r.error.message === "title is required"; })()` },
+    { name: "A movie with a string year is an invalid error", check: `(async () => { const movie = { id: 1, title: "X", year: "2019", director: "D", genres: [], rating: 5, minutes: 90 }; const r = await createClient({ fetch: async () => Response.json(movie) }).getMovie(1); return r.ok === false && r.error.kind === "invalid" && r.error.message === 'year: expected a number, got "2019"'; })()` },
+    { name: "Bad movies inside a search page are caught too", check: `(async () => { const page = { page: 1, totalPages: 1, total: 1, results: [{ id: 1, title: 5, year: 2019, director: "D", genres: [], rating: 5, minutes: 90 }] }; const r = await createClient({ fetch: async () => Response.json(page) }).searchMovies(); return r.ok === false && r.error.kind === "invalid" && r.error.message === "results[0].title: expected a string, got 5"; })()` },
+    { name: "A todo with a non-boolean done is an invalid error", check: `(async () => { const todo = { id: 1, title: "T", done: "yes" }; const r = await createClient({ fetch: async () => Response.json(todo, { status: 201 }) }).createTodo({ title: "T" }); return r.ok === false && r.error.kind === "invalid" && r.error.message.startsWith("done:"); })()` },
+    { name: "All tests pass, including your new one", check: `__vitest.failed === 0 && __vitest.passed >= 4` },
+    { name: "Your test catches broken number validation", check: `(await __retest([['(v): v is number => typeof v === "number"', "(v): v is number => true"]])).failed > 0` },
+  ]}
+>
+
+Build a typed client for the practice API. Everything it returns is a `Result<T, ApiError>`, and every response is **validated** with a schema, so the types are true at runtime too. The schema library, the error types and the `moviesPath` helper are ready at the top (don't change them).
+
+1. **Schemas.** Finish `MovieSchema` (a movie has `id`, `title`, `year`, `director`, `genres` (strings), `rating` and `minutes`). Add `MoviePageSchema` for search results (`page`, `totalPages`, `total` and `results`, an array of movies) and `TodoSchema` (`id`, `title`, `done`), each with its type from `Infer`.
+2. **Validate in `request`.** TypeScript already refuses `value: data`, because `data` is `unknown`, not `T`. Parse it with the schema; a `ValidationError` becomes `{ kind: "invalid", message }`.
+3. **Client methods.** Next to `getMovie`, add `searchMovies(search)` (GET `moviesPath(search)`) and `createTodo(input)` (POST `/todos` with a JSON body), with return types like `getMovie`'s.
+4. **A test.** Replace the `TODO` in the tests with a test called "rejects a movie whose year is a string": a fake `fetch` answers `Response.json({ ...goodMovie, year: "2019" })`, and `getMovie` must give `{ ok: false, error: { kind: "invalid", message: 'year: expected a number, got "2019"' } }`.
+
+The **type tests** at the bottom fail until the client is complete: the `@ts-expect-error` lines only pass when that line *is* an error, so `any` won't sneak through. When you're done, all four tests should pass.
+
+<Hint>
+
+In `request`, replace the last `return` with `try { return { ok: true, value: schema.parse(data) }; } catch (error) { ... }`. Inside `catch`, check `error instanceof ValidationError` and return the `invalid` error; rethrow anything else. For `MoviePageSchema`, `results: array(MovieSchema)` reuses the movie schema. `createTodo` passes `{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) }` as `request`'s third argument. For the test, copy the "reports network errors" test: `vi.fn<typeof fetch>(async () => Response.json({ ...goodMovie, year: "2019" }))`.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+// ---- The schema library from this lesson (don't change) ----
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // every key was checked, so this cast is safe
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// ---- Results and errors (don't change) ----
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+type MovieSearch = {
+  search?: string;
+  genre?: string;
+  page?: number;
+  limit?: number;
+};
+
+function moviesPath(options: MovieSearch = {}): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined) params.set(key, String(value));
+  }
+  const query = params.toString();
+  return query ? `/movies?${query}` : "/movies";
+}
+
+// ---- 1. Schemas (the types come from them) ----
+const MovieSchema = object({
+  id: number(),
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof MovieSchema>;
+
+const MoviePageSchema = object({
+  page: number(),
+  totalPages: number(),
+  total: number(),
+  results: array(MovieSchema),
+});
+type MoviePage = Infer<typeof MoviePageSchema>;
+
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+type NewTodo = { title: string; done?: boolean };
+
+// ---- 2. The client ----
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function createClient(options: ClientOptions = {}) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  async function request<T>(
+    path: string,
+    schema: Schema<T>,
+    init: RequestInit = {},
+  ): Promise<Result<T, ApiError>> {
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? `HTTP ${res.status}`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schema.parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  }
+
+  return {
+    getMovie(id: number): Promise<Result<Movie, ApiError>> {
+      return request(`/movies/${id}`, MovieSchema);
+    },
+    searchMovies(
+      search: MovieSearch = {},
+    ): Promise<Result<MoviePage, ApiError>> {
+      return request(moviesPath(search), MoviePageSchema);
+    },
+    createTodo(input: NewTodo): Promise<Result<Todo, ApiError>> {
+      return request("/todos", TodoSchema, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      });
+    },
+  };
+}
+
+// ---- 3. Tests ----
+const goodMovie = {
+  id: 1,
+  title: "The Bamboo Heist",
+  year: 2019,
+  director: "Mei Lin",
+  genres: ["comedy", "crime"],
+  rating: 7.8,
+  minutes: 104,
+};
+
+describe("api client", () => {
+  it("gets a movie from the practice API", async () => {
+    const result = await createClient().getMovie(1);
+    expect(result).toEqual({ ok: true, value: goodMovie });
+  });
+
+  it("turns a 404 into an http error", async () => {
+    const result = await createClient().getMovie(99);
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Movie not found" },
+    });
+  });
+
+  it("reports network errors", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createClient({ fetch: offline }).getMovie(1);
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+    expect(offline).toHaveBeenCalledWith(
+      "https://api.pandadev.test/movies/1",
+      {},
+    );
+  });
+
+  it("rejects a movie whose year is a string", async () => {
+    const fake = vi.fn<typeof fetch>(async () =>
+      Response.json({ ...goodMovie, year: "2019" }),
+    );
+    const result = await createClient({ fetch: fake }).getMovie(1);
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "invalid",
+        message: 'year: expected a number, got "2019"',
+      },
+    });
+  });
+});
+
+// ---- Type tests (don't change) ----
+async function typeTests() {
+  const client = createClient();
+  const movie = await client.getMovie(1);
+  if (movie.ok) {
+    const title: string = movie.value.title;
+    const year: number = movie.value.year;
+    // @ts-expect-error: a movie's year is a number, not a string
+    const wrong: string = movie.value.year;
+  }
+  const page = await client.searchMovies({ search: "panda" });
+  if (page.ok) {
+    const first: Movie | undefined = page.value.results[0];
+  }
+  const todo = await client.createTodo({ title: "Test" });
+  if (todo.ok) {
+    const done: boolean = todo.value.done;
+  }
+  // @ts-expect-error: check ok before reading value
+  todo.value;
+}
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Types are erased before code runs, so `JSON.parse`, `res.json()` and friends are never checked by TypeScript. Only runtime code can check outside data.
+- Hand-written type guards work but drift from their types, are long, and can't say what was wrong.
+- A **schema** is a runtime value that checks data and from which TypeScript derives the type: `type Movie = Infer<typeof MovieSchema>`. One source of truth.
+- Small schemas (`string()`, `number()`) combine into bigger ones (`array(...)`, `object({...})`) with error paths like `results[0].title`.
+- A generic helper like `getJson(url, schema)` infers `T` from the schema, so it's honest.
+- Inject `fetch` (`typeof fetch`) to test bad responses with a typed fake.
+- In real projects use **zod** or **valibot**, and validate once, at the edges of your app.
+
+🎉 That's the Async & Typed APIs module done: your fetch calls are now typed **and** true. Next, you'll learn to [test typed code](/learn/typescript/testing-typed-code) properly.

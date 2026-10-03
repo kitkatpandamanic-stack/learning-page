@@ -1,0 +1,725 @@
+---
+title: Тестирование типов
+description: Тестируйте сами типы — через @ts-expect-error для кода, который не должен компилироваться, и помощники Equal/Expect для точных типов; познакомьтесь с expectTypeOf и tsd и запускайте tsc --noEmit в CI.
+duration: 20
+xp: 30
+---
+
+Ваши тесты проверяют, что код **делает**. Но для некоторого кода самое важное — его **тип**: дженерик-помощник, который используется в пятидесяти местах, общая утилита, библиотека, от которой зависят другие команды. Представьте, что рефакторинг тихо превратил её возвращаемый тип в `any`. Все тесты времени выполнения по-прежнему проходят, приложение работает, и никто не замечает, что компилятор перестал защищать всех, кто её использует, — пока не начнут приходить баги. В этом уроке вы будете писать тесты для самих типов. 🧪
+
+## Зачем типам тесты
+
+Вот маленький помощник `pluck`, написанный дважды: один раз с точными дженерик-типами, другой — с расплывчатыми. JavaScript внутри одинаковый, так что тесты времени выполнения их не различат:
+
+<CodeExample output={`✓ pluck > берёт одно свойство у каждого элемента
+✓ pluck > возвращает пустой массив, если элементов нет
+✓ pluckLoose > берёт одно свойство у каждого элемента
+✓ pluckLoose > возвращает пустой массив, если элементов нет
+
+Tests  4 passed (4)`}>
+
+```ts
+import { describe, it, expect } from "vitest";
+
+// Версия 1: точные типы
+function pluck<T, K extends keyof T>(items: T[], key: K): T[K][] {
+  return items.map((item) => item[key]);
+}
+
+// Версия 2: расплывчатые типы, тот же код
+function pluckLoose(items: any[], key: string): any[] {
+  return items.map((item) => item[key]);
+}
+
+const users = [
+  { name: "Mei", age: 31 },
+  { name: "Bao", age: 27 },
+];
+
+describe.each([
+  ["pluck", pluck],
+  ["pluckLoose", pluckLoose],
+])("%s", (_name, fn) => {
+  it("берёт одно свойство у каждого элемента", () => {
+    expect(fn(users, "name")).toEqual(["Mei", "Bao"]);
+  });
+
+  it("возвращает пустой массив, если элементов нет", () => {
+    expect(fn([], "name")).toEqual([]);
+  });
+});
+```
+
+</CodeExample>
+
+Но для тех, кто ими **пользуется**, разница огромная. С `pluckLoose` всё это компилируется без единой жалобы:
+
+```ts
+const names = pluckLoose(users, "name"); // any[]
+names[0].toFixed(1);       // компилируется; TypeError при запуске
+pluckLoose(users, "nmae"); // компилируется; возвращает [undefined, undefined]
+```
+
+У типа **две задачи**, и для каждой нужен свой вид тестов:
+
+1. **Отвергать неправильный код.** `pluck(users, "nmae")` обязан быть ошибкой. Это проверяется кодом, который **не** должен компилироваться.
+2. **Давать правильные типы.** `pluck(users, "name")` обязан иметь тип ровно `string[]`. Это проверяется точными **утверждениями о типах** (type assertions).
+
+Какой код заслуживает тестов типов? Не весь. Обычный код приложения проверяется типами уже тем, что его используют: если бы `formatPrice` возвращала не тот тип, перестал бы компилироваться вызывающий её код. Тесты типов (type tests) окупаются там, где типы — **это и есть продукт**: общие помощники и дженерик-утилиты, библиотеки, функции с перегрузками или хитрым выводом типов, а также типы, вычисляемые из других типов (их вы встретите на Уровне 3).
+
+## Код, который не должен компилироваться: @ts-expect-error
+
+Комментарий **`// @ts-expect-error`** говорит компилятору: «в следующей строке ошибка типов, и это сделано намеренно». Если в строке действительно есть ошибка, компилятор молчит. Если **нет** — компилятор сообщает об ошибке в самом комментарии. Именно второе правило превращает комментарий в тест:
+
+<CodeExample output="Тесты типов пройдены">
+
+```ts
+function pluck<T, K extends keyof T>(items: T[], key: K): T[K][] {
+  return items.map((item) => item[key]);
+}
+
+const users = [
+  { name: "Mei", age: 31 },
+  { name: "Bao", age: 27 },
+];
+
+// Тесты типов: каждая строка под директивой ОБЯЗАНА быть ошибкой
+function typeTests() {
+  // @ts-expect-error: "nmae" — не свойство пользователя
+  pluck(users, "nmae");
+
+  // @ts-expect-error: результат — string[], так что toFixed нет
+  pluck(users, "name")[0].toFixed(1);
+}
+
+console.log("Тесты типов пройдены");
+```
+
+</CodeExample>
+
+Код компилируется, значит, обе ожидаемые ошибки случились. Теперь запустите тот же тест для расплывчатой версии:
+
+```ts
+function pluck(items: any[], key: string): any[] {
+  return items.map((item) => item[key]);
+}
+
+// @ts-expect-error: "nmae" — не свойство пользователя
+// ❌ Error: Unused '@ts-expect-error' directive.
+pluck(users, "nmae");
+```
+
+**«Unused '@ts-expect-error' directive.»** («Неиспользованная директива '@ts-expect-error'») — это сообщение о провале теста типов. Читайте его так: «вы сказали, что эта строка будет отвергнута, а типы её пропустили». Всё, что идёт после директивы в той же строке, — свободная заметка; всегда записывайте, **какую** ошибку вы ожидаете, чтобы следующий читатель понимал, о чём тест.
+
+Почему `typeTests` — функция, которую никто не вызывает? Потому что строка под `@ts-expect-error` — всё равно **обычный код**: компилятор её проверяет, а затем она выполняется, как любая другая. `pluck(users, "name")[0].toFixed(1)` упала бы во время выполнения с `TypeError`. Если обернуть тесты, касающиеся только типов, в функцию, которую никто не вызывает (или вынести их в отдельный файл тестов типов, как вы увидите ниже), компилятор их проверит, но ничто не выполнит.
+
+<Callout type="danger" title="@ts-expect-error принимает вообще любую ошибку">
+
+Директива не знает, **какую** ошибку вы имели в виду. Все эти примеры «проходят», но не по той причине:
+
+```ts
+// @ts-expect-error: "nmae" — не ключ
+pluk(users, "nmae");      // проходит: ошибка — опечатка в pluk
+
+// @ts-expect-error: "nmae" — не ключ
+pluck(
+  users,
+  "nmae",                 // ошибка сообщается в ЭТОЙ строке...
+);                        // ...так что директива выше не использована
+```
+
+Делайте каждую строку с ожидаемой ошибкой **короткой**, в **одну строку** и ровно с **одной** ошибкой, чтобы единственная возможная ошибка была той, которую вы тестируете.
+
+</Callout>
+
+Её старший родственник **`// @ts-ignore`** тоже глушит ошибки, но никогда не жалуется, если глушить нечего. Поэтому для тестов он бесполезен, а в обычном коде рискован: ставший ненужным ignore остаётся навсегда. Многие команды включают правило typescript-eslint `ban-ts-comment`, которое запрещает `@ts-ignore` и разрешает `@ts-expect-error` только с описанием.
+
+У `@ts-expect-error` есть и второе честное применение — в тестах **времени выполнения**: намеренная передача неправильного типа. Библиотека, которой пользуются и проекты на обычном JavaScript, всё равно должна проверять ввод во время выполнения, и эта проверка заслуживает теста:
+
+<CodeExample output={`✓ принимает значения от 0 до 10
+✓ отвергает строку от вызывающих из JavaScript
+
+Tests  2 passed (2)`}>
+
+```ts
+import { it, expect } from "vitest";
+
+// Часть библиотеки, которой пользуются и проекты на обычном JavaScript
+function setVolume(level: number): number {
+  if (typeof level !== "number" || !(level >= 0 && level <= 10)) {
+    throw new RangeError(`Громкость 0–10, получено ${String(level)}`);
+  }
+  return level;
+}
+
+it("принимает значения от 0 до 10", () => {
+  expect(setVolume(7)).toBe(7);
+});
+
+it("отвергает строку от вызывающих из JavaScript", () => {
+  // @ts-expect-error: строку мог бы передать только обычный JavaScript
+  expect(() => setVolume("11")).toThrow(RangeError);
+});
+```
+
+</CodeExample>
+
+Это лучше, чем `setVolume("11" as any)`: если `setVolume` когда-нибудь начнёт принимать строки, директива станет неиспользованной и подскажет, что тест пора переосмыслить.
+
+## Точные типы: Equal и Expect
+
+Для второй задачи — «тип должен быть ровно `string[]`» — очевидная идея — аннотация. Она не работает:
+
+<CodeExample output="[ 'Mei', 'Bao' ] [ 31, 27 ]">
+
+```ts
+function pluckLoose(items: any[], key: string): any[] {
+  return items.map((item) => item[key]);
+}
+
+const users = [
+  { name: "Mei", age: 31 },
+  { name: "Bao", age: 27 },
+];
+
+const names: string[] = pluckLoose(users, "name");
+const ages: string[] = pluckLoose(users, "age"); // это числа!
+console.log(names, ages);
+```
+
+</CodeExample>
+
+`any` можно присвоить **чему угодно**, так что аннотация никогда не поймает `any`. К тому же совместимость проверяется только в одну сторону: `"light"` помещается в переменную типа `string`, поэтому аннотация не скажет вам и того, что тип слишком **широкий** или слишком **узкий**. Нужна проверка «эти два типа **одинаковые**». Встроенного оператора для этого в TypeScript нет, но с задачей справляются два крошечных вспомогательных типа:
+
+<CodeExample output="[ 'Mei', 'Bao' ] [ 31, 27 ]">
+
+```ts
+// Помощники для тестов типов: скопируйте их в проект один раз
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+function pluck<T, K extends keyof T>(items: T[], key: K): T[K][] {
+  return items.map((item) => item[key]);
+}
+
+const users = [
+  { name: "Mei", age: 31 },
+  { name: "Bao", age: 27 },
+];
+
+const names = pluck(users, "name");
+const ages = pluck(users, "age");
+
+type cases = [
+  Expect<Equal<typeof names, string[]>>,
+  Expect<Equal<typeof ages, number[]>>,
+];
+
+console.log(names, ages);
+```
+
+</CodeExample>
+
+Как их читать:
+
+- **`Equal<A, B>`** — тип, который вычисляется в `true`, если `A` и `B` — в точности один и тот же тип, и в `false` иначе. В его теле используются **условные типы** (conditional types) (`X extends Y ? 1 : 2`), которые вы будете изучать на Уровне 3 ([Условные типы и infer](/learn/typescript/conditional-types-and-infer)). Трюк сравнивает две дженерик-функции, которые TypeScript может сопоставить, только если `A` и `B` идентичны, поэтому он достаточно строг, чтобы отличить `any` от `string`. Чтобы им пользоваться, понимать его устройство не обязательно: это тот же помощник, что используется в проекте type-challenges и в наборах тестов многих библиотек.
+- **`Expect<T extends true>`** принимает только `true`. Передайте ему `false` — и получите ошибку компиляции.
+- **`typeof names`** превращает значение в его тип, а **`type cases = [...]`** — просто список проверок. Этот псевдоним нигде не используется; он нужен, чтобы компилятор вычислил каждый элемент.
+
+Направьте те же тесты на расплывчатую версию — и они провалятся:
+
+```ts
+type cases = [
+  Expect<Equal<typeof names, string[]>>,
+  // ❌ Error: Type 'false' does not satisfy the constraint 'true'.
+  Expect<Equal<typeof ages, number[]>>,
+  // ❌ Error: Type 'false' does not satisfy the constraint 'true'.
+];
+```
+
+**«Type 'false' does not satisfy the constraint 'true'.»** («Тип 'false' не удовлетворяет ограничению 'true'») — сообщение о провале теста точного типа: тип в этой строке не тот, что заявлен в тесте. Чтобы увидеть, какой он на самом деле, наведите курсор на переменную в редакторе.
+
+`Equal` строг ровно в том, в чём это нужно тесту типов. А в сочетании с `@ts-expect-error` им можно проверить, что два типа **не** равны:
+
+<CodeExample output="Все тесты типов пройдены">
+
+```ts
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+type cases = [
+  // Порядок в объединении не важен
+  Expect<Equal<"a" | "b", "b" | "a">>,
+  // @ts-expect-error: any — не то же самое, что string
+  Expect<Equal<any, string>>,
+  // @ts-expect-error: более широкий тип — не то же самое
+  Expect<Equal<string, "a" | "b">>,
+  // @ts-expect-error: readonly имеет значение
+  Expect<Equal<{ a: string }, { readonly a: string }>>,
+  // @ts-expect-error: необязательное свойство имеет значение
+  Expect<Equal<{ a?: string }, { a: string | undefined }>>,
+];
+
+console.log("Все тесты типов пройдены");
+```
+
+</CodeExample>
+
+<Callout type="note" title="Один сюрприз: пересечения">
+
+`Equal<{ a: 1 } & { b: 2 }, { a: 1; b: 2 }>` — это `false`, хотя оба типа описывают одни и те же объекты: `Equal` сравнивает то, как типы **записаны**, а не только то, какие значения в них помещаются. Если тестируемый тип даёт пересечение (intersection type), либо сравнивайте с таким же пересечением, либо сначала «сплющите» его небольшим помощником, который обычно называют `Simplify` (вы напишете его на Уровне 3).
+
+</Callout>
+
+## Тесты типов охраняют проектные решения
+
+Тесты типов особенно хороши, когда тип такой, какой есть, **намеренно**. Этот `groupBy` возвращает `Partial<Record<K, T[]>>`, а не `Record<K, T[]>`, потому что группы без элементов просто не существует, и компилятор должен заставлять вызывающий код это проверять. Будущий коллега может это «упростить», поэтому тесты типов закрепляют решение — прямо рядом с тестами времени выполнения:
+
+<CodeExample output={`✓ groupBy > группирует элементы по ключу
+✓ groupBy > не создаёт групп без элементов
+
+Tests  2 passed (2)`}>
+
+```ts
+import { describe, it, expect } from "vitest";
+
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+// ---- Библиотека ----
+function groupBy<T, K extends string>(
+  items: readonly T[],
+  keyOf: (item: T) => K,
+): Partial<Record<K, T[]>> {
+  const groups: Partial<Record<K, T[]>> = {};
+  for (const item of items) {
+    const key = keyOf(item);
+    const group = groups[key] ?? [];
+    group.push(item);
+    groups[key] = group;
+  }
+  return groups;
+}
+
+// ---- Тесты времени выполнения ----
+type User = { name: string; plan: "free" | "pro" };
+
+const users: User[] = [
+  { name: "Mei", plan: "pro" },
+  { name: "Bao", plan: "free" },
+  { name: "Ana", plan: "pro" },
+];
+
+describe("groupBy", () => {
+  it("группирует элементы по ключу", () => {
+    const byPlan = groupBy(users, (user) => user.plan);
+    expect(byPlan.pro?.map((user) => user.name)).toEqual(["Mei", "Ana"]);
+    expect(byPlan.free).toHaveLength(1);
+  });
+
+  it("не создаёт групп без элементов", () => {
+    const byPlan = groupBy([users[1]], (user) => user.plan);
+    expect(byPlan.pro).toBeUndefined();
+  });
+});
+
+// ---- Тесты типов (проверяет компилятор, никто не вызывает) ----
+function typeTests() {
+  const byPlan = groupBy(users, (user) => user.plan);
+  type ByPlan = Partial<Record<"free" | "pro", User[]>>;
+
+  type cases = [
+    // Ключи берутся из колбэка: ровно "free" | "pro"
+    Expect<Equal<typeof byPlan, ByPlan>>,
+  ];
+
+  // @ts-expect-error: группы может не быть, сначала проверьте её
+  byPlan.pro.length;
+
+  // @ts-expect-error: группы "gold" нет
+  byPlan.gold;
+
+  // @ts-expect-error: ключи должны быть строками
+  groupBy(users, (user) => user.name.length);
+}
+```
+
+</CodeExample>
+
+Теперь предположим, что кто-то поменял возвращаемый тип на `Record<K, T[]>` (и заглушил ошибку внутри приведением). Оба теста времени выполнения по-прежнему проходят: во время выполнения `byPlan.pro` всё так же равно `undefined`, если пользователей с тарифом pro нет. А тесты типов ловят это сразу:
+
+```ts
+    Expect<Equal<typeof byPlan, ByPlan>>,
+    // ❌ Error: Type 'false' does not satisfy the constraint 'true'.
+
+  // @ts-expect-error: группы может не быть, сначала проверьте её
+  // ❌ Error: Unused '@ts-expect-error' directive.
+  byPlan.pro.length;
+```
+
+Комментарии после каждой директивы заодно служат документацией: они объясняют, **почему** API отвергает такой код.
+
+## Инструменты для тестирования типов в реальных проектах
+
+Паре `Equal`/`Expect` и `@ts-expect-error` не нужно ничего, кроме компилятора TypeScript, поэтому они работают и в этом редакторе, и в любом проекте. Два инструмента добавляют более удобный синтаксис и сообщения об ошибках.
+
+**`expectTypeOf` из Vitest** читается как `expect`, но проверяет типы. Кладите тесты типов в файлы с окончанием **`.test-d.ts`**: Vitest проверяет в них типы, но никогда их не запускает:
+
+```ts title="pluck.test-d.ts"
+import { expectTypeOf, test } from "vitest";
+import { pluck } from "./pluck";
+
+const users = [{ name: "Mei", age: 31 }];
+
+test("типы pluck", () => {
+  expectTypeOf(pluck(users, "name")).toEqualTypeOf<string[]>();
+  expectTypeOf(pluck(users, "age")).toEqualTypeOf<number[]>();
+
+  // @ts-expect-error: "nmae" — не свойство пользователя
+  pluck(users, "nmae");
+});
+```
+
+```bash
+npx vitest --typecheck   # запускает и тесты, и тесты типов
+```
+
+**tsd** популярен у библиотек, потому что проверяет опубликованные файлы объявлений (declaration files, `.d.ts`) — ровно то, что получают пользователи пакета:
+
+```ts title="index.test-d.ts"
+import { expectType, expectError } from "tsd";
+import { pluck } from ".";
+
+const users = [{ name: "Mei", age: 31 }];
+
+expectType<string[]>(pluck(users, "name"));
+expectError(pluck(users, "nmae"));
+```
+
+```bash
+npx tsd
+```
+
+Что выбрать? В проекте, где уже есть Vitest, естественный выбор — `expectTypeOf`. Для опубликованных типов библиотеки — tsd. Если не хочется зависимостей (или нужна быстрая проверка где угодно) — `Equal`/`Expect` и `@ts-expect-error`. Все они проверяют одно и то же: что должно компилироваться и в какой именно тип, а что компилироваться не должно.
+
+## Запускайте проверку типов в CI
+
+Тесты типов помогают, только если их что-то **запускает**, а `npx vitest run` этого не делает (помните: Vitest стирает типы, не проверяя их). Команда, которая проверяет все файлы, включая тесты и тесты типов:
+
+```bash
+npx tsc --noEmit
+```
+
+`--noEmit` означает «только проверить, не записывать никаких файлов JavaScript» (см. [tsconfig и компилятор](/learn/typescript/tsconfig-and-the-compiler)). Добавьте её в `package.json` рядом с тестами и сделайте так, чтобы CI запускал обе команды при каждом push:
+
+```json title="package.json"
+{
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  }
+}
+```
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+```
+
+<Callout type="warning" title="Убедитесь, что тесты включены в проверку">
+
+Классическая ошибка: в `tsconfig.json` проекта стоит `"include": ["src"]` или исключены `**/*.test.ts` — часто это скопировано из конфигурации сборки, которая не должна включать тесты. Тогда `tsc --noEmit` вообще не смотрит на файлы тестов, и каждый `@ts-expect-error` в них «проходит», потому что его никто не проверяет. Сделайте один раз: намеренно сломайте тип и посмотрите, как CI покраснеет. Если он остался зелёным, ваши тесты типов не запускаются.
+
+</Callout>
+
+<Quiz
+  question="В файле тестов типов над строкой settings.set('fontSize', 16) стоит // @ts-expect-error, а сама строка совершенно корректна. О чём сообщит компилятор?"
+  options={[
+    "Ни о чём, потому что @ts-expect-error скрывает все ошибки",
+    "Unused '@ts-expect-error' directive.",
+    "Type 'false' does not satisfy the constraint 'true'.",
+    "Строка будет пропущена и никогда не выполнится",
+  ]}
+  answer={1}
+  explanation="@ts-expect-error обещает ошибку в следующей строке. Если её нет, компилятор сообщает, что сама директива не использована. Именно это и делает её тестом типов: корректный код под директивой проваливает проверку."
+/>
+
+<Quiz
+  question="Возвращаемый тип помощника случайно стал any. Какой тест типов это поймает?"
+  options={[
+    "const result: Date = parseDate(input);",
+    "const result = parseDate(input) as Date;",
+    "type cases = [Expect<Equal<ReturnType<typeof parseDate>, Date>>];",
+    "expect(parseDate(input)).toBeInstanceOf(Date);",
+  ]}
+  answer={2}
+  explanation="any можно присвоить чему угодно, поэтому аннотация и приведение спокойно компилируются, а проверка времени выполнения типов не видит. Equal отличает any от Date, так что Expect сообщит: Type 'false' does not satisfy the constraint 'true'."
+/>
+
+<Exercise
+  title="Добейтесь, чтобы тесты типов проходили"
+  language="typescript"
+  starter={`import { describe, it, expect } from "vitest";
+
+// ---- Помощники для тестов типов (не меняйте) ----
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+// ---- Библиотека: сделайте её типы точными ----
+function createSettings(defaults: Record<string, any>) {
+  let current = { ...defaults };
+  return {
+    get(key: string): any {
+      return current[key];
+    },
+    set(key: string, value: any): void {
+      current[key] = value;
+    },
+    update(changes: Record<string, any>): void {
+      current = { ...current, ...changes };
+    },
+    reset(): void {
+      current = { ...defaults };
+    },
+    all(): Record<string, any> {
+      return current;
+    },
+  };
+}
+
+// ---- Как её использует приложение (не меняйте) ----
+type Settings = {
+  theme: "light" | "dark";
+  fontSize: number;
+  autosave: boolean;
+};
+
+const defaults: Settings = {
+  theme: "light",
+  fontSize: 14,
+  autosave: true,
+};
+const settings = createSettings(defaults);
+
+// ---- Тесты времени выполнения (не меняйте) ----
+describe("createSettings", () => {
+  it("начинает со значений по умолчанию", () => {
+    expect(createSettings(defaults).all()).toEqual(defaults);
+  });
+
+  it("меняет одну настройку", () => {
+    const s = createSettings(defaults);
+    s.set("theme", "dark");
+    expect(s.get("theme")).toBe("dark");
+  });
+
+  it("обновляет несколько настроек сразу", () => {
+    const s = createSettings(defaults);
+    s.update({ fontSize: 18, autosave: false });
+    expect(s.all()).toEqual({
+      theme: "light",
+      fontSize: 18,
+      autosave: false,
+    });
+  });
+
+  it("сбрасывает к значениям по умолчанию, не меняя их", () => {
+    const s = createSettings(defaults);
+    s.set("fontSize", 30);
+    s.reset();
+    expect(s.get("fontSize")).toBe(14);
+    expect(defaults.fontSize).toBe(14);
+  });
+});
+
+// ---- Тесты типов (не меняйте) ----
+function typeTests() {
+  const theme = settings.get("theme");
+  const size = settings.get("fontSize");
+  const everything = settings.all();
+
+  type cases = [
+    Expect<Equal<typeof theme, "light" | "dark">>,
+    Expect<Equal<typeof size, number>>,
+    Expect<Equal<typeof everything, Readonly<Settings>>>,
+  ];
+
+  // @ts-expect-error: настройки "colour" нет
+  settings.get("colour");
+
+  // @ts-expect-error: "purple" — не тема
+  settings.set("theme", "purple");
+
+  // @ts-expect-error: fontSize — число, а не строка
+  settings.set("fontSize", "16px");
+
+  // @ts-expect-error: update принимает только известные настройки
+  settings.update({ fontsize: 16 });
+
+  // @ts-expect-error: all() только для чтения
+  settings.all().autosave = false;
+}
+`}
+  tests={[
+    { name: "Все тесты типов на месте", check: `(typeTests.toString().match(/@ts-expect-error/g) || []).length === 5 && typeTests.toString().includes('settings.set("theme", "purple")') && typeTests.toString().includes("settings.all().autosave = false")` },
+    { name: "Тесты времени выполнения проходят (а значит, и тесты типов, иначе ничего бы не запустилось)", check: `__vitest.failed === 0 && __vitest.passed >= 4` },
+    { name: "get, set, update и reset работают", check: `(() => { const s = createSettings({ a: 1, b: "x" }); s.set("a", 2); s.update({ b: "y" }); const changed = s.get("a") === 2 && s.all().b === "y"; s.reset(); return changed && s.get("a") === 1 && s.get("b") === "x"; })()` },
+    { name: "Объект значений по умолчанию никогда не меняется", check: `(() => { const d = { a: 1, b: 2 }; const s = createSettings(d); s.set("a", 5); s.update({ b: 6 }); s.reset(); s.set("b", 7); return d.a === 1 && d.b === 2 && s.get("a") === 1; })()` },
+  ]}
+>
+
+`createSettings` — крошечная библиотека настроек. Она работает (тесты времени выполнения проходят), но все её типы — `any` и `string`, поэтому она принимает чепуху вроде `settings.set("theme", "purple")`. Кто-то уже написал **тесты типов** для того API, которое у неё должно быть. Добейтесь, чтобы они проходили, меняя только **типы** в `createSettings`; JavaScript внутри может остаться как есть.
+
+Сначала нажмите **«Запустить»** и прочитайте 8 ошибок. Каждая из них — проваленный тест типов:
+
+- **«Type 'false' does not satisfy the constraint 'true'.»** означает, что метод возвращает не тот тип: `get("theme")` должен давать `"light" | "dark"`, `get("fontSize")` — `number`, а `all()` — `Readonly<Settings>`.
+- **«Unused '@ts-expect-error' directive.»** означает, что API принимает код, который должен отвергать: неизвестные ключи, значения не того типа, неизвестные ключи в `update` и присваивание результату `all()`.
+
+Сделайте `createSettings` дженериком по типу настроек `S` (выводится из `defaults`) и типизируйте каждый метод через него, используя `keyof` и индексные типы доступа из урока [Дженерик-функции](/learn/typescript/generic-functions).
+
+<Hint>
+
+Начните с `function createSettings<S extends object>(defaults: S)` и `let current: S = { ...defaults };`. Затем используйте `keyof` и индексные типы доступа: `get<K extends keyof S>(key: K): S[K]` и `set<K extends keyof S>(key: K, value: S[K]): void`. `update` принимает `Partial<S>`, а `all()` возвращает `Readonly<S>`. Исправляйте по одному и смотрите, как список ошибок сокращается.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect } from "vitest";
+
+// ---- Помощники для тестов типов (не меняйте) ----
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+// ---- Библиотека: сделайте её типы точными ----
+function createSettings<S extends object>(defaults: S) {
+  let current: S = { ...defaults };
+  return {
+    get<K extends keyof S>(key: K): S[K] {
+      return current[key];
+    },
+    set<K extends keyof S>(key: K, value: S[K]): void {
+      current[key] = value;
+    },
+    update(changes: Partial<S>): void {
+      current = { ...current, ...changes };
+    },
+    reset(): void {
+      current = { ...defaults };
+    },
+    all(): Readonly<S> {
+      return current;
+    },
+  };
+}
+
+// ---- Как её использует приложение (не меняйте) ----
+type Settings = {
+  theme: "light" | "dark";
+  fontSize: number;
+  autosave: boolean;
+};
+
+const defaults: Settings = {
+  theme: "light",
+  fontSize: 14,
+  autosave: true,
+};
+const settings = createSettings(defaults);
+
+// ---- Тесты времени выполнения (не меняйте) ----
+describe("createSettings", () => {
+  it("начинает со значений по умолчанию", () => {
+    expect(createSettings(defaults).all()).toEqual(defaults);
+  });
+
+  it("меняет одну настройку", () => {
+    const s = createSettings(defaults);
+    s.set("theme", "dark");
+    expect(s.get("theme")).toBe("dark");
+  });
+
+  it("обновляет несколько настроек сразу", () => {
+    const s = createSettings(defaults);
+    s.update({ fontSize: 18, autosave: false });
+    expect(s.all()).toEqual({
+      theme: "light",
+      fontSize: 18,
+      autosave: false,
+    });
+  });
+
+  it("сбрасывает к значениям по умолчанию, не меняя их", () => {
+    const s = createSettings(defaults);
+    s.set("fontSize", 30);
+    s.reset();
+    expect(s.get("fontSize")).toBe(14);
+    expect(defaults.fontSize).toBe(14);
+  });
+});
+
+// ---- Тесты типов (не меняйте) ----
+function typeTests() {
+  const theme = settings.get("theme");
+  const size = settings.get("fontSize");
+  const everything = settings.all();
+
+  type cases = [
+    Expect<Equal<typeof theme, "light" | "dark">>,
+    Expect<Equal<typeof size, number>>,
+    Expect<Equal<typeof everything, Readonly<Settings>>>,
+  ];
+
+  // @ts-expect-error: настройки "colour" нет
+  settings.get("colour");
+
+  // @ts-expect-error: "purple" — не тема
+  settings.set("theme", "purple");
+
+  // @ts-expect-error: fontSize — число, а не строка
+  settings.set("fontSize", "16px");
+
+  // @ts-expect-error: update принимает только известные настройки
+  settings.update({ fontsize: 16 });
+
+  // @ts-expect-error: all() только для чтения
+  settings.all().autosave = false;
+}
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Тесты времени выполнения не видят типов. Когда тип **и есть** продукт (общие помощники, дженерики, библиотеки), тестируйте его: он должен **отвергать неправильный код** и **давать точные типы**.
+- `// @ts-expect-error: причина` ожидает ошибку в следующей строке; корректный код там проваливает проверку с сообщением **«Unused '@ts-expect-error' directive.»** Делайте такие строки короткими, однострочными и с одной ошибкой каждая, а тесты, касающиеся только типов, оборачивайте в функцию, которая никогда не выполняется. Предпочитайте `@ts-expect-error` вместо `@ts-ignore` и `as any`.
+- Аннотация вроде `const x: string[] = f()` не может поймать `any`. Используйте `Expect<Equal<typeof x, string[]>>`; несовпадение проваливается с сообщением **«Type 'false' does not satisfy the constraint 'true'.»**
+- Тесты типов документируют намеренные решения (например, результат с `Partial`), чтобы никто их не «упростил».
+- В реальных проектах: `expectTypeOf` из Vitest в файлах `.test-d.ts` (`vitest --typecheck`) или tsd для опубликованных типов.
+- Vitest не проверяет типы, поэтому запускайте в CI `tsc --noEmit` рядом с `vitest run` и убедитесь, что tsconfig включает файлы тестов.

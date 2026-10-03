@@ -1,0 +1,754 @@
+---
+title: Монорепозитории и ссылки на проекты
+description: Соберите приложения и общие пакеты в одном репозитории через workspaces, дайте каждому пакету типизированный публичный интерфейс и собирайте их по порядку с помощью project references и tsc -b.
+duration: 23
+xp: 25
+---
+
+Одна компания, с которой я работал, держала общие типы TypeScript в отдельном репозитории и публиковала их в приватный npm-реестр как `@acme/types`. API использовал версию 3.2, веб-приложение — 2.8, а мобильное — 3.0, потому что обновление всегда откладывали «на следующий спринт». Когда в API переименовали `todo.title` в `todo.text`, каждый репозиторий по-прежнему отлично компилировался — каждый против своей версии правды, — а веб-приложение в продакшене показывало пустые списки задач. Типы были правильными. Они просто не были **общими**. 📦
+
+В уроке [Общие типы для клиента и сервера](/learn/typescript/sharing-types-between-client-and-server) контракт, сервер и клиент жили в одном файле, поэтому разойтись не могли. **Монорепозиторий** (monorepo) даёт реальному проекту то же свойство: приложения и общие для них пакеты лежат в одном репозитории, так что один коммит может изменить контракт вместе со всеми приложениями, которые его используют, а один запуск CI доказывает, что они по-прежнему согласованы. В этом уроке вы настроите монорепозиторий по-TypeScript-овски: **workspaces** (рабочие пространства), чтобы связать пакеты, типизированный **публичный интерфейс** для каждого пакета и **ссылки на проекты** (project references), чтобы `tsc` собирал и проверял их в правильном порядке и быстро.
+
+<Callout type="note" title="Примеры в этом уроке">
+
+Редактор PandaDev запускает по одному файлу за раз, поэтому конфигурации и деревья папок показаны обычными блоками, а сообщения об ошибках в них получены запуском настоящего `tsc` на настоящем монорепозитории. Запускаемые примеры складывают несколько «пакетов» в один файл, и в начале каждой части комментарий говорит, где она лежала бы на самом деле.
+
+</Callout>
+
+## Монорепозиторий или много репозиториев?
+
+Монорепозиторий — **не** монолит: приложения по-прежнему собираются и деплоятся отдельно. Это решение о том, где живёт код, и, как любое архитектурное решение, оно зависит от обстоятельств:
+
+- **Выбирайте монорепозиторий**, когда у приложений есть общий код, который часто меняется (контракты API, дизайн-система, правила валидации), когда вы хотите, чтобы одно изменение обновляло и поставщика, и потребителей сразу, и когда одни и те же люди работают над несколькими приложениями. Один lock-файл и один набор инструментов — приятные бонусы.
+- **Оставайтесь с отдельными репозиториями**, когда команды и циклы релизов действительно независимы, когда доступ нужно ограничивать для каждой кодовой базы или когда общий пакет — настоящий продукт с внешними пользователями (тогда ему всё равно нужны semver и changelog; об этом в следующем уроке).
+
+Издержки реальны: время CI растёт вместе с репозиторием, если не собирать только то, что изменилось; один красный `main` блокирует всех; а у инструментов должен быть владелец. Остаток урока — о том, как держать эти издержки маленькими.
+
+## Workspaces связывают пакеты
+
+В типичном монорепозитории на TypeScript есть **приложения** (apps), которые деплоятся, и переиспользуемые **пакеты** (packages):
+
+```text
+acme/
+├── package.json              "workspaces": ["apps/*", "packages/*"]
+├── package-lock.json         ОДИН lock-файл на всё
+├── tsconfig.base.json        общие опции компилятора
+├── tsconfig.json             «решение» (solution): ссылается на каждый проект
+├── apps/
+│   ├── api/                  сервер на Express   (@acme/api)
+│   └── web/                  приложение на React (@acme/web)
+└── packages/
+    ├── contracts/            типы + парсеры      (@acme/contracts)
+    └── config/               типизированный загрузчик env (@acme/config)
+```
+
+**Workspaces** — это возможность пакетного менеджера (она есть у npm, pnpm, Yarn и Bun). Корневой `package.json` перечисляет, где лежат пакеты, а у каждого пакета есть свой `package.json` с именем в скоупе:
+
+```json title="package.json"
+{
+  "name": "acme",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}
+```
+
+```json title="apps/web/package.json"
+{
+  "name": "@acme/web",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@acme/contracts": "*"
+  }
+}
+```
+
+В pnpm список вместо этого кладут в `pnpm-workspace.yaml` и пишут `"@acme/contracts": "workspace:*"` — такая запись громко падает, если пакета нет в репозитории (а `"*"` в npm может молча скачать публичный пакет с тем же именем). В любом случае при установке пакет не скачивается, а подключается **символической ссылкой** (symlink):
+
+```bash
+npm install
+ls -l node_modules/@acme
+# contracts -> ../../packages/contracts
+# web -> ../../apps/web
+# ...
+
+npm run build --workspace @acme/api      # один пакет
+npm run test --workspaces --if-present   # все, у кого есть скрипт test
+pnpm --filter @acme/web dev              # то же в pnpm
+```
+
+Поэтому `import { isTodo } from "@acme/contracts"` в веб-приложении разрешается точно так же, как npm-пакет, — через `node_modules` к коду в `packages/contracts`. Измените его там, и каждое приложение увидит изменение при следующей сборке.
+
+## Что кладут в общий пакет
+
+Общий пакет — это код, который нужен **нескольким** приложениям: контракты API и их парсеры, типизированный загрузчик конфигурации, UI-кит, несколько чистых помощников. Вот три «пакета» в одном файле: контракты, API, которое проверяет с их помощью тела запросов, и веб-клиент, который проверяет ответы **тем же самым** кодом (он обращается к учебному API PandaDev, который следует тому же контракту, поэтому заменяет задеплоенный сервер):
+
+<CodeExample output={`201 { id: 1, title: 'Nap', done: false }
+400 { error: 'title is required' }
+[ 'Learn fetch', 'Build the movie app', 'Eat some bamboo' ]`}>
+
+```ts
+import express from "express";
+import request from "supertest";
+
+// ======== packages/contracts/src/index.ts ========
+// Только типы и чистые функции: ни Node, ни DOM, ни Express
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+interface Todo {
+  id: number;
+  title: string;
+  done: boolean;
+}
+
+interface NewTodo {
+  title: string;
+  done: boolean;
+}
+
+const TITLE_MAX = 80;
+
+function parseNewTodo(input: unknown): Result<NewTodo, string> {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: "send a JSON object" };
+  }
+  const title = "title" in input ? input.title : undefined;
+  if (typeof title !== "string" || title.trim() === "") {
+    return { ok: false, error: "title is required" };
+  }
+  if (title.trim().length > TITLE_MAX) {
+    return { ok: false, error: `title is over ${TITLE_MAX} chars` };
+  }
+  const done = "done" in input && input.done === true;
+  return { ok: true, value: { title: title.trim(), done } };
+}
+
+function isTodo(value: unknown): value is Todo {
+  return (
+    typeof value === "object" && value !== null &&
+    "id" in value && typeof value.id === "number" &&
+    "title" in value && typeof value.title === "string" &&
+    "done" in value && typeof value.done === "boolean"
+  );
+}
+
+// ======== apps/api/src/app.ts ========
+// import { parseNewTodo, type Todo } from "@acme/contracts";
+function createApi() {
+  const todos: Todo[] = [];
+  const app = express();
+  app.use(express.json());
+  app.post("/todos", (req, res) => {
+    const parsed = parseNewTodo(req.body);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const todo: Todo = { id: todos.length + 1, ...parsed.value };
+    todos.push(todo);
+    res.status(201).json(todo);
+  });
+  return app;
+}
+
+// ======== apps/web/src/todos.ts ========
+// import { isTodo, type Todo } from "@acme/contracts";
+async function loadTodos(baseUrl: string): Promise<Todo[]> {
+  const res = await fetch(`${baseUrl}/todos`);
+  const data: unknown = await res.json();
+  return Array.isArray(data) ? data.filter(isTodo) : [];
+}
+
+// API, протестированный в том же процессе
+const api = request(createApi());
+for (const body of [{ title: " Nap " }, { title: "" }]) {
+  const res = await api.post("/todos").send(body);
+  console.log(res.status, res.body);
+}
+
+// Веб-приложение — против учебного API PandaDev (тот же контракт)
+const todos = await loadTodos("https://api.pandadev.test");
+console.log(todos.map((todo) => todo.title));
+```
+
+</CodeExample>
+
+Правило `TITLE_MAX` теперь живёт в **одном** месте: браузер может проверить его до отправки, а сервер — ещё раз при получении, причём одним и тем же кодом. Обратите внимание, чего в части с контрактами **нет**: ни `express`, ни `fetch`, ни `document`, ни `process.env`. Общий пакет должен работать везде, где работают его потребители. Если бы `contracts` импортировал типы Express, бандл веб-приложения потащил бы за собой код только для Node — или вообще не собрался бы.
+
+Охранять это можно поручить компилятору. Дайте пакету `lib` без DOM и пустой список `types` (никаких глобальных имён из `@types/node`):
+
+```json title="packages/contracts/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["es2023"],
+    "types": [],
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"]
+}
+```
+
+Теперь код, привязанный к окружению, внутри пакета — ошибка компиляции, а приложения сохраняют свои собственные настройки `lib`:
+
+```ts title="packages/contracts/src/ids.ts"
+export function newId(): string {
+  return `${process.pid}-${Date.now()}`;
+  // ❌ Error: Cannot find name 'process'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.
+}
+
+export function pageTitle(): string {
+  return document.title;
+  // ❌ Error: Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'.
+}
+```
+
+### Публичный интерфейс: `exports`
+
+Поле **`exports`** в `package.json` пакета — его парадная дверь. Импортировать можно только перечисленные там пути, и TypeScript это учитывает (если `moduleResolution` равен `bundler`, `node16` или `nodenext`). Условие `types` идёт первым и сообщает TypeScript, где лежат объявления:
+
+```json title="packages/contracts/package.json"
+{
+  "name": "@acme/contracts",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  }
+}
+```
+
+Обойти парадную дверь теперь — ошибка, поэтому внутренности пакета можно свободно менять:
+
+```ts title="apps/web/src/main.ts"
+import { secret } from "@acme/contracts/src/internal.js";
+// ❌ Error: Cannot find module '@acme/contracts/src/internal.js' or its corresponding type declarations.
+```
+
+Нужна вторая точка входа — например, фабрики для тестов, которые продакшен-код никогда не должен импортировать? Добавьте её сознательно: `"./testing": { "types": "./dist/testing.d.ts", "default": "./dist/testing.js" }`. Каждая запись в `exports` — это публичный API со всеми вытекающими обещаниями совместимости.
+
+<Callout type="warning" title="Осторожно с пакетом utils">
+
+Первый общий пакет в большинстве монорепозиториев называется `shared` или `utils`, а через два года это ящик со всяким хламом, от которого зависят все пакеты, так что любое изменение пересобирает всё. Называйте пакеты по **назначению** (`contracts`, `config`, `money`, `ui`), держите каждый маленьким и с небольшим числом зависимостей, и пусть пакет зависит от другого, только когда это действительно необходимо. Пакет, который «может пригодиться потом», — это просто код без владельца.
+
+</Callout>
+
+## Собранные и внутренние пакеты
+
+Приложение может потреблять пакет из workspace двумя способами, и в больших репозиториях часто используют оба:
+
+- **Собранные пакеты** (built packages). `exports` указывает на `dist/*.js` и `dist/*.d.ts`, которые создаёт `tsc`. Приложения потребляют скомпилированный результат точно так же, как npm-пакет, — это работает с любым инструментом (Node, Jest, любой бандлер) и готово к публикации (см. [Сборка и публикация пакетов](/learn/typescript/building-and-publishing-packages)). Цена — шаг сборки: `dist` должен быть актуальным, прежде чем приложение проверит типы. Ссылки на проекты (следующий раздел) это автоматизируют.
+- **Внутренние пакеты** (internal packages; в Turborepo их называют «just-in-time»). `exports` указывает прямо на исходники TypeScript, и бандлер приложения компилирует их, как будто это собственный код приложения:
+
+```json title="packages/ui/package.json"
+{
+  "name": "@acme/ui",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
+```
+
+Никакого шага сборки и мгновенные изменения — это приятно. Но потреблять такой пакет могут только инструменты, которые компилируют TypeScript (Vite, Next.js с `transpilePackages`, Vitest; но не обычный `node`), каждое приложение заново проверяет типы в исходниках пакета со **своими** опциями компилятора, и опубликовать его как есть нельзя. Хороший вариант по умолчанию: внутренние пакеты — для кода только для приложений, вроде UI-кита, собранные — для всего, что Node запускает напрямую или что может быть опубликовано.
+
+## Ссылки на проекты и `tsc -b`
+
+Без дополнительной настройки во многих монорепозиториях есть один гигантский `tsconfig.json`, который включает всё. Это работает, но каждый запуск `tsc` проверяет весь репозиторий, редактор загружает одну огромную программу, и ничто не мешает `apps/web` импортировать файл из глубины `apps/api`.
+
+**Ссылки на проекты** делят репозиторий на отдельные **проекты** TypeScript — по одному на пакет, — которые знают друг о друге. Общие опции идут в базовую конфигурацию:
+
+```json title="tsconfig.base.json"
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "nodenext",
+    "strict": true,
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+Каждый пакет расширяет её и перечисляет в `references` проекты, от которых он **зависит**:
+
+```json title="apps/api/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src"],
+  "references": [{ "path": "../../packages/contracts" }]
+}
+```
+
+А корневой `tsconfig.json` — это **файл решения** (solution file): своих файлов у него нет, только список всех проектов:
+
+```json title="tsconfig.json"
+{
+  "files": [],
+  "references": [
+    { "path": "packages/contracts" },
+    { "path": "packages/config" },
+    { "path": "apps/api" },
+    { "path": "apps/web" }
+  ]
+}
+```
+
+Опции, которые делают всю работу:
+
+| Опция | Что делает |
+| --- | --- |
+| `composite` | Помечает проект, на который могут ссылаться другие. Требует `declaration`, требует, чтобы каждый файл попадал под `include`/`files`, и записывает файл `.tsbuildinfo`, чтобы следующие сборки знали, что изменилось. |
+| `declaration` | Создаёт файлы `.d.ts`. Проекты, которые ссылаются на этот, проверяют типы по ним, а не перепроверяют исходники пакета, — отсюда и скорость. |
+| `declarationMap` | Создаёт файлы `.d.ts.map`, чтобы «Go to definition» в редакторе переходил к настоящему исходнику `.ts`, а не к `.d.ts`. |
+| `references` | «Этот проект использует тот»: сначала собрать его и разрешать его импорты в его объявления. |
+
+Всё это — поверх опций из урока [tsconfig и компилятор](/learn/typescript/tsconfig-and-the-compiler). Затем собирайте всё командой **`tsc -b`** (`--build`). Она определяет порядок зависимостей, собирает каждый устаревший проект и **пропускает** остальные. Вот настоящий вывод (без временных меток) для репозитория из трёх проектов после правки одного файла в `apps/web`:
+
+```bash
+npx tsc -b --verbose
+# Projects in this build:
+#     * packages/contracts/tsconfig.json
+#     * apps/api/tsconfig.json
+#     * apps/web/tsconfig.json
+#     * tsconfig.json
+# Project 'packages/contracts/tsconfig.json' is up to date because newest input 'packages/contracts/src/internal.ts' is older than output 'packages/contracts/tsconfig.tsbuildinfo'
+# Project 'apps/api/tsconfig.json' is up to date because newest input 'apps/api/src/server.ts' is older than output 'apps/api/tsconfig.tsbuildinfo'
+# Project 'apps/web/tsconfig.json' is out of date because output 'apps/web/tsconfig.tsbuildinfo' is older than input 'apps/web/src/main.ts'
+# Building project 'apps/web/tsconfig.json'...
+```
+
+Если вместо этого изменить контракт (переименовать `title` в `text` в `Todo`), `tsc -b` пересоберёт `contracts`, затем каждый проект, который на него ссылается, и сообщит о поломке там, где она случилась:
+
+```text
+Building project 'packages/contracts/tsconfig.json'...
+Project 'apps/api/tsconfig.json' is out of date because output 'apps/api/tsconfig.tsbuildinfo' is older than input 'packages/contracts'
+Building project 'apps/api/tsconfig.json'...
+apps/api/src/server.ts(2,42): error TS2353: Object literal may only specify known properties, and 'title' does not exist in type 'Todo'.
+```
+
+Это та самая история из вступления, пойманная одной командой ещё до коммита. (Сколько времени это экономит на большом репозитории и как это измерить — часть урока [Ускоряем проверку типов](/learn/typescript/faster-type-checking).) Ещё несколько команд, которые вам пригодятся:
+
+```bash
+npx tsc -b                # собрать всё устаревшее
+npx tsc -b apps/web       # только web и то, от чего он зависит
+npx tsc -b --watch        # пересобирать при сохранении
+npx tsc -b --clean        # удалить результаты сборки
+npx tsc -b --force        # пересобрать всё
+```
+
+Приложениям, которые собирает бандлер (Vite, Next.js), JavaScript от `tsc` не нужен. Дайте им `"noEmit": true`: тогда `tsc -b` только проверяет их типы и по-прежнему пропускает их, если ничего не изменилось. На приложение никто не ссылается, поэтому объявления ему не нужны.
+
+### Что обеспечивают ссылки
+
+Ссылки ещё и превращают граф пакетов в правила. Импорт **исходников** другого проекта по относительному пути без ссылки падает дважды:
+
+```text
+apps/web/src/rel.ts(1,24): error TS6059: File 'packages/contracts/src/internal.ts' is not under 'rootDir' 'apps/web/src'. 'rootDir' is expected to contain all source files.
+apps/web/src/rel.ts(1,24): error TS6307: File 'packages/contracts/src/internal.ts' is not listed within the file list of project 'apps/web/tsconfig.json'. Projects must list all files or use an 'include' pattern.
+```
+
+А ссылка на проект без `composite` даёт:
+
+```text
+apps/web/tsconfig.json(8,18): error TS6306: Referenced project 'packages/contracts' must have setting "composite": true.
+```
+
+<Callout type="danger" title="«У меня работает»: пропущенная ссылка">
+
+Классика жанра. `apps/web` импортирует `@acme/contracts` через символическую ссылку workspace, но в его tsconfig **нет ссылки** на этот проект. На вашем ноутбуке `packages/contracts/dist` остался от прошлой сборки, поэтому типы проверяются — но против **устаревших** объявлений. В CI на свежем клоне никто не собрал `contracts` заранее:
+
+```text
+apps/web/src/main.ts(1,24): error TS2307: Cannot find module '@acme/contracts' or its corresponding type declarations.
+```
+
+Правило: каждой workspace-зависимости в `package.json` соответствует запись в `references`. Инструменты могут поддерживать их синхронизацию за вас (например, Nx умеет обновлять ссылки по графу пакетов), а CI всегда должен начинать с чистого checkout.
+
+</Callout>
+
+## Псевдонимы путей или пакеты
+
+До появления workspaces монорепозитории часто склеивали код **псевдонимами путей** (path aliases) в `tsconfig.json`:
+
+```json title="apps/web/tsconfig.json"
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"],
+      "@acme/contracts": ["../../packages/contracts/src/index.ts"]
+    }
+  }
+}
+```
+
+Здесь происходят две разные вещи:
+
+- **`@/*` → `./src/*`** — удобство **внутри одного пакета**, чтобы не писать `../../../`. Это нормально, с одной оговоркой: `paths` сообщает только **проверке типов**. Бандлеру, тест-раннеру и Node нужно то же сопоставление каждому отдельно (например, `resolve.alias` в Vite или плагин tsconfig-paths). Для кода, который Node запускает напрямую, стандартная альтернатива — **импорты подпутей** (subpath imports) в `package.json`, которые понимают и Node, и TypeScript: `"imports": { "#lib/*": "./src/lib/*" }`, а затем `import { slugify } from "#lib/slugify.js"`. (`baseUrl` для `paths` не нужен; в TypeScript 6 он объявлен устаревшим.)
+- **`@acme/contracts` → исходники другого пакета** — антипаттерн. Он обходит `exports` пакета, так что внутренности становятся доступными для импорта. Он компилирует файлы другого пакета как часть этого проекта, с опциями этого проекта (привет, ошибки `rootDir`). А пакетный менеджер и инструменты сборки не видят зависимости, поэтому не знают, что изменение `contracts` влияет на `web`.
+
+Практическое правило: **псевдонимы — внутри пакета, workspace-зависимости — между пакетами.**
+
+## Запускалки задач: Turborepo и Nx
+
+`tsc -b` знает граф TypeScript. Но в монорепозитории есть и другие задачи: тесты, линтинг, бандлинг, Docker-образы. **Turborepo** и **Nx** читают граф workspace из ваших файлов `package.json` и добавляют три вещи:
+
+1. **Порядок задач**: «собрать зависимости пакета до самого пакета» — одна строчка конфигурации.
+2. **Кеширование**: результат задачи сохраняется под хешем её входных данных (исходники, зависимости, переменные окружения). Запустите её снова с теми же входными данными — и результат воспроизведётся за миллисекунды. С **удалённым кешем** (remote caching) на вашей машине можно переиспользовать сборку коллеги или CI.
+3. **Запуск только затронутого**: в пул-реквесте тестируются только пакеты, изменённые с момента `main`, и пакеты, которые от них зависят.
+
+```json title="turbo.json"
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    "typecheck": { "dependsOn": ["^build"] },
+    "test": { "dependsOn": ["^build"] },
+    "lint": {}
+  }
+}
+```
+
+`"^build"` означает «задачу `build` моих **зависимостей**». В CI `npx turbo run typecheck test lint --affected` (или `npx nx affected -t typecheck test lint`) делает пул-реквесты в репозитории из 40 пакетов такими же быстрыми, как в репозитории из 4. В первый день ни один из этих инструментов не нужен: npm workspaces плюс `tsc -b` долго тянут небольшой монорепозиторий. Беритесь за них, когда время CI или вопрос «какие пакеты затрагивает это изменение?» начинают причинять боль.
+
+<Quiz
+  question="apps/web импортирует @acme/contracts, но в его tsconfig.json нет записи references для этого пакета. На вашем ноутбуке tsc -b проходит, а CI на свежем клоне падает с Cannot find module '@acme/contracts'. Почему?"
+  options={[
+    "CI использует другую версию TypeScript, которая не поддерживает workspaces",
+    "На вашем ноутбуке лежит старый packages/contracts/dist от прошлой сборки; без ссылки tsc -b никогда не собирает contracts первым",
+    "Символическая ссылка workspace создаётся только в macOS",
+    "Чтобы TypeScript нашёл пакет, в exports должен быть указан ./src/index.ts",
+  ]}
+  answer={1}
+  explanation="Импорт разрешается через символическую ссылку в package.json пакета contracts, где types указывает на dist. Локально существует устаревший dist, поэтому типы проверяются (против старых объявлений!). На чистом checkout его никто не собрал. Если добавить ссылку, tsc -b будет каждый раз собирать contracts первым."
+/>
+
+<Quiz
+  question="Зачем давать packages/contracts tsconfig, где lib равен ['es2023'], а types равен []?"
+  options={[
+    "Чтобы пакет компилировался быстрее за счёт пропуска проверки lib",
+    "Чтобы глобальные имена браузера вроде document и глобальные имена Node вроде process были ошибками компиляции и пакетом могли пользоваться и веб-приложение, и API",
+    "Потому что composite-проектам нельзя использовать библиотеку DOM",
+    "Чтобы пакет можно было опубликовать без файлов объявлений",
+  ]}
+  answer={1}
+  explanation="Общий пакет должен работать везде, где работают его потребители. Без библиотеки DOM и без @types/node любое случайное использование document, localStorage или process внутри пакета ловит компилятор, а не ломает одно из приложений во время выполнения."
+/>
+
+<Exercise
+  title="Типизированный пакет конфигурации для двух приложений"
+  language="typescript"
+  starter={`type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// ======== packages/config/src/index.ts ========
+type FieldSpec =
+  | { type: "string"; default?: string }
+  | { type: "number"; default?: number }
+  | { type: "boolean"; default?: boolean }
+  | {
+      type: "enum";
+      values: readonly string[];
+      default?: string;
+    };
+
+type Schema = Record<string, FieldSpec>;
+
+// \`const\` сохраняет литеральные типы: values остаётся ["debug", "info", …]
+function defineSchema<const S extends Schema>(schema: S): S {
+  return schema;
+}
+
+type Env = Record<string, string | undefined>;
+
+// ---------- TODO 1 ----------
+// Тип загруженной конфигурации, выведенный из её схемы:
+// "number" → number, "boolean" → boolean, "string" → string,
+// "enum" → объединение его values
+type ConfigOf<S extends Schema> = Record<string, any>;
+
+// ---------- TODO 2 ----------
+// Для каждого ключа схемы прочитайте env[key]:
+//   нет значения или "" → default или "<KEY> is required"
+//   number:  конечное число или "<KEY> must be a number"
+//   boolean: "true"/"1" или "false"/"0",
+//            иначе "<KEY> must be true or false"
+//   enum:    одно из values,
+//            иначе "<KEY> must be one of a, b, c"
+// Верните ВСЕ проблемы в порядке схемы или конфигурацию
+// только с ключами схемы.
+function loadConfig<S extends Schema>(
+  schema: S,
+  env: Env,
+): Result<ConfigOf<S>, string[]> {
+  return { ok: false, error: ["not implemented yet"] };
+}
+
+// ======== apps/api/src/config.ts ========
+const apiSchema = defineSchema({
+  PORT: { type: "number", default: 3000 },
+  DATABASE_URL: { type: "string" },
+  LOG_LEVEL: {
+    type: "enum",
+    values: ["debug", "info", "warn"],
+    default: "info",
+  },
+});
+type ApiConfig = ConfigOf<typeof apiSchema>;
+
+function describeApi(config: ApiConfig): string {
+  return \`api on port \${config.PORT}, log level \${config.LOG_LEVEL}\`;
+}
+
+// ======== apps/worker/src/config.ts ========
+const workerSchema = defineSchema({
+  QUEUE_URL: { type: "string" },
+  CONCURRENCY: { type: "number", default: 4 },
+  DRY_RUN: { type: "boolean", default: false },
+});
+type WorkerConfig = ConfigOf<typeof workerSchema>;
+
+function describeWorker(config: WorkerConfig): string {
+  const mode = config.DRY_RUN ? "dry run" : "live";
+  return \`worker with \${config.CONCURRENCY} jobs at once (\${mode})\`;
+}
+
+// ======== тесты типов (не меняйте их) ========
+function typeTests(api: ApiConfig, worker: WorkerConfig): void {
+  const port: number = api.PORT;
+  const level: "debug" | "info" | "warn" = api.LOG_LEVEL;
+  const dryRun: boolean = worker.DRY_RUN;
+  // @ts-expect-error: PORT — это число, а не строка
+  const portText: string = api.PORT;
+  // @ts-expect-error: LOG_LEVEL — один из трёх литералов
+  console.log(api.LOG_LEVEL === "verbose");
+  // @ts-expect-error: опечатки ловятся
+  console.log(api.DATABASE_ULR);
+  // @ts-expect-error: каждое приложение видит только свои ключи
+  console.log(worker.PORT);
+}
+
+// ======== попробуйте ========
+const api = loadConfig(apiSchema, {
+  DATABASE_URL: "postgres://localhost/acme",
+  HOME: "/home/mei",
+});
+if (api.ok) {
+  console.log(api.value);
+  console.log(describeApi(api.value));
+}
+const worker = loadConfig(workerSchema, {
+  QUEUE_URL: "amqp://localhost",
+  CONCURRENCY: "8",
+  DRY_RUN: "true",
+});
+if (worker.ok) console.log(describeWorker(worker.value));
+const broken = { PORT: "eighty", LOG_LEVEL: "loud" };
+console.log(loadConfig(apiSchema, broken));
+`}
+  tests={[
+    { name: "Тесты типов компилируются (нет неиспользованных @ts-expect-error)", check: `true` },
+    { name: "Значения по умолчанию заполняют пропуски, и остаются только ключи схемы", check: `(() => { const r = loadConfig(apiSchema, { DATABASE_URL: "pg://x", HOME: "/h" }); return r.ok && r.value.PORT === 3000 && r.value.LOG_LEVEL === "info" && r.value.DATABASE_URL === "pg://x" && Object.keys(r.value).sort().join() === "DATABASE_URL,LOG_LEVEL,PORT"; })()` },
+    { name: "Числа, логические значения и значения enum разбираются", check: `(() => { const w = loadConfig(workerSchema, { QUEUE_URL: "q", CONCURRENCY: "16", DRY_RUN: "1" }); const w2 = loadConfig(workerSchema, { QUEUE_URL: "q", DRY_RUN: "false" }); const a = loadConfig(apiSchema, { DATABASE_URL: "d", PORT: "8080", LOG_LEVEL: "warn" }); return w.ok && w.value.CONCURRENCY === 16 && w.value.DRY_RUN === true && w2.ok && w2.value.DRY_RUN === false && w2.value.CONCURRENCY === 4 && a.ok && a.value.PORT === 8080 && a.value.LOG_LEVEL === "warn"; })()` },
+    { name: "Сообщается о каждой проблеме в порядке схемы", check: `(() => { const r = loadConfig(apiSchema, { PORT: "eighty", LOG_LEVEL: "loud" }); return !r.ok && JSON.stringify(r.error) === JSON.stringify(["PORT must be a number", "DATABASE_URL is required", "LOG_LEVEL must be one of debug, info, warn"]); })()` },
+    { name: "Пустые строки считаются отсутствующими; неверные числа и логические значения отклоняются", check: `(() => { const r = loadConfig(workerSchema, { QUEUE_URL: "", DRY_RUN: "yes", CONCURRENCY: "Infinity" }); return !r.ok && JSON.stringify(r.error) === JSON.stringify(["QUEUE_URL is required", "CONCURRENCY must be a number", "DRY_RUN must be true or false"]); })()` },
+    { name: "loadConfig работает для любой схемы, а не только для двух приложений", check: `(() => { const r = loadConfig({ MODE: { type: "enum", values: ["a", "b"], default: "b" }, NAME: { type: "string", default: "panda" }, ON: { type: "boolean" } }, { ON: "0" }); const bad = loadConfig({ ON: { type: "boolean" } }, {}); return r.ok && r.value.MODE === "b" && r.value.NAME === "panda" && r.value.ON === false && !bad.ok && bad.error[0] === "ON is required"; })()` },
+  ]}
+>
+
+Каждое приложение в монорепозитории читает настройки из переменных окружения, и раньше каждое делало это по-своему: тут `Number(process.env.PORT)`, там опечатка в `DATABASE_ULR`, а где-то ещё строка `"false"`, которая считалась истиной. Соберите общий пакет **`@acme/config`**, которым два приложения (API и фоновый воркер, в том же файле) пользуются с полной типизацией.
+
+Входные типы пакета готовы: `FieldSpec` описывает одну переменную (`"string"`, `"number"`, `"boolean"` или `"enum"` с `values`, у каждой необязательный `default`), а `defineSchema` сохраняет литеральные типы схемы благодаря своему `const`-параметру типа. Вы пишете:
+
+1. **`ConfigOf<S>`**: сопоставленный тип (mapped type) по ключам схемы. Поля `"number"` становятся `number`, поля `"boolean"` — `boolean`, поля `"enum"` — **объединением своих values**, а поля `"string"` — `string`. Тогда `ApiConfig` и `WorkerConfig` (они уже объявлены через него) получают точные типы, и тесты типов с `@ts-expect-error` проходят: каждый проходит, только когда эта строка действительно ошибка.
+2. **`loadConfig(schema, env)`**: для каждого ключа схемы прочитайте `env[key]`. Отсутствие значения или `""` означает «взять значение по умолчанию», а если его нет — проблема `"<KEY> is required"`. Числа должны быть конечными (`"<KEY> must be a number"`); логические значения принимают `"true"`/`"1"` и `"false"`/`"0"` (`"<KEY> must be true or false"`); значения enum должны быть в списке (`"<KEY> must be one of debug, info, warn"`, через `", "`); строки используются как есть. Верните **все** проблемы в порядке схемы или конфигурацию только с ключами схемы (никакого пробравшегося `HOME`).
+
+<Hint>
+
+Для типа используйте [сопоставленный тип](/learn/typescript/mapped-types) вида `{ [K in keyof S]: S[K] extends { type: "number" } ? number : … }`, вкладывая условия друг в друга. Для enum `S[K] extends { values: readonly (infer V)[] } ? V : …` достаёт объединение из кортежа. Для функции пройдите циклом по `Object.entries(schema)` и напишите маленький `parseField(key, spec, raw)`, который возвращает `Result<string | number | boolean, string>` с помощью `switch (spec.type)`. Собирайте значения в `Record<string, string | number | boolean>`; в конце одно приведение `config as ConfigOf<S>` допустимо: цикл построил ровно эту форму, а тесты типов проверяют интерфейс снаружи.
+
+</Hint>
+
+<Solution>
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+// ======== packages/config/src/index.ts ========
+type FieldSpec =
+  | { type: "string"; default?: string }
+  | { type: "number"; default?: number }
+  | { type: "boolean"; default?: boolean }
+  | {
+      type: "enum";
+      values: readonly string[];
+      default?: string;
+    };
+
+type Schema = Record<string, FieldSpec>;
+
+// `const` сохраняет литеральные типы: values остаётся ["debug", "info", …]
+function defineSchema<const S extends Schema>(schema: S): S {
+  return schema;
+}
+
+type Env = Record<string, string | undefined>;
+
+// Тип загруженной конфигурации, выведенный из её схемы
+type ConfigOf<S extends Schema> = {
+  [K in keyof S]: S[K] extends { type: "number" }
+    ? number
+    : S[K] extends { type: "boolean" }
+      ? boolean
+      : S[K] extends { values: readonly (infer V)[] }
+        ? V
+        : string;
+};
+
+function parseField(
+  key: string,
+  spec: FieldSpec,
+  raw: string | undefined,
+): Result<string | number | boolean, string> {
+  if (raw === undefined || raw === "") {
+    return spec.default === undefined
+      ? { ok: false, error: `${key} is required` }
+      : { ok: true, value: spec.default };
+  }
+  switch (spec.type) {
+    case "string":
+      return { ok: true, value: raw };
+    case "number": {
+      const value = Number(raw);
+      return Number.isFinite(value)
+        ? { ok: true, value }
+        : { ok: false, error: `${key} must be a number` };
+    }
+    case "boolean":
+      if (raw === "true" || raw === "1") {
+        return { ok: true, value: true };
+      }
+      if (raw === "false" || raw === "0") {
+        return { ok: true, value: false };
+      }
+      return { ok: false, error: `${key} must be true or false` };
+    case "enum":
+      return spec.values.includes(raw)
+        ? { ok: true, value: raw }
+        : {
+            ok: false,
+            error: `${key} must be one of ${spec.values.join(", ")}`,
+          };
+  }
+}
+
+function loadConfig<S extends Schema>(
+  schema: S,
+  env: Env,
+): Result<ConfigOf<S>, string[]> {
+  const config: Record<string, string | number | boolean> = {};
+  const issues: string[] = [];
+  for (const [key, spec] of Object.entries(schema)) {
+    const field = parseField(key, spec, env[key]);
+    if (field.ok) config[key] = field.value;
+    else issues.push(field.error);
+  }
+  if (issues.length > 0) return { ok: false, error: issues };
+  // Единственное приведение: цикл выше построил ровно ConfigOf<S>
+  return { ok: true, value: config as ConfigOf<S> };
+}
+
+// ======== apps/api/src/config.ts ========
+const apiSchema = defineSchema({
+  PORT: { type: "number", default: 3000 },
+  DATABASE_URL: { type: "string" },
+  LOG_LEVEL: {
+    type: "enum",
+    values: ["debug", "info", "warn"],
+    default: "info",
+  },
+});
+type ApiConfig = ConfigOf<typeof apiSchema>;
+
+function describeApi(config: ApiConfig): string {
+  return `api on port ${config.PORT}, log level ${config.LOG_LEVEL}`;
+}
+
+// ======== apps/worker/src/config.ts ========
+const workerSchema = defineSchema({
+  QUEUE_URL: { type: "string" },
+  CONCURRENCY: { type: "number", default: 4 },
+  DRY_RUN: { type: "boolean", default: false },
+});
+type WorkerConfig = ConfigOf<typeof workerSchema>;
+
+function describeWorker(config: WorkerConfig): string {
+  const mode = config.DRY_RUN ? "dry run" : "live";
+  return `worker with ${config.CONCURRENCY} jobs at once (${mode})`;
+}
+
+// ======== тесты типов (не меняйте их) ========
+function typeTests(api: ApiConfig, worker: WorkerConfig): void {
+  const port: number = api.PORT;
+  const level: "debug" | "info" | "warn" = api.LOG_LEVEL;
+  const dryRun: boolean = worker.DRY_RUN;
+  // @ts-expect-error: PORT — это число, а не строка
+  const portText: string = api.PORT;
+  // @ts-expect-error: LOG_LEVEL — один из трёх литералов
+  console.log(api.LOG_LEVEL === "verbose");
+  // @ts-expect-error: опечатки ловятся
+  console.log(api.DATABASE_ULR);
+  // @ts-expect-error: каждое приложение видит только свои ключи
+  console.log(worker.PORT);
+}
+
+// ======== попробуйте ========
+const api = loadConfig(apiSchema, {
+  DATABASE_URL: "postgres://localhost/acme",
+  HOME: "/home/mei",
+});
+if (api.ok) {
+  console.log(api.value);
+  console.log(describeApi(api.value));
+}
+const worker = loadConfig(workerSchema, {
+  QUEUE_URL: "amqp://localhost",
+  CONCURRENCY: "8",
+  DRY_RUN: "true",
+});
+if (worker.ok) console.log(describeWorker(worker.value));
+const broken = { PORT: "eighty", LOG_LEVEL: "loud" };
+console.log(loadConfig(apiSchema, broken));
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Монорепозиторий** держит приложения и общие для них пакеты в одном репозитории, так что один коммит меняет контракт вместе с его потребителями. Это не монолит: приложения по-прежнему деплоятся отдельно. Отдельные репозитории подходят независимым командам и действительно публичным пакетам.
+- **Workspaces** (npm, pnpm, Yarn, Bun) подключают пакеты в `node_modules` символическими ссылками, так что `@acme/contracts` импортируется как любой npm-пакет. По возможности используйте протокол `workspace:*` из pnpm.
+- В общих пакетах лежат контракты, парсеры, конфигурация и UI, а называют их по назначению. Держите их **независимыми от окружения** (`lib` без DOM, `types: []`) и дайте им парадную дверь через **`exports`**; глубокие импорты становятся ошибками.
+- **Собранные пакеты** поставляют `dist` + `.d.ts` и работают везде; **внутренние пакеты** направляют `exports` на исходники `.ts` и полагаются на бандлер приложения.
+- **Ссылки на проекты** делят репозиторий на проекты: в каждом `composite` + `declaration` (+ `declarationMap` для редактора), `references` для зависимостей, корневой файл решения и `tsc -b`, чтобы собирать по порядку и пропускать актуальное. Конечным приложениям подойдёт `noEmit`.
+- Каждой workspace-зависимости нужна соответствующая **ссылка** (reference), иначе устаревший `dist` будет прятать ошибки до самого CI.
+- Используйте **псевдонимы путей** только внутри пакета; между пакетами — workspace-зависимости. **Turborepo** и **Nx** добавляют порядок задач, кеширование и CI только для затронутого, когда репозиторий растёт.

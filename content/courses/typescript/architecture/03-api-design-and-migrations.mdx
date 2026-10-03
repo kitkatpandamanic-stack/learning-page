@@ -1,0 +1,660 @@
+---
+title: API Design & Migrations
+description: Design TypeScript APIs with good inference, options objects and overloads, know which type changes break users, deprecate safely, and migrate a JavaScript codebase step by step.
+duration: 25
+xp: 30
+---
+
+A team I know maintained an internal HTTP client used by about 40 services. In a minor release they changed `getUser(id)` from returning `Promise<User>` to `Promise<User | undefined>`. It was honest, because the user really could be missing, and the JavaScript didn't change at all. On Monday morning, 40 builds failed with `'user' is possibly 'undefined'.` Nobody had broken any **code**; they had broken a **type**, and in TypeScript the types are part of your API. 🧭
+
+This lesson is about the long life of TypeScript code that other people depend on: designing APIs that are pleasant to call, knowing which type changes are breaking, deprecating things without drama, and moving an existing JavaScript codebase to TypeScript without stopping feature work.
+
+## Design for the call site
+
+The best typed API is one where users **never write a type argument**. They pass ordinary values, and TypeScript infers everything from them. That means putting the inference sources in arguments users write anyway, and telling the compiler which arguments should **not** be used for inference.
+
+Here's a small state-machine library. Users describe states and events once, as a plain object, and get back a machine whose `send` only accepts real events:
+
+<CodeExample output={`closed true false
+locked locked
+closed opened`}>
+
+```ts
+// The library: users never write a type argument
+interface MachineConfig<S extends string, E extends string> {
+  initial: NoInfer<S>;
+  states: Record<S, Partial<Record<E, NoInfer<S>>>>;
+}
+
+interface Machine<S extends string, E extends string> {
+  readonly state: S;
+  send(event: E): S;
+  can(event: E): boolean;
+}
+
+function createMachine<S extends string, E extends string>(
+  config: MachineConfig<S, E>,
+): Machine<S, E> {
+  let state = config.initial;
+  return {
+    get state() {
+      return state;
+    },
+    send(event) {
+      state = config.states[state][event] ?? state;
+      return state;
+    },
+    can(event) {
+      return config.states[state][event] !== undefined;
+    },
+  };
+}
+
+// The user's code: every name below is checked
+const door = createMachine({
+  initial: "closed",
+  states: {
+    closed: { open: "opened", lock: "locked" },
+    opened: { close: "closed" },
+    locked: { unlock: "closed" },
+  },
+});
+
+console.log(door.state, door.can("open"), door.can("unlock"));
+console.log(door.send("lock"), door.send("open"));
+console.log(door.send("unlock"), door.send("open"));
+```
+
+</CodeExample>
+
+The type parameters `S` (states) and `E` (events) are inferred from the **keys** of `states` and of each inner object, so mistakes in the user's code get precise errors:
+
+```ts
+door.send("kick");
+// ❌ Error: Argument of type '"kick"' is not assignable to parameter of type '"open" | "lock" | "close" | "unlock"'.
+
+const job = createMachine({
+  initial: "idle",
+  states: {
+    idle: { start: "runing" },
+    // ❌ Error: Type '"runing"' is not assignable to type '"idle" | "running" | undefined'. Did you mean '"running"'?
+    running: { stop: "idle" },
+  },
+});
+```
+
+Two design decisions make those errors good:
+
+- **`NoInfer<S>`** (from [Variance & Inference](/learn/typescript/variance-and-inference)) on `initial` and on every target state says: "don't learn `S` from here, only check against it". Without it, the typo `"runing"` would become a new **state** in the union, and the error would appear on the line that's actually correct: `Object literal may only specify known properties, but 'running' does not exist in type 'Record<"idle" | "runing", …>'`. Users would stare at `running` wondering what's wrong with it.
+- **A named return type** (`Machine<S, E>`) means users see `Machine<"closed" | "opened" | "locked", "open" | …>` on hover instead of a wall of inferred object type. Like the `Billing` interface in the first lesson of this module, it's also the contract: you can change the implementation without changing what users see.
+
+A few more rules senior library authors follow:
+
+- **A type parameter should appear at least twice**, for example in a parameter and the return type. `function parse<T>(json: string): T` uses `T` once: it's a cast with nicer syntax, and the caller is trusting you blindly (exactly the "honesty problem" from [Typed Fetch](/learn/typescript/typed-fetch)). Return `unknown`, or take a parser.
+- **Give defaults to type parameters people may pass explicitly**: `createEmitter<Events = Record<string, unknown>>()` works for quick scripts and for users who spell out their event map.
+- **Use `const` type parameters** when literal types matter, like `defineSchema` in the last lesson, so users don't have to write `as const`.
+- **Don't be too clever.** If the inferred type on hover takes a screen to read, users can't debug their own mistakes. A slightly less precise type with clear errors usually wins.
+
+## Options objects, overloads and unions
+
+Positional parameters are fine for one or two required values. Beyond that, call sites stop explaining themselves. What does this do?
+
+```ts
+paginate(items, 2, 10, true);
+```
+
+The famous **boolean trap**: nobody reading it knows what `true` means, and swapping `2` and `10` still compiles. An **options object** names everything, makes optional values easy, and, crucially for libraries, can grow: adding a new **optional** property never breaks existing callers.
+
+When a function accepts different shapes, you have three tools. Choose by asking how the **return type** depends on the input:
+
+- **Same return type for every input** → a **union parameter**: `format(value: string | number): string`.
+- **Return type follows the input type** → a **generic**: `first<T>(items: readonly T[]): T | undefined`.
+- **Return type depends on which shape you pass**, in a few discrete cases → **overloads**.
+
+<CodeExample output={`Kim [ 'Mei', 'Ana' ]
+[ 'Mei', 'Ana', 'Kim' ]
+[ 'Kim', 'Ana' ]`}>
+
+```ts
+interface User {
+  id: string;
+  name: string;
+  joined: number; // year
+}
+
+const users = new Map<string, User>([
+  ["u1", { id: "u1", name: "Mei", joined: 2021 }],
+  ["u2", { id: "u2", name: "Kim", joined: 2024 }],
+  ["u3", { id: "u3", name: "Ana", joined: 2023 }],
+]);
+
+// Overloads: the return type depends on the argument's shape
+function getUsers(id: string): User | undefined;
+function getUsers(ids: readonly string[]): User[];
+function getUsers(
+  idOrIds: string | readonly string[],
+): User | undefined | User[] {
+  if (typeof idOrIds === "string") return users.get(idOrIds);
+  return idOrIds.flatMap((id) => users.get(id) ?? []);
+}
+
+// An options object: named, optional, easy to extend later
+interface ListOptions {
+  newestFirst?: boolean;
+  limit?: number;
+}
+
+function listUsers(options: ListOptions = {}): string[] {
+  const { newestFirst = false, limit = Infinity } = options;
+  return [...users.values()]
+    .sort((a, b) =>
+      newestFirst ? b.joined - a.joined : a.joined - b.joined,
+    )
+    .slice(0, limit)
+    .map((user) => user.name);
+}
+
+const one = getUsers("u2");   // User | undefined
+const many = getUsers(["u1", "u3", "u9"]); // User[]
+console.log(one?.name, many.map((user) => user.name));
+console.log(listUsers());
+console.log(listUsers({ newestFirst: true, limit: 2 }));
+```
+
+</CodeExample>
+
+Callers only see the two overload signatures; the third, the **implementation signature**, is invisible from outside. Overloads have one big limitation: they're checked one at a time, so a caller holding a `string | string[]` can't call `getUsers` at all:
+
+```ts
+declare const input: string | string[];
+getUsers(input);
+// ❌ Error: No overload matches this call.
+```
+
+If callers will commonly have the union, add a third overload `(idOrIds: string | readonly string[]): User | User[] | undefined` for them, or rethink the API (two functions, `getUser` and `getUsers`, are often clearer than one clever one).
+
+## Semver for types
+
+Semantic versioning says: **major** for breaking changes, **minor** for new features, **patch** for fixes. For a TypeScript library, "breaking" includes changes that make a user's correct code **stop compiling**. Whether a change breaks depends on which **direction** the type flows, the same covariance and contravariance you met in [Variance & Inference](/learn/typescript/variance-and-inference):
+
+| Change | Breaking? |
+| --- | --- |
+| Remove or rename an exported value **or type** | Yes |
+| Add a **required** property to an input/options type | Yes |
+| Add an **optional** property to an options type | No |
+| Make a parameter type **narrower** (`string \| number` → `string`) | Yes |
+| Make a parameter type **wider** (`string` → `string \| number`) | No |
+| Make a return type **wider** (`User` → `User \| undefined`) | Yes |
+| Make a return type **narrower** | Usually no |
+| Add a member to an interface users **implement** | Yes |
+| Add a member to an interface users only **read** | No |
+| Add a member to a union users **receive** (a status, an event kind) | In practice, yes: it breaks exhaustive switches |
+| Add a type parameter **without** a default | Yes (with a default: no) |
+| Require a newer TypeScript version | Yes, unless you've published a support policy |
+
+Here's what three of those look like in a user's code that compiled fine against version 1:
+
+```ts
+// v2 added teardown() to the Plugin interface
+const logger: Plugin = { name: "logger", setup(app) { /* … */ } };
+// ❌ Error: Property 'teardown' is missing in type '{ name: string; setup(app: App): void; }' but required in type 'Plugin'.
+
+// v2: findUser now returns User | null
+const user = findUser("u1");
+console.log(user.name.toUpperCase());
+// ❌ Error: 'user' is possibly 'null'.
+
+// v2 added "suspended" to Status
+default:
+  return assertNever(status);
+// ❌ Error: Argument of type '"suspended"' is not assignable to parameter of type 'never'.
+```
+
+The last one is the most debated. Adding a union member is "just a new feature" from the library's point of view, but every user who followed good practice and wrote an exhaustive `switch` gets a compile error. Some libraries treat it as breaking; others document up front that "new event kinds may be added in minor versions, handle unknown kinds". Either is fine; **deciding and writing it down** is what matters. The community spec at semver-ts.org spells out these rules in detail, including how to handle TypeScript version support.
+
+<Callout type="tip" title="Make breaking changes visible in review">
+
+Tools can catch these before release. **API Extractor** writes your package's whole public type surface to a report file (`etc/my-lib.api.md`) that's committed to the repo, so any change to the public types shows up as a diff in the pull request, where a reviewer asks "is this breaking?". **Type tests** ([Testing Types](/learn/typescript/testing-types)) pin down what must and must not compile. Together they turn "we accidentally broke 40 builds" into a red CI check.
+
+</Callout>
+
+## Deprecating without breaking
+
+Removing an API is a **three-step** process, spread over releases:
+
+1. **Add** the replacement (minor release). Both work.
+2. **Deprecate** the old one (minor release): a `@deprecated` JSDoc tag, a runtime warning **once**, a line in the changelog, ideally a codemod.
+3. **Remove** it (next major release), with a migration guide.
+
+Here a client library renames `makeClient(url, timeout)` to `createClient({ baseUrl, timeoutMs })`. The old function stays, delegates to the new one, and tells its callers how to move on:
+
+<CodeExample output={`DeprecationWarning: makeClient(url, timeout) is now createClient({ baseUrl })
+https://api.pandadev.test, timeout 5000 ms
+https://api.pandadev.test, timeout 1000 ms
+https://api.pandadev.test, timeout 5000 ms`}>
+
+```ts
+interface ClientOptions {
+  baseUrl: string;
+  timeoutMs?: number;
+}
+
+interface Client {
+  describe(): string;
+}
+
+// v3.2: the new API
+function createClient(options: ClientOptions): Client {
+  const { baseUrl, timeoutMs = 5_000 } = options;
+  return { describe: () => `${baseUrl}, timeout ${timeoutMs} ms` };
+}
+
+const warned = new Set<string>();
+function deprecate(id: string, message: string): void {
+  if (warned.has(id)) return; // once per process, not per call
+  warned.add(id);
+  console.warn(`DeprecationWarning: ${message}`);
+}
+
+/**
+ * @deprecated Use `createClient({ baseUrl, timeoutMs })`.
+ * makeClient will be removed in v4.0.
+ */
+function makeClient(baseUrl: string, timeoutMs?: number): Client {
+  deprecate(
+    "makeClient",
+    "makeClient(url, timeout) is now createClient({ baseUrl })",
+  );
+  return createClient({ baseUrl, timeoutMs });
+}
+
+// Old code keeps working, and is told once how to move on
+const a = makeClient("https://api.pandadev.test");
+const b = makeClient("https://api.pandadev.test", 1_000);
+const c = createClient({ baseUrl: "https://api.pandadev.test" });
+console.log(a.describe());
+console.log(b.describe());
+console.log(c.describe());
+```
+
+</CodeExample>
+
+The `@deprecated` tag is understood by TypeScript itself: editors show `makeClient` struck through at every call site with the message on hover, and typescript-eslint's **`no-deprecated`** rule turns it into a lint error you can switch on when you're ready to finish the migration. It also works on a **single overload**, so you can deprecate one old calling style while keeping the function. The runtime warning is for JavaScript users and for code that's never opened in an editor; warn **once**, not on every call, or your users' logs fill up and they'll silence it. (Node has `util.deprecate(fn, message)` built in for exactly this.)
+
+## Migrating JavaScript to TypeScript
+
+This section is the technical playbook; leading the people side of it is the topic of [Leading TypeScript Adoption](/learn/typescript/leading-typescript-adoption). Big-bang rewrites of large JavaScript codebases rarely finish: features keep landing on the old code while the rewrite branch rots. Successful migrations are **incremental**, ship every day, and are measured. The usual path:
+
+**1. Add TypeScript without changing any files.** A tsconfig that lets `.js` and `.ts` live together, and `tsc --noEmit` in CI from day one:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "strict": true,
+    "module": "nodenext",
+    "target": "es2022"
+  },
+  "include": ["src"]
+}
+```
+
+`allowJs` lets TypeScript files import JavaScript files (and gives them inferred types). `checkJs: false` means JavaScript files aren't type-checked yet, so CI is green on day one.
+
+**2. Check JavaScript files one at a time** with a `// @ts-check` comment at the top, and add types as **JSDoc**. This catches real bugs before a single file is renamed. Here's real `tsc` output for this file:
+
+```js title="src/cart.js"
+// @ts-check
+
+/**
+ * @typedef {object} LineItem
+ * @property {string} sku
+ * @property {number} cents
+ * @property {number} [qty] defaults to 1
+ */
+
+/**
+ * @param {LineItem[]} items
+ * @returns {number}
+ */
+export function total(items) {
+  return items.reduce(
+    (sum, item) => sum + item.cent * (item.qty ?? 1),
+    0,
+  );
+}
+
+total([{ sku: "tea", cents: "450" }]);
+```
+
+```text
+src/cart.js(16,31): error TS2551: Property 'cent' does not exist on type 'LineItem'. Did you mean 'cents'?
+src/cart.js(21,22): error TS2322: Type 'string' is not assignable to type 'number'.
+```
+
+Why not set `checkJs: true` for everything at once? Because with `strict`, every untyped parameter in every old file becomes an error (`error TS7006: Parameter 'a' implicitly has an 'any' type.`), thousands of them, and the team learns to ignore the type checker on day two.
+
+**3. Rename files to `.ts` from the leaves up.** Start with modules that import nothing of yours (utilities, domain rules), then the code that uses them. Each converted file gives its callers real types, so the work compounds. Keep each pull request small and **pure**: a rename plus types, no behaviour changes, so reviewers can approve it quickly.
+
+**4. Ratchet the strictness.** If `strict` is too much at first, start with it off and turn on flags one at a time (`noImplicitAny`, then `strictNullChecks`, the biggest one, then the rest). Or turn `strict` on for everything and suppress the existing errors with comments, so that **new** code is strict from day one. Tools like ts-migrate (from Airbnb) do that mechanically: convert files, add `any` and `@ts-expect-error` comments until it compiles, and leave the clean-up for later.
+
+**5. Budget the escape hatches.** During a migration, prefer `@ts-expect-error` over `@ts-ignore`: when someone fixes the underlying problem, `@ts-expect-error` itself becomes an error (*Unused '@ts-expect-error' directive.*), so the budget can only shrink. Make every suppression explain itself with typescript-eslint:
+
+```js
+// in eslint.config.mjs
+rules: {
+  "@typescript-eslint/ban-ts-comment": ["error", {
+    "ts-ignore": true,
+    "ts-expect-error": "allow-with-description",
+  }],
+},
+```
+
+**6. Use codemods for repetitive changes.** Renaming an API across 600 files, or replacing a deprecated call, is a job for a script, not for people. **ts-morph** wraps the compiler API so a codemod understands types and references, not just text:
+
+```ts title="scripts/rename-make-client.ts"
+import { Project } from "ts-morph";
+
+const project = new Project({ tsConfigFilePath: "tsconfig.json" });
+const file = project.getSourceFileOrThrow("src/client.ts");
+
+// Renames the declaration AND every reference, like F2 in VS Code
+file.getFunctionOrThrow("makeClient").rename("createClient");
+await project.save();
+```
+
+Libraries ship codemods like this with their major releases (`npx @my-lib/codemod v4`), which turns a breaking change from a week of work into a reviewed diff.
+
+## Measuring progress
+
+A migration needs numbers, both to know you're moving and to show the people who pay for it. Useful ones: the share of files that are TypeScript, the number of `any`s (or the **type coverage** percentage from the `type-coverage` package, which counts identifiers typed as `any`), the number of `@ts-expect-error` comments, and which `strict` flags are on. The trick that keeps them moving the right way is a **ratchet**: CI stores a baseline and fails if any number gets **worse**, and when a number improves, the baseline is updated so it can't creep back:
+
+<CodeExample output={`{ jsFiles: 2, anys: 2, expectErrors: 1 }
+[]
+[ 'anys went up: 2 → 3' ]`}>
+
+```ts
+interface Metrics {
+  jsFiles: number;
+  anys: number;
+  expectErrors: number;
+}
+
+// A tiny stand-in for the repo: path → source code
+const repo: Record<string, string> = {
+  "src/cart.ts": "export function total(items: Item[]) { /*…*/ }",
+  "src/legacy/report.js": "module.exports = function report(x) {}",
+  "src/api.ts": [
+    "const data = (await res.json()) as any;",
+    "// @ts-expect-error: old SDK types are wrong",
+    "sdk.connect(options);",
+  ].join("\n"),
+  "src/legacy/csv.js": "export function parseCsv(text) {}",
+  "src/user.ts": "function load(raw: any): User { /*…*/ }",
+};
+
+function count(text: string, pattern: RegExp): number {
+  return text.match(pattern)?.length ?? 0;
+}
+
+function measure(files: Record<string, string>): Metrics {
+  const sources = Object.entries(files);
+  return {
+    jsFiles: sources.filter(([path]) => path.endsWith(".js")).length,
+    anys: sources.reduce(
+      (n, [, text]) => n + count(text, /\bany\b/g),
+      0,
+    ),
+    expectErrors: sources.reduce(
+      (n, [, text]) => n + count(text, /@ts-expect-error/g),
+      0,
+    ),
+  };
+}
+
+// The ratchet: numbers may go down, never up
+function ratchet(baseline: Metrics, now: Metrics): string[] {
+  // Object.keys returns string[]; these are Metrics' own keys
+  const keys = Object.keys(baseline) as (keyof Metrics)[];
+  return keys
+    .filter((key) => now[key] > baseline[key])
+    .map((key) => `${key} went up: ${baseline[key]} → ${now[key]}`);
+}
+
+const baseline: Metrics = { jsFiles: 3, anys: 2, expectErrors: 1 };
+const now = measure(repo);
+console.log(now);
+console.log(ratchet(baseline, now)); // [] → CI passes
+
+// Someone adds a quick fix with any…
+repo["src/cart.ts"] += "\nconst discount: any = getDiscount();";
+console.log(ratchet(baseline, measure(repo))); // CI fails
+```
+
+</CodeExample>
+
+A regular expression is crude (it would count "any" in a comment), but for a ratchet it doesn't matter: the same rule measures the baseline and today. Tools such as **Betterer** do this properly for real repos. And know when to stop: the goal is fewer production bugs and safer refactors, not 100% on a dashboard. Some old, stable, rarely touched code can stay JavaScript with JSDoc for years.
+
+<Callout type="warning" title="Don't migrate and refactor at the same time">
+
+The most common way migrations go wrong: "while I'm converting this file, I'll also clean it up". Now a type change and a behaviour change are mixed in one diff, a bug slips through review, and the team decides "TypeScript caused an outage". Convert first, with no behaviour changes and the tests green; refactor in a separate pull request, now with the compiler on your side.
+
+</Callout>
+
+<Quiz
+  question="A library exports interface Plugin { name: string; setup(app: App): void }, and users write their own plugin objects of that type. Version 2.4.0 adds a required teardown(): void method to Plugin. What happens?"
+  options={[
+    "Nothing breaks: adding a member is a new feature, so a minor version is right",
+    "Every user's plugin stops compiling because teardown is missing, so it needs a major version (or teardown should be optional)",
+    "Only JavaScript users are affected, because TypeScript users get a default teardown",
+    "Nothing breaks until a user calls teardown",
+  ]}
+  answer={1}
+  explanation="Users create Plugin values, so for them Plugin is an input they must satisfy. A new required member makes their existing objects incomplete. Adding it as optional (teardown?(): void) is the non-breaking way to ship it in a minor version. If users only read Plugin values your library creates, a new member would be harmless."
+/>
+
+<Quiz
+  question="Why do migrations prefer // @ts-expect-error over // @ts-ignore for suppressing existing errors?"
+  options={[
+    "@ts-expect-error is faster for the compiler",
+    "@ts-ignore doesn't work in .ts files",
+    "@ts-expect-error becomes an error itself once the line no longer has an error, so fixed suppressions get removed and the budget only shrinks",
+    "@ts-expect-error also turns off ESLint for that line",
+  ]}
+  answer={2}
+  explanation="A @ts-ignore stays forever, even after the problem is fixed, silently hiding any new error on that line. @ts-expect-error reports 'Unused @ts-expect-error directive', so every fix removes its comment and the count goes down."
+/>
+
+<Exercise
+  title="Version 2 without breaking version 1"
+  language="typescript"
+  starter={`// ---------- helpers (done) ----------
+type Currency = "EUR" | "USD" | "GBP";
+
+const SYMBOLS: Record<Currency, string> = {
+  EUR: "€",
+  USD: "$",
+  GBP: "£",
+};
+
+function isCurrency(code: string): code is Currency {
+  return code in SYMBOLS;
+}
+
+const warned = new Set<string>();
+function deprecate(id: string, message: string): void {
+  if (warned.has(id)) return;
+  warned.add(id);
+  console.warn(\`DeprecationWarning: \${message}\`);
+}
+
+const OLD_STYLE =
+  "formatMoney(cents, currency, symbol) is deprecated: " +
+  "use formatMoney(cents, { currency, symbol })";
+
+// ---------- v1: thousands of calls depend on this ----------
+// TODO: turn it into v2 without breaking any of them
+function formatMoney(
+  cents: number,
+  currency: string,
+  symbol = true,
+): string {
+  const amount = (cents / 100).toFixed(2);
+  if (symbol && isCurrency(currency)) {
+    return SYMBOLS[currency] + amount;
+  }
+  return amount + " " + currency;
+}
+
+// ---------- type tests (don't change them) ----------
+function typeTests(): void {
+  formatMoney(100); // v2 with defaults
+  formatMoney(100, { currency: "USD" });
+  formatMoney(100, { symbol: false });
+  formatMoney(100, "CHF", false); // v1 calls still compile
+  formatMoney(100, "EUR");
+  // @ts-expect-error: v2 only accepts known currencies
+  formatMoney(100, { currency: "CHF" });
+  // @ts-expect-error: a typo in an option name
+  formatMoney(100, { curency: "USD" });
+  // @ts-expect-error: symbol goes inside the options object
+  formatMoney(100, { currency: "USD" }, false);
+  // @ts-expect-error: no signature takes four arguments
+  formatMoney(100, "EUR", true, "extra");
+}
+
+// ---------- try it ----------
+console.log(formatMoney(1250));
+console.log(formatMoney(1250, { currency: "USD" }));
+console.log(formatMoney(1250, { currency: "GBP", symbol: false }));
+console.log(formatMoney(1250, "EUR")); // old code
+console.log(formatMoney(1250, "CHF", true)); // old code again
+`}
+  tests={[
+    { name: "The type tests compile (no unused @ts-expect-error)", check: `true` },
+    { name: "v2: an options object with defaults (EUR, with symbol)", check: `formatMoney(1250) === "€12.50" && formatMoney(99, {}) === "€0.99" && formatMoney(500, { currency: "GBP" }) === "£5.00" && formatMoney(1, { currency: "USD", symbol: false }) === "0.01 USD" && formatMoney(1999, { symbol: false }) === "19.99 EUR"` },
+    { name: "v1 calls behave exactly as before", check: `formatMoney(1250, "USD") === "$12.50" && formatMoney(300, "EUR", false) === "3.00 EUR" && formatMoney(1250, "CHF") === "12.50 CHF" && formatMoney(1250, "CHF", true) === "12.50 CHF" && formatMoney(7, "GBP", true) === "£0.07"` },
+    { name: "Old-style calls warn once; new-style calls never warn", check: `(() => { warned.clear(); formatMoney(100, { currency: "USD" }); formatMoney(100); const quiet = warned.size === 0; formatMoney(100, "USD"); formatMoney(200, "EUR", false); return quiet && warned.size === 1; })()` },
+  ]}
+>
+
+`formatMoney(cents, currency, symbol)` is used thousands of times across the company, and its positional booleans keep causing bugs. Design **version 2** of its API without breaking a single version-1 call:
+
+1. Add an **`interface FormatOptions`** with optional `currency` (a `Currency`, default `"EUR"`) and `symbol` (default `true`).
+2. Turn `formatMoney` into **two overloads** plus an implementation: the new `formatMoney(cents: number, options?: FormatOptions): string` first, then the old `formatMoney(cents: number, currency: string, symbol?: boolean): string` with a **`@deprecated`** JSDoc comment. Keep the old one's `currency: string`: narrowing a parameter type is a breaking change, so old calls with `"CHF"` must still compile and still print `"12.50 CHF"`.
+3. In the implementation, when the second argument is a string, call `deprecate("formatMoney-positional", OLD_STYLE)` before formatting; the helper makes sure the warning appears only once. New-style calls must never warn.
+
+Formatting doesn't change: with a symbol and a known currency `"€12.50"`, otherwise `"12.50 CHF"`. The type tests at the bottom check the API's shape: v1 calls must compile, and unknown currencies, misspelled options and mixing both styles must not.
+
+<Hint>
+
+Write the two overload signatures (no bodies), then the implementation: `function formatMoney(cents: number, currencyOrOptions: string | FormatOptions = {}, symbol = true): string`. Narrow with `typeof currencyOrOptions === "string"` for the old style. For the new style, destructure with defaults: `const { currency = "EUR", symbol: showSymbol = true } = currencyOrOptions;` (renamed, because `symbol` is already a parameter). Move the old formatting code into a small helper so both paths share it.
+
+</Hint>
+
+<Solution>
+
+```ts
+// ---------- helpers (done) ----------
+type Currency = "EUR" | "USD" | "GBP";
+
+const SYMBOLS: Record<Currency, string> = {
+  EUR: "€",
+  USD: "$",
+  GBP: "£",
+};
+
+function isCurrency(code: string): code is Currency {
+  return code in SYMBOLS;
+}
+
+const warned = new Set<string>();
+function deprecate(id: string, message: string): void {
+  if (warned.has(id)) return;
+  warned.add(id);
+  console.warn(`DeprecationWarning: ${message}`);
+}
+
+const OLD_STYLE =
+  "formatMoney(cents, currency, symbol) is deprecated: " +
+  "use formatMoney(cents, { currency, symbol })";
+
+// ---------- v2 ----------
+interface FormatOptions {
+  /** Defaults to "EUR". */
+  currency?: Currency;
+  /** Show "€12.50" (true, the default) or "12.50 EUR". */
+  symbol?: boolean;
+}
+
+function formatMoney(cents: number, options?: FormatOptions): string;
+/**
+ * @deprecated Use `formatMoney(cents, { currency, symbol })`.
+ * Will be removed in v3.0.
+ */
+function formatMoney(
+  cents: number,
+  currency: string,
+  symbol?: boolean,
+): string;
+function formatMoney(
+  cents: number,
+  currencyOrOptions: string | FormatOptions = {},
+  symbol = true,
+): string {
+  if (typeof currencyOrOptions === "string") {
+    deprecate("formatMoney-positional", OLD_STYLE);
+    return format(cents, currencyOrOptions, symbol);
+  }
+  const { currency = "EUR", symbol: showSymbol = true } =
+    currencyOrOptions;
+  return format(cents, currency, showSymbol);
+}
+
+function format(cents: number, currency: string, symbol: boolean) {
+  const amount = (cents / 100).toFixed(2);
+  if (symbol && isCurrency(currency)) {
+    return SYMBOLS[currency] + amount;
+  }
+  return amount + " " + currency;
+}
+
+// ---------- type tests (don't change them) ----------
+function typeTests(): void {
+  formatMoney(100); // v2 with defaults
+  formatMoney(100, { currency: "USD" });
+  formatMoney(100, { symbol: false });
+  formatMoney(100, "CHF", false); // v1 calls still compile
+  formatMoney(100, "EUR");
+  // @ts-expect-error: v2 only accepts known currencies
+  formatMoney(100, { currency: "CHF" });
+  // @ts-expect-error: a typo in an option name
+  formatMoney(100, { curency: "USD" });
+  // @ts-expect-error: symbol goes inside the options object
+  formatMoney(100, { currency: "USD" }, false);
+  // @ts-expect-error: no signature takes four arguments
+  formatMoney(100, "EUR", true, "extra");
+}
+
+// ---------- try it ----------
+console.log(formatMoney(1250));
+console.log(formatMoney(1250, { currency: "USD" }));
+console.log(formatMoney(1250, { currency: "GBP", symbol: false }));
+console.log(formatMoney(1250, "EUR")); // old code
+console.log(formatMoney(1250, "CHF", true)); // old code again
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Design for the **call site**: users shouldn't need type arguments. Infer from arguments they write anyway, use `NoInfer` where a value should be checked rather than inferred from, name your return types, and make sure each type parameter appears at least twice.
+- Prefer **options objects** over long positional lists and boolean flags; adding an optional property never breaks callers. Choose a union, a generic or **overloads** by how the return type depends on the input, and remember overloads don't accept unions of their parameter types.
+- **Types are API.** Narrowing inputs, widening outputs, adding required members to types users implement, removing exports and adding union members users switch over all break users. Decide your policy, write it down, and catch changes with API reports and type tests.
+- Deprecate in three steps: add the replacement, deprecate with `@deprecated` + a once-only runtime warning + a codemod, remove in the next major.
+- Migrate JavaScript **incrementally**: `allowJs` and `tsc --noEmit` in CI first, `// @ts-check` + JSDoc per file, rename leaves first, ratchet strictness, budget suppressions with `@ts-expect-error`, and use codemods for repetitive changes.
+- **Measure** with a ratchet (JS files, `any`s, suppressions, type coverage) that can only improve, and don't mix migration with refactoring.

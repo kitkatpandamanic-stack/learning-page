@@ -1,0 +1,667 @@
+---
+title: "Building Your Own Utility Types"
+description: "Build DeepReadonly, DeepPartial, PickByValue, RequireAtLeastOne, UnionToIntersection and Simplify, test them with type tests, and know when recursive types cost too much."
+duration: 24
+xp: 25
+---
+
+In [Advanced Types](/learn/typescript/mapped-types) you rebuilt `Partial`, `Pick` and `Mutable` and filtered keys by their value type. Real codebases soon need more: config overrides that reach deep into nested objects, search forms that need **at least one** filter, plugin systems whose APIs merge into one object. In this lesson you'll build the utility types behind those jobs, the way libraries such as `type-fest` do it: every type with **type tests** next to it, and every design decision written down. 🧰
+
+A word of warning from experience first. One team's `types/helpers.ts` grew to 400 lines of clever types with no tests. When TypeScript was upgraded, two of them quietly changed meaning, half the "type-safe" API turned into `any`, and nobody noticed for a month. Utility types are code. Test them, keep them small, and know when to stop.
+
+## The workbench: types with tests
+
+You know the two helpers from [Testing Types](/learn/typescript/testing-types): `Equal<A, B>` is `true` only when two types are identical, and `Expect` turns a `false` into a compile error. Every type in this lesson gets a `type cases = [...]` list, and so should every utility type you write at work.
+
+Tests do more than catch regressions. They force you to **decide** what a type should do in the awkward cases. What should a "deep partial" do with an array? With a function? With a `Date`? There's no single right answer, but there should be a **written-down** answer, and a test case is the best place for it.
+
+## Going deep: `DeepReadonly`
+
+`Readonly<T>` is shallow: `config.server` can't be replaced, but `config.server.port` can. A **deep** version has to call itself for every property, and that takes a conditional type to decide what to do with each kind of value:
+
+```ts
+type DeepReadonly<T> =
+  T extends (...args: any[]) => unknown ? T // functions: keep
+  : T extends object
+    ? { readonly [K in keyof T]: DeepReadonly<T[K]> } // recurse
+    : T; // primitives: done
+```
+
+Three decisions hide in those lines:
+
+1. **Functions stay as they are.** A function is an `object` too, and mapping over its keys would throw away its call signature, so `config.log("hi")` would stop compiling.
+2. **Arrays and tuples** go through the object branch. A homomorphic mapped type maps an array element by element, so `string[]` becomes `readonly string[]` and a tuple stays a tuple.
+3. **Primitives** end the recursion. Without that exit, the type would never finish.
+
+Now TypeScript protects the whole tree:
+
+```ts
+interface AppConfig {
+  server: { host: string; port: number };
+  features: string[];
+  log: (message: string) => void;
+}
+
+declare const config: DeepReadonly<AppConfig>;
+
+config.server.port = 80;
+// ❌ Error: Cannot assign to 'port' because it is a read-only property.
+config.features.push("beta");
+// ❌ Error: Property 'push' does not exist on type 'readonly string[]'.
+config.log("functions still work"); // ✅
+```
+
+(`declare const` describes a value without creating it: handy in type-only examples like this one.) Remember that this is only a **type**: the object itself can still be changed at runtime by code that doesn't use it. Pair it with `Object.freeze` when that matters; you'll write a deep freeze in the exercise.
+
+## `DeepPartial` and deep merging
+
+The most common use for a deep type is **configuration**: sensible defaults, plus small overrides per environment. The override may mention any property at any depth. That's `DeepPartial`, and this time the array decision is different on purpose: most config systems **replace** arrays rather than merging them item by item, so the type does the same:
+
+<CodeExample output={`{ url: 'postgres://localhost/dev', pool: { min: 1, max: 50 } }
+3000 [ 'search' ]`}>
+
+```ts
+type DeepPartial<T> =
+  T extends (...args: any[]) => unknown ? T
+  : T extends readonly unknown[] ? T // arrays are replaced whole
+  : T extends object ? { [K in keyof T]?: DeepPartial<T[K]> }
+  : T;
+
+interface Config {
+  server: { host: string; port: number };
+  db: { url: string; pool: { min: number; max: number } };
+  features: string[];
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function deepMerge<T>(base: T, patch: DeepPartial<T>): T {
+  if (!isPlainObject(base) || !isPlainObject(patch)) {
+    return (patch === undefined ? base : patch) as T;
+  }
+  const result: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) result[key] = deepMerge(base[key], value);
+  }
+  return result as T;
+}
+
+const defaults: Config = {
+  server: { host: "localhost", port: 3000 },
+  db: { url: "postgres://localhost/dev", pool: { min: 1, max: 5 } },
+  features: [],
+};
+
+const production = deepMerge(defaults, {
+  db: { pool: { max: 50 } },
+  features: ["search"],
+});
+
+console.log(production.db);
+console.log(production.server.port, production.features);
+```
+
+</CodeExample>
+
+The runtime merge walks the objects with `unknown` values, so it needs two casts; the **signature** is what callers see, and it's precise. Wrong types and misspelt keys are caught at any depth:
+
+```ts
+deepMerge(defaults, { db: { pool: { max: "50" } } });
+// ❌ Error: Type 'string' is not assignable to type 'number'.
+deepMerge(defaults, { db: { pol: { max: 50 } } });
+// ❌ Error: Object literal may only specify known properties, but 'pol' does not exist in type '{ url?: string | undefined; pool?: { min?: number | undefined; max?: number | undefined; } | undefined; }'. Did you mean to write 'pool'?
+```
+
+<Callout type="warning" title="Deep types meet built-in objects">
+
+To a deep type, a `Date` is just an object with methods. `DeepPartial<{ publishedAt: Date }>` makes every one of those methods optional, so `{ publishedAt: {} }` compiles happily, and `.getTime()` crashes later. The same happens with `Map`, `Set`, `RegExp` and class instances. Production versions keep a list of types to leave alone (`T extends Date | RegExp | Map<unknown, unknown> | ... ? T`), and that list is one of the reasons to use a well-tested library instead of your own.
+
+</Callout>
+
+## Filtering by value: `PickByValue` and `OmitByValue`
+
+In [Mapped Types](/learn/typescript/mapped-types) you selected keys by the type of their value with `as ... ? K : never`. Wrap that in two utilities, `PickByValue` and `OmitByValue`, and the first test you write exposes a trap: **optional properties**. Under `strict`, `bio?: string` has the type `string | undefined`, and `string | undefined extends string` is false. The naive version silently drops every optional field:
+
+```ts
+type NaivePickByValue<T, V> = {
+  [K in keyof T as T[K] extends V ? K : never]: T[K];
+};
+
+interface Profile {
+  id: number;
+  name: string;
+  bio?: string;
+  city?: string;
+  verified: boolean;
+}
+
+type Texts = NaivePickByValue<Profile, string>;
+// { name: string }: bio and city are gone!
+```
+
+The fix is to compare the value type **without** the `undefined` that `?` adds. That's a decision worth a test case:
+
+<CodeExample output={`{ id: 1, name: 'Mei', bio: 'Panda fan', verified: true }`}>
+
+```ts
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+// Optional properties count by their value type
+type PickByValue<T, V> = {
+  [K in keyof T as Exclude<T[K], undefined> extends V ? K : never]:
+    T[K];
+};
+type OmitByValue<T, V> = {
+  [K in keyof T as Exclude<T[K], undefined> extends V ? never : K]:
+    T[K];
+};
+
+interface Profile {
+  id: number;
+  name: string;
+  bio?: string;
+  city?: string;
+  verified: boolean;
+}
+
+type cases = [
+  Expect<Equal<
+    PickByValue<Profile, string>,
+    { name: string; bio?: string; city?: string }
+  >>,
+  Expect<Equal<
+    OmitByValue<Profile, string>,
+    { id: number; verified: boolean }
+  >>,
+];
+
+type TextField = keyof PickByValue<Profile, string>;
+
+function cleanText(profile: Profile): Profile {
+  const fields: TextField[] = ["name", "bio", "city"];
+  const copy = { ...profile };
+  for (const field of fields) {
+    const value = copy[field];
+    if (value !== undefined) copy[field] = value.trim();
+  }
+  return copy;
+}
+
+const mei: Profile = {
+  id: 1,
+  name: " Mei ",
+  bio: "Panda fan  ",
+  verified: true,
+};
+console.log(cleanText(mei));
+```
+
+</CodeExample>
+
+Add a `nickname?: string` to `Profile` and `TextField` grows with it. And if someone "simplifies" `PickByValue` back to the naive version, the first test case fails with **"Type 'false' does not satisfy the constraint 'true'."**
+
+<Quiz
+  question="With strict on, interface Item { title: string; note?: string }. Which keys does { [K in keyof Item as Item[K] extends string ? K : never]: Item[K] } keep?"
+  options={[
+    "Only title, because note's type is string | undefined",
+    "title and note, because both are strings",
+    "Only note, because it's optional",
+    "None: optional properties break mapped types",
+  ]}
+  answer={0}
+  explanation="The ? adds undefined to the property's type, and string | undefined doesn't extend string, so note is filtered out. Compare Exclude<Item[K], undefined> instead to keep optional properties."
+/>
+
+## `RequireAtLeastOne`
+
+A user search accepts an id, an email or a name, plus an optional `limit`. Every field is optional, so `findUsers({})` type-checks and returns... everyone? A union says what you actually mean: "at least one of these three". Writing that union by hand gets long, so derive it:
+
+<CodeExample output={`[ 'u1', 'u3' ]
+[ 'u1' ]
+[ 'u2' ]`}>
+
+```ts
+type RequireAtLeastOne<T, Keys extends keyof T = keyof T> =
+  Omit<T, Keys> &
+  {
+    [K in Keys]-?: Required<Pick<T, K>> &
+      Partial<Pick<T, Exclude<Keys, K>>>;
+  }[Keys];
+
+interface UserQuery {
+  id?: string;
+  email?: string;
+  name?: string;
+  limit?: number;
+}
+
+type UserSearch = RequireAtLeastOne<UserQuery, "id" | "email" | "name">;
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+}
+
+const users: User[] = [
+  { id: "u1", email: "mei@panda.dev", name: "Mei" },
+  { id: "u2", email: "sam@panda.dev", name: "Sam" },
+  { id: "u3", email: "mei.l@panda.dev", name: "Mei" },
+];
+
+function findUsers(search: UserSearch): User[] {
+  const found = users.filter(
+    (u) =>
+      (search.id === undefined || u.id === search.id) &&
+      (search.email === undefined || u.email === search.email) &&
+      (search.name === undefined || u.name === search.name),
+  );
+  return found.slice(0, search.limit ?? 10);
+}
+
+console.log(findUsers({ name: "Mei" }).map((u) => u.id));
+console.log(findUsers({ name: "Mei", limit: 1 }).map((u) => u.id));
+console.log(findUsers({ email: "sam@panda.dev" }).map((u) => u.id));
+```
+
+</CodeExample>
+
+The trick is a pattern worth knowing by name: **map, then index**. The mapped type builds an object whose **values** are the variants, one per key:
+
+```ts
+// {
+//   id:    { id: string }    & { email?: string; name?: string };
+//   email: { email: string } & { id?: string; name?: string };
+//   name:  { name: string }  & { id?: string; email?: string };
+// }
+```
+
+Indexing it with `[Keys]` collects those values into a **union**, and `Omit<T, Keys>` adds back the properties that weren't part of the deal (`limit`). The `-?` matters: without it, the variants for optional keys would include `undefined` and the union would let `{}` through.
+
+Now an empty search is a compile error. Look closely at the message for the second one, though:
+
+```ts
+findUsers({});
+// ❌ Error: Argument of type '{}' is not assignable to parameter of type 'UserSearch'.
+findUsers({ limit: 5 });
+// ❌ Error: Argument of type '{ limit: number; }' is not assignable to parameter of type 'UserSearch'.
+//   ...
+//   Property 'name' is missing in type '{ limit: number; }' but required in type 'Required<Pick<UserQuery, "name">>'.
+```
+
+"Property 'name' is missing" is technically true and practically misleading: `id` or `email` would do just as well. TypeScript reports against **one** member of the union, usually the last. That's the hidden cost of clever types: their error messages are written in the language of their implementation. Give the type a good name (`UserSearch`) and a comment, so the next person knows what the error really means.
+
+## `UnionToIntersection`
+
+Plugin systems often combine several objects into one. If the plugins are `{ log }`, `{ price }` and `{ shout }`, the result should have all three: an **intersection**. But a list of plugins gives you a **union** of their types (`P[number]`). Turning one into the other is a famous little type:
+
+<CodeExample output={`[log] ready
+£19.99 SALE`}>
+
+```ts
+type UnionToIntersection<U> =
+  (U extends unknown ? (arg: U) => void : never) extends
+  (arg: infer I) => void
+    ? I
+    : never;
+
+type Plugin = Record<string, (...args: any[]) => unknown>;
+
+function combine<P extends Plugin[]>(
+  ...plugins: P
+): UnionToIntersection<P[number]> {
+  return Object.assign({}, ...plugins);
+}
+
+const logger = { log: (msg: string) => `[log] ${msg}` };
+const money = {
+  price: (cents: number) => `£${(cents / 100).toFixed(2)}`,
+};
+const text = { shout: (s: string) => s.toUpperCase() };
+
+const kit = combine(logger, money, text);
+console.log(kit.log("ready"));
+console.log(kit.price(1999), kit.shout("sale"));
+```
+
+</CodeExample>
+
+How does it work? Two steps:
+
+1. `U extends unknown ? (arg: U) => void : never` **distributes** over the union (as you saw in [Conditional Types](/learn/typescript/conditional-types-and-infer)), giving a union of functions: `((arg: Logger) => void) | ((arg: Money) => void) | ...`.
+2. Then `infer I` asks: "what single parameter type would let this be **any** of those functions?" A value you pass must be acceptable to every one of them, so it must be a `Logger` **and** a `Money` **and** a `Text`. TypeScript infers the intersection.
+
+Step 2 works because function parameters are checked "backwards" (they're **contravariant**), which is exactly the topic of the [next lesson](/learn/typescript/variance-and-inference). Know its sharp edges before you use it:
+
+```ts
+type A = UnionToIntersection<{ a: 1 } | { b: 2 }>;
+// { a: 1 } & { b: 2 }
+type B = UnionToIntersection<"draft" | "live">; // never
+type C = UnionToIntersection<boolean>; // never: true & false
+```
+
+An intersection of two different literals (or of `true` and `false`) is impossible, so it collapses to `never`. That's correct, but surprising when a `boolean` sneaks into a union of options. Use `UnionToIntersection` for unions of **object** types, in library code, behind a well-named type.
+
+## `Simplify`: readable results
+
+Hover over `kit` in an editor, and you see `{ log: ... } & { price: ... } & { shout: ... }`. Correct, but hard to read, and with ten plugins it's unreadable. **`Simplify`** (some codebases call it `Prettify`) copies the properties into one flat object type:
+
+```ts
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+type WithId = { id: string };
+type WithTimestamps = { createdAt: string; updatedAt: string };
+type Post = WithId & WithTimestamps & { title: string };
+
+type Flat = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  title: string;
+};
+
+type cases = [
+  Expect<Equal<Simplify<Post>, Flat>>, // ✅
+  Expect<Equal<Post, Flat>>,
+  // ❌ Error: Type 'false' does not satisfy the constraint 'true'.
+];
+```
+
+The mapped type does the real work; the `& {}` is a nudge that makes editors show the expanded result instead of the alias name. Notice the second test case: `Equal` treats an intersection and the flat object as **different** types, even though the same values fit both (the surprise from [Testing Types](/learn/typescript/testing-types)). So `Simplify` earns its place twice: readable hovers, and exact type tests. Wrap results that are built from intersections: `Simplify<UnionToIntersection<P[number]>>`, `Simplify<RequireAtLeastOne<...>>`.
+
+## Recursion limits and compile-time cost
+
+You know the limits from [Conditional Types](/learn/typescript/conditional-types-and-infer): about 1,000 levels for tail-recursive types, about 50 otherwise, and then **"Type instantiation is excessively deep and possibly infinite."** Deep utility types are where real projects meet that message, often far from where the problem is. Here's one that bit a team using the `DeepReadonly` from earlier on a recursive JSON type:
+
+```ts
+type Json =
+  | string
+  | number
+  | boolean
+  | null
+  | Json[]
+  | { [key: string]: Json };
+
+type FrozenJson = DeepReadonly<Json>;
+// ❌ Error: Type instantiation is excessively deep and possibly infinite.
+```
+
+The data isn't deep at all; the **type** is infinite, and the mapped type over `Json[]` keeps expanding it. A dedicated array branch that uses the named generic `ReadonlyArray` gives TypeScript a type it can stop at and reuse:
+
+```ts
+type DeepReadonly<T> =
+  T extends (...args: any[]) => unknown ? T
+  : T extends readonly (infer E)[] ? ReadonlyArray<DeepReadonly<E>>
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+  : T;
+
+type FrozenJson = DeepReadonly<Json>; // ✅ fine now
+```
+
+Every fix has a price: with this version, a tuple `[string, number]` becomes `readonly (string | number)[]`. Pick the trade-off your data needs, and **write a test case** for it.
+
+Even when a type compiles, it costs time. TypeScript computes every new **instantiation** (each `DeepPartial<X>` for a new `X`) and caches it. One `DeepPartial<Config>` is nothing. `DeepPartial` of a 300-endpoint API schema, used in 500 files, can add seconds to every keystroke in the editor. To see what your types cost, ask the compiler:
+
+```bash
+npx tsc --noEmit --extendedDiagnostics
+# ...
+# Instantiations:      1843921   ← watch this number grow
+# Check time:            11.84s
+```
+
+Habits that keep it fast:
+
+- **Apply deep types at the edges** (the config loader, the test factory), not on every internal function.
+- **Name intermediate results** (`type UserSearch = ...`) so they're computed once and read easily.
+- **Annotate return types** of functions that return big derived types, so TypeScript doesn't re-infer them for every caller.
+
+<Callout type="tip" title="Reach for a library first">
+
+Every type in this lesson exists, battle-tested, in **type-fest**: `PartialDeep`, `ReadonlyDeep`, `ConditionalPick`, `RequireAtLeastOne`, `UnionToIntersection`, `Simplify` and many more. They handle the built-ins, tuples and edge cases you haven't hit yet. `npm i -D type-fest` and `import type { PartialDeep } from "type-fest"` cost nothing at runtime, because it ships only types. Write your own when you need different semantics, and then test it as carefully as the library does.
+
+</Callout>
+
+When **not** to build one? When a plain type written out by hand would be shorter. When only one place uses it. When the error messages it produces would confuse your team more than the bug it prevents. A senior engineer's utility types file is short, tested, and boring.
+
+<Quiz
+  question="Why does type DeepReadonly<T> = T extends (...args: any[]) => unknown ? T : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T have a separate branch for functions?"
+  options={[
+    "Functions are primitives, so they would end the recursion anyway",
+    "Mapping over a function's keys would lose its call signature, so it could no longer be called",
+    "Functions can't be read-only in JavaScript",
+    "It makes the type faster, but the result is the same",
+  ]}
+  answer={1}
+  explanation="A function is an object, so without the branch it would go through the mapped type, which keeps only its properties (like length and name) and drops the call signature. config.log('hi') would stop compiling."
+/>
+
+<Exercise
+  title="Your own utility belt"
+  language="typescript"
+  starter={`// ===== Type-test helpers: don't change =====
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+// 1. Read-only at every depth. Functions stay as they are,
+//    arrays become read-only arrays.
+type DeepReadonly<T> = T;
+
+// 2. The keys of T whose values are assignable to V
+type KeysByValue<T, V> = keyof T;
+
+// 3. T, but at least one of Keys must be there
+type RequireAtLeastOne<T, Keys extends keyof T = keyof T> = T;
+
+// 4. Freeze value and every object and array inside it,
+//    then return it
+function freezeDeep<T>(value: T): DeepReadonly<T> {
+  return value;
+}
+
+// 5. The total of one numeric property over all rows
+function sumBy<T>(
+  rows: readonly T[],
+  key: KeysByValue<T, number>,
+): number {
+  return 0;
+}
+
+// ===== Type tests: don't change these =====
+interface Settings {
+  theme: { name: string; colours: string[] };
+  fontSize: number;
+  lineHeight: number;
+  onChange: (key: string) => void;
+}
+
+type cases = [
+  Expect<Equal<DeepReadonly<Settings>, {
+    readonly theme: {
+      readonly name: string;
+      readonly colours: readonly string[];
+    };
+    readonly fontSize: number;
+    readonly lineHeight: number;
+    readonly onChange: (key: string) => void;
+  }>>,
+  Expect<Equal<
+    KeysByValue<Settings, number>,
+    "fontSize" | "lineHeight"
+  >>,
+];
+
+interface Contact {
+  email?: string;
+  phone?: string;
+  note?: string;
+}
+type Reachable = RequireAtLeastOne<Contact, "email" | "phone">;
+const _c1: Reachable = { email: "mei@panda.dev" };
+const _c2: Reachable = { phone: "0123", note: "evenings" };
+// @ts-expect-error: needs an email or a phone
+const _c3: Reachable = { note: "no way to reach me" };
+
+// ===== Try it =====
+const settings = freezeDeep({
+  theme: { name: "forest", colours: ["green", "brown"] },
+  fontSize: 16,
+  lineHeight: 24,
+});
+console.log(Object.isFrozen(settings.theme.colours));
+
+const week = [
+  { day: "Mon", minutes: 30, pages: 12 },
+  { day: "Tue", minutes: 45, pages: 20 },
+];
+console.log(sumBy(week, "minutes"), sumBy(week, "pages"));
+`}
+  tests={[
+    { name: "freezeDeep freezes the object and everything inside it", check: "(() => { const o = { a: { b: [1, { c: 2 }] }, d: 'x' }; const r = freezeDeep(o); return r === o && Object.isFrozen(o) && Object.isFrozen(o.a) && Object.isFrozen(o.a.b) && Object.isFrozen(o.a.b[1]); })()" },
+    { name: "freezeDeep returns primitives and null unchanged", check: "freezeDeep(5) === 5 && freezeDeep(null) === null && freezeDeep('hi') === 'hi'" },
+    { name: "Functions inside still work", check: "(() => { const f = () => 1; const o = { f, n: { m: 1 } }; freezeDeep(o); return o.f() === 1 && Object.isFrozen(o.n); })()" },
+    { name: "sumBy adds up one property", check: "sumBy([{ a: 1, b: 'x' }, { a: 2.5, b: 'y' }, { a: -1, b: 'z' }], 'a') === 2.5 && sumBy([{ a: 1, n: 7 }], 'n') === 7" },
+    { name: "sumBy of no rows is 0", check: "sumBy([], 'a') === 0" },
+  ]}
+>
+
+Build a small utility belt, type tests included. The starter's types are placeholders, so the type tests fail and the code won't run until all three types are right. The `// @ts-expect-error` line is a type test too: it passes only when that line **is** an error.
+
+1. **`DeepReadonly<T>`**: every property at every depth is `readonly`; functions stay as they are, arrays become read-only arrays.
+2. **`KeysByValue<T, V>`**: the union of keys of `T` whose values are assignable to `V` (for `Settings` and `number`: `"fontSize" | "lineHeight"`).
+3. **`RequireAtLeastOne<T, Keys>`**: like `T`, but at least one of `Keys` must be present.
+
+Then make the two functions work:
+
+4. **`freezeDeep(value)`** freezes `value` with `Object.freeze`, and every object and array inside it, at any depth, then returns the **same** value. Primitives and `null` are returned unchanged; functions inside are left alone.
+5. **`sumBy(rows, key)`** adds up `row[key]` over all rows (0 for no rows).
+
+<Hint>
+
+**Types:** `DeepReadonly` is the one from the lesson (either version passes). For `KeysByValue`, use "map, then index": `{ [K in keyof T]-?: T[K] extends V ? K : never }[keyof T]`, or take `keyof` of a filtering mapped type. `RequireAtLeastOne` is exactly the lesson's version.
+
+**freezeDeep:** if `typeof value === "object" && value !== null`, call `Object.freeze(value)`, then loop over `Object.values(value)` and call `freezeDeep` on each child (arrays work too, and functions are skipped because their `typeof` is `"function"`). TypeScript can't follow the recursion, so end with one cast: `return value as DeepReadonly<T>;`.
+
+**sumBy:** a `for...of` loop with `total += row[key] as number;` (inside the generic function, TypeScript can't see that the filtered key always points at a number).
+
+</Hint>
+
+<Solution>
+
+```ts
+// ===== Type-test helpers: don't change =====
+type Expect<T extends true> = T;
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends
+  (<T>() => T extends B ? 1 : 2) ? true : false;
+
+type DeepReadonly<T> =
+  T extends (...args: any[]) => unknown ? T
+  : T extends readonly (infer E)[] ? ReadonlyArray<DeepReadonly<E>>
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+  : T;
+
+type KeysByValue<T, V> = {
+  [K in keyof T]-?: T[K] extends V ? K : never;
+}[keyof T];
+
+type RequireAtLeastOne<T, Keys extends keyof T = keyof T> =
+  Omit<T, Keys> &
+  {
+    [K in Keys]-?: Required<Pick<T, K>> &
+      Partial<Pick<T, Exclude<Keys, K>>>;
+  }[Keys];
+
+function freezeDeep<T>(value: T): DeepReadonly<T> {
+  if (typeof value === "object" && value !== null) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) {
+      freezeDeep(child);
+    }
+  }
+  // The one cast: TypeScript can't follow the recursion
+  return value as DeepReadonly<T>;
+}
+
+function sumBy<T>(
+  rows: readonly T[],
+  key: KeysByValue<T, number>,
+): number {
+  let total = 0;
+  for (const row of rows) {
+    total += row[key] as number;
+  }
+  return total;
+}
+
+// ===== Type tests: don't change these =====
+interface Settings {
+  theme: { name: string; colours: string[] };
+  fontSize: number;
+  lineHeight: number;
+  onChange: (key: string) => void;
+}
+
+type cases = [
+  Expect<Equal<DeepReadonly<Settings>, {
+    readonly theme: {
+      readonly name: string;
+      readonly colours: readonly string[];
+    };
+    readonly fontSize: number;
+    readonly lineHeight: number;
+    readonly onChange: (key: string) => void;
+  }>>,
+  Expect<Equal<
+    KeysByValue<Settings, number>,
+    "fontSize" | "lineHeight"
+  >>,
+];
+
+interface Contact {
+  email?: string;
+  phone?: string;
+  note?: string;
+}
+type Reachable = RequireAtLeastOne<Contact, "email" | "phone">;
+const _c1: Reachable = { email: "mei@panda.dev" };
+const _c2: Reachable = { phone: "0123", note: "evenings" };
+// @ts-expect-error: needs an email or a phone
+const _c3: Reachable = { note: "no way to reach me" };
+
+// ===== Try it =====
+const settings = freezeDeep({
+  theme: { name: "forest", colours: ["green", "brown"] },
+  fontSize: 16,
+  lineHeight: 24,
+});
+console.log(Object.isFrozen(settings.theme.colours));
+
+const week = [
+  { day: "Mon", minutes: 30, pages: 12 },
+  { day: "Tue", minutes: 45, pages: 20 },
+];
+console.log(sumBy(week, "minutes"), sumBy(week, "pages"));
+// true
+// 75 32
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Treat utility types as code: write **type tests** (`Expect<Equal<...>>`) next to them, and use the awkward cases to decide and record what the type should do.
+- **Deep types** (`DeepReadonly`, `DeepPartial`) recurse through a conditional type: keep functions as they are, decide what arrays should do, stop at primitives, and watch out for built-ins like `Date`.
+- **`PickByValue` / `OmitByValue`** filter keys by value type; compare `Exclude<T[K], undefined>` or optional properties silently disappear.
+- **`RequireAtLeastOne`** uses "map, then index" to build a union of variants; clever unions produce confusing error messages, so name and document them.
+- **`UnionToIntersection`** turns `A | B` into `A & B` through a contravariant `infer`; literals and `boolean` collapse to `never`.
+- **`Simplify`** flattens intersections for readable hovers and exact type tests.
+- Recursive types can hit **"excessively deep"** on infinite types like `Json` and slow down big projects: give arrays their own branch, apply deep types at the edges, measure with `--extendedDiagnostics`, and reach for **type-fest** before writing your own.

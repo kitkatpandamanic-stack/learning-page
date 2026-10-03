@@ -1,0 +1,1270 @@
+---
+title: Sharing Types Between Client and Server
+description: Describe your API once as a contract type, derive a typed client from it, keep the Express handlers in sync, and see how monorepos, tRPC and OpenAPI do the same.
+duration: 20
+xp: 30
+---
+
+Here's a bug that type-checks perfectly. On Friday the server team renames a note's `text` field to `body`. Their tests pass. The front end still reads `note.text`, gets `undefined` and shows empty notes, and no compiler complains, because the front end has its **own** copy of the `Note` type that nobody updated. Both sides were type-safe; they just weren't safe **together**.
+
+The fix is to describe the API **once**, as a **contract**, and let both sides use it. In this lesson you'll write a contract type, derive a typed client from it, make the server's handlers follow it, and finish the module by building the typed notes API with its own client. 🤝
+
+## One contract for both sides
+
+A contract lists every endpoint of the API with what goes in and what comes out. A nice way to write it in TypeScript is one object type whose keys are `"METHOD /path"` strings:
+
+```ts title="contract.ts"
+export interface Note {
+  id: number;
+  title: string;
+  text: string;
+  pinned: boolean;
+}
+export interface NewNote {
+  title: string;
+  text?: string;
+  pinned?: boolean;
+}
+export type NotePatch = Partial<NewNote>;
+
+export type NotesApi = {
+  "GET /notes": { response: Note[] };
+  "POST /notes": { body: NewNote; response: Note };
+  "GET /notes/:id": { params: { id: string }; response: Note };
+  "PATCH /notes/:id": {
+    params: { id: string };
+    body: NotePatch;
+    response: Note;
+  };
+  "DELETE /notes/:id": { params: { id: string }; response: null };
+};
+```
+
+Each entry says which `params` the path has, what `body` the client sends (if any) and what `response` it gets back (`null` for the `DELETE`, which answers 204 with no body). It's only types, so it costs nothing at runtime.
+
+The pieces come out with the tools from the Generics module: `keyof` for the list of routes and **indexed access types** for the parts of one route:
+
+```ts
+type Route = keyof NotesApi; // "GET /notes" | "POST /notes" | ...
+type CreateBody = NotesApi["POST /notes"]["body"]; // NewNote
+type ListResponse = NotesApi["GET /notes"]["response"]; // Note[]
+
+const route: Route = "GET /note";
+// ❌ Error: Type '"GET /note"' is not assignable to type 'keyof NotesApi'. Did you mean '"GET /notes"'?
+const draft: CreateBody = { titel: "Nap" };
+// ❌ Error: Object literal may only specify known properties, but 'titel' does not exist in type 'NewNote'. Did you mean to write 'title'?
+type Nope = NotesApi["GET /notes"]["body"];
+// ❌ Error: Property 'body' does not exist on type '{ response: Note[]; }'.
+```
+
+In a real project, `contract.ts` lives in a folder (or package) that both the server and the front end import, with `import type { NotesApi } from "../shared/contract"`. As you saw in [Modules & Declaration Files](/learn/typescript/modules-and-declaration-files), a type-only import disappears from the compiled JavaScript, so the browser bundle doesn't pull in any server code. Rename `text` to `body` in the contract, and every place on **both** sides that still says `text` stops compiling.
+
+## A client derived from the contract
+
+Writing one fetch function per endpoint by hand is how clients drift. Instead, write **one** generic `call` function whose types come from the contract: pick a route, and TypeScript knows which params and body it needs and what it returns. It doesn't even need to know about notes: `createClient<Api>` works for **any** contract.
+
+To show that, here's a contract for the practice API's to-dos. PandaDev has a practice API built in, so this runs offline and always gives the same answers, but real APIs work the same way:
+
+<CodeExample output={`{ id: 4, title: 'Nap', done: false }
+true
+[ 'Learn fetch', 'Build the movie app', 'Eat some bamboo', 'Nap' ]
+{ kind: 'http', status: 404, message: 'Todo not found' }`}>
+
+```ts
+// ----- the contract (shared by client and server) -----
+interface Todo {
+  id: number;
+  title: string;
+  done: boolean;
+}
+type NewTodo = { title: string; done?: boolean };
+
+type TodosApi = {
+  "GET /todos": { response: Todo[] };
+  "POST /todos": { body: NewTodo; response: Todo };
+  "PATCH /todos/:id": {
+    params: { id: string };
+    body: Partial<NewTodo>;
+    response: Todo;
+  };
+  "DELETE /todos/:id": { params: { id: string }; response: null };
+};
+
+// ----- a client for ANY contract -----
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string };
+
+// How requests travel: fetch in the browser, supertest in tests
+type Transport = (request: {
+  method: string;
+  path: string;
+  body?: object;
+}) => Promise<{ status: number; body: unknown }>;
+
+function errorMessage(status: number, body: unknown): string {
+  if (typeof body === "object" && body !== null && "error" in body &&
+      typeof body.error === "string") {
+    return body.error;
+  }
+  return `HTTP ${status}`;
+}
+
+function createClient<Api extends Record<keyof Api, Endpoint>>(
+  transport: Transport,
+) {
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    let res;
+    try {
+      res = await transport({ method, path, body });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: { kind: "network", message } };
+    }
+    const { status } = res;
+    if (status >= 400) {
+      const message = errorMessage(status, res.body);
+      return { ok: false, error: { kind: "http", status, message } };
+    }
+    // We trust our own server here (see the callout below)
+    const value = status === 204 ? null : res.body;
+    return { ok: true, value: value as Api[R]["response"] };
+  };
+}
+
+function fetchTransport(baseUrl: string): Transport {
+  return async ({ method, path, body }) => {
+    const res = await fetch(baseUrl + path, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    return { status: res.status, body: text ? JSON.parse(text) : null };
+  };
+}
+
+// ----- using it -----
+const todos = createClient<TodosApi>(
+  fetchTransport("https://api.pandadev.test"),
+);
+
+const created = await todos("POST /todos", { body: { title: "Nap" } });
+if (created.ok) console.log(created.value); // Todo
+
+const updated = await todos("PATCH /todos/:id", {
+  params: { id: "4" },
+  body: { done: true },
+});
+if (updated.ok) console.log(updated.value.done); // boolean
+
+const all = await todos("GET /todos", {});
+if (all.ok) console.log(all.value.map((t) => t.title));
+
+const missing = await todos("DELETE /todos/:id", {
+  params: { id: "99" },
+});
+if (!missing.ok) console.log(missing.error);
+```
+
+</CodeExample>
+
+The interesting types, piece by piece:
+
+- **`Api extends Record<keyof Api, Endpoint>`** says "every entry of this contract must look like an endpoint". A contract with `body: string` is rejected, because `Endpoint` says bodies are objects.
+- **`call<R extends keyof Api & string>(route: R, ...)`** makes `R` the exact route you pass, like `"PATCH /todos/:id"`. (`& string` because object keys could also be numbers or symbols, and we call `route.split`.)
+- **`input: Omit<Api[R], "response">`** is "everything the endpoint describes, except the response": `params` and `body`, exactly as the contract requires them.
+- **`Promise<Result<Api[R]["response"], ApiError>>`** is the contract's response, wrapped in the `Result` from [Typed Fetch](/learn/typescript/typed-fetch), so callers must handle errors before they can touch the data.
+- **`Transport`** is the only part that knows how requests travel. Here it's `fetch`; in tests it can be anything with the same signature.
+
+And every way of calling it wrong is now a compile error:
+
+```ts
+await todos("GET /todo", {});
+// ❌ Error: Argument of type '"GET /todo"' is not assignable to parameter of type '"GET /todos" | "POST /todos" | "PATCH /todos/:id" | "DELETE /todos/:id"'.
+
+await todos("POST /todos", { body: { titel: "Nap" } });
+// ❌ Error: Object literal may only specify known properties, but 'titel' does not exist in type 'NewTodo'. Did you mean to write 'title'?
+
+await todos("PATCH /todos/:id", { body: { done: true } });
+// ❌ Error: Property 'params' is missing in type '{ body: { done: true; }; }' but required in type 'Omit<{ params: { id: string; }; body: Partial<NewTodo>; response: Todo; }, "response">'.
+
+const all = await todos("GET /todos", {});
+if (all.ok) console.log(all.value[0].name);
+// ❌ Error: Property 'name' does not exist on type 'Todo'.
+```
+
+<Callout type="warning" title="The one place where the client trusts the server">
+
+Look at the end of `call`: `value as Api[R]["response"]`. The response is `unknown` (it came over the network), and the client simply **believes** the contract. That's a reasonable trade when you own both sides and deploy them together: one cast, in one tested function, instead of one in every call. For an API you don't control, validate responses with schemas, as in [Runtime Validation](/learn/typescript/runtime-validation). Some teams share the **schemas** instead of plain types, so the client can check everything it receives.
+
+</Callout>
+
+## Keeping the server in sync
+
+The client now follows the contract. The server has to as well, or the contract is just a hopeful comment. The trick is to describe the server's handlers **with the contract too**: an object with one handler per route, where each handler must return that route's response type:
+
+```ts
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+```
+
+This is a **mapped type**: "for every route `R` in the contract, a function returning a promise of `R`'s response". `Partial` and `Record` are built the same way, and you'll write your own in Level 3. A small `mountApi` helper registers each handler with Express, using the method and path from the key:
+
+<CodeExample output={`1 Nap
+[ { id: 1, title: 'Nap' } ]`}>
+
+```ts
+import express, {
+  type Application,
+  type RequestHandler,
+  type Router,
+} from "express";
+import request from "supertest";
+
+// ----- contract.ts -----
+interface Note {
+  id: number;
+  title: string;
+}
+type NotesApi = {
+  "GET /notes": { response: Note[] };
+  "POST /notes": { body: { title: string }; response: Note };
+};
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+
+// ----- server.ts: one handler per route in the contract -----
+type RawRequest = { params: Record<string, string>; body: unknown };
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+
+function register(
+  router: Router,
+  method: string,
+  path: string,
+  handler: RequestHandler,
+): void {
+  if (method === "GET") router.get(path, handler);
+  else if (method === "POST") router.post(path, handler);
+  else if (method === "PATCH") router.patch(path, handler);
+  else if (method === "DELETE") router.delete(path, handler);
+  else throw new Error(`Unsupported method: ${method}`);
+}
+
+function mountApi<Api extends Record<keyof Api, Endpoint>>(
+  router: Router,
+  handlers: Handlers<Api>,
+): void {
+  for (const route of Object.keys(handlers) as (keyof Api & string)[]) {
+    const [method, path] = route.split(" ");
+    const handler = handlers[route];
+    register(router, method, path, async (req, res) => {
+      const { params, body } = req;
+      const result = await handler({ params, body });
+      res.status(method === "POST" ? 201 : 200).json(result);
+    });
+  }
+}
+
+function createApp(): Application {
+  const notes: Note[] = [];
+  const router = express.Router();
+  mountApi<NotesApi>(router, {
+    "GET /notes": async () => notes,
+    "POST /notes": async ({ body }) => {
+      // body is unknown: the contract can't promise what clients send
+      const title =
+        typeof body === "object" && body !== null && "title" in body &&
+        typeof body.title === "string" ? body.title.trim() : "";
+      const note: Note = { id: notes.length + 1, title };
+      notes.push(note);
+      return note; // must be a Note, says the contract
+    },
+  });
+  const app = express();
+  app.use(express.json());
+  app.use("/api", router);
+  return app;
+}
+
+// ----- client.ts: requests typed by the same contract -----
+type Transport = (request: {
+  method: string;
+  path: string;
+  body?: object;
+}) => Promise<{ status: number; body: unknown }>;
+
+function createClient<Api extends Record<keyof Api, Endpoint>>(
+  transport: Transport,
+) {
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Api[R]["response"]> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    const res = await transport({ method, path, body });
+    if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
+    return res.body as Api[R]["response"];
+  };
+}
+
+// In tests: requests go straight to the Express app
+function supertestTransport(app: Application, prefix = ""): Transport {
+  const agent = request(app);
+  return async ({ method, path, body }) => {
+    const url = prefix + path;
+    const test =
+      method === "POST" ? agent.post(url)
+      : method === "PATCH" ? agent.patch(url)
+      : method === "DELETE" ? agent.delete(url)
+      : agent.get(url);
+    const res = await (body === undefined ? test : test.send(body));
+    return { status: res.status, body: res.body };
+  };
+}
+
+// ----- both sides, one contract -----
+const api = createClient<NotesApi>(
+  supertestTransport(createApp(), "/api"),
+);
+const note = await api("POST /notes", { body: { title: " Nap " } });
+console.log(note.id, note.title); // note: Note
+const all = await api("GET /notes", {});
+console.log(all); // all: Note[]
+```
+
+</CodeExample>
+
+To keep the focus on the server, the client here is a trimmed version of the previous one: it throws on errors instead of returning a `Result`. The important part is what the compiler now checks on the server side:
+
+```ts
+mountApi<NotesApi>(router, {
+  "GET /notes": async () => notes,
+});
+// ❌ Error: Property '"POST /notes"' is missing in type '{ "GET /notes": () => Promise<Note[]>; }' but required in type 'Handlers<NotesApi>'.
+
+mountApi<NotesApi>(router, {
+  "GET /notes": async () => notes,
+  "POST /notes": async () => ({ id: 1, name: "Nap" }),
+  // ❌ Error: Type 'Promise<{ id: number; name: string; }>' is not assignable to type 'Promise<Note>'.
+});
+```
+
+Add a route to the contract and the server won't compile until it handles it; change a response type and every handler that returns the old shape lights up. A handler that might return `undefined` (like a `find` that didn't find anything) is caught too, which nudges you to throw a 404 instead.
+
+Notice what the handlers **don't** get: a typed body. `body` is `unknown`, even though the contract says the client sends a `NewNote`. That's deliberate. The contract binds **your** client, but anyone can call your API with `curl`, an old version of your app or a script. The server still parses every body, exactly as in the [last lesson](/learn/typescript/validation-and-errors).
+
+<Callout type="tip" title="Conventions instead of configuration">
+
+`mountApi` decides the status codes by convention: `POST` answers 201, a handler that returns `null` answers 204, and everything else 200. Conventions like this keep the contract small. When an API needs more (headers, several success codes, streaming), contracts grow a `status` field or move to one of the tools below.
+
+</Callout>
+
+## How real projects share a contract
+
+What you built is the core idea behind several popular tools. Which one fits depends mostly on **who** writes the server and the clients.
+
+**A shared package in a monorepo.** When the front end and the back end live in one repository, the contract becomes a small package that both import. This is exactly this lesson's approach, with the folders split up:
+
+```text
+notes-app/
+├── package.json          "workspaces": ["packages/*"]
+└── packages/
+    ├── contract/         NotesApi, Note, NewNote (types only)
+    ├── server/           Express + mountApi, imports @notes/contract
+    └── web/              React app + createClient, imports @notes/contract
+```
+
+**tRPC.** If both sides are TypeScript, tRPC removes the separate contract: the server's router **is** the contract, and the client imports its type.
+
+```ts
+// server: procedures with input schemas
+const t = initTRPC.create();
+export const appRouter = t.router({
+  noteById: t.procedure
+    .input(z.object({ id: z.number() }))
+    .query(({ input }) => notes.get(input.id)),
+});
+export type AppRouter = typeof appRouter;
+
+// client: fully typed calls, no code generation
+const trpc = createTRPCClient<AppRouter>({
+  links: [httpBatchLink({ url: "/trpc" })],
+});
+const note = await trpc.noteById.query({ id: 1 });
+```
+
+**OpenAPI.** When clients are written in other languages, or the API is public, the contract is an **OpenAPI** document (YAML or JSON) that tools turn into types for every language. For TypeScript, `openapi-typescript` generates the types and `openapi-fetch` gives you a client that looks remarkably like yours:
+
+```bash
+npx openapi-typescript ./openapi.yaml -o src/api-types.ts
+```
+
+```ts
+import createClient from "openapi-fetch";
+import type { paths } from "./api-types";
+
+const api = createClient<paths>({ baseUrl: "https://api.example.com" });
+const { data, error } = await api.GET("/notes/{id}", {
+  params: { path: { id: 1 } },
+});
+```
+
+| Approach | Good fit when | Watch out for |
+| --- | --- | --- |
+| Shared contract types | one repo, TypeScript on both sides, plain REST | the server must still validate input |
+| tRPC | one team, TypeScript everywhere, internal API | not a public REST API; clients must be TypeScript |
+| OpenAPI + generators | public APIs, many languages, separate teams | keeping the spec and the code in sync (generate one from the other) |
+
+Whichever you choose, run `tsc --noEmit` over the **whole** repository in CI, so a contract change that breaks the other side fails the build instead of reaching users.
+
+<Quiz
+  question="In a shared NotesApi contract, the response of GET /notes/:id changes from Note to a type where text is renamed to body. Both the server and the React app use the contract. What happens?"
+  options={["Nothing until users report empty notes", "Only the server stops compiling", "Every server handler and client component that still uses text stops compiling, on both sides", "TypeScript renames text to body everywhere automatically"]}
+  answer={2}
+  explanation="Both sides get their types from the same contract, so the change reaches both. Every place that still returns or reads text is a compile error, which is exactly the Friday bug from the start of the lesson, caught before it ships."
+/>
+
+<Quiz
+  question="The contract says POST /notes takes a NewNote body. Why do the server's handlers still receive the body as unknown and parse it?"
+  options={["Because Express can't read types", "Because the contract only describes your own client: anyone can send the server any JSON, so the server must check it at runtime", "Because NewNote has optional fields", "Because mapped types can't include request bodies"]}
+  answer={1}
+  explanation="Types are erased at runtime and the contract can't stop curl, scripts or an old app version from sending something else. The server is the last line of defence, so it parses unknown input, while the shared types keep your own client honest."
+/>
+
+<Exercise
+  title="Mini-project: Typed notes API"
+  language="typescript"
+  starter={`import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+  type Router,
+} from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ========== contract.ts: shared by server and client ==========
+
+interface Note {
+  id: number;
+  title: string;
+  text: string;
+  pinned: boolean;
+}
+interface NewNote {
+  title: string;
+  text?: string;
+  pinned?: boolean;
+}
+type NotePatch = Partial<NewNote>;
+
+type ErrorCode = "bad_request" | "not_found" | "internal";
+const STATUS: Record<ErrorCode, number> = {
+  bad_request: 400,
+  not_found: 404,
+  internal: 500,
+};
+interface ErrorBody {
+  error: string;
+  code: ErrorCode;
+  details?: string[];
+}
+
+type NotesApi = {
+  "GET /notes": { response: Note[] };
+  "POST /notes": { body: NewNote; response: Note };
+  "GET /notes/:id": { params: { id: string }; response: Note };
+  "PATCH /notes/:id": {
+    params: { id: string };
+    body: NotePatch;
+    response: Note;
+  };
+  "DELETE /notes/:id": { params: { id: string }; response: null };
+};
+
+// ========== ready-made helpers: don't change this part ==========
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+// Express's own errors (e.g. broken JSON) carry a 4xx status
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+class HttpError extends Error {
+  readonly status: number;
+  readonly code: ErrorCode;
+  readonly details?: string[];
+  constructor(code: ErrorCode, message: string, details?: string[]) {
+    super(message);
+    this.name = "HttpError";
+    this.code = code;
+    this.status = STATUS[code];
+    this.details = details;
+  }
+}
+
+function parseOrThrow<T>(
+  parse: (input: unknown) => Result<T, string[]>,
+  input: unknown,
+): T {
+  const result = parse(input);
+  if (!result.ok) {
+    throw new HttpError("bad_request", "Invalid body", result.error);
+  }
+  return result.value;
+}
+
+// Returns the trimmed title, or adds a message to errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value !== "string" || value.trim() === "") {
+    errors.push("title is required");
+  } else if (value.length > 100) {
+    errors.push("title must be at most 100 characters");
+  } else {
+    return value.trim();
+  }
+  return undefined;
+}
+
+function parseNewNote(input: unknown): Result<NewNote, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  if (input.text !== undefined && typeof input.text !== "string") {
+    errors.push("text must be a string");
+  }
+  if (input.pinned !== undefined && typeof input.pinned !== "boolean") {
+    errors.push("pinned must be true or false");
+  }
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  const note: NewNote = { title };
+  if (typeof input.text === "string") note.text = input.text;
+  if (typeof input.pinned === "boolean") note.pinned = input.pinned;
+  return { ok: true, value: note };
+}
+
+function createNotesRepository() {
+  const notes = new Map<number, Note>();
+  let nextId = 1;
+  return {
+    list(): Note[] {
+      return [...notes.values()];
+    },
+    get(id: number): Note | undefined {
+      return notes.get(id);
+    },
+    create(input: NewNote): Note {
+      const note: Note = {
+        id: nextId++,
+        title: input.title,
+        text: input.text ?? "",
+        pinned: input.pinned ?? false,
+      };
+      notes.set(note.id, note);
+      return note;
+    },
+    update(id: number, changes: NotePatch): Note | undefined {
+      const note = notes.get(id);
+      if (!note) return undefined;
+      const updated = { ...note, ...changes };
+      notes.set(id, updated);
+      return updated;
+    },
+    remove(id: number): boolean {
+      return notes.delete(id);
+    },
+  };
+}
+
+// The server side of the contract: one handler per route
+type RawRequest = { params: Record<string, string>; body: unknown };
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+
+function register(
+  router: Router,
+  method: string,
+  path: string,
+  handler: RequestHandler,
+): void {
+  if (method === "GET") router.get(path, handler);
+  else if (method === "POST") router.post(path, handler);
+  else if (method === "PATCH") router.patch(path, handler);
+  else if (method === "DELETE") router.delete(path, handler);
+  else throw new Error(\`Unsupported method: \${method}\`);
+}
+
+// POST answers 201, a null result 204, everything else 200
+function mountApi<Api extends Record<keyof Api, Endpoint>>(
+  router: Router,
+  handlers: Handlers<Api>,
+): void {
+  for (const route of Object.keys(handlers) as (keyof Api & string)[]) {
+    const [method, path] = route.split(" ");
+    const handler = handlers[route];
+    register(router, method, path, async (req, res) => {
+      const { params, body } = req;
+      const result = await handler({ params, body });
+      if (result === null) {
+        res.sendStatus(204);
+        return;
+      }
+      res.status(method === "POST" ? 201 : 200).json(result);
+    });
+  }
+}
+
+function errorHandler(
+  err: unknown,
+  req: Request,
+  res: Response<ErrorBody>,
+  _next: NextFunction,
+): void {
+  if (err instanceof HttpError) {
+    const { status, code, message, details } = err;
+    res.status(status).json({ error: message, code, details });
+    return;
+  }
+  if (isClientError(err)) {
+    const { status, message } = err;
+    res.status(status).json({ error: message, code: "bad_request" });
+    return;
+  }
+  const message = "Something went wrong";
+  res.status(500).json({ error: message, code: "internal" });
+}
+
+// The client side of the contract
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string };
+
+type Transport = (request: {
+  method: string;
+  path: string;
+  body?: object;
+}) => Promise<{ status: number; body: unknown }>;
+
+function createClient<Api extends Record<keyof Api, Endpoint>>(
+  transport: Transport,
+) {
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    let res;
+    try {
+      res = await transport({ method, path, body });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: { kind: "network", message } };
+    }
+    const { status } = res;
+    if (status >= 400) {
+      const message =
+        isRecord(res.body) && typeof res.body.error === "string"
+          ? res.body.error
+          : \`HTTP \${status}\`;
+      return { ok: false, error: { kind: "http", status, message } };
+    }
+    const value = status === 204 ? null : res.body;
+    return { ok: true, value: value as Api[R]["response"] };
+  };
+}
+
+// Sends the client's requests to an Express app, without a network
+function supertestTransport(app: Application, prefix = ""): Transport {
+  const agent = request(app);
+  return async ({ method, path, body }) => {
+    const url = prefix + path;
+    const test =
+      method === "POST" ? agent.post(url)
+      : method === "PATCH" ? agent.patch(url)
+      : method === "DELETE" ? agent.delete(url)
+      : agent.get(url);
+    const res = await (body === undefined ? test : test.send(body));
+    return { status: res.status, body: res.body };
+  };
+}
+
+// ========== your code ==========
+
+// TODO 1: like parseNewNote, but every field is optional
+function parseNotePatch(input: unknown): Result<NotePatch, string[]> {
+  return { ok: false, error: ["not written yet"] };
+}
+
+function createApp(): Application {
+  const repo = createNotesRepository();
+
+  function findNote(idText: string): Note {
+    const note = repo.get(Number(idText));
+    if (!note) throw new HttpError("not_found", "Note not found");
+    return note;
+  }
+
+  const router = express.Router();
+  mountApi<NotesApi>(router, {
+    "GET /notes": async () => repo.list(),
+    "POST /notes": async ({ body }) =>
+      repo.create(parseOrThrow(parseNewNote, body)),
+    "GET /notes/:id": async ({ params }) => findNote(params.id),
+    // TODO 2: the contract has two more routes
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use("/api", router);
+  app.use(errorHandler);
+  return app;
+}
+
+function createNotesClient(transport: Transport) {
+  const call = createClient<NotesApi>(transport);
+  return {
+    list: () => call("GET /notes", {}),
+    create: (note: NewNote) => call("POST /notes", { body: note }),
+    // TODO 3: get(id), update(id, patch) and remove(id)
+  };
+}
+
+// ========== tests ==========
+
+describe("Notes API through the typed client", () => {
+  let notes: ReturnType<typeof createNotesClient>;
+
+  beforeEach(() => {
+    notes = createNotesClient(supertestTransport(createApp(), "/api"));
+  });
+
+  it("creates and lists notes", async () => {
+    const created = await notes.create({ title: " Buy bamboo " });
+    expect(created).toEqual({
+      ok: true,
+      value: { id: 1, title: "Buy bamboo", text: "", pinned: false },
+    });
+    const list = await notes.list();
+    expect(list.ok && list.value.length).toBe(1);
+  });
+
+  it("rejects an empty title with a 400", async () => {
+    const result = await notes.create({ title: "" });
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "http", status: 400, message: "Invalid body" },
+    });
+  });
+
+  // TODO 4: write these two tests (replace it.todo with it)
+  it.todo("update changes only the fields sent");
+  it.todo("remove deletes the note, so get answers 404");
+});
+`}
+  tests={[
+    { name: "All the tests in the editor pass (no it.todo left)", check: `__vitest.failed === 0 && __vitest.skipped === 0 && __vitest.passed >= 4` },
+    { name: "Your tests catch an update that resets the fields you didn't send", check: `(await __retest([['const updated = { ...note, ...changes };', 'const updated = { id: note.id, title: "", text: "", pinned: false, ...changes };']])).failed > 0` },
+    { name: "Your tests catch a remove that doesn't remove", check: `(await __retest([['return notes.delete(id);', 'return notes.has(id);']])).failed > 0` },
+    { name: "parseNotePatch accepts any subset of valid fields and lists every problem", check: `(() => { const same = (x, y) => JSON.stringify(Object.entries(x).sort()) === JSON.stringify(Object.entries(y).sort()); const p = (v) => parseNotePatch(v); const a = p({}); const b = p({ title: ' Long nap ', id: 5, isAdmin: true }); const c = p({ text: '', pinned: false }); const bad = p({ title: '', text: 3, pinned: 'no' }); const long = p({ title: 'x'.repeat(101) }); return a.ok && same(a.value, {}) && b.ok && same(b.value, { title: 'Long nap' }) && c.ok && same(c.value, { text: '', pinned: false }) && !bad.ok && bad.error.join('|') === 'title is required|text must be a string|pinned must be true or false' && !long.ok && long.error.join('|') === 'title must be at most 100 characters' && [null, [], 'x'].every((v) => { const r = p(v); return !r.ok && r.error.join('|') === 'body must be a JSON object'; }); })()` },
+    { name: "PATCH /api/notes/:id changes only the fields sent, validates them and 404s unknown ids", check: `await (async () => { const api = require('supertest')(createApp()); await api.post('/api/notes').send({ title: 'Nap', text: 'Soon' }); const a = await api.patch('/api/notes/1').send({ pinned: true, id: 500 }); const b = await api.patch('/api/notes/1').send({ title: '  Long nap ' }); const bad = await api.patch('/api/notes/1').send({ title: '' }); const missing = await api.patch('/api/notes/9').send({ pinned: true }); const after = (await api.get('/api/notes/1')).body; return a.status === 200 && a.body.id === 1 && a.body.title === 'Nap' && a.body.text === 'Soon' && a.body.pinned === true && b.body.title === 'Long nap' && b.body.pinned === true && bad.status === 400 && JSON.stringify(bad.body.details) === JSON.stringify(['title is required']) && missing.status === 404 && missing.body.error === 'Note not found' && after.id === 1 && after.title === 'Long nap' && after.text === 'Soon' && after.pinned === true; })()` },
+    { name: "DELETE /api/notes/:id answers 204, the note is gone, unknown ids give 404", check: `await (async () => { const api = require('supertest')(createApp()); await api.post('/api/notes').send({ title: 'Temp' }); const d = await api.delete('/api/notes/1'); const g = await api.get('/api/notes/1'); const again = await api.delete('/api/notes/1'); const next = await api.post('/api/notes').send({ title: 'Next' }); const list = await api.get('/api/notes'); return d.status === 204 && d.text === '' && g.status === 404 && again.status === 404 && again.body.code === 'not_found' && next.body.id === 2 && list.body.length === 1; })()` },
+    { name: "The client's get, update and remove return the right Results", check: `await (async () => { const c = createNotesClient(supertestTransport(createApp(), '/api')); await c.create({ title: 'Nap' }); const g = await c.get(1); const u = await c.update(1, { text: 'After lunch' }); const r = await c.remove(1); const gone = await c.get(1); const none = await c.update(42, {}); return g.ok && g.value.title === 'Nap' && u.ok && u.value.text === 'After lunch' && u.value.title === 'Nap' && r.ok && r.value === null && !gone.ok && gone.error.kind === 'http' && gone.error.status === 404 && gone.error.message === 'Note not found' && !none.ok && none.error.status === 404; })()` },
+  ]}
+>
+
+Finish the typed notes API and its client. Everything above the `your code` line is ready-made: the contract, the error handling from the last lesson, the repository, `mountApi` and the contract-typed client with its supertest transport. Press **Run**: TypeScript already knows something is missing.
+
+1. **`parseNotePatch(input)`**: like `parseNewNote`, but **every** field is optional. Check only the fields that are present (`title` with the ready-made `checkTitle`, `text` must be a string, `pinned` a boolean) and return only those. `{}` is a valid patch. Collect every problem, in the order title, text, pinned; anything that isn't an object gives only `"body must be a JSON object"`.
+2. **Server**: TypeScript says the handlers object is missing two routes of the contract. Add them, using the repository's `update` and `remove`:
+   - `PATCH /notes/:id`: parse the body with `parseOrThrow(parseNotePatch, body)`, find the note (404 if it doesn't exist) and return the updated note;
+   - `DELETE /notes/:id`: find the note (404), remove it and return `null`, which `mountApi` turns into a 204.
+3. **Client**: add `get(id)`, `update(id, patch)` and `remove(id)` to `createNotesClient`. Ids are numbers for callers, but path params are strings: use `String(id)`.
+4. **Tests**: replace the two `it.todo` lines with real tests that go through the client. The checks plant bugs in the ready-made repository (an update that resets the fields you didn't send, and a remove that doesn't remove) and your tests must catch them.
+
+<Hint>
+
+1. Start with `if (!isRecord(input)) return { ok: false, error: [...] };` and `const patch: NotePatch = {};`. For each field: `if (input.text !== undefined) { ... }`, and for the title, `const title = checkTitle(input.title, errors); if (title !== undefined) patch.title = title;`.
+2. `"PATCH /notes/:id": async ({ params, body }) => { const changes = parseOrThrow(parseNotePatch, body); const note = findNote(params.id); return repo.update(note.id, changes) ?? note; }`. For `DELETE`, call `repo.remove(findNote(params.id).id)` and `return null;`.
+3. `get: (id: number) => call("GET /notes/:id", { params: { id: String(id) } })`, and similarly for the other two; `update` also passes `body: patch`.
+4. For the update test, create a note with a `title` and a `text`, update only `pinned`, and check with `toEqual` that the result still has the original title and text. For remove, check that `remove(1)` gives `{ ok: true, value: null }` and that `get(1)` afterwards is not `ok`, with status 404.
+
+</Hint>
+
+<Solution>
+
+```ts
+import express, {
+  type Application,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+  type Router,
+} from "express";
+import request from "supertest";
+import { describe, it, expect, beforeEach } from "vitest";
+
+// ========== contract.ts: shared by server and client ==========
+
+interface Note {
+  id: number;
+  title: string;
+  text: string;
+  pinned: boolean;
+}
+interface NewNote {
+  title: string;
+  text?: string;
+  pinned?: boolean;
+}
+type NotePatch = Partial<NewNote>;
+
+type ErrorCode = "bad_request" | "not_found" | "internal";
+const STATUS: Record<ErrorCode, number> = {
+  bad_request: 400,
+  not_found: 404,
+  internal: 500,
+};
+interface ErrorBody {
+  error: string;
+  code: ErrorCode;
+  details?: string[];
+}
+
+type NotesApi = {
+  "GET /notes": { response: Note[] };
+  "POST /notes": { body: NewNote; response: Note };
+  "GET /notes/:id": { params: { id: string }; response: Note };
+  "PATCH /notes/:id": {
+    params: { id: string };
+    body: NotePatch;
+    response: Note;
+  };
+  "DELETE /notes/:id": { params: { id: string }; response: null };
+};
+
+// ========== ready-made helpers: don't change this part ==========
+
+interface Endpoint {
+  params?: Record<string, string>;
+  body?: object;
+  response: unknown;
+}
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+// Express's own errors (e.g. broken JSON) carry a 4xx status
+type ClientError = Error & { status: number };
+function isClientError(err: unknown): err is ClientError {
+  return err instanceof Error && "status" in err &&
+    typeof err.status === "number" && err.status < 500;
+}
+
+class HttpError extends Error {
+  readonly status: number;
+  readonly code: ErrorCode;
+  readonly details?: string[];
+  constructor(code: ErrorCode, message: string, details?: string[]) {
+    super(message);
+    this.name = "HttpError";
+    this.code = code;
+    this.status = STATUS[code];
+    this.details = details;
+  }
+}
+
+function parseOrThrow<T>(
+  parse: (input: unknown) => Result<T, string[]>,
+  input: unknown,
+): T {
+  const result = parse(input);
+  if (!result.ok) {
+    throw new HttpError("bad_request", "Invalid body", result.error);
+  }
+  return result.value;
+}
+
+// Returns the trimmed title, or adds a message to errors
+function checkTitle(
+  value: unknown,
+  errors: string[],
+): string | undefined {
+  if (typeof value !== "string" || value.trim() === "") {
+    errors.push("title is required");
+  } else if (value.length > 100) {
+    errors.push("title must be at most 100 characters");
+  } else {
+    return value.trim();
+  }
+  return undefined;
+}
+
+function parseNewNote(input: unknown): Result<NewNote, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const title = checkTitle(input.title, errors);
+  if (input.text !== undefined && typeof input.text !== "string") {
+    errors.push("text must be a string");
+  }
+  if (input.pinned !== undefined && typeof input.pinned !== "boolean") {
+    errors.push("pinned must be true or false");
+  }
+  if (title === undefined || errors.length > 0) {
+    return { ok: false, error: errors };
+  }
+  const note: NewNote = { title };
+  if (typeof input.text === "string") note.text = input.text;
+  if (typeof input.pinned === "boolean") note.pinned = input.pinned;
+  return { ok: true, value: note };
+}
+
+function createNotesRepository() {
+  const notes = new Map<number, Note>();
+  let nextId = 1;
+  return {
+    list(): Note[] {
+      return [...notes.values()];
+    },
+    get(id: number): Note | undefined {
+      return notes.get(id);
+    },
+    create(input: NewNote): Note {
+      const note: Note = {
+        id: nextId++,
+        title: input.title,
+        text: input.text ?? "",
+        pinned: input.pinned ?? false,
+      };
+      notes.set(note.id, note);
+      return note;
+    },
+    update(id: number, changes: NotePatch): Note | undefined {
+      const note = notes.get(id);
+      if (!note) return undefined;
+      const updated = { ...note, ...changes };
+      notes.set(id, updated);
+      return updated;
+    },
+    remove(id: number): boolean {
+      return notes.delete(id);
+    },
+  };
+}
+
+// The server side of the contract: one handler per route
+type RawRequest = { params: Record<string, string>; body: unknown };
+type Handlers<Api extends Record<keyof Api, Endpoint>> = {
+  [R in keyof Api]: (req: RawRequest) => Promise<Api[R]["response"]>;
+};
+
+function register(
+  router: Router,
+  method: string,
+  path: string,
+  handler: RequestHandler,
+): void {
+  if (method === "GET") router.get(path, handler);
+  else if (method === "POST") router.post(path, handler);
+  else if (method === "PATCH") router.patch(path, handler);
+  else if (method === "DELETE") router.delete(path, handler);
+  else throw new Error(`Unsupported method: ${method}`);
+}
+
+// POST answers 201, a null result 204, everything else 200
+function mountApi<Api extends Record<keyof Api, Endpoint>>(
+  router: Router,
+  handlers: Handlers<Api>,
+): void {
+  for (const route of Object.keys(handlers) as (keyof Api & string)[]) {
+    const [method, path] = route.split(" ");
+    const handler = handlers[route];
+    register(router, method, path, async (req, res) => {
+      const { params, body } = req;
+      const result = await handler({ params, body });
+      if (result === null) {
+        res.sendStatus(204);
+        return;
+      }
+      res.status(method === "POST" ? 201 : 200).json(result);
+    });
+  }
+}
+
+function errorHandler(
+  err: unknown,
+  req: Request,
+  res: Response<ErrorBody>,
+  _next: NextFunction,
+): void {
+  if (err instanceof HttpError) {
+    const { status, code, message, details } = err;
+    res.status(status).json({ error: message, code, details });
+    return;
+  }
+  if (isClientError(err)) {
+    const { status, message } = err;
+    res.status(status).json({ error: message, code: "bad_request" });
+    return;
+  }
+  const message = "Something went wrong";
+  res.status(500).json({ error: message, code: "internal" });
+}
+
+// The client side of the contract
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string };
+
+type Transport = (request: {
+  method: string;
+  path: string;
+  body?: object;
+}) => Promise<{ status: number; body: unknown }>;
+
+function createClient<Api extends Record<keyof Api, Endpoint>>(
+  transport: Transport,
+) {
+  return async function call<R extends keyof Api & string>(
+    route: R,
+    input: Omit<Api[R], "response">,
+  ): Promise<Result<Api[R]["response"], ApiError>> {
+    const { params = {}, body }: Omit<Endpoint, "response"> = input;
+    const [method, pattern] = route.split(" ");
+    const path = pattern.replace(/:(\w+)/g, (_, name: string) =>
+      encodeURIComponent(params[name] ?? ""),
+    );
+    let res;
+    try {
+      res = await transport({ method, path, body });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: { kind: "network", message } };
+    }
+    const { status } = res;
+    if (status >= 400) {
+      const message =
+        isRecord(res.body) && typeof res.body.error === "string"
+          ? res.body.error
+          : `HTTP ${status}`;
+      return { ok: false, error: { kind: "http", status, message } };
+    }
+    const value = status === 204 ? null : res.body;
+    return { ok: true, value: value as Api[R]["response"] };
+  };
+}
+
+// Sends the client's requests to an Express app, without a network
+function supertestTransport(app: Application, prefix = ""): Transport {
+  const agent = request(app);
+  return async ({ method, path, body }) => {
+    const url = prefix + path;
+    const test =
+      method === "POST" ? agent.post(url)
+      : method === "PATCH" ? agent.patch(url)
+      : method === "DELETE" ? agent.delete(url)
+      : agent.get(url);
+    const res = await (body === undefined ? test : test.send(body));
+    return { status: res.status, body: res.body };
+  };
+}
+
+// ========== your code ==========
+
+function parseNotePatch(input: unknown): Result<NotePatch, string[]> {
+  if (!isRecord(input)) {
+    return { ok: false, error: ["body must be a JSON object"] };
+  }
+  const errors: string[] = [];
+  const patch: NotePatch = {};
+  if (input.title !== undefined) {
+    const title = checkTitle(input.title, errors);
+    if (title !== undefined) patch.title = title;
+  }
+  if (input.text !== undefined) {
+    if (typeof input.text === "string") patch.text = input.text;
+    else errors.push("text must be a string");
+  }
+  if (input.pinned !== undefined) {
+    if (typeof input.pinned === "boolean") patch.pinned = input.pinned;
+    else errors.push("pinned must be true or false");
+  }
+  return errors.length > 0
+    ? { ok: false, error: errors }
+    : { ok: true, value: patch };
+}
+
+function createApp(): Application {
+  const repo = createNotesRepository();
+
+  function findNote(idText: string): Note {
+    const note = repo.get(Number(idText));
+    if (!note) throw new HttpError("not_found", "Note not found");
+    return note;
+  }
+
+  const router = express.Router();
+  mountApi<NotesApi>(router, {
+    "GET /notes": async () => repo.list(),
+    "POST /notes": async ({ body }) =>
+      repo.create(parseOrThrow(parseNewNote, body)),
+    "GET /notes/:id": async ({ params }) => findNote(params.id),
+    "PATCH /notes/:id": async ({ params, body }) => {
+      const changes = parseOrThrow(parseNotePatch, body);
+      const note = findNote(params.id);
+      return repo.update(note.id, changes) ?? note;
+    },
+    "DELETE /notes/:id": async ({ params }) => {
+      repo.remove(findNote(params.id).id);
+      return null;
+    },
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use("/api", router);
+  app.use(errorHandler);
+  return app;
+}
+
+function createNotesClient(transport: Transport) {
+  const call = createClient<NotesApi>(transport);
+  return {
+    list: () => call("GET /notes", {}),
+    create: (note: NewNote) => call("POST /notes", { body: note }),
+    get: (id: number) =>
+      call("GET /notes/:id", { params: { id: String(id) } }),
+    update: (id: number, patch: NotePatch) =>
+      call("PATCH /notes/:id", {
+        params: { id: String(id) },
+        body: patch,
+      }),
+    remove: (id: number) =>
+      call("DELETE /notes/:id", { params: { id: String(id) } }),
+  };
+}
+
+// ========== tests ==========
+
+describe("Notes API through the typed client", () => {
+  let notes: ReturnType<typeof createNotesClient>;
+
+  beforeEach(() => {
+    notes = createNotesClient(supertestTransport(createApp(), "/api"));
+  });
+
+  it("creates and lists notes", async () => {
+    const created = await notes.create({ title: " Buy bamboo " });
+    expect(created).toEqual({
+      ok: true,
+      value: { id: 1, title: "Buy bamboo", text: "", pinned: false },
+    });
+    const list = await notes.list();
+    expect(list.ok && list.value.length).toBe(1);
+  });
+
+  it("rejects an empty title with a 400", async () => {
+    const result = await notes.create({ title: "" });
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "http", status: 400, message: "Invalid body" },
+    });
+  });
+
+  it("update changes only the fields sent", async () => {
+    await notes.create({ title: "Nap", text: "After lunch" });
+    const result = await notes.update(1, { pinned: true });
+    expect(result).toEqual({
+      ok: true,
+      value: { id: 1, title: "Nap", text: "After lunch", pinned: true },
+    });
+  });
+
+  it("remove deletes the note, so get answers 404", async () => {
+    await notes.create({ title: "Temporary" });
+    expect(await notes.remove(1)).toEqual({ ok: true, value: null });
+    const result = await notes.get(1);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatchObject({ kind: "http", status: 404 });
+    }
+  });
+});
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Describe the API **once** as a contract type: keys like `"POST /notes"`, each with `params`, `body` and `response`. Share it between server and client with `import type`.
+- `keyof` and indexed access types (`NotesApi["POST /notes"]["body"]`) pull out any piece of the contract.
+- A **generic client** `createClient<Api>(transport)` derives each call's input (`Omit<Api[R], "response">`) and output (`Api[R]["response"]`) from the contract; wrong routes, params and bodies don't compile.
+- Put how requests travel behind a **`Transport`**: `fetch` in the app, supertest in tests.
+- Type the server's handlers with a **mapped type** over the contract, so a missing route or a wrong response shape is a compile error. Bodies stay `unknown` on the server and are still **parsed**.
+- The client's response cast is a deliberate trust in your own server; validate responses from APIs you don't control.
+- Real projects do the same with shared packages in a **monorepo**, **tRPC** (the router is the contract) or **OpenAPI** with code generators, plus `tsc --noEmit` over everything in CI.
+
+🎉 That completes the Node module. Next comes the Level 2 capstone, where you'll put everything together in a full-stack typed to-do app: a shared contract, a validated Express API with tests, a typed client and a React front end.

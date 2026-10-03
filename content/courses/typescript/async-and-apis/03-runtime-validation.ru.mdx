@@ -1,0 +1,1115 @@
+---
+title: Валидация во время выполнения
+description: Во время работы программы типов уже нет, поэтому внешние данные нужно проверять по-настоящему. Соберите крошечную библиотеку схем, которые дают и проверку, и тип, и познакомьтесь с zod и valibot.
+duration: 20
+xp: 30
+---
+
+В прошлом уроке вы держали внешние данные в `unknown` и проверяли их защитниками типа, написанными вручную. Это работает, но плохо масштабируется: у настоящего API десятки форм данных, и каждый защитник — ещё одно место, которое надо синхронизировать с его типом. В этом уроке вы соберёте крошечную **библиотеку схем**, где одно описание даёт **и** проверку во время выполнения, **и** тип TypeScript. Именно так работают популярные библиотеки вроде zod, а в конце вы примените свою в типизированном API-клиенте. 🛡️
+
+## Во время выполнения типы исчезают
+
+TypeScript проверяет ваш код, затем **стирает типы** и запускает обычный JavaScript. Вот этот TypeScript:
+
+```ts
+type Movie = { title: string; year: number };
+
+function nextYear(movie: Movie): number {
+  return movie.year + 1;
+}
+```
+
+выполняется как такой JavaScript, без всякого следа `Movie`:
+
+```js
+function nextYear(movie) {
+  return movie.year + 1;
+}
+```
+
+Значит, данные, которые приходят во время работы программы, никто не проверяет. Если сервер пришлёт год строкой, ваш `number` окажется строкой, и TypeScript тут не поможет:
+
+<CodeExample output={`string
+20191`}>
+
+```ts
+type Movie = { title: string; year: number };
+
+// Представьте, что этот текст пришёл с сервера
+const json = '{ "title": "The Bamboo Heist", "year": "2019" }';
+const movie: Movie = JSON.parse(json); // ошибки нет: parse даёт any
+
+console.log(typeof movie.year); // TypeScript думает: number
+console.log(movie.year + 1); // «следующий год»?
+```
+
+</CodeExample>
+
+`"2019" + 1` — это `"20191"`: склейка строк, а не арифметика. Ни падения, ни ошибки — просто неверное число у кого-то на экране. Типы описывают то, что вы **ожидаете**; проверить, что вы **получили**, может только код, работающий во время выполнения.
+
+## Защитники, написанные вручную, расходятся с типами
+
+Защитник типа — это настоящий код, который выполняется, так что он действительно проверяет. Но он живёт **рядом** с типом, а не внутри него, и они могут разойтись:
+
+<CodeExample output={`Похоже на фильм!
+undefined`}>
+
+```ts
+type Movie = {
+  title: string;
+  year: number;
+  rating: number; // добавили на прошлой неделе
+};
+
+// Написан до появления rating и с тех пор не обновлялся
+function isMovie(value: unknown): value is Movie {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "title" in value &&
+    typeof value.title === "string" &&
+    "year" in value &&
+    typeof value.year === "number"
+  );
+}
+
+const data: unknown = JSON.parse('{"title":"Code Red","year":2018}');
+
+if (isMovie(data)) {
+  console.log("Похоже на фильм!");
+  console.log(data.rating); // data.rating: number... или нет?
+}
+```
+
+</CodeExample>
+
+TypeScript **доверяет** предикату типа: он не может проверить, что тело функции действительно доказывает `value is Movie`. Кто-то добавил `rating` в тип, забыл про защитника, и теперь `data.rating` — «число», равное `undefined`. У рукописных защитников есть ещё две проблемы: они длинные, а при неудаче говорят только `false` и никогда — **какое** поле было не так.
+
+## Схема: одно описание, две задачи
+
+Решение — перевернуть всё наоборот. Вместо того чтобы писать тип, а потом защитника для него, мы пишем **схему** (schema): значение времени выполнения, которое умеет проверять данные, — и позволяем TypeScript **вывести** из неё тип. Один источник истины, поэтому расходиться нечему.
+
+Наша схема — просто объект с методом `parse`. Он принимает данные типа `unknown` и либо возвращает их как `T`, либо бросает `ValidationError`, в которой сказано, где и почему. Начнём со строк и чисел:
+
+<CodeExample output={`43
+age: expected a number, got "42"
+age: expected a number, got null
+BAMBOO`}>
+
+```ts
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+// Схема превращает неизвестные данные в T (или отказывает)
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value; // value: T благодаря предикату типа
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+
+const age = number().parse(JSON.parse("42")); // age: number
+console.log(age + 1);
+
+for (const input of ['"42"', "null"]) {
+  try {
+    number().parse(JSON.parse(input), "age");
+  } catch (error) {
+    if (error instanceof ValidationError) console.log(error.message);
+  }
+}
+console.log(string().parse("bamboo").toUpperCase());
+```
+
+</CodeExample>
+
+`primitive` — маленькая дженерик-фабрика: дайте ей описание и защитник типа, и она вернёт `Schema<T>` для этого типа. Защитники здесь — однострочники, в которых трудно ошибиться, и каждая большая схема будет **собрана** из этих маленьких надёжных кусочков. (Сообщения об ошибках у нашей библиотеки на английском, как у настоящих библиотек валидации.)
+
+### Достаём тип обратно: `Infer`
+
+Вот трюк, ради которого схемы того стоят. `parse` у `Schema<T>` возвращает `T`, значит, `ReturnType` от `parse` — **это и есть** `T`. С индексным типом доступа `S["parse"]` из урока [Дженерик-функции](/learn/typescript/generic-functions) это одна строка:
+
+```ts
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+const AgeSchema = number();
+type Age = Infer<typeof AgeSchema>; // number
+```
+
+Читайте `Infer<typeof AgeSchema>` как «тип данных, которые пропускает `AgeSchema`». Вы никогда не пишете этот тип вручную: он следует за схемой.
+
+## Объекты и массивы
+
+Настоящие данные вложенные: объекты, внутри которых массивы объектов. Это покрывают ещё два строительных блока:
+
+- **`array(item)`** проверяет, что значение — массив, а затем разбирает **каждый** элемент схемой элемента, добавляя к пути `[0]`, `[1]`…, чтобы ошибки указывали на нужный элемент.
+- **`object(shape)`** принимает объект из схем, например `{ title: string(), year: number() }`, проверяет каждый ключ его схемой и собирает чистый результат только с этими ключами.
+
+Самое интересное — тип результата `object`. Для формы `S` это `{ [K in keyof S]: Infer<S[K]> }`: «для каждого ключа `K` формы — тип, который даёт схема этого ключа». Это **сопоставленный тип** (mapped type) — цикл по ключам на уровне типов. Подробно вы разберёте их на Уровне 3, а пока читайте его как это предложение.
+
+Вот вся библиотека, около 70 строк, а за ней — схема фильма:
+
+<CodeExample output={`Code Red 2019
+year: expected a number, got "2018"
+genres[1]: expected a string, got 7
+title: expected a string, got undefined
+value: expected an object, got ["Code Red"]`}>
+
+```ts
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// Одна схема: и проверка во время выполнения, И тип
+const MovieSchema = object({
+  title: string(),
+  year: number(),
+  genres: array(string()),
+});
+type Movie = Infer<typeof MovieSchema>;
+// { title: string; year: number; genres: string[] }
+
+const good = MovieSchema.parse(
+  JSON.parse('{"title":"Code Red","year":2018,"genres":["action"]}'),
+);
+console.log(good.title, good.year + 1); // good: Movie
+
+const broken = [
+  '{"title":"Code Red","year":"2018","genres":[]}',
+  '{"title":"Code Red","year":2018,"genres":["action",7]}',
+  '{"year":2018,"genres":[]}',
+  '["Code Red"]',
+];
+for (const json of broken) {
+  try {
+    MovieSchema.parse(JSON.parse(json));
+  } catch (error) {
+    if (error instanceof ValidationError) console.log(error.message);
+  }
+}
+```
+
+</CodeExample>
+
+Посмотрите, что вы получили от одного описания `MovieSchema`:
+
+- **Тип** `Movie`, который редактор показывает как `{ title: string; year: number; genres: string[] }`. Добавьте в схему `rating: number()` — и в типе тоже появится `rating`; больше ничего обновлять не нужно.
+- **Проверку** с полезными сообщениями: путь (`genres[1]`), что ожидалось и что пришло. Запишите их в лог — и сломанный деплой диагностируется за минуты.
+- **Чистые данные**: `object` копирует только ключи из формы, так что лишние поля, которые присылает сервер, не просачиваются в приложение.
+
+А поскольку `Movie` получается из схемы, компилятор ловит ошибки относительно **настоящей** формы данных:
+
+```ts
+function show(movie: Movie) {
+  return movie.rating;
+  // ❌ Error: Property 'rating' does not exist on type '{ title: string; year: number; genres: string[]; }'.
+}
+```
+
+<Callout type="note" title="Одно приведение, в одном месте">
+
+`object` заканчивается на `return result as { ... }`. Это приведение типа, но честное: цикл только что проверил **каждый** ключ его схемой, а проследить это сам TypeScript не может. Отличие от `as Movie` в коде приложения — в том, где оно живёт: в крошечной библиотечной функции, написанной и протестированной один раз, а не разбросанной по всем вызовам fetch. Внутри настоящих библиотек вроде zod есть такое же приведение.
+
+</Callout>
+
+## Валидация ответов API
+
+Теперь `getJson` из прошлого урока может быть честным **без** рукописных защитников: параметр типа `T` выводится из переданной схемы, а данные действительно проверяются, прежде чем их кто-то увидит:
+
+<CodeExample output={`Paris: 17°C, Sunny
+[ 'Mon 18°', 'Tue 16°', 'Wed 23°' ]
+city: expected a string, got undefined`}>
+
+```ts
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+const API = "https://api.pandadev.test";
+
+// Честный getJson: T берётся из схемы, а не из обещания
+async function getJson<T>(url: string, schema: Schema<T>): Promise<T> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} от ${url}`);
+  return schema.parse(await res.json());
+}
+
+const WeatherSchema = object({
+  city: string(),
+  temperature: number(),
+  condition: string(),
+});
+
+const ForecastSchema = object({
+  city: string(),
+  forecast: array(object({ day: string(), high: number() })),
+});
+
+const now = await getJson(`${API}/weather?city=Paris`, WeatherSchema);
+console.log(`${now.city}: ${now.temperature}°C, ${now.condition}`);
+
+const week = await getJson(
+  `${API}/weather?city=Paris&days=3`,
+  ForecastSchema,
+);
+console.log(week.forecast.map((d) => `${d.day} ${d.high}°`));
+
+// Не та схема для этого URL: поймано на границе
+try {
+  await getJson(`${API}/movies/1`, WeatherSchema);
+} catch (error) {
+  if (error instanceof ValidationError) console.log(error.message);
+}
+```
+
+</CodeExample>
+
+Обратите внимание, какая маленькая `WeatherSchema`: в ней только поля, которые использует этот экран. Схема не обязана повторять весь ответ API — только ту часть, на которую вы опираетесь. Заодно приложение становится устойчивее: API может добавлять поля, не ломая вас.
+
+<Callout type="tip" title="Проверяйте на границах, доверяйте внутри">
+
+Проверяйте данные там, где они **входят** в программу: ответы API, тела запросов на сервере, `localStorage`, файлы, параметры URL, переменные окружения, сообщения из других окон или воркеров. После этой точки у данных есть настоящий, проверенный тип, и остальной код может доверять им без повторных проверок. Эту идею часто формулируют так: **«parse, don't validate»** («разбирайте, а не просто проверяйте»): не отвечайте лишь «да» или «нет», а один раз, на границе, превратите `unknown` в типизированное значение.
+
+</Callout>
+
+## Тестирование с поддельным `fetch`
+
+Как проверить, что код отвергает плохие данные, если учебное API всегда присылает хорошие? **Внедрите** `fetch`: принимайте его параметром, по умолчанию — настоящий, а в тестах передавайте подделку. Его тип — просто `typeof fetch`, а `vi.fn<typeof fetch>(...)` из Vitest следит, чтобы подделка действительно вела себя как `fetch` (она должна возвращать `Promise<Response>`). Статический метод `Response.json(data)` собирает JSON-ответ в одну строку. (PandaDev запускает Vitest прямо в редакторе: `describe` группирует тесты, `it` описывает один тест, `expect` проверяет значение, а в конце печатается отчёт.)
+
+<CodeExample output={`✓ getTemperature > читает учебное API
+✓ getTemperature > отвергает данные без числовой температуры
+
+Tests  2 passed (2)`}>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+const API = "https://api.pandadev.test";
+
+async function getTemperature(
+  city: string,
+  fetchFn: typeof fetch = fetch, // внедряем, по умолчанию — настоящий
+): Promise<number> {
+  const res = await fetchFn(`${API}/weather?city=${city}`);
+  const data: unknown = await res.json();
+  if (
+    typeof data === "object" && data !== null &&
+    "temperature" in data && typeof data.temperature === "number"
+  ) {
+    return data.temperature;
+  }
+  throw new Error("Неожиданные данные о погоде");
+}
+
+describe("getTemperature", () => {
+  it("читает учебное API", async () => {
+    expect(await getTemperature("Cairo")).toBe(31);
+  });
+
+  it("отвергает данные без числовой температуры", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({ temperature: "hot" }),
+    );
+    await expect(getTemperature("Cairo", fakeFetch)).rejects.toThrow(
+      "Неожиданные данные о погоде",
+    );
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+</CodeExample>
+
+Если бы подделка возвращала обычный объект вместо `Response`, TypeScript остановил бы вас ещё до запуска теста:
+
+```ts
+const fakeFetch = vi.fn<typeof fetch>(async () => ({ temperature: 31 }));
+// ❌ Error: Type '{ temperature: number; }' is missing the following properties from type 'Response': headers, ok, redirected, status, and 12 more.
+```
+
+Гораздо глубже в типизированные тесты, подделки и моки вы погрузитесь в следующем модуле, [Тестирование типизированного кода](/learn/typescript/testing-typed-code).
+
+<Quiz
+  question="const MovieSchema = object({ title: string(), year: number() }); type Movie = Infer<typeof MovieSchema>; Позже вы добавляете в схему rating: number(). Что ещё нужно изменить, чтобы у Movie появился rating?"
+  options={[
+    "Вручную добавить rating: number в тип Movie",
+    "Ничего: Movie выводится из схемы, поэтому rating появится автоматически",
+    "Написать новый защитник типа для rating",
+    "Привести разобранные данные через as Movie"
+  ]}
+  answer={1}
+  explanation="Infer достаёт тип из схемы, так что схема — единственный источник истины. Измените схему, и тип последует за ней — именно это не даёт проверке и типу разойтись."
+/>
+
+## Что используют в реальных проектах: zod и valibot
+
+В нашей библиотеке около 70 строк, и ей многого не хватает: необязательных полей, объединений, литеральных значений, минимальной длины, email, дат, преобразований, понятных списков ошибок. В реальных проектах берут проверенную в бою библиотеку, где всё это есть и которая построена ровно на тех идеях, что вы только что реализовали. Самая популярная — **zod**:
+
+```ts
+import { z } from "zod"; // npm i zod
+
+const Movie = z.object({
+  id: z.number().int(),
+  title: z.string().min(1),
+  year: z.number().int().min(1888),
+  genres: z.array(z.string()),
+  rating: z.number().min(0).max(10).optional(),
+});
+type Movie = z.infer<typeof Movie>; // как наш Infer
+
+const movie = Movie.parse(await res.json()); // бросает ZodError
+
+const result = Movie.safeParse(await res.json()); // никогда не бросает
+if (result.success) {
+  console.log(result.data.title); // result.data: Movie
+} else {
+  console.log(result.error.issues); // каждая проблема со своим путём
+}
+```
+
+У **valibot** те же идеи, но другой стиль: вместо методов — маленькие отдельные функции, так что бандлеры могут выбросить всё, что вы не используете, и в браузерной сборке библиотека получается гораздо меньше:
+
+```ts
+import * as v from "valibot"; // npm i valibot
+
+const Movie = v.object({
+  id: v.number(),
+  title: v.pipe(v.string(), v.minLength(1)),
+  genres: v.array(v.string()),
+});
+type Movie = v.InferOutput<typeof Movie>;
+
+const movie = v.parse(Movie, await res.json());
+```
+
+Какую выбрать? Зависит от ситуации. zod используют шире всего, для неё больше всего примеров и интеграций (формы, tRPC, генераторы OpenAPI); valibot выигрывает, когда важен размер сборки, например в небольшом фронтенде. Обе (как и другие, например ArkType) реализуют **Standard Schema** — общий интерфейс, поэтому многие инструменты принимают любую из них. Важнее всего привычка: **никакие внешние данные не попадают в приложение, не пройдя через схему.**
+
+<Callout type="warning" title="Не проверяйте одни и те же данные дважды">
+
+Валидация стоит времени, а проверки каждого объекта повсюду «на всякий случай» захламляют код. Проверьте один раз на границе, а дальше передавайте типизированное значение. Если вы ловите себя на том, что пишете `isMovie(movie)` посреди приложения, скорее всего, данные проскочили валидацию там, где входили в программу.
+
+</Callout>
+
+<Quiz
+  question="Почему const movie: Movie = JSON.parse(text) компилируется, даже если в text лежит { title: 5 }?"
+  options={[
+    "Потому что TypeScript проверяет JSON во время выполнения и превращает 5 в строку",
+    "Потому что JSON.parse возвращает any, а типы стираются до запуска кода, так что данные с Movie никто не сравнивает",
+    "Потому что Movie — интерфейс, а не тип",
+    "Не компилируется: TypeScript читает текст и сообщает об ошибке"
+  ]}
+  answer={1}
+  explanation="JSON.parse типизирован так, что возвращает any, а any можно присвоить чему угодно; во время выполнения типов, с которыми можно было бы сверить данные, уже нет. Проверить данные может только код времени выполнения, например parse у схемы."
+/>
+
+<Exercise
+  title="Мини-проект: типизированный API-клиент"
+  language="typescript"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ---- Библиотека схем из этого урока (не меняйте) ----
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// ---- Результаты и ошибки (не меняйте) ----
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+type MovieSearch = {
+  search?: string;
+  genre?: string;
+  page?: number;
+  limit?: number;
+};
+
+function moviesPath(options: MovieSearch = {}): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined) params.set(key, String(value));
+  }
+  const query = params.toString();
+  return query ? \`/movies?\${query}\` : "/movies";
+}
+
+// ---- 1. Схемы: типы получаются из них ----
+const MovieSchema = object({
+  id: number(),
+  title: string(),
+  // TODO: year, director, genres (строки), rating, minutes
+});
+type Movie = Infer<typeof MovieSchema>;
+
+// TODO: MoviePageSchema: { page, totalPages, total, results }
+//       (results — массив фильмов) и тип MoviePage
+
+// TODO: TodoSchema: { id, title, done } и тип Todo
+
+type NewTodo = { title: string; done?: boolean };
+
+// ---- 2. Клиент ----
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function createClient(options: ClientOptions = {}) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  async function request<T>(
+    path: string,
+    schema: Schema<T>,
+    init: RequestInit = {},
+  ): Promise<Result<T, ApiError>> {
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? \`HTTP \${res.status}\`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    // TODO: data имеет тип unknown, а не T. Проверьте его схемой;
+    // ValidationError превращается в { kind: "invalid", message }
+    return { ok: true, value: data };
+  }
+
+  return {
+    getMovie(id: number): Promise<Result<Movie, ApiError>> {
+      return request(\`/movies/\${id}\`, MovieSchema);
+    },
+    // TODO: searchMovies(search) -> GET moviesPath(search)
+    // TODO: createTodo(input: NewTodo) -> POST /todos с JSON
+  };
+}
+
+// ---- 3. Тесты ----
+const goodMovie = {
+  id: 1,
+  title: "The Bamboo Heist",
+  year: 2019,
+  director: "Mei Lin",
+  genres: ["comedy", "crime"],
+  rating: 7.8,
+  minutes: 104,
+};
+
+describe("api client", () => {
+  it("получает фильм из учебного API", async () => {
+    const result = await createClient().getMovie(1);
+    expect(result).toEqual({ ok: true, value: goodMovie });
+  });
+
+  it("превращает 404 в http-ошибку", async () => {
+    const result = await createClient().getMovie(99);
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Movie not found" },
+    });
+  });
+
+  it("сообщает о сетевых ошибках", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createClient({ fetch: offline }).getMovie(1);
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+    expect(offline).toHaveBeenCalledWith(
+      "https://api.pandadev.test/movies/1",
+      {},
+    );
+  });
+
+  // TODO: «отвергает фильм, у которого год — строка»: поддельный
+  // fetch отвечает Response.json({ ...goodMovie, year: "2019" }),
+  // а getMovie даёт ошибку "invalid" с точным сообщением
+});
+
+// ---- Тесты типов (не меняйте) ----
+async function typeTests() {
+  const client = createClient();
+  const movie = await client.getMovie(1);
+  if (movie.ok) {
+    const title: string = movie.value.title;
+    const year: number = movie.value.year;
+    // @ts-expect-error: год фильма — число, а не строка
+    const wrong: string = movie.value.year;
+  }
+  const page = await client.searchMovies({ search: "panda" });
+  if (page.ok) {
+    const first: Movie | undefined = page.value.results[0];
+  }
+  const todo = await client.createTodo({ title: "Test" });
+  if (todo.ok) {
+    const done: boolean = todo.value.done;
+  }
+  // @ts-expect-error: проверьте ok, прежде чем читать value
+  todo.value;
+}
+`}
+  tests={[
+    { name: "getMovie возвращает проверенный фильм", check: `(async () => { const r = await createClient().getMovie(1); return r.ok === true && r.value.title === "The Bamboo Heist" && r.value.year === 2019 && r.value.genres.length === 2 && r.value.minutes === 104; })()` },
+    { name: "getMovie превращает 404 в http-ошибку", check: `(async () => { const r = await createClient().getMovie(99); return r.ok === false && r.error.kind === "http" && r.error.status === 404 && r.error.message === "Movie not found"; })()` },
+    { name: "searchMovies отправляет запрос и возвращает проверенную страницу", check: `(async () => { const r = await createClient().searchMovies({ genre: "comedy", limit: 2 }); return r.ok === true && r.value.total === 4 && r.value.totalPages === 2 && r.value.results.length === 2 && r.value.results[1].title === "The Last Dumpling" && __requests.at(-1).url.endsWith("/movies?genre=comedy&limit=2"); })()` },
+    { name: "createTodo отправляет JSON через POST и возвращает проверенную задачу", check: `(async () => { const r = await createClient().createTodo({ title: "Write tests" }); const sent = __requests.at(-1); return r.ok === true && r.value.title === "Write tests" && typeof r.value.id === "number" && r.value.done === false && sent.method === "POST" && sent.body?.title === "Write tests" && /json/.test(sent.headers["content-type"] ?? ""); })()` },
+    { name: "createTodo превращает 400 в http-ошибку", check: `(async () => { const r = await createClient().createTodo({ title: "" }); return r.ok === false && r.error.kind === "http" && r.error.status === 400 && r.error.message === "title is required"; })()` },
+    { name: "Фильм с годом-строкой — ошибка invalid", check: `(async () => { const movie = { id: 1, title: "X", year: "2019", director: "D", genres: [], rating: 5, minutes: 90 }; const r = await createClient({ fetch: async () => Response.json(movie) }).getMovie(1); return r.ok === false && r.error.kind === "invalid" && r.error.message === 'year: expected a number, got "2019"'; })()` },
+    { name: "Плохие фильмы внутри страницы поиска тоже ловятся", check: `(async () => { const page = { page: 1, totalPages: 1, total: 1, results: [{ id: 1, title: 5, year: 2019, director: "D", genres: [], rating: 5, minutes: 90 }] }; const r = await createClient({ fetch: async () => Response.json(page) }).searchMovies(); return r.ok === false && r.error.kind === "invalid" && r.error.message === "results[0].title: expected a string, got 5"; })()` },
+    { name: "Задача с done не логического типа — ошибка invalid", check: `(async () => { const todo = { id: 1, title: "T", done: "yes" }; const r = await createClient({ fetch: async () => Response.json(todo, { status: 201 }) }).createTodo({ title: "T" }); return r.ok === false && r.error.kind === "invalid" && r.error.message.startsWith("done:"); })()` },
+    { name: "Все тесты проходят, включая ваш новый", check: `__vitest.failed === 0 && __vitest.passed >= 4` },
+    { name: "Ваш тест ловит сломанную проверку чисел", check: `(await __retest([['(v): v is number => typeof v === "number"', "(v): v is number => true"]])).failed > 0` },
+  ]}
+>
+
+Соберите типизированный клиент для учебного API. Всё, что он возвращает, — это `Result<T, ApiError>`, и каждый ответ **проверяется** схемой, так что типы правдивы и во время выполнения. Библиотека схем, типы ошибок и помощник `moviesPath` уже готовы вверху (не меняйте их).
+
+1. **Схемы.** Допишите `MovieSchema` (у фильма есть `id`, `title`, `year`, `director`, `genres` (строки), `rating` и `minutes`). Добавьте `MoviePageSchema` для результатов поиска (`page`, `totalPages`, `total` и `results` — массив фильмов) и `TodoSchema` (`id`, `title`, `done`), каждую со своим типом через `Infer`.
+2. **Проверка в `request`.** TypeScript уже отказывается принимать `value: data`, потому что `data` имеет тип `unknown`, а не `T`. Разберите его схемой; `ValidationError` превращается в `{ kind: "invalid", message }`.
+3. **Методы клиента.** Рядом с `getMovie` добавьте `searchMovies(search)` (GET `moviesPath(search)`) и `createTodo(input)` (POST `/todos` с телом в JSON), с возвращаемыми типами по образцу `getMovie`.
+4. **Тест.** Замените `TODO` в тестах на тест с названием «отвергает фильм, у которого год — строка»: поддельный `fetch` отвечает `Response.json({ ...goodMovie, year: "2019" })`, а `getMovie` должен вернуть `{ ok: false, error: { kind: "invalid", message: 'year: expected a number, got "2019"' } }`.
+
+**Тесты типов** внизу не проходят, пока клиент не готов: строки с `@ts-expect-error` проходят, только если строка под директивой *действительно* ошибка, так что `any` не проскочит. Когда закончите, все четыре теста должны пройти.
+
+<Hint>
+
+В `request` замените последний `return` на `try { return { ok: true, value: schema.parse(data) }; } catch (error) { ... }`. Внутри `catch` проверьте `error instanceof ValidationError` и верните ошибку `invalid`; всё остальное бросьте дальше. В `MoviePageSchema` строка `results: array(MovieSchema)` переиспользует схему фильма. `createTodo` передаёт `{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) }` третьим аргументом `request`. Для теста скопируйте тест «сообщает о сетевых ошибках»: `vi.fn<typeof fetch>(async () => Response.json({ ...goodMovie, year: "2019" }))`.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+// ---- Библиотека схем из этого урока (не меняйте) ----
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = { parse: (value: unknown, path?: string) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+
+function object<S extends Shape>(
+  shape: S,
+): Schema<{ [K in keyof S]: Infer<S[K]> }> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        result[key] = shape[key].parse(value[key], where);
+      }
+      // каждый ключ проверен, так что это приведение безопасно
+      return result as { [K in keyof S]: Infer<S[K]> };
+    },
+  };
+}
+
+// ---- Результаты и ошибки (не меняйте) ----
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid"; message: string };
+
+function apiMessage(body: unknown): string | undefined {
+  if (isRecord(body) && typeof body.error === "string") {
+    return body.error;
+  }
+  return undefined;
+}
+
+type MovieSearch = {
+  search?: string;
+  genre?: string;
+  page?: number;
+  limit?: number;
+};
+
+function moviesPath(options: MovieSearch = {}): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined) params.set(key, String(value));
+  }
+  const query = params.toString();
+  return query ? `/movies?${query}` : "/movies";
+}
+
+// ---- 1. Схемы (типы получаются из них) ----
+const MovieSchema = object({
+  id: number(),
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof MovieSchema>;
+
+const MoviePageSchema = object({
+  page: number(),
+  totalPages: number(),
+  total: number(),
+  results: array(MovieSchema),
+});
+type MoviePage = Infer<typeof MoviePageSchema>;
+
+const TodoSchema = object({
+  id: number(),
+  title: string(),
+  done: boolean(),
+});
+type Todo = Infer<typeof TodoSchema>;
+type NewTodo = { title: string; done?: boolean };
+
+// ---- 2. Клиент ----
+type ClientOptions = {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+};
+
+function createClient(options: ClientOptions = {}) {
+  const baseUrl = options.baseUrl ?? "https://api.pandadev.test";
+  const fetchFn = options.fetch ?? fetch;
+
+  async function request<T>(
+    path: string,
+    schema: Schema<T>,
+    init: RequestInit = {},
+  ): Promise<Result<T, ApiError>> {
+    let res: Response;
+    try {
+      res = await fetchFn(baseUrl + path, init);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return { ok: false, error: { kind: "network", message } };
+    }
+    const data: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const message = apiMessage(data) ?? `HTTP ${res.status}`;
+      return {
+        ok: false,
+        error: { kind: "http", status: res.status, message },
+      };
+    }
+    try {
+      return { ok: true, value: schema.parse(data) };
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        return {
+          ok: false,
+          error: { kind: "invalid", message: error.message },
+        };
+      }
+      throw error;
+    }
+  }
+
+  return {
+    getMovie(id: number): Promise<Result<Movie, ApiError>> {
+      return request(`/movies/${id}`, MovieSchema);
+    },
+    searchMovies(
+      search: MovieSearch = {},
+    ): Promise<Result<MoviePage, ApiError>> {
+      return request(moviesPath(search), MoviePageSchema);
+    },
+    createTodo(input: NewTodo): Promise<Result<Todo, ApiError>> {
+      return request("/todos", TodoSchema, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      });
+    },
+  };
+}
+
+// ---- 3. Тесты ----
+const goodMovie = {
+  id: 1,
+  title: "The Bamboo Heist",
+  year: 2019,
+  director: "Mei Lin",
+  genres: ["comedy", "crime"],
+  rating: 7.8,
+  minutes: 104,
+};
+
+describe("api client", () => {
+  it("получает фильм из учебного API", async () => {
+    const result = await createClient().getMovie(1);
+    expect(result).toEqual({ ok: true, value: goodMovie });
+  });
+
+  it("превращает 404 в http-ошибку", async () => {
+    const result = await createClient().getMovie(99);
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Movie not found" },
+    });
+  });
+
+  it("сообщает о сетевых ошибках", async () => {
+    const offline = vi.fn<typeof fetch>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const result = await createClient({ fetch: offline }).getMovie(1);
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+    expect(offline).toHaveBeenCalledWith(
+      "https://api.pandadev.test/movies/1",
+      {},
+    );
+  });
+
+  it("отвергает фильм, у которого год — строка", async () => {
+    const fake = vi.fn<typeof fetch>(async () =>
+      Response.json({ ...goodMovie, year: "2019" }),
+    );
+    const result = await createClient({ fetch: fake }).getMovie(1);
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "invalid",
+        message: 'year: expected a number, got "2019"',
+      },
+    });
+  });
+});
+
+// ---- Тесты типов (не меняйте) ----
+async function typeTests() {
+  const client = createClient();
+  const movie = await client.getMovie(1);
+  if (movie.ok) {
+    const title: string = movie.value.title;
+    const year: number = movie.value.year;
+    // @ts-expect-error: год фильма — число, а не строка
+    const wrong: string = movie.value.year;
+  }
+  const page = await client.searchMovies({ search: "panda" });
+  if (page.ok) {
+    const first: Movie | undefined = page.value.results[0];
+  }
+  const todo = await client.createTodo({ title: "Test" });
+  if (todo.ok) {
+    const done: boolean = todo.value.done;
+  }
+  // @ts-expect-error: проверьте ok, прежде чем читать value
+  todo.value;
+}
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Типы стираются до запуска кода, поэтому `JSON.parse`, `res.json()` и подобные им TypeScript никогда не проверяет. Проверить внешние данные может только код времени выполнения.
+- Рукописные защитники типа работают, но расходятся со своими типами, получаются длинными и не умеют сказать, что именно не так.
+- **Схема** — это значение времени выполнения, которое проверяет данные и из которого TypeScript выводит тип: `type Movie = Infer<typeof MovieSchema>`. Один источник истины.
+- Маленькие схемы (`string()`, `number()`) собираются в большие (`array(...)`, `object({...})`) с путями в ошибках вроде `results[0].title`.
+- Дженерик-помощник вроде `getJson(url, schema)` выводит `T` из схемы, поэтому он честный.
+- Внедряйте `fetch` (`typeof fetch`), чтобы тестировать плохие ответы типизированной подделкой.
+- В реальных проектах используйте **zod** или **valibot** и проверяйте данные один раз, на границах приложения.
+
+🎉 Модуль «Асинхронность и типизированные API» пройден: ваши вызовы fetch теперь и типизированы, **и** правдивы. Дальше вы научитесь как следует [тестировать типизированный код](/learn/typescript/testing-typed-code).
