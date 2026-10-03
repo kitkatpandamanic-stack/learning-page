@@ -1,0 +1,2265 @@
+---
+title: "Part 2: The client"
+description: "Turn the API description into a working client: methods typed from the description, typed errors, retries with backoff and an injected sleep, pagination with for await, hooks and fast tests."
+duration: 25
+xp: 30
+---
+
+In Part 1 you designed `@pandadev/sdk` and built its foundation: `pandaApi` describes every endpoint, `Client<A>` derives every method's type from it, and `buildRequest` turns checked input into a request. But nothing talks to the network yet. In this part, the description becomes a **working client**. 🔌
+
+We'll build `createClient(api, options)`, and with it everything a real SDK does between "the user called a method" and "the user got a `Result`":
+
+- **one method per endpoint**, created at runtime from the description, with the types from Part 1,
+- **typed errors**: every way a request can fail becomes one of the three `ApiError` kinds,
+- **retries with backoff and jitter** for the requests that are safe to repeat, with an injected `sleep`, so tests never wait,
+- **pagination as an async iterator**: `for await (const movie of paginate(panda.searchMovies))`,
+- **hooks** to add headers and watch every attempt, for auth, logs and metrics,
+- and **tests** with a fake `fetch`, plus a few against the practice API.
+
+It brings together the error strategy from [Designing Types for Large Codebases](/learn/typescript/designing-types-for-large-codebases), `Result` from [Typed Fetch](/learn/typescript/typed-fetch), injected clocks and fakes from [Dependency Injection & Fakes](/learn/typescript/dependency-injection-and-fakes), and backoff with jitter from the JavaScript lesson [Real-time and Resilience](/learn/javascript/real-time-and-resilience).
+
+## Types outside, one cast inside
+
+`Client<A>` is a promise about an object: "for every key of the description, there's a method with these types". `createClient` has to **keep** that promise at runtime, and the simplest way is a loop over the description's keys. Here's the idea in miniature, with two endpoints and stand-in schemas:
+
+<CodeExample output={`The Bamboo Heist
+[ 'Learn fetch', 'Build the movie app', 'Eat some bamboo' ]
+[ 'firstMovie', 'todos' ]`}>
+
+```ts
+type Schema<T> = { parse: (value: unknown) => T };
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+
+// Stand-in schemas, just enough for this example
+const titled: Schema<{ title: string }> = {
+  parse(value) {
+    if (
+      typeof value === "object" && value !== null &&
+      "title" in value && typeof value.title === "string"
+    ) {
+      return { title: value.title };
+    }
+    throw new Error("expected an object with a title");
+  },
+};
+const titledList: Schema<{ title: string }[]> = {
+  parse(value) {
+    if (!Array.isArray(value)) throw new Error("expected an array");
+    return value.map((item) => titled.parse(item));
+  },
+};
+
+interface Endpoint {
+  path: string;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// The promise: one method per endpoint
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: () => Promise<Infer<A[K]["response"]>>;
+};
+
+function createClient<A extends ApiDescription>(
+  api: A,
+  baseUrl: string,
+): Client<A> {
+  // Keeping the promise: a loop over the description
+  const client: Record<string, () => Promise<unknown>> = {};
+  for (const name of Object.keys(api)) {
+    const endpoint = api[name];
+    client[name] = async () => {
+      const res = await fetch(baseUrl + endpoint.path);
+      return endpoint.response.parse(await res.json());
+    };
+  }
+  return client as Client<A>; // the one cast
+}
+
+const panda = createClient(
+  {
+    firstMovie: { path: "/movies/1", response: titled },
+    todos: { path: "/todos", response: titledList },
+  },
+  "https://api.pandadev.test",
+);
+
+const movie = await panda.firstMovie(); // { title: string }
+const todos = await panda.todos(); // { title: string }[]
+console.log(movie.title);
+console.log(todos.map((todo) => todo.title));
+console.log(Object.keys(panda));
+```
+
+</CodeExample>
+
+TypeScript can't follow the loop. It sees a `Record<string, ...>` being filled, so without the cast it refuses:
+
+```ts
+return client;
+// ❌ Error: Type 'Record<string, () => Promise<unknown>>' is not assignable to type 'Client<A>'.
+```
+
+That's the same deal you made in [Mapped Types](/learn/typescript/mapped-types) with `makeGetters`: when the type and the runtime code follow the same rule ("one method per key"), the type can't verify the code, so you write the rule twice, keep both halves next to each other, cast **once**, and let tests prove the code keeps its promise. One cast in one place inside the SDK buys precise types at every call site outside it.
+
+Why not a `Proxy` from [Proxies, Reflect and Symbols](/learn/javascript/proxies-reflect-and-symbols), whose `get` trap could invent each method the moment it's called? Some SDKs do that, but here we know every method up front, and a plain object is friendlier: `Object.keys(panda)` lists the methods, `console.log(panda)` shows them, and a debugger doesn't step through proxy traps. Prefer boring runtime code when the types already do the clever part.
+
+### Everything slow, random or outside is injected
+
+The real `createClient` takes an options object. Everything the client needs from the outside world is in it, each with a sensible default, so normal users pass nothing and tests pass fakes:
+
+```ts
+interface ClientOptions {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+  retry?: Partial<RetryOptions>;
+  hooks?: Hooks;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  now?: () => number;
+}
+```
+
+`fetch` is the network, `sleep` is waiting, `random` is the jitter in backoff and `now` is the clock that times each attempt. That's the list from [Dependency Injection & Fakes](/learn/typescript/dependency-injection-and-fakes): inject what's slow, random or outside your program. `retry` is a `Partial` so users can change one setting and keep the defaults for the rest: `{ ...DEFAULT_RETRY, ...options.retry }`.
+
+## Every failure has a kind
+
+`attemptOnce` sends one request and reports how it went as a `Result`. It decides which `ApiError` each failure becomes, so it's worth reading closely:
+
+<CodeExample output={`/movies/1   ok, a JSON body
+/status/204 ok, no content
+/movies/99  HTTP 404: Movie not found
+/status/503 HTTP 503: Service Unavailable
+/offline    no answer (Failed to fetch)`}>
+
+```ts
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+// Result<never, ...> fits a Result of ANY value type
+function fail(error: ApiError): Result<never, ApiError> {
+  return { ok: false, error };
+}
+
+function apiMessage(body: unknown): string | undefined {
+  return typeof body === "object" && body !== null &&
+    "error" in body && typeof body.error === "string"
+    ? body.error
+    : undefined;
+}
+
+async function attemptOnce(
+  url: string,
+): Promise<Result<unknown, ApiError>> {
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch (error) {
+    // fetch only rejects when there's no answer at all
+    const message =
+      error instanceof Error ? error.message : String(error);
+    return fail({ kind: "network", message });
+  }
+  const body: unknown =
+    res.status === 204 ? null : await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = apiMessage(body) ?? `HTTP ${res.status}`;
+    return fail({ kind: "http", status: res.status, message });
+  }
+  return { ok: true, value: body };
+}
+
+function describeError(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      return `no answer (${error.message})`;
+    case "http":
+      return `HTTP ${error.status}: ${error.message}`;
+    case "invalid-response":
+      return `odd answer: ${error.message}`;
+  }
+}
+
+const API = "https://api.pandadev.test";
+for (const path of [
+  "/movies/1",
+  "/status/204",
+  "/movies/99",
+  "/status/503",
+  "/offline",
+]) {
+  const result = await attemptOnce(API + path);
+  const text = result.ok
+    ? `ok, ${result.value === null ? "no content" : "a JSON body"}`
+    : describeError(result.error);
+  console.log(path.padEnd(11), text);
+}
+```
+
+</CodeExample>
+
+| What happened | Becomes | Retry? |
+| --- | --- | --- |
+| `fetch` rejected: offline, DNS failure, connection reset | `{ kind: "network" }` | yes |
+| 429 Too Many Requests, or any 5xx | `{ kind: "http", status }` | yes |
+| Any other 4xx: 400, 401, 404… | `{ kind: "http", status }` | no: asking again gives the same answer |
+| A 2xx whose body breaks the schema | `{ kind: "invalid-response" }` | no: the API changed, not the network |
+| The caller's input breaks its schema | a thrown `ValidationError` | never sent at all |
+
+A few details are easy to get wrong:
+
+- **`fetch` only rejects when there's no answer at all.** A 404 or 503 is a perfectly good `Response`, so `res.ok` decides.
+- **Error bodies may not be JSON.** A proxy in front of the API can answer with an HTML error page, so `res.json().catch(() => null)` keeps a broken body from turning into an exception, and the message falls back to `HTTP 503`.
+- **A 204 has no body**, and calling `res.json()` on it would throw. It becomes `null`, which is exactly what `nothing()` from Part 1 expects.
+- **`fail` returns `Result<never, ApiError>`**, a result whose success side can't exist, so it fits a `Result` of any value type, as in [Designing Types for Large Codebases](/learn/typescript/designing-types-for-large-codebases).
+
+`describeError` handles every kind in a `switch` without a `default`, and that's on purpose. If 1.1 adds a `{ kind: "timeout" }`, every such function stops compiling until somebody decides what a timeout means there:
+
+```ts
+function describeError(error: ApiError): string {
+// ❌ Error: Function lacks ending return statement and return type does not include 'undefined'.
+```
+
+That's great inside the SDK. For the SDK's **users**, though, it means a new error kind breaks their builds, which makes it a breaking change. We'll decide what to do about that in Part 3.
+
+## Retries that don't make things worse
+
+Retrying looks easy: if it failed, try again. Done carelessly, retries turn a small outage into a big one, or charge a customer twice. A senior retry policy answers three questions.
+
+**Which requests?** Only those that are safe to send twice. `GET`, `PUT` and `DELETE` are **idempotent**: doing them twice leaves the server in the same state as doing them once. A `POST` isn't: if `POST /todos` timed out, the server may well have created the to-do before the connection dropped, and a retry creates a second one. A payments company I know learnt this the expensive way, when an automatic retry on a "create charge" call charged a few hundred customers twice during a network blip. APIs that need safe `POST` retries accept an **idempotency key** header (Stripe's `Idempotency-Key`), so the server can recognise a repeat; ours doesn't, so the SDK never retries `POST` or `PATCH`:
+
+```ts
+// Sending these twice does no harm, so they may be retried
+const IDEMPOTENT = new Set<Method>(["GET", "PUT", "DELETE"]);
+```
+
+**Which failures?** Only the ones that might go away: network errors, 429 and 5xx, as in the table above.
+
+**How long to wait?** Long enough for the server to recover, and not all at the same time:
+
+<CodeExample output={`after attempt 1: wait 100-200 ms
+after attempt 2: wait 200-400 ms
+after attempt 3: wait 400-800 ms
+after attempt 4: wait 800-1600 ms
+after attempt 5: wait 1000-2000 ms
+after attempt 6: wait 1000-2000 ms
+without jitter: 200, 200, 200, 200, 200
+with jitter:    100, 192, 129, 121, 173`}>
+
+```ts
+interface RetryOptions {
+  attempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+// Exponential, capped, with "equal jitter": half fixed, half random
+function backoff(
+  attempt: number,
+  retry: RetryOptions,
+  random: () => number,
+): number {
+  const exp = Math.min(
+    retry.maxDelayMs,
+    retry.baseDelayMs * 2 ** (attempt - 1),
+  );
+  return Math.round(exp / 2 + (exp / 2) * random());
+}
+
+const retry = { attempts: 7, baseDelayMs: 200, maxDelayMs: 2_000 };
+for (let attempt = 1; attempt < retry.attempts; attempt++) {
+  const low = backoff(attempt, retry, () => 0);
+  const high = backoff(attempt, retry, () => 1);
+  console.log(`after attempt ${attempt}: wait ${low}-${high} ms`);
+}
+
+// 5 clients fail at the same moment. When do they come back?
+// (A predictable "random" so this example prints the same output)
+let seed = 7;
+function fakeRandom(): number {
+  seed = (seed * 16807) % 2147483647;
+  return seed / 2147483647;
+}
+const noJitter = [1, 2, 3, 4, 5].map(() => backoff(1, retry, () => 1));
+const jitter = [1, 2, 3, 4, 5].map(() => backoff(1, retry, fakeRandom));
+console.log("without jitter:", noJitter.join(", "));
+console.log("with jitter:   ", jitter.join(", "));
+```
+
+</CodeExample>
+
+- **Exponential backoff**: each wait is twice the last (100–200 ms, then 200–400, 400–800), so a struggling server gets more and more breathing room.
+- **A cap** (`maxDelayMs`) stops the waits from growing for ever.
+- **Jitter** spreads clients out. Look at the last two lines: when a server restarts, thousands of clients fail at the same moment. Without jitter they all come back at exactly 200 ms and knock it over again (the **thundering herd**). With jitter they arrive spread out. The JavaScript lesson used "full jitter" (anywhere from 0 to the maximum); we use **"equal jitter"**: half of the wait is fixed and half is random, so no client ever retries instantly.
+
+The `random` function is injected for the same reason as `sleep`: so a test can say "random is always 1" and expect exactly `[200, 400]`. Real SDKs also respect a **`Retry-After`** header when the server sends one with a 429 or 503; ours is on the "take it further" list.
+
+Put together, `send` (which you'll write in the exercise) is a loop: build the request, run the `onRequest` hook, then call `attemptOnce`. On success, parse the body with the endpoint's response schema. On failure, if there are attempts left **and** the method is idempotent **and** the error is retryable, `await sleep(backoff(...))` and go round again; otherwise return the error.
+
+<Callout type="tip" title="Retries multiply">
+
+If your app retries 3 times, the SDK under it retries 3 times, and the load balancer retries 3 times, one click can become 27 requests to a server that is already down. Retry in **one** layer (an SDK is a good one), keep the number of attempts small, and make it configurable, so apps that retry themselves can turn the SDK's retries off.
+
+</Callout>
+
+<Quiz
+  question="The SDK gets a 503 from each of these requests. Which one may it retry automatically?"
+  options={[
+    "POST /todos with { title: 'Nap' }",
+    "PATCH /todos/3 with { done: true }",
+    "GET /movies?page=2",
+    "All of them: a 503 means the server didn't do anything",
+  ]}
+  answer={2}
+  explanation="Only idempotent requests may be repeated blindly. GET is. POST isn't: a 503 from a proxy doesn't prove the server did nothing, and without an idempotency key a retried POST can create a duplicate. PATCH isn't guaranteed to be idempotent either (a patch like 'add 1 to likes' isn't), so the SDK retries neither."
+/>
+
+## Pagination as an async iterator
+
+`searchMovies` returns one **page** at a time: `{ page, totalPages, total, results }`. Users nearly always want "all the movies" or "movies until I find one", and writing the page loop every time is boring and easy to get wrong (off by one, forgetting the last page). An **async generator** hides the pages: `async function*` can `await` between items and `yield` them one at a time, and `for await` consumes them. You may remember `allMovies` from the JavaScript lesson [The Event Loop in Depth](/learn/javascript/the-event-loop-in-depth); here it is with types:
+
+<CodeExample output={`First film before 2017: Midnight in the Forest
+Requests so far: 1
+12 films, 5 requests in total`}>
+
+```ts
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+type Movie = { title: string; year: number };
+
+let requests = 0;
+async function moviePage(page: number): Promise<Page<Movie>> {
+  requests++;
+  const url = `https://api.pandadev.test/movies?limit=3&page=${page}`;
+  const res = await fetch(url);
+  return (await res.json()) as Page<Movie>; // the SDK validates instead
+}
+
+async function* allMovies(): AsyncGenerator<Movie, void, undefined> {
+  for (let page = 1; ; page++) {
+    const { results, totalPages } = await moviePage(page);
+    yield* results; // hand out this page's movies, one by one
+    if (page >= totalPages) return;
+  }
+}
+
+for await (const movie of allMovies()) {
+  if (movie.year < 2017) {
+    console.log(`First film before 2017: ${movie.title}`);
+    break; // the generator stops: no more pages are fetched
+  }
+}
+console.log(`Requests so far: ${requests}`);
+
+const titles: string[] = [];
+for await (const movie of allMovies()) {
+  titles.push(movie.title);
+}
+console.log(`${titles.length} films, ${requests} requests in total`);
+```
+
+</CodeExample>
+
+Two properties make generators perfect for this:
+
+- **They're lazy.** The first loop found its film on page 1 and `break`, which ends the generator, so pages 2 to 4 were never fetched. A function that returned a big array would have loaded all four pages first.
+- **`yield*` hands out a whole array**, item by item, so the generator's body stays a tiny loop over pages.
+
+The SDK's version works with **any** method whose response is a page. Its signature is where the types come in:
+
+```ts
+async function* paginate<Q extends { page?: number }, T>(
+  method: (input: { query?: Q }) => Promise<Result<Page<T>, ApiError>>,
+  query?: NoInfer<Q>,
+): AsyncGenerator<T, void, undefined>
+```
+
+- **The `method` parameter is the constraint.** `T` is inferred from the method's result, so `paginate(panda.searchMovies)` yields `Movie`s. A method that doesn't return pages doesn't fit; the message ends with a clear line: `Property 'params' is missing in type '{ query?: { page?: number | undefined; } | undefined; }' but required in type '{ params: { id: Brand<number, "MovieId">; }; }'.`
+- **`NoInfer<Q>`** (from [Variance & Inference](/learn/typescript/variance-and-inference)) makes `Q` come from the method only. Without it, a misspelt option in `query` would simply widen `Q`. With it, you get the error you want:
+
+```ts
+paginate(panda.searchMovies, { genr: "drama" });
+// ❌ Error: Object literal may only specify known properties, but 'genr' does not exist in type '{ page?: number | undefined; search?: string | undefined; genre?: string | undefined; limit?: number | undefined; }'. Did you mean to write 'genre'?
+```
+
+- **`AsyncGenerator<T, void, undefined>`** spells out what `for await` gets (`T`), what the generator returns at the end (nothing) and what callers may pass into `next()` (nothing).
+
+Inside, each page request becomes `method({ query: { ...query, page } as Q })`. That cast is the one TypeScript asks for, and it's worth understanding why: spreading a `Q` that might be `undefined` gives `{ page: number }`, and TypeScript can't prove that's a valid `Q` in general (`'{ page: number; }' is assignable to the constraint of type 'Q', but 'Q' could be instantiated with a different subtype of constraint '{ page?: number | undefined; }'.`). It's right: a `Q` with a **required** field would break. Paged endpoints have only optional query fields, and `buildRequest` would throw a `ValidationError` if one didn't, so the cast is safe here.
+
+What about errors? A `for await` loop has no place for a `Result`: there's no value to hand back when page 3 fails. So `paginate` **throws**, an `ApiFailure` that carries the `ApiError`, so a `catch` still gets the typed error:
+
+```ts
+try {
+  for await (const movie of paginate(panda.searchMovies)) {
+    show(movie);
+  }
+} catch (error) {
+  if (error instanceof ApiFailure) report(error.error); // ApiError
+  else throw error;
+}
+```
+
+`ApiFailure` declares its `error` field and assigns it in the constructor, instead of using a parameter property like `constructor(readonly error: ApiError)`. That keeps the SDK's source **erasable** (see [How the Compiler Works](/learn/typescript/how-the-compiler-works)), so it runs as it is under Node's type stripping and any transpile-only tool.
+
+## Hooks for auth, logs and metrics
+
+Every real SDK gets the same feature requests within a month: "how do I add my API key?", "how do I log requests?", "how do I measure latency?". Instead of an option for each, we offer two **hooks**:
+
+```ts
+interface Hooks {
+  onRequest?: (request: SdkRequest) => SdkRequest;
+  onResponse?: (info: ResponseInfo) => void;
+}
+
+interface ResponseInfo {
+  request: SdkRequest;
+  attempt: number;
+  status: number | null; // null: the request never got an answer
+  ms: number;
+}
+```
+
+`onRequest` runs **once** per call, before the first attempt, and returns the request to send, so it can add headers without mutating anything the SDK holds. `onResponse` runs after **every** attempt, including failed ones, with the attempt number and the time it took (measured with the injected `now`). Here's how an app might use them:
+
+```ts
+const panda = createClient(pandaApi, {
+  hooks: {
+    onRequest: (request) => ({
+      ...request,
+      headers: { ...request.headers, Authorization: `Bearer ${key}` },
+    }),
+    onResponse: ({ request, status, attempt, ms }) => {
+      metrics.timing("panda.request", ms, { status, attempt });
+      if (status === null || status >= 500) {
+        log.warn(`${request.method} ${request.url} -> ${status}`);
+      }
+    },
+  },
+});
+```
+
+Libraries such as ky and axios offer full middleware chains (any number of interceptors that can also change responses). Two hooks cover the requests we actually get, and adding a third later is a minor release, while removing one would be a major. Start small. And one rule for anything that logs requests: **never log the `Authorization` header**. Hooks see everything, including secrets.
+
+## Testing the client
+
+The client is the part of the SDK that talks to the outside world, so it's where injected fakes pay off. Two tiny helpers cover almost every test. `fakeFetch` answers with a list of prepared responses (or throws an `Error` from the list), using real `Response` objects, so it needs no casts, as you saw in [Dependency Injection & Fakes](/learn/typescript/dependency-injection-and-fakes):
+
+```ts
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep = async (ms: number) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+// A fetch that gives these answers in order (an Error is thrown)
+function fakeFetch(...answers: (Response | Error)[]) {
+  return vi.fn<typeof fetch>(async () => {
+    const next = answers.shift();
+    if (next === undefined) throw new Error("No more answers");
+    if (next instanceof Error) throw next;
+    return next;
+  });
+}
+```
+
+With them, the backoff schedule is one line to check, and the test doesn't wait at all (`busy()` makes a 503 response, and `movieJson` is a movie as the API sends it):
+
+```ts
+it("retries a GET with backoff, then succeeds", async () => {
+  const { sleep, waits } = fakeSleep();
+  const fetch = fakeFetch(busy(), busy(), Response.json(movieJson));
+  const panda = createClient(pandaApi, {
+    fetch,
+    sleep,
+    random: () => 1,
+  });
+  const result = await panda.getMovie({
+    params: { id: MovieId.parse(1) },
+  });
+  expect(result.ok).toBe(true);
+  expect(fetch).toHaveBeenCalledTimes(3);
+  expect(waits).toEqual([200, 400]);
+});
+```
+
+Fakes test the rare cases you can't produce on demand (a dropped connection, a broken body). A few tests also run against the **practice API**, which stands in for the real service: they check that our description matches what the API really sends. One of them shows off a property of the design: `createClient` works with **any** description, so a test can describe the practice API's `/flaky` endpoint (it fails twice with 503, then works) without adding it to the SDK:
+
+```ts
+const testApi = defineApi({
+  flaky: {
+    method: "GET",
+    path: "/flaky",
+    response: object({ ok: boolean(), attempt: number() }),
+  },
+});
+const client = createClient(testApi, { sleep });
+expect(await client.flaky()).toEqual({
+  ok: true,
+  value: { ok: true, attempt: 3 },
+});
+```
+
+<Callout type="note" title="Tests against a live API">
+
+In a real repository, tests that call the live API are **contract tests**: slower, and they can fail because of the network rather than your code. Keep them few, run them on a schedule or before releases, and keep the fast fake-based tests for every push. PandaDev's practice API answers within 100 ms and the same way every time, so here they can run with the rest.
+
+</Callout>
+
+<Quiz
+  question="A user writes: for await (const movie of paginate(panda.searchMovies)) { if (movie.rating > 8) { show(movie); break; } }. The first movie rated above 8 is on page 1 of 3. How many page requests does paginate make?"
+  options={[
+    "3: it loads every page first",
+    "1: the generator only fetches the next page when the loop asks for more, and break ends it",
+    "2: it always fetches one page ahead",
+    "0: async generators can't use fetch",
+  ]}
+  answer={1}
+  explanation="An async generator runs only when the consumer asks for the next item. After page 1's movies, the loop breaks, which calls the generator's return() and ends it before it ever requests page 2."
+/>
+
+<Exercise
+  title="Build it: The client"
+  language="typescript"
+  starter={`import { describe, it, expect, vi } from "vitest";
+
+// ---------- schemas: Level 2's library, grown up ----------
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(\`\${where}: expected \${expected}, got \${JSON.stringify(got)}\`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = {
+  parse: (value: unknown, path?: string) => T;
+  optional?: true;
+};
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+// 204 No Content: the client reads it as null
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, \`\${path}[\${i}]\`));
+    },
+  };
+}
+
+function optional<T>(
+  schema: Schema<T>,
+): Schema<T | undefined> & { optional: true } {
+  return {
+    optional: true,
+    parse: (value, path) =>
+      value === undefined ? undefined : schema.parse(value, path),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+// The keys whose schema is optional(...)
+type OptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K] extends { optional: true } ? K : never;
+}[keyof S];
+type ObjectOf<S extends Shape> = Simplify<
+  { [K in Exclude<keyof S, OptionalKeys<S>>]: Infer<S[K]> } & {
+    [K in OptionalKeys<S>]?: Infer<S[K]>;
+  }
+>;
+
+function object<S extends Shape>(shape: S): Schema<ObjectOf<S>> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? \`\${path}.\${key}\` : key;
+        const parsed = shape[key].parse(value[key], where);
+        if (parsed !== undefined) result[key] = parsed;
+      }
+      // every key was checked, so this cast is safe
+      return result as ObjectOf<S>;
+    },
+  };
+}
+
+// ---------- branded ids ----------
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+// A schema for ids, and the only way to make one
+function brandedId<Name extends string>(
+  name: Name,
+): Schema<Brand<number, Name>> {
+  return primitive(
+    \`a \${name}\`,
+    (v): v is Brand<number, Name> =>
+      typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+  );
+}
+
+// ---------- the practice API's data ----------
+const MovieId = brandedId("MovieId");
+type MovieId = Infer<typeof MovieId>;
+const TodoId = brandedId("TodoId");
+type TodoId = Infer<typeof TodoId>;
+const UserId = brandedId("UserId");
+type UserId = Infer<typeof UserId>;
+const PostId = brandedId("PostId");
+type PostId = Infer<typeof PostId>;
+
+const Movie = object({
+  id: MovieId,
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof Movie>;
+
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+function page<T>(item: Schema<T>): Schema<Page<T>> {
+  return object({
+    page: number(),
+    totalPages: number(),
+    total: number(),
+    results: array(item),
+  });
+}
+
+const User = object({
+  id: UserId,
+  name: string(),
+  username: string(),
+  email: string(),
+});
+type User = Infer<typeof User>;
+
+const Post = object({
+  id: PostId,
+  userId: UserId,
+  title: string(),
+  likes: number(),
+});
+type Post = Infer<typeof Post>;
+
+const Todo = object({ id: TodoId, title: string(), done: boolean() });
+type Todo = Infer<typeof Todo>;
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+const TodoPatch = object({
+  title: optional(string()),
+  done: optional(boolean()),
+});
+
+// ---------- the API description ----------
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface Endpoint {
+  method: Method;
+  path: \`/\${string}\`;
+  params?: Shape;
+  query?: Schema<object>;
+  body?: Schema<unknown>;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// "/users/:userId/posts/:postId" -> "userId" | "postId"
+type ParamNames<P extends string> =
+  P extends \`\${string}:\${infer Name}/\${infer Rest}\`
+    ? Name | ParamNames<Rest>
+    : P extends \`\${string}:\${infer Name}\`
+      ? Name
+      : never;
+
+// A path with :params needs one schema per param
+type ParamsFor<P extends string> = [ParamNames<P>] extends [never]
+  ? {}
+  : { params: Record<ParamNames<P>, Schema<string | number>> };
+
+type CheckParams<A extends ApiDescription> = {
+  [K in keyof A]: ParamsFor<A[K]["path"]>;
+};
+
+function defineApi<const A extends ApiDescription>(
+  api: A & CheckParams<A>,
+): A {
+  return api;
+}
+
+const pandaApi = defineApi({
+  getMovie: {
+    method: "GET",
+    path: "/movies/:id",
+    params: { id: MovieId },
+    response: Movie,
+  },
+  searchMovies: {
+    method: "GET",
+    path: "/movies",
+    query: object({
+      search: optional(string()),
+      genre: optional(string()),
+      page: optional(number()),
+      limit: optional(number()),
+    }),
+    response: page(Movie),
+  },
+  getUser: {
+    method: "GET",
+    path: "/users/:id",
+    params: { id: UserId },
+    response: User,
+  },
+  listPosts: {
+    method: "GET",
+    path: "/posts",
+    query: object({ userId: optional(UserId) }),
+    response: array(Post),
+  },
+  listTodos: {
+    method: "GET",
+    path: "/todos",
+    response: array(Todo),
+  },
+  createTodo: {
+    method: "POST",
+    path: "/todos",
+    body: NewTodo,
+    response: Todo,
+  },
+  updateTodo: {
+    method: "PATCH",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    body: TodoPatch,
+    response: Todo,
+  },
+  deleteTodo: {
+    method: "DELETE",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    response: nothing(),
+  },
+});
+type PandaApi = typeof pandaApi;
+
+// ---------- types derived from the description ----------
+type ParamsInput<E> = E extends { params: infer P extends Shape }
+  ? { params: ObjectOf<P> }
+  : {};
+type QueryInput<E> = E extends { query: infer Q extends Schema<object> }
+  ? {} extends Infer<Q>
+    ? { query?: Infer<Q> } // every query field is optional
+    : { query: Infer<Q> }
+  : {};
+type BodyInput<E> = E extends { body: infer B extends Schema<unknown> }
+  ? { body: Infer<B> }
+  : {};
+
+type Input<E extends Endpoint> = Simplify<
+  ParamsInput<E> & QueryInput<E> & BodyInput<E>
+>;
+type Output<E extends Endpoint> = Infer<E["response"]>;
+// No required input: the argument may be left out
+type InputArgs<E extends Endpoint> = {} extends Input<E>
+  ? [input?: Input<E>]
+  : [input: Input<E>];
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: (
+    ...input: InputArgs<A[K]>
+  ) => Promise<Result<Output<A[K]>, ApiError>>;
+};
+
+// ---------- from input to request ----------
+interface SdkRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+// Inside the SDK, input is loosely typed (and checked at runtime)
+type RawInput = {
+  params?: Record<string, unknown>;
+  query?: unknown;
+  body?: unknown;
+};
+
+function buildRequest(
+  baseUrl: string,
+  endpoint: Endpoint,
+  input: RawInput = {},
+): SdkRequest {
+  const path = endpoint.path.replace(/:(\\w+)/g, (_, name: string) => {
+    const schema = endpoint.params?.[name];
+    if (!schema) throw new Error(\`No schema for :\${name}\`);
+    const value = schema.parse(input.params?.[name], \`params.\${name}\`);
+    return encodeURIComponent(String(value));
+  });
+  let url = baseUrl.replace(/\\/+$/, "") + path;
+  if (endpoint.query) {
+    const query = endpoint.query.parse(input.query ?? {}, "query");
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      search.set(key, String(value));
+    }
+    if (search.size > 0) url += \`?\${search}\`;
+  }
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  const request: SdkRequest = { method: endpoint.method, url, headers };
+  if (endpoint.body) {
+    const body = endpoint.body.parse(input.body, "body");
+    request.body = JSON.stringify(body);
+    headers["Content-Type"] = "application/json";
+  }
+  return request;
+}
+
+// ---------- the client: options ----------
+interface RetryOptions {
+  attempts: number; // in total, including the first
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+interface ResponseInfo {
+  request: SdkRequest;
+  attempt: number;
+  status: number | null; // null: the request never got an answer
+  ms: number;
+}
+
+interface Hooks {
+  onRequest?: (request: SdkRequest) => SdkRequest;
+  onResponse?: (info: ResponseInfo) => void;
+}
+
+interface ClientOptions {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+  retry?: Partial<RetryOptions>;
+  hooks?: Hooks;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  now?: () => number;
+}
+
+const DEFAULT_RETRY: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 200,
+  maxDelayMs: 2_000,
+};
+
+// Sending these twice does no harm, so they may be retried
+const IDEMPOTENT = new Set<Method>(["GET", "PUT", "DELETE"]);
+
+function fail(error: ApiError): Result<never, ApiError> {
+  return { ok: false, error };
+}
+
+function apiMessage(body: unknown): string | undefined {
+  return isRecord(body) && typeof body.error === "string"
+    ? body.error
+    : undefined;
+}
+
+// ---------- retries ----------
+// TODO: network errors, 429 and 5xx are worth another try;
+// anything else isn't
+function isRetryable(error: ApiError): boolean {
+  return false;
+}
+
+// TODO: baseDelayMs, doubling with every attempt, never more than
+// maxDelayMs; then half of that is fixed and half is random
+function backoff(
+  attempt: number,
+  retry: RetryOptions,
+  random: () => number,
+): number {
+  return 0;
+}
+
+// ---------- the client ----------
+function createClient<A extends ApiDescription>(
+  api: A,
+  options: ClientOptions = {},
+): Client<A> {
+  const {
+    baseUrl = "https://api.pandadev.test",
+    fetch: fetchFn = fetch,
+    hooks = {},
+    sleep = (ms: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    random = Math.random,
+    now = Date.now,
+  } = options;
+  const retry: RetryOptions = { ...DEFAULT_RETRY, ...options.retry };
+
+  // One attempt: fetch, read the body, and say how it went
+  async function attemptOnce(
+    request: SdkRequest,
+    attempt: number,
+  ): Promise<Result<unknown, ApiError>> {
+    const started = now();
+    const report = (status: number | null) => {
+      const ms = now() - started;
+      hooks.onResponse?.({ request, attempt, status, ms });
+    };
+    let res: Response;
+    try {
+      res = await fetchFn(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      });
+    } catch (error) {
+      report(null);
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return fail({ kind: "network", message });
+    }
+    const body: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    report(res.status);
+    if (!res.ok) {
+      const message = apiMessage(body) ?? \`HTTP \${res.status}\`;
+      return fail({ kind: "http", status: res.status, message });
+    }
+    return { ok: true, value: body };
+  }
+
+  // Build the request, try it (again), check what comes back
+  async function send(
+    endpoint: Endpoint,
+    input: RawInput,
+  ): Promise<Result<unknown, ApiError>> {
+    // TODO: build the request (buildRequest, then hooks.onRequest).
+    // Try it with attemptOnce: up to retry.attempts times for
+    // IDEMPOTENT methods, once for the others. Retry only
+    // retryable errors, sleeping backoff(...) ms in between.
+    // Parse a successful body with endpoint.response; a
+    // ValidationError becomes an "invalid-response" error.
+    throw new Error("Not written yet");
+  }
+
+  // One method per endpoint: Client<A> is the promise, this loop
+  // keeps it, and the cast says so in exactly one place
+  const client: Record<string, (input?: RawInput) => unknown> = {};
+  for (const name of Object.keys(api)) {
+    const endpoint = api[name];
+    client[name] = (input = {}) => send(endpoint, input);
+  }
+  return client as Client<A>;
+}
+
+// ---------- pagination ----------
+// For APIs without a Result channel, like async iteration
+class ApiFailure extends Error {
+  readonly error: ApiError;
+  constructor(error: ApiError) {
+    super(error.message);
+    this.name = "ApiFailure";
+    this.error = error;
+  }
+}
+
+// Every item of every page, fetching one page at a time
+async function* paginate<Q extends { page?: number }, T>(
+  method: (input: { query?: Q }) => Promise<Result<Page<T>, ApiError>>,
+  query?: NoInfer<Q>,
+): AsyncGenerator<T, void, undefined> {
+  // TODO: ask for one page at a time, from query.page (or 1) to
+  // the last page, and yield each item. A failed page throws an
+  // ApiFailure.
+  throw new Error("Not written yet");
+}
+
+// ---------- tests ----------
+const BASE = "https://api.pandadev.test";
+
+describe("buildRequest", () => {
+  it("fills in path params", () => {
+    const request = buildRequest(BASE, pandaApi.getMovie, {
+      params: { id: 7 },
+    });
+    expect(request).toEqual({
+      method: "GET",
+      url: \`\${BASE}/movies/7\`,
+      headers: { Accept: "application/json" },
+    });
+  });
+
+  it("adds only the query values that are set", () => {
+    const request = buildRequest(BASE, pandaApi.searchMovies, {
+      query: { search: "bamboo & tea", page: undefined, limit: 2 },
+    });
+    expect(request.url).toBe(
+      \`\${BASE}/movies?search=bamboo+%26+tea&limit=2\`,
+    );
+    const all = buildRequest(BASE, pandaApi.searchMovies);
+    expect(all.url).toBe(\`\${BASE}/movies\`);
+  });
+
+  it("sends the body as JSON", () => {
+    const request = buildRequest(BASE, pandaApi.updateTodo, {
+      params: { id: 2 },
+      body: { done: true },
+    });
+    expect(request.method).toBe("PATCH");
+    expect(request.url).toBe(\`\${BASE}/todos/2\`);
+    expect(request.body).toBe('{"done":true}');
+    expect(request.headers["Content-Type"]).toBe("application/json");
+  });
+
+  it("checks every part of the input before sending", () => {
+    expect(() =>
+      buildRequest(BASE, pandaApi.getMovie, { params: { id: "7" } }),
+    ).toThrow('params.id: expected a MovieId, got "7"');
+    expect(() =>
+      buildRequest(BASE, pandaApi.createTodo, { body: { title: 5 } }),
+    ).toThrow("body.title: expected a string, got 5");
+  });
+});
+
+describe("brandedId", () => {
+  it("accepts a positive whole number", () => {
+    expect(MovieId.parse(7)).toBe(7);
+  });
+
+  it.each([0, -3, 1.5])("refuses %s", (value) => {
+    expect(() => MovieId.parse(value)).toThrow(ValidationError);
+  });
+
+  it("refuses strings", () => {
+    expect(() => MovieId.parse("7")).toThrow('expected a MovieId');
+  });
+});
+
+// ---------- client tests ----------
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep = async (ms: number) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+// A fetch that gives these answers in order (an Error is thrown)
+function fakeFetch(...answers: (Response | Error)[]) {
+  return vi.fn<typeof fetch>(async () => {
+    const next = answers.shift();
+    if (next === undefined) throw new Error("No more answers");
+    if (next instanceof Error) throw next;
+    return next;
+  });
+}
+
+const movieJson = {
+  id: 1,
+  title: "The Bamboo Heist",
+  year: 2019,
+  director: "Mei Lin",
+  genres: ["comedy", "crime"],
+  rating: 7.8,
+  minutes: 104,
+};
+const busy = () => Response.json({ error: "busy" }, { status: 503 });
+
+describe("createClient", () => {
+  it("gets a movie from the practice API", async () => {
+    const panda = createClient(pandaApi);
+    const id = MovieId.parse(1);
+    expect(await panda.getMovie({ params: { id } })).toEqual({
+      ok: true,
+      value: movieJson,
+    });
+  });
+
+  it("turns a 404 into an http error, without retrying", async () => {
+    const { sleep, waits } = fakeSleep();
+    const panda = createClient(pandaApi, { sleep });
+    const id = MovieId.parse(99);
+    expect(await panda.getMovie({ params: { id } })).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Movie not found" },
+    });
+    expect(waits).toEqual([]);
+  });
+
+  it("retries a GET with backoff, then succeeds", async () => {
+    const { sleep, waits } = fakeSleep();
+    const fetch = fakeFetch(busy(), busy(), Response.json(movieJson));
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep,
+      random: () => 1,
+    });
+    const result = await panda.getMovie({
+      params: { id: MovieId.parse(1) },
+    });
+    expect(result.ok).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(waits).toEqual([200, 400]);
+  });
+
+  it("gives up after the last attempt", async () => {
+    const { sleep, waits } = fakeSleep();
+    const offline = () => new TypeError("Failed to fetch");
+    const fetch = fakeFetch(offline(), offline(), offline());
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep,
+      random: () => 0,
+    });
+    expect(await panda.listTodos()).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+    expect(waits).toEqual([100, 200]);
+  });
+
+  it("reports a body that doesn't match the schema", async () => {
+    const wrong = { ...movieJson, year: "2019" };
+    const fetch = fakeFetch(Response.json(wrong));
+    const panda = createClient(pandaApi, { fetch });
+    const result = await panda.getMovie({
+      params: { id: MovieId.parse(1) },
+    });
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "invalid-response",
+        message: 'year: expected a number, got "2019"',
+      },
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets hooks change requests and watch every attempt", async () => {
+    const log: string[] = [];
+    const fetch = fakeFetch(busy(), Response.json([]));
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep: fakeSleep().sleep,
+      hooks: {
+        onRequest: (request) => ({
+          ...request,
+          headers: { ...request.headers, Authorization: "Bearer abc" },
+        }),
+        onResponse: ({ request, status, attempt }) => {
+          log.push(\`\${request.method} \${status} #\${attempt}\`);
+        },
+      },
+    });
+    await panda.listTodos();
+    expect(log).toEqual(["GET 503 #1", "GET 200 #2"]);
+    expect(fetch).toHaveBeenLastCalledWith(
+      "https://api.pandadev.test/todos",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: "Bearer abc",
+        }),
+      }),
+    );
+  });
+
+  it("works with any description: /flaky needs retries", async () => {
+    const testApi = defineApi({
+      flaky: {
+        method: "GET",
+        path: "/flaky",
+        response: object({ ok: boolean(), attempt: number() }),
+      },
+    });
+    const { sleep, waits } = fakeSleep();
+    const client = createClient(testApi, { sleep });
+    expect(await client.flaky()).toEqual({
+      ok: true,
+      value: { ok: true, attempt: 3 },
+    });
+    expect(waits).toHaveLength(2);
+  });
+
+  // TODO: your test: a POST that fails with 503 is NOT retried
+  // (creating a todo twice would be a real bug)
+});
+
+describe("paginate", () => {
+  it("walks every page of the practice API", async () => {
+    const spy = vi.fn<typeof fetch>((url, init) => fetch(url, init));
+    const panda = createClient(pandaApi, { fetch: spy });
+    const titles: string[] = [];
+    for await (const movie of paginate(panda.searchMovies, {})) {
+      titles.push(movie.title);
+    }
+    expect(titles).toHaveLength(12);
+    expect(titles[11]).toBe("The Great Bamboo Race");
+    expect(spy).toHaveBeenCalledTimes(3);
+  });
+});
+
+// ---------- type tests: don't change them ----------
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamNames<"/users/:userId/posts/:postId">,
+    "userId" | "postId">>,
+  Expect<Equal<ParamNames<"/todos">, never>>,
+  Expect<Equal<Input<PandaApi["getMovie"]>,
+    { params: { id: MovieId } }>>,
+  Expect<Equal<Input<PandaApi["listPosts"]>,
+    { query?: { userId?: UserId } }>>,
+  Expect<Equal<Input<PandaApi["updateTodo"]>, {
+    params: { id: TodoId };
+    body: { title?: string; done?: boolean };
+  }>>,
+  Expect<Equal<Input<PandaApi["listTodos"]>, {}>>,
+  Expect<Equal<Output<PandaApi["getUser"]>, User>>,
+  Expect<Equal<Output<PandaApi["deleteTodo"]>, null>>,
+];
+
+async function typeTests(
+  panda: Client<PandaApi>,
+  todo: Todo,
+  post: Post,
+) {
+  await panda.listTodos(); // nothing required, so no argument
+  await panda.getUser({ params: { id: post.userId } });
+  await panda.createTodo({ body: { title: "Nap" } });
+  // @ts-expect-error: a TodoId is not a MovieId
+  await panda.getMovie({ params: { id: todo.id } });
+  // @ts-expect-error: a plain number is not a checked id
+  await panda.getMovie({ params: { id: 1 } });
+  // @ts-expect-error: getMovie needs its params
+  await panda.getMovie();
+  // @ts-expect-error: limit is a number
+  await panda.searchMovies({ query: { limit: "5" } });
+  // @ts-expect-error: a new todo needs a title
+  await panda.createTodo({ body: { done: true } });
+  const id = MovieId.parse(1);
+  const movie = await panda.getMovie({ params: { id } });
+  // @ts-expect-error: check ok before reading value
+  movie.value;
+}
+
+async function typeTests2(panda: Client<PandaApi>) {
+  const client: Client<PandaApi> = createClient(pandaApi);
+  for await (const movie of paginate(panda.searchMovies)) {
+    const title: string = movie.title;
+  }
+  // @ts-expect-error: getMovie doesn't return pages
+  paginate(panda.getMovie);
+  // @ts-expect-error: the movie query has no "genr"
+  paginate(panda.searchMovies, { genr: "drama" });
+}
+
+// ---------- try it ----------
+const panda = createClient(pandaApi, {
+  hooks: {
+    onResponse: ({ request, status, attempt }) => {
+      const { method, url } = request;
+      console.log(\`\${method} \${url} -> \${status} (attempt \${attempt})\`);
+    },
+  },
+});
+const todo = await panda.createTodo({
+  body: { title: "Ship the SDK" },
+});
+console.log(todo);
+if (todo.ok) {
+  const done = await panda.updateTodo({
+    params: { id: todo.value.id },
+    body: { done: true },
+  });
+  console.log(done);
+}
+for await (const movie of paginate(panda.searchMovies, { limit: 2 })) {
+  if (movie.year < 2016) {
+    console.log(\`Found an oldie: \${movie.title} (\${movie.year})\`);
+    break; // no more pages are fetched
+  }
+}`}
+  tests={[
+    { name: "The code compiles, type tests included", check: "true" },
+    { name: "All the tests pass: Part 1's, Part 2's and your new one", check: "__vitest.failed === 0 && __vitest.passed >= 18" },
+    { name: "isRetryable: network errors, 429 and 5xx yes; other errors no", check: "isRetryable({ kind: 'network', message: 'x' }) === true && [429, 500, 502, 503].every((status) => isRetryable({ kind: 'http', status, message: 'x' }) === true) && [400, 401, 404, 409, 422].every((status) => isRetryable({ kind: 'http', status, message: 'x' }) === false) && isRetryable({ kind: 'invalid-response', message: 'x' }) === false" },
+    { name: "backoff doubles, stops at the maximum, and is half random", check: "(() => { const r = { attempts: 9, baseDelayMs: 100, maxDelayMs: 1000 }; const top = [1, 2, 3, 4, 5, 6].map((a) => backoff(a, r, () => 1)).join(); const low = [1, 2, 3, 4, 5].map((a) => backoff(a, r, () => 0)).join(); return top === '100,200,400,800,1000,1000' && low === '50,100,200,400,500' && backoff(1, r, () => 0.5) === 75 && backoff(2, { attempts: 3, baseDelayMs: 300, maxDelayMs: 5000 }, () => 1) === 600; })()" },
+    { name: "GETs are retried after network errors and 5xx, sleeping in between", check: "await (async () => { const answers = [...[new TypeError('Failed to fetch'), () => Response.json({ error: 'busy' }, { status: 503 }), () => Response.json([{ id: 1, title: 'A', done: false }])]]; const calls = []; const fetchFn = async (url, init) => { calls.push({ url, init }); const next = answers.shift(); if (next === undefined) throw new Error('No more answers'); if (next instanceof Error) throw next; return next(); }; const waits = []; const c = createClient(pandaApi, { fetch: fetchFn, sleep: async (ms) => { waits.push(ms); }, random: () => 1, retry: { baseDelayMs: 10 } }); const r = await c.listTodos(); return r.ok === true && r.value[0].title === 'A' && calls.length === 3 && waits.join() === '10,20'; })()" },
+    { name: "Retries stop at retry.attempts and return the last error", check: "await (async () => { const answers = [...[() => Response.json({ error: 'a' }, { status: 500 }), () => Response.json({ error: 'b' }, { status: 502 }), () => Response.json({ error: 'c' }, { status: 503 }), () => Response.json({ error: 'd' }, { status: 504 })]]; const calls = []; const fetchFn = async (url, init) => { calls.push({ url, init }); const next = answers.shift(); if (next === undefined) throw new Error('No more answers'); if (next instanceof Error) throw next; return next(); }; const waits = []; const c = createClient(pandaApi, { fetch: fetchFn, sleep: async (ms) => { waits.push(ms); }, random: () => 0, retry: { attempts: 4, baseDelayMs: 100, maxDelayMs: 300 } }); const r = await c.searchMovies(); return r.ok === false && r.error.kind === 'http' && r.error.status === 504 && r.error.message === 'd' && calls.length === 4 && waits.join() === '50,100,150'; })()" },
+    { name: "No retries for 4xx, invalid bodies, POST or PATCH", check: "await (async () => { const run = async (call, answer) => { let n = 0; const waits = []; const c = createClient(pandaApi, { fetch: async () => { n++; return answer(); }, sleep: async (ms) => { waits.push(ms); } }); const r = await call(c); return r.ok === false && n === 1 && waits.length === 0; }; const busy = () => Response.json({ error: 'busy' }, { status: 503 }); return await run((c) => c.getUser({ params: { id: 1 } }), () => Response.json({ error: 'nope' }, { status: 404 })) && await run((c) => c.getUser({ params: { id: 1 } }), () => Response.json({ id: 1 })) && await run((c) => c.createTodo({ body: { title: 'x' } }), busy) && await run((c) => c.updateTodo({ params: { id: 1 }, body: {} }), busy); })()" },
+    { name: "Results: http errors use the body's message, invalid bodies say why, 204 is null", check: "await (async () => { const one = (answer) => createClient(pandaApi, { fetch: async () => answer(), sleep: async () => {} }); const a = await one(() => Response.json({ error: 'Movie not found' }, { status: 404 })).getMovie({ params: { id: 5 } }); const b = await one(() => new Response('oops', { status: 400 })).getMovie({ params: { id: 5 } }); const c = await one(() => Response.json({ id: 1, name: 'Mei' })).getUser({ params: { id: 1 } }); const d = await one(() => new Response(null, { status: 204 })).deleteTodo({ params: { id: 3 } }); return JSON.stringify(a) === JSON.stringify({ ok: false, error: { kind: 'http', status: 404, message: 'Movie not found' } }) && JSON.stringify(b) === JSON.stringify({ ok: false, error: { kind: 'http', status: 400, message: 'HTTP 400' } }) && c.ok === false && c.error.kind === 'invalid-response' && c.error.message === 'username: expected a string, got undefined' && JSON.stringify(d) === JSON.stringify({ ok: true, value: null }); })()" },
+    { name: "Bad input throws a ValidationError before anything is sent", check: "await (async () => { let n = 0; const c = createClient(pandaApi, { fetch: async () => { n++; return Response.json({}); } }); try { await c.getMovie({ params: { id: 'one' } }); return false; } catch (e) { return e instanceof ValidationError && e.message === 'params.id: expected a MovieId, got \"one\"' && n === 0; } })()" },
+    { name: "onRequest changes the request once; onResponse sees every attempt", check: "await (async () => { let t = 1000; const answers = [...[new TypeError('down'), () => { t += 40; return Response.json({ error: 'busy' }, { status: 503 }); }, () => { t += 25; return Response.json([]); }]]; const calls = []; const fetchFn = async (url, init) => { calls.push({ url, init }); const next = answers.shift(); if (next === undefined) throw new Error('No more answers'); if (next instanceof Error) throw next; return next(); }; const seen = []; let changed = 0; const c = createClient(pandaApi, { fetch: fetchFn, sleep: async () => {}, now: () => t, hooks: { onRequest: (req) => { changed++; return { ...req, headers: { ...req.headers, 'X-Trace': 't-1' } }; }, onResponse: (info) => seen.push(info.attempt + ':' + info.status + ':' + info.ms + ':' + info.request.headers['X-Trace']) } }); const r = await c.listPosts({ query: { userId: 2 } }); return r.ok === true && changed === 1 && seen.join() === '1:null:0:t-1,2:503:40:t-1,3:200:25:t-1' && calls.every((call) => call.url === 'https://api.pandadev.test/posts?userId=2' && call.init.headers['X-Trace'] === 't-1' && call.init.method === 'GET'); })()" },
+    { name: "paginate yields every item, page by page, from query.page", check: "await (async () => { const urls = []; const pageOf = (page, totalPages) => Response.json({ page, totalPages, total: 9, results: [{ id: page, title: 'M' + page, year: 2000, director: 'D', genres: [], rating: 5, minutes: 90 }] }); const c = createClient(pandaApi, { fetch: async (url) => { urls.push(url); const page = Number(new URL(url).searchParams.get('page')); return pageOf(page, 4); } }); const titles = []; for await (const m of paginate(c.searchMovies, { genre: 'drama', page: 2 })) titles.push(m.title); return titles.join() === 'M2,M3,M4' && urls.length === 3 && urls[0] === 'https://api.pandadev.test/movies?genre=drama&page=2'; })()" },
+    { name: "paginate is lazy, and a failed page throws an ApiFailure", check: "await (async () => { let n = 0; const ok = (page) => Response.json({ page, totalPages: 5, total: 5, results: [{ id: page, title: 'M' + page, year: 2000, director: 'D', genres: [], rating: 5, minutes: 90 }] }); const c = createClient(pandaApi, { fetch: async () => { n++; return n === 3 ? Response.json({ error: 'gone' }, { status: 410 }) : ok(n); } }); for await (const m of paginate(c.searchMovies)) { break; } const lazy = n === 1; n = 0; const got = []; try { for await (const m of paginate(c.searchMovies)) got.push(m.title); return false; } catch (e) { return lazy && e instanceof ApiFailure && e.error.kind === 'http' && e.error.status === 410 && got.join() === 'M1,M2'; } })()" },
+    { name: "Your test catches a client that retries POSTs", check: "(await __retest([['[\"GET\", \"PUT\", \"DELETE\"]', '[\"GET\", \"PUT\", \"DELETE\", \"POST\"]']])).failed > __vitest.failed" },
+  ]}
+>
+
+Turn the description into a working client. Part 1's code is all there, followed by the client's options, `fail`, `apiMessage`, `attemptOnce`, the method loop and `ApiFailure`, which are done. Your jobs are marked `TODO`:
+
+1. **`isRetryable(error)`**: `true` for network errors, 429 and 5xx; `false` for other HTTP errors and invalid responses. Use a `switch` over `error.kind` without a `default`, so a new kind can't be forgotten.
+2. **`backoff(attempt, retry, random)`**: `baseDelayMs`, doubled for every attempt after the first, at most `maxDelayMs`; then half of that is fixed and half is `random()` times the other half, rounded.
+3. **`send(endpoint, input)`** inside `createClient`: build the request, pass it through `hooks.onRequest` (once), and try it with `attemptOnce`. Retry only `IDEMPOTENT` methods, up to `retry.attempts` attempts in total, only for retryable errors, sleeping `backoff(...)` ms before each new attempt. On success, parse the body with `endpoint.response`; a `ValidationError` becomes an `invalid-response` error. Bad input must still throw before anything is sent.
+4. **`paginate(method, query)`**: ask for one page at a time, starting at `query.page` (or 1), yield every item, and stop after the last page. A failed page throws an `ApiFailure`.
+5. **Your test**: in `describe("createClient")`, check that a `POST` that fails with 503 is **not** retried: one fetch call, no waits, and the 503 as the result.
+
+All of Part 1's tests and most of Part 2's are there already: they're your to-do list.
+
+<Hint>
+
+**`isRetryable`**: `case "network": return true;`, `case "http": return error.status === 429 || error.status >= 500;`, `case "invalid-response": return false;`.
+
+**`backoff`**: `const exp = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** (attempt - 1));` then `Math.round(exp / 2 + (exp / 2) * random())`.
+
+**`send`**: start with `let request = buildRequest(baseUrl, endpoint, input);` and `if (hooks.onRequest) request = hooks.onRequest(request);`. Work out `const attempts = IDEMPOTENT.has(endpoint.method) ? retry.attempts : 1;`, then loop `for (let attempt = 1; ; attempt++)`. Inside: `const result = await attemptOnce(request, attempt);`. If `!result.ok`: when `attempt < attempts && isRetryable(result.error)`, `await sleep(backoff(attempt, retry, random))` and `continue`; otherwise `return result`. If it's ok, `try` to return `{ ok: true, value: endpoint.response.parse(result.value) }`, and in the `catch` turn a `ValidationError` into `fail({ kind: "invalid-response", message })` (rethrow anything else).
+
+**`paginate`**: `for (let page = query?.page ?? 1; ; page++)`, then `const result = await method({ query: { ...query, page } as Q });`, throw `new ApiFailure(result.error)` if it failed, `yield* result.value.results`, and `return` once `page >= result.value.totalPages`.
+
+**Your test**: `fakeFetch(busy(), busy())`, `createClient(pandaApi, { fetch, sleep })`, then `panda.createTodo({ body: { title: "Nap" } })`, and expect one call and no waits.
+
+</Hint>
+
+<Solution>
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+
+// ---------- schemas: Level 2's library, grown up ----------
+class ValidationError extends Error {
+  constructor(path: string, expected: string, got: unknown) {
+    const where = path || "value";
+    super(`${where}: expected ${expected}, got ${JSON.stringify(got)}`);
+    this.name = "ValidationError";
+  }
+}
+
+type Schema<T> = {
+  parse: (value: unknown, path?: string) => T;
+  optional?: true;
+};
+type Infer<S extends Schema<unknown>> = ReturnType<S["parse"]>;
+type Simplify<T> = { [K in keyof T]: T[K] } & {};
+
+function primitive<T>(
+  expected: string,
+  test: (value: unknown) => value is T,
+): Schema<T> {
+  return {
+    parse(value, path = "") {
+      if (!test(value)) {
+        throw new ValidationError(path, expected, value);
+      }
+      return value;
+    },
+  };
+}
+
+const string = () =>
+  primitive("a string", (v): v is string => typeof v === "string");
+const number = () =>
+  primitive("a number", (v): v is number => typeof v === "number");
+const boolean = () =>
+  primitive("a boolean", (v): v is boolean => typeof v === "boolean");
+// 204 No Content: the client reads it as null
+const nothing = () =>
+  primitive("no content", (v): v is null => v === null);
+
+function array<T>(item: Schema<T>): Schema<T[]> {
+  return {
+    parse(value, path = "") {
+      if (!Array.isArray(value)) {
+        throw new ValidationError(path, "an array", value);
+      }
+      return value.map((v, i) => item.parse(v, `${path}[${i}]`));
+    },
+  };
+}
+
+function optional<T>(
+  schema: Schema<T>,
+): Schema<T | undefined> & { optional: true } {
+  return {
+    optional: true,
+    parse: (value, path) =>
+      value === undefined ? undefined : schema.parse(value, path),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+}
+
+type Shape = Record<string, Schema<unknown>>;
+// The keys whose schema is optional(...)
+type OptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K] extends { optional: true } ? K : never;
+}[keyof S];
+type ObjectOf<S extends Shape> = Simplify<
+  { [K in Exclude<keyof S, OptionalKeys<S>>]: Infer<S[K]> } & {
+    [K in OptionalKeys<S>]?: Infer<S[K]>;
+  }
+>;
+
+function object<S extends Shape>(shape: S): Schema<ObjectOf<S>> {
+  return {
+    parse(value, path = "") {
+      if (!isRecord(value)) {
+        throw new ValidationError(path, "an object", value);
+      }
+      const result: Record<string, unknown> = {};
+      for (const key in shape) {
+        const where = path ? `${path}.${key}` : key;
+        const parsed = shape[key].parse(value[key], where);
+        if (parsed !== undefined) result[key] = parsed;
+      }
+      // every key was checked, so this cast is safe
+      return result as ObjectOf<S>;
+    },
+  };
+}
+
+// ---------- branded ids ----------
+declare const brand: unique symbol;
+type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+// A schema for ids, and the only way to make one
+function brandedId<Name extends string>(
+  name: Name,
+): Schema<Brand<number, Name>> {
+  return primitive(
+    `a ${name}`,
+    (v): v is Brand<number, Name> =>
+      typeof v === "number" && Number.isSafeInteger(v) && v > 0,
+  );
+}
+
+// ---------- the practice API's data ----------
+const MovieId = brandedId("MovieId");
+type MovieId = Infer<typeof MovieId>;
+const TodoId = brandedId("TodoId");
+type TodoId = Infer<typeof TodoId>;
+const UserId = brandedId("UserId");
+type UserId = Infer<typeof UserId>;
+const PostId = brandedId("PostId");
+type PostId = Infer<typeof PostId>;
+
+const Movie = object({
+  id: MovieId,
+  title: string(),
+  year: number(),
+  director: string(),
+  genres: array(string()),
+  rating: number(),
+  minutes: number(),
+});
+type Movie = Infer<typeof Movie>;
+
+interface Page<T> {
+  page: number;
+  totalPages: number;
+  total: number;
+  results: T[];
+}
+function page<T>(item: Schema<T>): Schema<Page<T>> {
+  return object({
+    page: number(),
+    totalPages: number(),
+    total: number(),
+    results: array(item),
+  });
+}
+
+const User = object({
+  id: UserId,
+  name: string(),
+  username: string(),
+  email: string(),
+});
+type User = Infer<typeof User>;
+
+const Post = object({
+  id: PostId,
+  userId: UserId,
+  title: string(),
+  likes: number(),
+});
+type Post = Infer<typeof Post>;
+
+const Todo = object({ id: TodoId, title: string(), done: boolean() });
+type Todo = Infer<typeof Todo>;
+const NewTodo = object({ title: string(), done: optional(boolean()) });
+const TodoPatch = object({
+  title: optional(string()),
+  done: optional(boolean()),
+});
+
+// ---------- the API description ----------
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface Endpoint {
+  method: Method;
+  path: `/${string}`;
+  params?: Shape;
+  query?: Schema<object>;
+  body?: Schema<unknown>;
+  response: Schema<unknown>;
+}
+type ApiDescription = Record<string, Endpoint>;
+
+// "/users/:userId/posts/:postId" -> "userId" | "postId"
+type ParamNames<P extends string> =
+  P extends `${string}:${infer Name}/${infer Rest}`
+    ? Name | ParamNames<Rest>
+    : P extends `${string}:${infer Name}`
+      ? Name
+      : never;
+
+// A path with :params needs one schema per param
+type ParamsFor<P extends string> = [ParamNames<P>] extends [never]
+  ? {}
+  : { params: Record<ParamNames<P>, Schema<string | number>> };
+
+type CheckParams<A extends ApiDescription> = {
+  [K in keyof A]: ParamsFor<A[K]["path"]>;
+};
+
+function defineApi<const A extends ApiDescription>(
+  api: A & CheckParams<A>,
+): A {
+  return api;
+}
+
+const pandaApi = defineApi({
+  getMovie: {
+    method: "GET",
+    path: "/movies/:id",
+    params: { id: MovieId },
+    response: Movie,
+  },
+  searchMovies: {
+    method: "GET",
+    path: "/movies",
+    query: object({
+      search: optional(string()),
+      genre: optional(string()),
+      page: optional(number()),
+      limit: optional(number()),
+    }),
+    response: page(Movie),
+  },
+  getUser: {
+    method: "GET",
+    path: "/users/:id",
+    params: { id: UserId },
+    response: User,
+  },
+  listPosts: {
+    method: "GET",
+    path: "/posts",
+    query: object({ userId: optional(UserId) }),
+    response: array(Post),
+  },
+  listTodos: {
+    method: "GET",
+    path: "/todos",
+    response: array(Todo),
+  },
+  createTodo: {
+    method: "POST",
+    path: "/todos",
+    body: NewTodo,
+    response: Todo,
+  },
+  updateTodo: {
+    method: "PATCH",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    body: TodoPatch,
+    response: Todo,
+  },
+  deleteTodo: {
+    method: "DELETE",
+    path: "/todos/:id",
+    params: { id: TodoId },
+    response: nothing(),
+  },
+});
+type PandaApi = typeof pandaApi;
+
+// ---------- types derived from the description ----------
+type ParamsInput<E> = E extends { params: infer P extends Shape }
+  ? { params: ObjectOf<P> }
+  : {};
+type QueryInput<E> = E extends { query: infer Q extends Schema<object> }
+  ? {} extends Infer<Q>
+    ? { query?: Infer<Q> } // every query field is optional
+    : { query: Infer<Q> }
+  : {};
+type BodyInput<E> = E extends { body: infer B extends Schema<unknown> }
+  ? { body: Infer<B> }
+  : {};
+
+type Input<E extends Endpoint> = Simplify<
+  ParamsInput<E> & QueryInput<E> & BodyInput<E>
+>;
+type Output<E extends Endpoint> = Infer<E["response"]>;
+// No required input: the argument may be left out
+type InputArgs<E extends Endpoint> = {} extends Input<E>
+  ? [input?: Input<E>]
+  : [input: Input<E>];
+
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+type ApiError =
+  | { kind: "network"; message: string }
+  | { kind: "http"; status: number; message: string }
+  | { kind: "invalid-response"; message: string };
+
+type Client<A extends ApiDescription> = {
+  [K in keyof A]: (
+    ...input: InputArgs<A[K]>
+  ) => Promise<Result<Output<A[K]>, ApiError>>;
+};
+
+// ---------- from input to request ----------
+interface SdkRequest {
+  method: Method;
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
+// Inside the SDK, input is loosely typed (and checked at runtime)
+type RawInput = {
+  params?: Record<string, unknown>;
+  query?: unknown;
+  body?: unknown;
+};
+
+function buildRequest(
+  baseUrl: string,
+  endpoint: Endpoint,
+  input: RawInput = {},
+): SdkRequest {
+  const path = endpoint.path.replace(/:(\w+)/g, (_, name: string) => {
+    const schema = endpoint.params?.[name];
+    if (!schema) throw new Error(`No schema for :${name}`);
+    const value = schema.parse(input.params?.[name], `params.${name}`);
+    return encodeURIComponent(String(value));
+  });
+  let url = baseUrl.replace(/\/+$/, "") + path;
+  if (endpoint.query) {
+    const query = endpoint.query.parse(input.query ?? {}, "query");
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      search.set(key, String(value));
+    }
+    if (search.size > 0) url += `?${search}`;
+  }
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  const request: SdkRequest = { method: endpoint.method, url, headers };
+  if (endpoint.body) {
+    const body = endpoint.body.parse(input.body, "body");
+    request.body = JSON.stringify(body);
+    headers["Content-Type"] = "application/json";
+  }
+  return request;
+}
+
+// ---------- the client: options ----------
+interface RetryOptions {
+  attempts: number; // in total, including the first
+  baseDelayMs: number;
+  maxDelayMs: number;
+}
+
+interface ResponseInfo {
+  request: SdkRequest;
+  attempt: number;
+  status: number | null; // null: the request never got an answer
+  ms: number;
+}
+
+interface Hooks {
+  onRequest?: (request: SdkRequest) => SdkRequest;
+  onResponse?: (info: ResponseInfo) => void;
+}
+
+interface ClientOptions {
+  baseUrl?: string;
+  fetch?: typeof fetch;
+  retry?: Partial<RetryOptions>;
+  hooks?: Hooks;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  now?: () => number;
+}
+
+const DEFAULT_RETRY: RetryOptions = {
+  attempts: 3,
+  baseDelayMs: 200,
+  maxDelayMs: 2_000,
+};
+
+// Sending these twice does no harm, so they may be retried
+const IDEMPOTENT = new Set<Method>(["GET", "PUT", "DELETE"]);
+
+function fail(error: ApiError): Result<never, ApiError> {
+  return { ok: false, error };
+}
+
+function apiMessage(body: unknown): string | undefined {
+  return isRecord(body) && typeof body.error === "string"
+    ? body.error
+    : undefined;
+}
+
+// ---------- retries ----------
+function isRetryable(error: ApiError): boolean {
+  switch (error.kind) {
+    case "network":
+      return true;
+    case "http":
+      return error.status === 429 || error.status >= 500;
+    case "invalid-response":
+      return false;
+  }
+}
+
+// Exponential, capped, with "equal jitter": half fixed, half random
+function backoff(
+  attempt: number,
+  retry: RetryOptions,
+  random: () => number,
+): number {
+  const exp = Math.min(
+    retry.maxDelayMs,
+    retry.baseDelayMs * 2 ** (attempt - 1),
+  );
+  return Math.round(exp / 2 + (exp / 2) * random());
+}
+
+// ---------- the client ----------
+function createClient<A extends ApiDescription>(
+  api: A,
+  options: ClientOptions = {},
+): Client<A> {
+  const {
+    baseUrl = "https://api.pandadev.test",
+    fetch: fetchFn = fetch,
+    hooks = {},
+    sleep = (ms: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    random = Math.random,
+    now = Date.now,
+  } = options;
+  const retry: RetryOptions = { ...DEFAULT_RETRY, ...options.retry };
+
+  // One attempt: fetch, read the body, and say how it went
+  async function attemptOnce(
+    request: SdkRequest,
+    attempt: number,
+  ): Promise<Result<unknown, ApiError>> {
+    const started = now();
+    const report = (status: number | null) => {
+      const ms = now() - started;
+      hooks.onResponse?.({ request, attempt, status, ms });
+    };
+    let res: Response;
+    try {
+      res = await fetchFn(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      });
+    } catch (error) {
+      report(null);
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return fail({ kind: "network", message });
+    }
+    const body: unknown =
+      res.status === 204 ? null : await res.json().catch(() => null);
+    report(res.status);
+    if (!res.ok) {
+      const message = apiMessage(body) ?? `HTTP ${res.status}`;
+      return fail({ kind: "http", status: res.status, message });
+    }
+    return { ok: true, value: body };
+  }
+
+  // Build the request, try it (again), check what comes back
+  async function send(
+    endpoint: Endpoint,
+    input: RawInput,
+  ): Promise<Result<unknown, ApiError>> {
+    let request = buildRequest(baseUrl, endpoint, input);
+    if (hooks.onRequest) request = hooks.onRequest(request);
+    const attempts = IDEMPOTENT.has(endpoint.method)
+      ? retry.attempts
+      : 1;
+    for (let attempt = 1; ; attempt++) {
+      const result = await attemptOnce(request, attempt);
+      if (!result.ok) {
+        if (attempt < attempts && isRetryable(result.error)) {
+          await sleep(backoff(attempt, retry, random));
+          continue;
+        }
+        return result;
+      }
+      try {
+        const value = endpoint.response.parse(result.value);
+        return { ok: true, value };
+      } catch (error) {
+        if (!(error instanceof ValidationError)) throw error;
+        const { message } = error;
+        return fail({ kind: "invalid-response", message });
+      }
+    }
+  }
+
+  // One method per endpoint: Client<A> is the promise, this loop
+  // keeps it, and the cast says so in exactly one place
+  const client: Record<string, (input?: RawInput) => unknown> = {};
+  for (const name of Object.keys(api)) {
+    const endpoint = api[name];
+    client[name] = (input = {}) => send(endpoint, input);
+  }
+  return client as Client<A>;
+}
+
+// ---------- pagination ----------
+// For APIs without a Result channel, like async iteration
+class ApiFailure extends Error {
+  readonly error: ApiError;
+  constructor(error: ApiError) {
+    super(error.message);
+    this.name = "ApiFailure";
+    this.error = error;
+  }
+}
+
+// Every item of every page, fetching one page at a time
+async function* paginate<Q extends { page?: number }, T>(
+  method: (input: { query?: Q }) => Promise<Result<Page<T>, ApiError>>,
+  query?: NoInfer<Q>,
+): AsyncGenerator<T, void, undefined> {
+  for (let page = query?.page ?? 1; ; page++) {
+    const result = await method({ query: { ...query, page } as Q });
+    if (!result.ok) throw new ApiFailure(result.error);
+    yield* result.value.results;
+    if (page >= result.value.totalPages) return;
+  }
+}
+
+// ---------- tests ----------
+const BASE = "https://api.pandadev.test";
+
+describe("buildRequest", () => {
+  it("fills in path params", () => {
+    const request = buildRequest(BASE, pandaApi.getMovie, {
+      params: { id: 7 },
+    });
+    expect(request).toEqual({
+      method: "GET",
+      url: `${BASE}/movies/7`,
+      headers: { Accept: "application/json" },
+    });
+  });
+
+  it("adds only the query values that are set", () => {
+    const request = buildRequest(BASE, pandaApi.searchMovies, {
+      query: { search: "bamboo & tea", page: undefined, limit: 2 },
+    });
+    expect(request.url).toBe(
+      `${BASE}/movies?search=bamboo+%26+tea&limit=2`,
+    );
+    const all = buildRequest(BASE, pandaApi.searchMovies);
+    expect(all.url).toBe(`${BASE}/movies`);
+  });
+
+  it("sends the body as JSON", () => {
+    const request = buildRequest(BASE, pandaApi.updateTodo, {
+      params: { id: 2 },
+      body: { done: true },
+    });
+    expect(request.method).toBe("PATCH");
+    expect(request.url).toBe(`${BASE}/todos/2`);
+    expect(request.body).toBe('{"done":true}');
+    expect(request.headers["Content-Type"]).toBe("application/json");
+  });
+
+  it("checks every part of the input before sending", () => {
+    expect(() =>
+      buildRequest(BASE, pandaApi.getMovie, { params: { id: "7" } }),
+    ).toThrow('params.id: expected a MovieId, got "7"');
+    expect(() =>
+      buildRequest(BASE, pandaApi.createTodo, { body: { title: 5 } }),
+    ).toThrow("body.title: expected a string, got 5");
+  });
+});
+
+describe("brandedId", () => {
+  it("accepts a positive whole number", () => {
+    expect(MovieId.parse(7)).toBe(7);
+  });
+
+  it.each([0, -3, 1.5])("refuses %s", (value) => {
+    expect(() => MovieId.parse(value)).toThrow(ValidationError);
+  });
+
+  it("refuses strings", () => {
+    expect(() => MovieId.parse("7")).toThrow('expected a MovieId');
+  });
+});
+
+// ---------- client tests ----------
+function fakeSleep() {
+  const waits: number[] = [];
+  const sleep = async (ms: number) => {
+    waits.push(ms);
+  };
+  return { sleep, waits };
+}
+
+// A fetch that gives these answers in order (an Error is thrown)
+function fakeFetch(...answers: (Response | Error)[]) {
+  return vi.fn<typeof fetch>(async () => {
+    const next = answers.shift();
+    if (next === undefined) throw new Error("No more answers");
+    if (next instanceof Error) throw next;
+    return next;
+  });
+}
+
+const movieJson = {
+  id: 1,
+  title: "The Bamboo Heist",
+  year: 2019,
+  director: "Mei Lin",
+  genres: ["comedy", "crime"],
+  rating: 7.8,
+  minutes: 104,
+};
+const busy = () => Response.json({ error: "busy" }, { status: 503 });
+
+describe("createClient", () => {
+  it("gets a movie from the practice API", async () => {
+    const panda = createClient(pandaApi);
+    const id = MovieId.parse(1);
+    expect(await panda.getMovie({ params: { id } })).toEqual({
+      ok: true,
+      value: movieJson,
+    });
+  });
+
+  it("turns a 404 into an http error, without retrying", async () => {
+    const { sleep, waits } = fakeSleep();
+    const panda = createClient(pandaApi, { sleep });
+    const id = MovieId.parse(99);
+    expect(await panda.getMovie({ params: { id } })).toEqual({
+      ok: false,
+      error: { kind: "http", status: 404, message: "Movie not found" },
+    });
+    expect(waits).toEqual([]);
+  });
+
+  it("retries a GET with backoff, then succeeds", async () => {
+    const { sleep, waits } = fakeSleep();
+    const fetch = fakeFetch(busy(), busy(), Response.json(movieJson));
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep,
+      random: () => 1,
+    });
+    const result = await panda.getMovie({
+      params: { id: MovieId.parse(1) },
+    });
+    expect(result.ok).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(waits).toEqual([200, 400]);
+  });
+
+  it("gives up after the last attempt", async () => {
+    const { sleep, waits } = fakeSleep();
+    const offline = () => new TypeError("Failed to fetch");
+    const fetch = fakeFetch(offline(), offline(), offline());
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep,
+      random: () => 0,
+    });
+    expect(await panda.listTodos()).toEqual({
+      ok: false,
+      error: { kind: "network", message: "Failed to fetch" },
+    });
+    expect(waits).toEqual([100, 200]);
+  });
+
+  it("reports a body that doesn't match the schema", async () => {
+    const wrong = { ...movieJson, year: "2019" };
+    const fetch = fakeFetch(Response.json(wrong));
+    const panda = createClient(pandaApi, { fetch });
+    const result = await panda.getMovie({
+      params: { id: MovieId.parse(1) },
+    });
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "invalid-response",
+        message: 'year: expected a number, got "2019"',
+      },
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets hooks change requests and watch every attempt", async () => {
+    const log: string[] = [];
+    const fetch = fakeFetch(busy(), Response.json([]));
+    const panda = createClient(pandaApi, {
+      fetch,
+      sleep: fakeSleep().sleep,
+      hooks: {
+        onRequest: (request) => ({
+          ...request,
+          headers: { ...request.headers, Authorization: "Bearer abc" },
+        }),
+        onResponse: ({ request, status, attempt }) => {
+          log.push(`${request.method} ${status} #${attempt}`);
+        },
+      },
+    });
+    await panda.listTodos();
+    expect(log).toEqual(["GET 503 #1", "GET 200 #2"]);
+    expect(fetch).toHaveBeenLastCalledWith(
+      "https://api.pandadev.test/todos",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: "Bearer abc",
+        }),
+      }),
+    );
+  });
+
+  it("works with any description: /flaky needs retries", async () => {
+    const testApi = defineApi({
+      flaky: {
+        method: "GET",
+        path: "/flaky",
+        response: object({ ok: boolean(), attempt: number() }),
+      },
+    });
+    const { sleep, waits } = fakeSleep();
+    const client = createClient(testApi, { sleep });
+    expect(await client.flaky()).toEqual({
+      ok: true,
+      value: { ok: true, attempt: 3 },
+    });
+    expect(waits).toHaveLength(2);
+  });
+
+  it("never retries a POST", async () => {
+    const { sleep, waits } = fakeSleep();
+    const fetch = fakeFetch(busy(), busy());
+    const panda = createClient(pandaApi, { fetch, sleep });
+    const result = await panda.createTodo({ body: { title: "Nap" } });
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "http", status: 503, message: "busy" },
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(waits).toEqual([]);
+  });
+});
+
+describe("paginate", () => {
+  it("walks every page of the practice API", async () => {
+    const spy = vi.fn<typeof fetch>((url, init) => fetch(url, init));
+    const panda = createClient(pandaApi, { fetch: spy });
+    const titles: string[] = [];
+    for await (const movie of paginate(panda.searchMovies, {})) {
+      titles.push(movie.title);
+    }
+    expect(titles).toHaveLength(12);
+    expect(titles[11]).toBe("The Great Bamboo Race");
+    expect(spy).toHaveBeenCalledTimes(3);
+  });
+});
+
+// ---------- type tests: don't change them ----------
+type Equal<A, B> =
+  (<X>() => X extends A ? 1 : 2) extends
+  (<X>() => X extends B ? 1 : 2) ? true : false;
+type Expect<T extends true> = T;
+
+type _tests = [
+  Expect<Equal<ParamNames<"/users/:userId/posts/:postId">,
+    "userId" | "postId">>,
+  Expect<Equal<ParamNames<"/todos">, never>>,
+  Expect<Equal<Input<PandaApi["getMovie"]>,
+    { params: { id: MovieId } }>>,
+  Expect<Equal<Input<PandaApi["listPosts"]>,
+    { query?: { userId?: UserId } }>>,
+  Expect<Equal<Input<PandaApi["updateTodo"]>, {
+    params: { id: TodoId };
+    body: { title?: string; done?: boolean };
+  }>>,
+  Expect<Equal<Input<PandaApi["listTodos"]>, {}>>,
+  Expect<Equal<Output<PandaApi["getUser"]>, User>>,
+  Expect<Equal<Output<PandaApi["deleteTodo"]>, null>>,
+];
+
+async function typeTests(
+  panda: Client<PandaApi>,
+  todo: Todo,
+  post: Post,
+) {
+  await panda.listTodos(); // nothing required, so no argument
+  await panda.getUser({ params: { id: post.userId } });
+  await panda.createTodo({ body: { title: "Nap" } });
+  // @ts-expect-error: a TodoId is not a MovieId
+  await panda.getMovie({ params: { id: todo.id } });
+  // @ts-expect-error: a plain number is not a checked id
+  await panda.getMovie({ params: { id: 1 } });
+  // @ts-expect-error: getMovie needs its params
+  await panda.getMovie();
+  // @ts-expect-error: limit is a number
+  await panda.searchMovies({ query: { limit: "5" } });
+  // @ts-expect-error: a new todo needs a title
+  await panda.createTodo({ body: { done: true } });
+  const id = MovieId.parse(1);
+  const movie = await panda.getMovie({ params: { id } });
+  // @ts-expect-error: check ok before reading value
+  movie.value;
+}
+
+async function typeTests2(panda: Client<PandaApi>) {
+  const client: Client<PandaApi> = createClient(pandaApi);
+  for await (const movie of paginate(panda.searchMovies)) {
+    const title: string = movie.title;
+  }
+  // @ts-expect-error: getMovie doesn't return pages
+  paginate(panda.getMovie);
+  // @ts-expect-error: the movie query has no "genr"
+  paginate(panda.searchMovies, { genr: "drama" });
+}
+
+// ---------- try it ----------
+const panda = createClient(pandaApi, {
+  hooks: {
+    onResponse: ({ request, status, attempt }) => {
+      const { method, url } = request;
+      console.log(`${method} ${url} -> ${status} (attempt ${attempt})`);
+    },
+  },
+});
+const todo = await panda.createTodo({
+  body: { title: "Ship the SDK" },
+});
+console.log(todo);
+if (todo.ok) {
+  const done = await panda.updateTodo({
+    params: { id: todo.value.id },
+    body: { done: true },
+  });
+  console.log(done);
+}
+for await (const movie of paginate(panda.searchMovies, { limit: 2 })) {
+  if (movie.year < 2016) {
+    console.log(`Found an oldie: ${movie.title} (${movie.year})`);
+    break; // no more pages are fetched
+  }
+}
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- **`createClient(api, options)`**: one method per endpoint, built by a loop and typed by `Client<A>` with a single cast, and every dependency (fetch, sleep, random, clock) injected with a default.
+- **Typed errors**: `attemptOnce` turns every outcome into a `Result`, with `network`, `http` and `invalid-response` errors, while bad input still throws a `ValidationError` before anything is sent.
+- **Retries that don't make things worse**: only idempotent methods, only retryable errors, exponential backoff with a cap and equal jitter.
+- **`paginate`**: an async generator that walks pages lazily, accepts only page-returning methods, and throws an `ApiFailure` when a page fails.
+- **Hooks** for headers, logs and metrics, and a fast **test suite** with fakes, plus a few tests against the practice API.
+
+The SDK works. In **Part 3** we make it something other people can depend on: a polished public API, type tests for all of it, and a package that's ready for npm. 📦
