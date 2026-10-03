@@ -1,0 +1,585 @@
+---
+title: Robust API Clients
+description: Handle network errors, timeouts and bad answers, retry with exponential backoff, walk through paginated results, wrap it all in a typed client, test it and call APIs concurrently.
+duration: 20
+xp: 25
+---
+
+Calling an API once on a good day is easy. Calling it **thousands of times**, from a scheduled job, over a flaky mobile network, against a server that is being redeployed, is not. Real API clients spend most of their code on what happens when things go **wrong**. In this lesson you'll make a client that survives all of it: errors, retries, pagination, a clean class around it all, tests, and concurrency. 🛡️
+
+## Everything that can go wrong
+
+A request can fail in several quite different ways, and requests raises a different exception for each:
+
+<CodeExample output={`/users/3    -> OK, got dict
+/offline    -> no connection
+/delay/600  -> too slow
+/status/404 -> 404: our mistake, don't retry
+/status/503 -> 503: server trouble
+/shop       -> answered, but not with JSON
+True`}>
+
+```python
+import requests
+
+BASE = "https://api.pandadev.test"
+
+def try_get(path):
+    try:
+        r = requests.get(BASE + path, timeout=0.3)
+        r.raise_for_status()
+        return f"OK, got {type(r.json()).__name__}"
+    except requests.ConnectionError:
+        return "no connection"
+    except requests.Timeout:
+        return "too slow"
+    except requests.HTTPError as error:
+        status = error.response.status_code
+        if status < 500:
+            return f"{status}: our mistake, don't retry"
+        return f"{status}: server trouble"
+    except requests.JSONDecodeError:
+        return "answered, but not with JSON"
+
+for path in ["/users/3", "/offline", "/delay/600",
+             "/status/404", "/status/503", "/shop"]:
+    print(f"{path:11} -> {try_get(path)}")
+
+print(issubclass(requests.Timeout, requests.RequestException))
+```
+
+</CodeExample>
+
+| Exception | What happened |
+| --- | --- |
+| `requests.ConnectionError` | no answer at all: DNS failed, server down, Wi-Fi gone |
+| `requests.Timeout` | the server took longer than your `timeout=` |
+| `requests.HTTPError` | from `raise_for_status()`: the server answered 4xx or 5xx |
+| `requests.JSONDecodeError` | `r.json()` on a body that isn't JSON (here an HTML page) |
+
+They all inherit from **`requests.RequestException`**, so `except requests.RequestException` catches any of them when you don't care which. (httpx has the same family: `httpx.ConnectError`, `httpx.TimeoutException`, `httpx.HTTPStatusError`, all under `httpx.HTTPError`.)
+
+## Which errors are worth retrying?
+
+Some failures are **temporary**: the server was restarting, overloaded, or the network hiccupped. Trying again a moment later often just works. Others are **permanent**: asking again for a movie that doesn't exist will give the same 404 forever.
+
+| Retry? | Errors |
+| --- | --- |
+| Yes | `ConnectionError`, `Timeout`, **5xx** (500, 502, 503, 504), **429 Too Many Requests** |
+| No | other **4xx**: 400, 401, 403, 404, 422... Your request is wrong; fix it instead |
+
+There's one more rule, about the **method**. `GET`, `PUT` and `DELETE` are **idempotent**: doing them twice has the same effect as doing them once. `POST` is not. If a `POST /orders` timed out, the server may have created the order anyway and only the answer got lost, so blindly retrying can charge a customer twice. Only retry a `POST` when the API supports an **idempotency key** (a unique id you send with the request so the server can spot repeats). You'll meet those in [Resilience Patterns](/learn/python/resilience-patterns).
+
+## Retries with exponential backoff
+
+If a server is overloaded, hammering it with instant retries makes things worse. Instead, wait a little longer before each new try: 0.5 s, then 1 s, then 2 s... This is **exponential backoff**. The practice API's `/flaky` endpoint fails twice with 503 and then works, perfect for trying it out:
+
+<CodeExample output={`  try 1: 503, waiting 0.5 s
+  try 2: 503, waiting 1.0 s
+{'ok': True, 'attempt': 3}
+  try 1: ConnectionError, waiting 0.5 s
+  try 2: ConnectionError, waiting 1.0 s
+Gave up: still offline
+No retry for 404`}>
+
+```python
+import time
+import requests
+
+BASE = "https://api.pandadev.test"
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+def get_with_retry(session, url, attempts=4, base_delay=0.5,
+                   sleep=time.sleep):
+    for attempt in range(1, attempts + 1):
+        last_try = attempt == attempts
+        try:
+            r = session.get(url, timeout=5)
+        except (requests.ConnectionError, requests.Timeout) as error:
+            if last_try:
+                raise
+            problem = type(error).__name__
+        else:
+            if r.status_code not in RETRY_STATUSES or last_try:
+                r.raise_for_status()   # 404 & co. raise at once
+                return r.json()
+            problem = r.status_code
+        delay = base_delay * 2 ** (attempt - 1)
+        print(f"  try {attempt}: {problem}, waiting {delay} s")
+        sleep(delay)
+
+def no_sleep(seconds):
+    pass  # tests and demos shouldn't really wait
+
+with requests.Session() as session:
+    print(get_with_retry(session, BASE + "/flaky", sleep=no_sleep))
+    try:
+        get_with_retry(session, BASE + "/offline", attempts=3,
+                       sleep=no_sleep)
+    except requests.ConnectionError:
+        print("Gave up: still offline")
+    try:
+        get_with_retry(session, BASE + "/status/404",
+                       sleep=no_sleep)
+    except requests.HTTPError as error:
+        print("No retry for", error.response.status_code)
+```
+
+</CodeExample>
+
+The interesting parts:
+
+- **`try ... except ... else`**: the `else` block runs only when no exception happened, so network errors and status codes are handled separately.
+- On the **last try** the function stops retrying: it re-raises the network error (`raise` with no argument), or lets `raise_for_status()` raise the HTTP error. Never retry forever.
+- **`sleep` is a parameter** with `time.sleep` as the default. The real program really waits; demos and tests pass a function that doesn't, so they run instantly. That's the dependency injection trick from [Mocks, Coverage and TDD](/learn/python/mocks-and-coverage).
+
+In production, add two refinements. **Jitter**: multiply each delay by something like `random.uniform(0.5, 1.5)`, so a thousand clients that failed together don't all retry at the same instant. And **`Retry-After`**: when a server answers 429 or 503 with a `Retry-After: 30` header, it's telling you how long to wait, so respect it.
+
+You don't always have to write the loop yourself. requests can retry for you through urllib3, and the **tenacity** package turns any function into a retrying one with a decorator:
+
+```python
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+
+retry = Retry(
+    total=4,
+    backoff_factor=0.5,                  # 0.5 s, 1 s, 2 s...
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "PUT", "DELETE"],   # no POST!
+)
+session = requests.Session()
+session.mount("https://", HTTPAdapter(max_retries=retry))
+```
+
+(That adapter talks to the real network, so it can't run here. Writing the loop once yourself is the best way to understand what those settings mean.)
+
+## Pagination: getting every page
+
+APIs rarely send thousands of results at once. They send one **page** and tell you how to ask for the next. The practice API answers `/movies` with `page`, `totalPages`, `total` and `results`, so you keep asking until `page == totalPages`. A **generator** is the perfect shape for this: the caller just sees a stream of movies, and pages are only fetched when needed (remember [Generators and Context Managers](/learn/python/generators-and-context-managers)):
+
+<CodeExample output={`  (got page 1 of 3)
+  (got page 2 of 3)
+  (got page 3 of 3)
+12 movies, best: The Quiet Algorithm
+  (got page 1 of 3)
+First oldie: Midnight in the Forest`}>
+
+```python
+import requests
+
+BASE = "https://api.pandadev.test"
+
+def iter_movies(session, page_size=5, **filters):
+    page = 1
+    while True:
+        params = {**filters, "page": page, "limit": page_size}
+        r = session.get(f"{BASE}/movies", params=params, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        print(f"  (got page {data['page']} of {data['totalPages']})")
+        yield from data["results"]
+        if data["page"] >= data["totalPages"]:
+            break
+        page += 1
+
+with requests.Session() as session:
+    movies = list(iter_movies(session))
+    print(len(movies), "movies, best:",
+          max(movies, key=lambda m: m["rating"])["title"])
+
+    for movie in iter_movies(session, page_size=4):
+        if movie["year"] < 2016:
+            print("First oldie:", movie["title"])
+            break
+```
+
+</CodeExample>
+
+`list(...)` pulled all three pages. The `for` loop found what it needed on page 1 and stopped, so pages 2 and 3 were **never requested**. `yield from data["results"]` yields each movie of the page in turn.
+
+Not every API pages the same way. Look out for these styles in API docs:
+
+- **Page numbers**: `?page=2&limit=20`, like here.
+- **Offset and limit**: `?offset=40&limit=20` ("skip 40, give me 20").
+- **Cursors**: the answer contains something like `"next": "eyJpZCI6NDJ9"` or a full `next` URL, and you pass it back until it's missing. GitHub puts the next URL in a `Link` header, which requests parses into `r.links["next"]["url"]`.
+
+The loop always has the same shape: request, yield the results, find the next page or stop.
+
+## A small typed client class
+
+Scattering `requests.get` calls all over a program means repeating the base URL, the timeout and the error handling everywhere, and passing raw dicts around. Professionals wrap an API in a small **client class**: one place for configuration and errors, and methods that return **dataclasses** instead of dicts:
+
+<CodeExample output={`Movie(id=8, title='The Quiet Algorithm', year=2024, rating=8.4)
+Weather(city='Reykjavik', temperature=3, condition='Windy')
+ApiError 404: Movie not found
+ApiError 404: City not found`}>
+
+```python
+from dataclasses import dataclass
+import requests
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(f"{status}: {message}")
+        self.status = status
+
+@dataclass(frozen=True)
+class Movie:
+    id: int
+    title: str
+    year: int
+    rating: float
+
+@dataclass(frozen=True)
+class Weather:
+    city: str
+    temperature: int
+    condition: str
+
+class PandaClient:
+    def __init__(self, base_url="https://api.pandadev.test",
+                 timeout=5, session=None):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = session or requests.Session()
+        self.session.headers["User-Agent"] = "panda-client/1.0"
+
+    def _get(self, path, **params):
+        try:
+            r = self.session.get(self.base_url + path,
+                                 params=params, timeout=self.timeout)
+        except requests.RequestException as error:
+            raise ApiError(0, type(error).__name__) from error
+        if not r.ok:
+            raise ApiError(r.status_code, r.json().get("error"))
+        return r.json()
+
+    def movie(self, movie_id: int) -> Movie:
+        data = self._get(f"/movies/{movie_id}")
+        return Movie(data["id"], data["title"], data["year"],
+                     data["rating"])
+
+    def weather(self, city: str) -> Weather:
+        data = self._get("/weather", city=city)
+        return Weather(data["city"], data["temperature"],
+                       data["condition"])
+
+client = PandaClient()
+print(client.movie(8))
+print(client.weather("Reykjavik"))
+for call in [lambda: client.movie(99),
+             lambda: client.weather("Atlantis")]:
+    try:
+        call()
+    except ApiError as error:
+        print("ApiError", error)
+```
+
+</CodeExample>
+
+Why this design pays off:
+
+- **One place** knows the base URL, timeout, headers and error handling (`_get`). Adding retries later means changing one method.
+- Callers catch **one exception type**, `ApiError`, instead of knowing about requests' whole family. If you swap requests for httpx one day, the rest of the program doesn't notice.
+- **Dataclasses** give you typed attributes (`movie.title`, with editor autocompletion) and keep only the fields you use. If the API renames a field, there's exactly one place to fix.
+- `base_url` and `session` are **parameters**, so tests can point the client somewhere else or hand it a fake session.
+
+(The `_get` method assumes error bodies are JSON. For an API that sometimes answers with HTML error pages, catch `ValueError` around `r.json()` there too.)
+
+## Testing an API client
+
+How do you test code that talks to a server? From [Mocks, Coverage and TDD](/learn/python/mocks-and-coverage) you know the main tool: replace the session with a **test double**, which also lets you simulate failures that are hard to cause for real. Here the practice API is available too, so you can also run some tests against a real (pretend) server:
+
+<CodeExample output={`...                                                  [100%]
+3 passed in 0.01s`}>
+
+```python
+from unittest.mock import MagicMock
+import pytest
+import requests
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(f"{status}: {message}")
+        self.status = status
+
+class PandaClient:
+    def __init__(self, base_url="https://api.pandadev.test",
+                 timeout=5, session=None):
+        self.base_url = base_url
+        self.timeout = timeout
+        self.session = session or requests.Session()
+
+    def temperature(self, city):
+        try:
+            r = self.session.get(self.base_url + "/weather",
+                                 params={"city": city},
+                                 timeout=self.timeout)
+        except requests.RequestException as error:
+            raise ApiError(0, type(error).__name__) from error
+        if not r.ok:
+            raise ApiError(r.status_code, r.json().get("error"))
+        return r.json()["temperature"]
+
+# Against the practice API (on your computer: a test server)
+def test_temperature():
+    assert PandaClient().temperature("Paris") == 17
+
+def test_unknown_city():
+    with pytest.raises(ApiError) as caught:
+        PandaClient().temperature("Atlantis")
+    assert caught.value.status == 404
+
+# With a test double: no network at all
+def test_network_error_becomes_api_error():
+    session = MagicMock()
+    session.get.side_effect = requests.ConnectionError("down")
+    with pytest.raises(ApiError) as caught:
+        PandaClient(session=session).temperature("Paris")
+    assert caught.value.status == 0
+    session.get.assert_called_once()
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+In real projects, keep most unit tests **offline** (fast, and they never fail because someone else's server is down), and add a few **integration tests** against a test server or a sandbox that the API provider offers. Libraries such as **responses** (for requests) and **respx** (for httpx) let you register fake answers for URLs, so even `requests.get` calls deep inside your code can be tested without a network.
+
+## Many requests at once with httpx.AsyncClient
+
+Fetching 50 cities one after another means waiting for 50 round trips in a row. With **`httpx.AsyncClient`** and the `asyncio.gather` you know from [Running Tasks Concurrently](/learn/python/concurrent-tasks), all requests are in flight at the same time:
+
+<CodeExample output={`London: 14°C
+Tokyo: 22°C
+Atlantis: 404
+Sydney: 25°C
+Moscow: 6°C`}>
+
+```python
+import asyncio
+import httpx
+
+CITIES = ["London", "Tokyo", "Atlantis", "Sydney", "Moscow"]
+
+async def temperature(client, city):
+    r = await client.get("/weather", params={"city": city})
+    r.raise_for_status()
+    return r.json()["temperature"]
+
+async def main():
+    async with httpx.AsyncClient(
+        base_url="https://api.pandadev.test", timeout=5
+    ) as client:
+        results = await asyncio.gather(
+            *(temperature(client, city) for city in CITIES),
+            return_exceptions=True,
+        )
+    for city, result in zip(CITIES, results):
+        if isinstance(result, httpx.HTTPStatusError):
+            print(f"{city}: {result.response.status_code}")
+        else:
+            print(f"{city}: {result}°C")
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+The code reads almost like the sync version: `await client.get(...)` instead of `client.get(...)`. Results come back **in the order of `CITIES`**, and thanks to `return_exceptions=True` the unknown city doesn't spoil the others. One `AsyncClient` is shared by all requests so connections are reused.
+
+<Callout type="warning" title="Be kind to the server">
+
+Concurrency makes it easy to fire 1,000 requests in a second, and many APIs will answer with **429 Too Many Requests** or block you. Limit how many run at once with an `asyncio.Semaphore` (say 5 or 10), respect the API's documented **rate limits**, and back off on 429.
+
+</Callout>
+
+## Caching responses
+
+The fastest request is the one you don't make. If your program asks for the same weather ten times a minute, remember the answer for a while. A simple cache stores each answer with the time it was saved, and only asks again when the saved copy is older than a **time to live** (TTL):
+
+<CodeExample output={`Requests made: 2
+Requests made: 3`}>
+
+```python
+import requests
+
+BASE = "https://api.pandadev.test"
+
+class CachedClient:
+    def __init__(self, session, ttl, clock):
+        self.session, self.ttl, self.clock = session, ttl, clock
+        self.cache = {}        # key -> (time saved, data)
+        self.requests_made = 0
+
+    def get_json(self, path, **params):
+        key = (path, tuple(sorted(params.items())))
+        if key in self.cache:
+            saved_at, data = self.cache[key]
+            if self.clock() - saved_at < self.ttl:
+                return data            # fresh enough: no request
+        r = self.session.get(BASE + path, params=params, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        self.cache[key] = (self.clock(), data)
+        self.requests_made += 1
+        return data
+
+now = 0
+client = CachedClient(requests.Session(), ttl=60,
+                      clock=lambda: now)
+for city in ["Paris", "Tokyo", "Paris", "Paris"]:
+    client.get_json("/weather", city=city)
+print("Requests made:", client.requests_made)
+
+now = 61   # a minute later the Paris answer is stale
+client.get_json("/weather", city="Paris")
+print("Requests made:", client.requests_made)
+```
+
+</CodeExample>
+
+The key is the path plus the **sorted** parameters, so `city="Paris"` asked in any order hits the same entry. The clock is injected (in real use, `clock=time.monotonic`) so the demo can jump a minute ahead without waiting.
+
+Only cache **`GET`** requests, and only data that may be a little out of date. `functools.cache` isn't a good fit here: it never expires, and it can't use dicts as arguments. In real projects, look at **requests-cache** or **hishel** (for httpx), which also understand HTTP's own caching headers such as `Cache-Control` and `ETag`.
+
+<Quiz
+  question="Which failure should an API client retry automatically?"
+  options={[
+    "GET /movies/99 answered 404 Not Found",
+    "POST /orders timed out, and the API has no idempotency keys",
+    "GET /weather answered 503 Service Unavailable",
+    "GET /users answered 401 Unauthorized",
+  ]}
+  answer={2}
+  explanation="503 is a temporary server problem and GET is safe to repeat, so retry with backoff. 404 and 401 won't change by asking again, and retrying a POST that may already have worked could create a second order."
+/>
+
+<Quiz
+  question="An API sends 5 movies per page and has 4 pages. Your generator yields the movies of each page in turn. A caller loops over it and breaks after the first 3 movies. How many pages were requested?"
+  options={["1", "3", "4", "0, generators never make requests"]}
+  answer={0}
+  explanation="Generators are lazy: their code runs only as far as needed to produce the next item. The first page already had 5 movies, so the loop broke before the generator ever asked for page 2."
+/>
+
+<Exercise
+  language="python"
+  title="Retry and paginate"
+  starter={`import time
+import requests
+
+BASE = "https://api.pandadev.test"
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+def get_json(session, url, params=None, attempts=3,
+             base_delay=0.1, sleep=time.sleep):
+    # GET url with params (timeout=5) and return r.json().
+    # Retry after a ConnectionError, a Timeout or a status in
+    # RETRY_STATUSES; before try number n + 1, call
+    # sleep(base_delay * 2 ** (n - 1)).
+    # After \`attempts\` tries, give up and raise.
+    # Other error statuses (like 404) raise HTTPError at once.
+    pass
+
+def all_movies(session, genre=None, page_size=5):
+    # Use get_json to fetch /movies page by page and return
+    # one list with every movie.
+    return []
+
+waits = []
+with requests.Session() as session:
+    print(get_json(session, BASE + "/flaky", sleep=waits.append))
+    print(waits)
+    movies = all_movies(session)
+    print(len(movies), "movies")
+    print([movie["title"] for movie in movies[:2]])
+`}
+  tests={[
+    { name: "The program prints the flaky answer, the waits and the movies", check: "__output == [\"{'ok': True, 'attempt': 3}\", '[0.1, 0.2]', '12 movies', \"['The Bamboo Heist', 'Panda Express to Mars']\"]" },
+    { name: "get_json returns the JSON at once when the request works", check: "[w := [], s := requests.Session()] and get_json(s, BASE + '/users/2') == {'id': 2, 'name': 'Sam Ortiz', 'username': 'sam', 'email': 'sam@pandadev.test'} and get_json(s, BASE + '/movies', params={'genre': 'sci-fi'}, sleep=w.append)['total'] == 3 and w == []" },
+    { name: "Retries a 503 with growing waits, then raises HTTPError", check: "exec('_w, _n = [], len(_panda_requests)\\ntry:\\n    get_json(requests.Session(), BASE + \"/status/503\", attempts=4, sleep=_w.append)\\n    _ok = False\\nexcept requests.HTTPError as e:\\n    _ok = e.response.status_code == 503') or (_ok and len(_panda_requests) - _n == 4 and [round(x, 6) for x in _w] == [0.1, 0.2, 0.4])" },
+    { name: "Uses base_delay and the default of 3 attempts", check: "exec('_w, _n = [], len(_panda_requests)\\ntry:\\n    get_json(requests.Session(), BASE + \"/status/500\", base_delay=1.5, sleep=_w.append)\\n    _ok = False\\nexcept requests.HTTPError:\\n    _ok = True') or (_ok and len(_panda_requests) - _n == 3 and _w == [1.5, 3.0])" },
+    { name: "Doesn't retry a 404", check: "exec('_w, _n = [], len(_panda_requests)\\ntry:\\n    get_json(requests.Session(), BASE + \"/status/404\", sleep=_w.append)\\n    _ok = False\\nexcept requests.HTTPError as e:\\n    _ok = e.response.status_code == 404') or (_ok and len(_panda_requests) - _n == 1 and _w == [])" },
+    { name: "Retries connection errors, then re-raises them", check: "exec('_w, _n = [], len(_panda_requests)\\ntry:\\n    get_json(requests.Session(), BASE + \"/offline\", attempts=2, sleep=_w.append)\\n    _ok = False\\nexcept requests.ConnectionError:\\n    _ok = True') or (_ok and len(_panda_requests) - _n == 2 and [round(x, 6) for x in _w] == [0.1])" },
+    { name: "all_movies walks through every page", check: "[n := len(_panda_requests), m := all_movies(requests.Session())] and [x['id'] for x in m] == list(range(1, 13)) and [r['url'].split('?')[0] for r in _panda_requests[n:]] == [BASE + '/movies'] * 3 and all(f'page={i + 1}' in r['url'] for i, r in enumerate(_panda_requests[n:]))" },
+    { name: "all_movies passes genre and page_size", check: "[n := len(_panda_requests), m := all_movies(requests.Session(), 'drama', page_size=2)] and [x['title'] for x in m] == ['Midnight in the Forest', 'Snow Leopard Summer', 'The Quiet Algorithm', 'Mountain of Echoes'] and len(_panda_requests) - n == 2 and all('genre=drama' in r['url'] and 'limit=2' in r['url'] for r in _panda_requests[n:])" },
+    { name: "all_movies stops after the last page", check: "[n := len(_panda_requests), m := all_movies(requests.Session(), page_size=50)] and len(m) == 12 and len(_panda_requests) - n == 1 and all_movies(requests.Session(), 'horror') == []" },
+  ]}
+>
+
+Build the two workhorses of a robust client.
+
+1. `get_json(session, url, params=None, attempts=3, base_delay=0.1, sleep=time.sleep)` sends `session.get(url, params=params, timeout=5)` and returns `r.json()`.
+   - After a `requests.ConnectionError`, a `requests.Timeout` or a status in `RETRY_STATUSES`, it waits and tries again: before the 2nd try it calls `sleep(base_delay)`, before the 3rd `sleep(base_delay * 2)`, then `sleep(base_delay * 4)` and so on.
+   - After `attempts` tries in total it gives up: it re-raises the network error, or raises `requests.HTTPError` for the status.
+   - Any other error status (like 404) raises `requests.HTTPError` straight away, without retrying.
+2. `all_movies(session, genre=None, page_size=5)` uses `get_json` to fetch `/movies` page by page, with the query parameters `page`, `limit=page_size` and (only when given) `genre`. It stops when `page` equals `totalPages` and returns one list of all the movie dicts.
+
+The program should print `{'ok': True, 'attempt': 3}`, `[0.1, 0.2]`, `12 movies` and the first two titles.
+
+<Hint>
+
+Loop `for attempt in range(1, attempts + 1):` with `last_try = attempt == attempts`. Put the request in `try`, catch `(requests.ConnectionError, requests.Timeout)` and `raise` if it's the last try. In the `else:` block, if `r.status_code not in RETRY_STATUSES or last_try`, call `r.raise_for_status()` and `return r.json()`. After the `try`, call `sleep(base_delay * 2 ** (attempt - 1))`. For `all_movies`, start at `page = 1`, extend a list with `data["results"]`, return when `data["page"] >= data["totalPages"]`, else `page += 1`.
+
+</Hint>
+
+<Solution>
+
+```python
+import time
+import requests
+
+BASE = "https://api.pandadev.test"
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+def get_json(session, url, params=None, attempts=3,
+             base_delay=0.1, sleep=time.sleep):
+    for attempt in range(1, attempts + 1):
+        last_try = attempt == attempts
+        try:
+            r = session.get(url, params=params, timeout=5)
+        except (requests.ConnectionError, requests.Timeout):
+            if last_try:
+                raise
+        else:
+            if r.status_code not in RETRY_STATUSES or last_try:
+                r.raise_for_status()
+                return r.json()
+        sleep(base_delay * 2 ** (attempt - 1))
+
+def all_movies(session, genre=None, page_size=5):
+    movies = []
+    page = 1
+    while True:
+        params = {"page": page, "limit": page_size}
+        if genre is not None:
+            params["genre"] = genre
+        data = get_json(session, f"{BASE}/movies", params=params)
+        movies.extend(data["results"])
+        if data["page"] >= data["totalPages"]:
+            return movies
+        page += 1
+
+waits = []
+with requests.Session() as session:
+    print(get_json(session, BASE + "/flaky", sleep=waits.append))
+    print(waits)
+    movies = all_movies(session)
+    print(len(movies), "movies")
+    print([movie["title"] for movie in movies[:2]])
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Requests fail in different ways: **`ConnectionError`**, **`Timeout`**, **`HTTPError`** (4xx/5xx after `raise_for_status()`), **`JSONDecodeError`**; all are **`RequestException`**s.
+- **Retry** temporary failures (network errors, timeouts, 5xx, 429) on **idempotent** requests; never retry other 4xx, and never blindly retry a `POST`.
+- Use **exponential backoff** (0.5 s, 1 s, 2 s...) with a limit on attempts, plus jitter and `Retry-After` in production. Make `sleep` a **parameter** so tests run instantly.
+- **Pagination**: loop until the last page (or until there's no `next` cursor); a **generator** that yields every item keeps callers simple and only fetches the pages that are needed.
+- Wrap an API in a small **client class**: one place for base URL, timeout and errors, one exception type (`ApiError`), and **dataclasses** for results.
+- Test clients with **test doubles** for failures, and a few tests against a real test server.
+- **`httpx.AsyncClient` + `asyncio.gather`** runs many requests concurrently; limit concurrency and respect rate limits.
+- **Cache** `GET` answers with a time to live when slightly old data is fine.
