@@ -161,7 +161,17 @@ async function solves(code: string, ex: Exercise) {
   };
 }
 
-const files = lessonFiles();
+const allFiles = lessonFiles();
+/**
+ * CI splits these tests by language to run them in parallel:
+ * CONTENT_LANGUAGES=python checks only the Python lessons.
+ */
+const only = process.env.CONTENT_LANGUAGES?.split(",").filter(Boolean);
+const files = only
+  ? allFiles.filter((file) =>
+      only.includes(file.slice(ROOT.length + 1).split("/")[0]),
+    )
+  : allFiles;
 const exercises = files.flatMap(exercisesIn);
 
 describe("interactive exercises", () => {
@@ -273,7 +283,7 @@ describe("TryIt live previews", () => {
 
 describe("links between lessons", () => {
   const slugs = new Set(
-    files.map((file) => {
+    allFiles.map((file) => {
       const [language, , name] = file.slice(ROOT.length + 1).split("/");
       return `/learn/${language}/${name.replace(/^\d+-/, "").replace(/\.mdx$/, "")}`;
     }),
