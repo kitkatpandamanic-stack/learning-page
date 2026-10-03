@@ -24,7 +24,7 @@ import {
  * collect the tests in it.
  */
 export const PYTHON_DRIVER = `
-import asyncio, builtins, contextlib, io, json, os, selectors, sys, time, traceback
+import asyncio, builtins, contextlib, io, json, os, re, selectors, sys, time, traceback
 import importlib, importlib.util
 
 _PANDA_MAX_LINES = __MAX_LINES__
@@ -32,6 +32,10 @@ _PANDA_DIR = "/home/pyodide/lesson"
 _PANDA_FILE = _PANDA_DIR + "/lesson.py"
 
 sys.dont_write_bytecode = True  # lesson.py changes every run
+import warnings
+# Libraries inside Pyodide (e.g. threadpoolctl, used by scikit-learn) warn
+# about Pyodide's own deprecated APIs; that says nothing about the lesson.
+warnings.filterwarnings("ignore", message=r"JsProxy\\.", category=RuntimeWarning)
 os.environ["MPLBACKEND"] = "agg"
 os.environ["COLUMNS"] = "60"
 os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"  # e.g. anyio's, which warns once imported
@@ -91,6 +95,18 @@ def _panda_error(exc):
         frames = [f for f in traceback.extract_tb(exc.__traceback__) if f.filename == "<lesson>"]
         line = frames[-1].lineno if frames else None
     message = str(exc) if not isinstance(exc, SyntaxError) else (exc.msg or str(exc))
+    # Python adds hints when it prints an error ("Did you mean: 'score'?");
+    # they aren't part of str(exc), so take them from the printed form.
+    try:
+        # (with the traceback: name hints come from the failing frame)
+        printed = list(
+            traceback.TracebackException.from_exception(exc).format_exception_only()
+        )[-1].rstrip("\\n")
+        hint = re.search(r"\\. (Did you mean: .+|Did you forget to import .+)$", printed)
+        if hint and hint.group(1) not in message:
+            message = f"{message}. {hint.group(1)}"
+    except Exception:
+        pass
     return {"name": type(exc).__name__, "message": message, "line": line}
 
 # --- asyncio without threads or sockets ---------------------------------
@@ -391,6 +407,16 @@ export function parsePythonResult(
   return { output, error, tests: tests.length ? results : undefined };
 }
 
+/**
+ * The code plus imports Pyodide can't see in it: zoneinfo finds its time
+ * zones in the tzdata package. Used to pick the packages to install.
+ */
+export function withImpliedImports(code: string) {
+  return /^\s*(?:import|from)\s+zoneinfo\b/m.test(code)
+    ? `${code}\nimport tzdata`
+    : code;
+}
+
 const driverLoaded = new WeakSet<PyodideInterface>();
 
 /**
@@ -407,7 +433,9 @@ export async function executePython(
     pyodide.runPython(PYTHON_DRIVER);
     driverLoaded.add(pyodide);
   }
-  await pyodide.loadPackagesFromImports(code, { messageCallback: () => {} });
+  await pyodide.loadPackagesFromImports(withImpliedImports(code), {
+    messageCallback: () => {},
+  });
   const prepare = pyodide.globals.get("_panda_prepare");
   try {
     prepare(code);

@@ -87,7 +87,51 @@ describe("executePython", () => {
 });
 
 // These install real packages (pytest, FastAPI, pandas…), like lessons do.
+describe("error hints", () => {
+  it("adds Python's suggestions to error messages", async () => {
+    const message = async (code: string) =>
+      (await executePython(py, code)).error?.message;
+    expect(await message("score = 3\nprint(scor)")).toBe(
+      "name 'scor' is not defined. Did you mean: 'score'?",
+    );
+    expect(await message("print(math.pi)")).toBe(
+      "name 'math' is not defined. Did you forget to import 'math'?",
+    );
+    expect(await message("[].apend(1)")).toBe(
+      "'list' object has no attribute 'apend'. Did you mean: 'append'?",
+    );
+  });
+});
+
 describe("executePython with packages", () => {
+  it("trains scikit-learn models without Pyodide's internal warnings", async () => {
+    const r = await executePython(
+      py,
+      [
+        "from sklearn.datasets import load_breast_cancer",
+        "from sklearn.neighbors import KNeighborsClassifier",
+        "X, y = load_breast_cancer(return_X_y=True)",
+        "print(round(KNeighborsClassifier().fit(X, y).score(X, y), 3))",
+      ].join("\n"),
+    );
+    expect(r.error).toBeUndefined();
+    expect(r.output.map((l) => l.text)).toEqual(["0.947"]);
+  }, 120_000);
+
+  it("has time zones for zoneinfo", async () => {
+    const r = await executePython(
+      py,
+      [
+        "from datetime import datetime",
+        "from zoneinfo import ZoneInfo",
+        'meet = datetime(2026, 3, 14, 9, 30, tzinfo=ZoneInfo("Europe/London"))',
+        'print(meet.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%H:%M"))',
+      ].join("\n"),
+    );
+    expect(r.error).toBeUndefined();
+    expect(r.output.map((l) => l.text)).toEqual(["18:30"]);
+  });
+
   it("runs asyncio.run without threads", async () => {
     const r = await executePython(
       py,
