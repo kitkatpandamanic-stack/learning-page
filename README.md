@@ -73,6 +73,7 @@ Lessons can use these components without importing them:
 | `<TryIt html={`…`} code={`…`} />`                                                                    | Live HTML + JavaScript demo the learner can edit       |
 | `<TryIt language="python" code={`…`} />`                                                             | Editable code to run, e.g. Python that draws a chart   |
 | `<TryIt language="react" code={`…`} />`                                                              | Live React component (renders into `<div id="root">`)  |
+| `<TryIt language="tsx" code={`…`} />`                                                                | The same in TypeScript, type-checked first             |
 
 Code blocks support titles and highlighted lines: ` ```js title="app.js" {2} `.
 
@@ -117,12 +118,25 @@ wait for renders and requests. To check a loading state without racing the respo
 hold the practice API's answers: `(__hold(), __type("input", "p"),
 await __release(await __waitFor(() => /* loading is shown */)))`.
 
-TypeScript exercises add `language="typescript"`. Code is type-checked first (strict,
-ES2023 library, no DOM) with the real TypeScript compiler, which `scripts/build-vendor.mjs`
-copies from `node_modules` into `public/vendor` (so the site serves it, not a CDN); code with type errors doesn't run, so a starter
-with deliberate type errors makes a good "fix the types" task. `npm test` fails if any
-TypeScript example or solution has a type error. To show an error in a lesson, use a plain
-code block with a `// ❌ Error: …` comment.
+TypeScript exercises add `language="typescript"`. Code is type-checked first (strict) with
+the real TypeScript compiler, which `scripts/build-vendor.mjs` copies from `node_modules`
+into `public/vendor` (so the site serves it, not a CDN); code with type errors doesn't run,
+so a starter with deliberate type errors makes a good "fix the types" task. What the code
+may use depends on where it runs (`src/lib/runner/typecheck.ts`):
+
+- Plain TypeScript runs in a Web Worker: ES2023 plus the worker library (fetch, URL,
+  crypto…, no DOM), and it can import the runner's libraries (`vitest`, `express`,
+  `supertest`, `cookie-parser`, `ws`, `http`) with types shaped like the real packages'
+  (`src/lib/runner/module-types.ts`; Express infers route parameters from the path).
+- With `html={`…`}`, TypeScript is checked against the DOM library and runs in the preview.
+- `language="tsx"` is React in TypeScript: checked with React's own types
+  (`@types/react`, vendored by `scripts/build-vendor.mjs`) and run like `language="react"`.
+
+Checks run after the types are stripped, so they can't see types; to test type-level work,
+let the starter fail type-checking, e.g. with `// @ts-expect-error` lines that must be
+errors ("Unused '@ts-expect-error' directive" fails a too-loose type). `npm test` fails if
+any TypeScript example or solution has a type error. To show an error in a lesson, use a
+plain code block with a `// ❌ Error: …` comment.
 
 DOM exercises add `html={`…`}`: the code runs against that page in a sandboxed iframe
 with a live preview, and each check is evaluated in the page afterwards, in order, so
