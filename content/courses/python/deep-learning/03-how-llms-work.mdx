@@ -1,0 +1,634 @@
+---
+title: How LLMs Work
+description: Tokens, embeddings, next-token prediction, sampling with temperature, attention and the transformer, built in miniature with NumPy, plus how real models are trained and used.
+duration: 25
+xp: 30
+---
+
+A **large language model (LLM)**, the engine inside every chat assistant, does one thing: given some text, it predicts **what comes next**, one small piece at a time. Everything else (answering questions, writing code, translating) emerges from doing that one thing extremely well, after training on a huge amount of text.
+
+In this lesson you'll build each part of that machine in miniature, with NumPy: how text becomes numbers, how a model predicts the next piece, how it picks one, and the **attention** mechanism that made modern LLMs possible. Then we'll zoom out to how real models are trained, why they sometimes make things up, and how to use one from Python. No hype, just the mechanics. 🔍
+
+## From text to tokens
+
+A neural network works with numbers, so the first step is to cut text into pieces called **tokens** and give each one a number. There are two obvious ways to cut:
+
+<CodeExample output={`24 character tokens: ['t', 'h', 'e', ' ', 'p', 'a'] ...
+5 word tokens: ['the', 'panda', 'ate', 'the', 'bamboo']
+[' ', 'a', 'b', 'd', 'e', 'h', 'm', 'n', 'o', 'p', 't']`}>
+
+```python
+text = "the panda ate the bamboo"
+
+chars = list(text)
+words = text.split()
+print(len(chars), "character tokens:", chars[:6], "...")
+print(len(words), "word tokens:", words)
+print(sorted(set(chars)))
+```
+
+</CodeExample>
+
+- **Characters**: the vocabulary is tiny (a few dozen symbols for English, a few thousand with every alphabet), and any text can be written with it. But sequences get very long, and a single letter carries little meaning.
+- **Words**: short sequences, meaningful pieces. But the vocabulary explodes (every name, typo, plural and verb form is a new word), and a word the model never saw is a dead end, just like the unknown words in [the spam classifier](/learn/python/text-classification).
+
+Real LLMs use a middle ground: **subword** tokens. Common words get one token, rare words are built from several pieces. The most popular algorithm for choosing those pieces is **byte-pair encoding (BPE)**, and it's simple enough to write in a few lines.
+
+### Byte-pair encoding
+
+Start with every word split into characters. Count every pair of neighbouring tokens, **merge the most frequent pair** into one new token, and repeat:
+
+<CodeExample output={`merge 1: ('l', 'o') (5x)
+merge 2: ('lo', 'w') (5x)
+merge 3: ('e', 'r') (3x)
+merge 4: ('e', 's') (3x)
+merge 5: ('es', 't') (3x)
+merge 6: ('n', 'e') (2x)
+    low -> ['low']
+  lower -> ['low', 'er']
+ lowest -> ['low', 'est']
+  newer -> ['ne', 'w', 'er']
+ newest -> ['ne', 'w', 'est']
+  wider -> ['w', 'i', 'd', 'er']
+ widest -> ['w', 'i', 'd', 'est']`}>
+
+```python
+from collections import Counter
+
+words = ["low", "low", "low", "lower", "lowest",
+         "newer", "newest", "wider", "widest"]
+corpus = [list(word) for word in words]
+
+def pair_counts(corpus):
+    counts = Counter()
+    for tokens in corpus:
+        for pair in zip(tokens, tokens[1:]):
+            counts[pair] += 1
+    return counts
+
+def merge(tokens, pair):
+    out, i = [], 0
+    while i < len(tokens):
+        if tuple(tokens[i:i + 2]) == pair:
+            out.append(tokens[i] + tokens[i + 1])   # glue the pair
+            i += 2
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+merges = []
+for step in range(6):
+    pair, count = pair_counts(corpus).most_common(1)[0]
+    merges.append(pair)
+    corpus = [merge(tokens, pair) for tokens in corpus]
+    print(f"merge {step + 1}: {pair} ({count}x)")
+
+for word, tokens in sorted(set(zip(words, map(tuple, corpus)))):
+    print(f"{word:>7} -> {list(tokens)}")
+```
+
+</CodeExample>
+
+After six merges, BPE has discovered `low`, `er` and `est` on its own, because they're frequent. To tokenise a **new** word, apply the learned merges in the same order:
+
+<CodeExample output={`['s', 'low', 'er']
+['ne', 'w', 'est']
+['z', 'e', 'b', 'r', 'a']`}>
+
+```python
+def merge(tokens, pair):
+    out, i = [], 0
+    while i < len(tokens):
+        if tuple(tokens[i:i + 2]) == pair:
+            out.append(tokens[i] + tokens[i + 1])
+            i += 2
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+merges = [("l", "o"), ("lo", "w"), ("e", "r"),
+          ("e", "s"), ("es", "t"), ("n", "e")]
+
+def tokenise(word):
+    tokens = list(word)
+    for pair in merges:
+        tokens = merge(tokens, pair)
+    return tokens
+
+print(tokenise("slower"))
+print(tokenise("newest"))
+print(tokenise("zebra"))
+```
+
+</CodeExample>
+
+`slower` was never in the training words, but it becomes `s` + `low` + `er`, pieces the model knows. And `zebra` still works, just as single characters: with BPE, **no word is ever unknown**. Real tokenisers learn tens of thousands to a couple of hundred thousand merges from a huge text collection, and work on **bytes** rather than characters, so that any text in any language, emoji included, can be encoded.
+
+On your own computer, you can try a real tokeniser, OpenAI's open-source `tiktoken`:
+
+```python
+# On your own computer: pip install tiktoken
+import tiktoken
+
+enc = tiktoken.get_encoding("cl100k_base")
+ids = enc.encode("Pandas eat bamboo, unbelievably!")
+print(ids)                               # a list of integers
+print([enc.decode([i]) for i in ids])    # the pieces they stand for
+```
+
+Common words come out as a single token (usually including the space before them), while rarer words are split into several pieces.
+
+<Callout type="note" title="Why chatbots used to fail at counting letters">
+
+A model never sees letters, only token numbers. "strawberry" might be one or two tokens, so "how many r's are in strawberry?" asks about something the model can't directly look at. It's also why prices are quoted **per token** (roughly ¾ of an English word on average) and why a model's limits are measured in tokens, not characters.
+
+</Callout>
+
+## Embeddings: tokens as vectors
+
+A token number like 4821 says nothing about meaning: token 4821 isn't "more" than token 17. So the first layer of an LLM is an **embedding table**: a matrix with one row per token in the vocabulary, each row a vector of numbers (768 numbers for the small GPT-2 model, many thousands for big models). Looking up a token's embedding is just picking its row.
+
+The model **learns** these vectors during training, and something remarkable happens: tokens used in similar contexts end up with similar vectors. Here's a hand-made toy table with three dimensions that I chose to mean "animal", "food" and "machine":
+
+<CodeExample output={`[[0.9 0.2 0. ]
+ [0.1 0.9 0. ]]
+   panda: 1.00
+    bear: 0.99
+  kitten: 0.98
+  bamboo: 0.32
+ noodles: 0.22
+   truck: 0.00`}>
+
+```python
+import numpy as np
+
+vocab = ["panda", "bear", "kitten", "bamboo", "noodles", "truck"]
+E = np.array([
+    # animal food  machine
+    [0.9, 0.2, 0.0],     # panda
+    [0.9, 0.1, 0.1],     # bear
+    [0.8, 0.0, 0.0],     # kitten
+    [0.1, 0.9, 0.0],     # bamboo
+    [0.0, 1.0, 0.1],     # noodles
+    [0.0, 0.0, 1.0],     # truck
+])
+
+def cosine(a, b):
+    return a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+
+ids = [vocab.index(w) for w in ["panda", "bamboo"]]
+print(E[ids])                      # embedding lookup = pick rows
+
+panda = E[vocab.index("panda")]
+for word, vector in zip(vocab, E):
+    print(f"{word:>8}: {cosine(panda, vector):.2f}")
+```
+
+</CodeExample>
+
+**Cosine similarity** measures the angle between two vectors: 1 means "pointing the same way", 0 means "unrelated". `panda` is closest to the other animals, a little related to `bamboo` (it shares some "food"), and unrelated to `truck`, as you'd hope.
+
+In a real model nobody labels the dimensions. They're learned, there are thousands of them, and each one mixes many kinds of meaning, but the principle is the same: **meaning becomes geometry**. Similar words are close, and directions can carry meaning too (the famous example: in some embeddings, `king - man + woman` lands near `queen`). Embeddings are also useful on their own: **semantic search** finds documents whose embedding is close to the question's embedding, even when they share no words.
+
+## Predicting the next token
+
+A **language model** gives a probability for every possible next token, given the text so far. The simplest one is a **bigram** model: it only looks at the **previous** word, and it learns its probabilities by **counting**: after "the", how often did each word follow?
+
+<CodeExample output={`the -> {'panda': 0.43, 'tree': 0.43, 'red': 0.14}
+panda -> {'eats': 0.6, 'sleeps': 0.2, 'climbs': 0.2}
+eats -> {'bamboo': 0.67, 'fruit': 0.33}`}>
+
+```python
+from collections import Counter, defaultdict
+
+corpus = """the panda eats bamboo . the panda sleeps in the tree .
+the red panda eats fruit . a panda eats bamboo all day .
+the tree is tall . the panda climbs the tree ."""
+words = corpus.split()
+
+counts = defaultdict(Counter)
+for prev, nxt in zip(words, words[1:]):
+    counts[prev][nxt] += 1
+
+def next_word_probs(prev):
+    total = sum(counts[prev].values())
+    return {w: n / total for w, n in counts[prev].most_common()}
+
+for prev in ["the", "panda", "eats"]:
+    probs = next_word_probs(prev)
+    print(prev, "->", {w: round(p, 2) for w, p in probs.items()})
+```
+
+</CodeExample>
+
+After "the", the model has seen "panda" 3 times out of 7, "tree" 3 times and "red" once. That's a complete (tiny) language model: a table of probabilities for the next word. To generate text, you pick a next word, append it, and repeat.
+
+### Choosing the next token: greedy, sampling and temperature
+
+How do you pick from the probabilities? The obvious choice is **greedy**: always take the most likely word. But greedy text is repetitive, and it can get stuck in loops. Let's compare it with **sampling**, picking at random according to the probabilities (with a seeded generator, so the output is repeatable):
+
+<CodeExample output={`greedy:  the panda eats bamboo . the panda eats bamboo . the
+sampled: the tree is tall . the red panda climbs the tree
+sampled: the panda eats bamboo . the tree is tall . a`}>
+
+```python
+import numpy as np
+from collections import Counter, defaultdict
+
+corpus = """the panda eats bamboo . the panda sleeps in the tree .
+the red panda eats fruit . a panda eats bamboo all day .
+the tree is tall . the panda climbs the tree ."""
+words = corpus.split()
+counts = defaultdict(Counter)
+for prev, nxt in zip(words, words[1:]):
+    counts[prev][nxt] += 1
+
+def generate(start, n, rng=None):
+    out = [start]
+    for _ in range(n):
+        options = counts[out[-1]]
+        candidates = list(options)
+        p = np.array(list(options.values())) / sum(options.values())
+        if rng is None:
+            out.append(candidates[p.argmax()])          # greedy
+        else:
+            out.append(rng.choice(candidates, p=p))     # sample
+    return " ".join(out)
+
+print("greedy: ", generate("the", 10))
+rng = np.random.default_rng(7)
+print("sampled:", generate("the", 10, rng))
+print("sampled:", generate("the", 10, rng))
+```
+
+</CodeExample>
+
+Greedy goes round in circles; sampling produces variety (sometimes odd variety). Real systems control the randomness with two knobs:
+
+- **Temperature** divides the model's scores (logits) before softmax. Below 1 it **sharpens** the distribution towards the top choice (at 0 it becomes greedy); above 1 it **flattens** it, giving unlikely tokens more of a chance.
+- **Top-k** only keeps the `k` most likely tokens and sets the rest to zero before sampling, which cuts off the long tail of nonsense. (**Top-p** does the same with a probability budget instead of a count.)
+
+<CodeExample output={`T=0.5: [0.473 0.473 0.053 0.002]
+T=1.0: [0.417 0.417 0.139 0.028]
+T=2.0: [0.353 0.353 0.204 0.091]
+top-2:  [0.5 0.5 0.  0. ]`}>
+
+```python
+import numpy as np
+
+words = ["panda", "tree", "red", "bamboo"]
+logits = np.log(np.array([3, 3, 1, 0.2]))    # model scores
+
+def softmax(z):
+    e = np.exp(z - z.max())
+    return e / e.sum()
+
+for t in [0.5, 1.0, 2.0]:
+    print(f"T={t}:", softmax(logits / t).round(3))
+
+def top_k(probs, k):
+    keep = np.argsort(probs)[-k:]            # the k largest
+    out = np.zeros_like(probs)
+    out[keep] = probs[keep]
+    return out / out.sum()
+
+print("top-2: ", top_k(softmax(logits), 2).round(3))
+```
+
+</CodeExample>
+
+That's why a chat assistant answers differently each time you ask, and why the same model can be "creative" or "precise" depending on these settings. Note that sampling doesn't make a model more or less **correct**: it only changes which of its guesses you get.
+
+## Attention: letting tokens look at each other
+
+A bigram model only sees one previous word. That's hopeless for real language: in "The panda that the keeper fed this morning **was** hungry", the verb has to agree with "panda", seven words back. Before 2017, models read text one token at a time and squeezed everything so far into one memory vector, which worked poorly over long distances.
+
+The **transformer** (from the 2017 paper *Attention Is All You Need*) replaced that with **attention**: every token can look directly at every earlier token and decide which ones matter for it. Each token's vector is turned, by three learned weight matrices, into three new vectors:
+
+- a **query**: "what am I looking for?"
+- a **key**: "what do I contain?"
+- a **value**: "what do I pass on if you pick me?"
+
+The score between two tokens is the dot product of one's query with the other's key (a big dot product means "pointing the same way", as with cosine similarity). A softmax over each row turns the scores into **attention weights** that add up to 1, and each token's output is the weighted average of the values. In one formula, **scaled dot-product attention**:
+
+```text
+Attention(Q, K, V) = softmax(Q @ K.T / sqrt(d)) @ V
+```
+
+Dividing by `sqrt(d)` (the vector size) keeps the scores from growing with `d`, which would make the softmax too peaky to train. Here it is on four tokens, with random weights standing in for learned ones:
+
+<CodeExample output={`[[0.03 0.01 0.31 0.65]
+ [0.   0.   0.13 0.87]
+ [0.07 0.08 0.24 0.61]
+ [0.14 0.07 0.42 0.37]]
+[1. 1. 1. 1.]
+(4, 4)`}>
+
+```python
+import numpy as np
+
+def softmax(z):
+    e = np.exp(z - z.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+tokens = ["the", "panda", "ate", "bamboo"]
+rng = np.random.default_rng(0)
+d = 4
+X = rng.normal(size=(4, d))       # one embedding per token
+Wq, Wk, Wv = (rng.normal(size=(d, d)) for _ in range(3))
+
+Q, K, V = X @ Wq, X @ Wk, X @ Wv  # each (4, d)
+scores = Q @ K.T / np.sqrt(d)     # (4, 4): every pair
+weights = softmax(scores)         # each row sums to 1
+out = weights @ V                 # (4, d): mixed values
+
+print(weights.round(2))
+print(weights.sum(axis=1).round(6))
+print(out.shape)
+```
+
+</CodeExample>
+
+Row `i` shows how much token `i` attends to each token. It's all matrix multiplication again, which is why it runs fast on GPUs: every token attends to every other token at the same time.
+
+### The causal mask
+
+When a model **generates** text, a token must not peek at the tokens after it (they don't exist yet, and during training it would be cheating: the answer is right there). So before the softmax, we set every score above the diagonal to minus infinity. `exp(-inf)` is 0, so those positions get zero weight:
+
+<CodeExample output={`[[0 1 1 1]
+ [0 0 1 1]
+ [0 0 0 1]
+ [0 0 0 0]]
+[[1.   0.   0.   0.  ]
+ [1.   0.   0.   0.  ]
+ [0.18 0.2  0.62 0.  ]
+ [0.14 0.07 0.42 0.37]]`}>
+
+```python
+import numpy as np
+
+def softmax(z):
+    e = np.exp(z - z.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+rng = np.random.default_rng(0)
+d = 4
+X = rng.normal(size=(4, d))
+Wq, Wk, Wv = (rng.normal(size=(d, d)) for _ in range(3))
+Q, K, V = X @ Wq, X @ Wk, X @ Wv
+scores = Q @ K.T / np.sqrt(d)
+
+mask = np.triu(np.ones((4, 4), dtype=bool), k=1)   # above diagonal
+print(mask.astype(int))
+scores = np.where(mask, -np.inf, scores)
+weights = softmax(scores)
+print(weights.round(2))
+```
+
+</CodeExample>
+
+Now "the" can only look at itself, "panda" at "the" and itself, and so on. This **causal** attention lets a model train on every position of a text at once: for each position, it predicts the next token using only what came before. A text of 1000 tokens gives 1000 training examples in one pass.
+
+Real models run many attention **heads** side by side (**multi-head attention**), each with its own `Wq`, `Wk`, `Wv`, so that one head can track grammar, another which noun a pronoun refers to, and so on. Their outputs are joined and mixed by one more matrix.
+
+## The transformer block
+
+Attention on its own only mixes information between tokens. A **transformer block** wraps it with three more ingredients:
+
+```text
+          token vectors (n tokens × d numbers each)
+                         │
+         ┌───────────────┤
+         │               ▼
+         │        layer norm
+         │               ▼
+         │    causal multi-head attention     tokens exchange information
+         │               │
+         └──────▶ (+) ◀──┘                    residual: add the input back
+                   │
+         ┌─────────┤
+         │         ▼
+         │    layer norm
+         │         ▼
+         │    MLP: Linear → activation → Linear   each token "thinks" on its own
+         │         │
+         └──▶ (+) ◀┘                          residual again
+                   │
+                   ▼
+          token vectors, same shape: ready for the next block
+```
+
+- The **MLP** is the 2-layer network from [the last lesson](/learn/python/a-neural-network-from-scratch), applied to every token separately. It holds much of what the model "knows".
+- **Residual connections** add each sub-layer's input to its output (`x + attention(x)`). Gradients can flow straight back through the `+`, which is what makes networks with dozens of blocks trainable at all.
+- **Layer norm** rescales each token's vector to mean 0 and standard deviation 1 (then applies a learned scale and shift), keeping numbers in a healthy range: `(x - x.mean()) / x.std()`.
+
+A whole LLM is: embedding table → add **position information** (attention itself doesn't know the order of the tokens, so the model is told each token's position) → a stack of identical blocks → a final layer that turns each token's vector into a score for every token in the vocabulary → softmax → probabilities for the next token. GPT-2 small, from 2019, had 12 blocks, vectors of 768 numbers and a vocabulary of 50 257 tokens, about 124 million weights. GPT-3 (2020) had 96 blocks and 175 billion weights. Today's frontier models are larger still, and their exact sizes are mostly not published.
+
+## Training at scale
+
+How do those billions of weights get their values? In stages:
+
+1. **Pre-training.** Collect a huge amount of text (web pages, books, code, typically trillions of tokens), and train the model on one task: predict the next token, with the cross-entropy loss and gradient descent you already know. Nobody labels anything: the next token **is** the label. This takes thousands of GPUs for weeks or months. The result is a **base model**: very knowledgeable, but it simply continues text. Ask it a question and it might continue with more questions.
+2. **Fine-tuning.** Continue training on a much smaller, curated dataset to specialise the model. **Instruction tuning** uses many examples of instructions with good answers, written or checked by people, and turns the base model into an assistant that answers and follows instructions.
+3. **Learning from preferences.** People (or models trained to imitate their judgement) compare several answers and say which is better: more helpful, more honest, safer. The model is then trained to prefer the better kind of answer. The best-known method is **RLHF** (reinforcement learning from human feedback); there are several newer variants. This stage shapes the assistant's tone and its behaviour on difficult requests.
+
+The core of it is still the loop from the first lesson of this module: predict, measure the loss, compute the gradient (backpropagation through every block), step.
+
+## Context windows and hallucinations
+
+An LLM has no memory between requests. Everything it can use, your question, the conversation so far, any documents, must fit into its **context window**: the maximum number of tokens it can attend to at once. Windows have grown from about a thousand tokens (GPT-2) to hundreds of thousands or more today, but they're still a hard limit. Chat apps "remember" a conversation by sending the whole history again with every message.
+
+The most important limitation to understand is **hallucination**: a model can state something false, fluently and confidently. That follows directly from how it works:
+
+- It's trained to produce **likely** text, not **true** text. For most questions those coincide; for a rare fact, an obscure paper or a specific number, a plausible-sounding guess is "likely" too.
+- It has no built-in way to check a fact, and its knowledge stops at its training **cutoff** date.
+- Its fluent, confident style doesn't depend on whether it knows the answer. Confidence in the wording is not evidence.
+
+So in real systems: give the model the relevant documents in its context (**retrieval-augmented generation**, RAG: search first, then ask the model to answer from what was found), let it use **tools** (a calculator, a database, a search API) instead of recalling, ask it to cite sources, and **check** anything that matters, especially code, numbers, names and references.
+
+<Callout type="warning" title="Treat model output like user input">
+
+Text that comes out of an LLM is untrusted data. Don't `eval()` it, don't paste it into SQL, don't let it trigger actions without checks. And be aware of **prompt injection**: instructions hidden in a web page or document that the model reads ("ignore your previous instructions and...") can steer it. Validate outputs (for example with a Pydantic model), limit what the model is allowed to do, and keep a human in the loop for anything with consequences.
+
+</Callout>
+
+## Using an LLM from Python
+
+In practice you rarely train an LLM. You call one through an **API**, the same way you'd call any web API. Here's a call with Anthropic's official Python SDK (other providers' SDKs look very similar). It needs a network connection and an API key, so run it on your own computer:
+
+```bash
+pip install anthropic
+export ANTHROPIC_API_KEY="..."     # from the provider's console
+```
+
+```python
+# On your own computer
+import anthropic
+
+client = anthropic.Anthropic()    # reads ANTHROPIC_API_KEY
+
+response = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=1024,              # upper limit for the answer
+    system="You are a friendly tutor. Answer in two sentences.",
+    messages=[
+        {"role": "user", "content": "What does a tokenizer do?"},
+    ],
+)
+
+if response.stop_reason == "refusal":
+    print("The model declined this request.")
+else:
+    for block in response.content:
+        if block.type == "text":
+            print(block.text)
+print(response.usage.input_tokens, response.usage.output_tokens)
+```
+
+- The **system** prompt sets the rules; **messages** is the conversation so far, alternating `"user"` and `"assistant"`. The API is stateless, so for a follow-up question you send the whole list again, with the model's previous answer added.
+- You pay per input and output **token**, which `response.usage` reports. Long documents in the context cost money on every call.
+- Never hard-code the key in your code or commit it to git: read it from an environment variable, as here. The SDK does that by default.
+- Model names change as new versions are released; check the provider's documentation for the current ones.
+
+<Quiz
+  question="A model's next-token probabilities are panda 0.6, tree 0.3, rock 0.1. What does lowering the temperature to 0.2 do?"
+  options={[
+    "It makes the model more likely to be factually correct",
+    "It sharpens the distribution, so panda becomes even more likely",
+    "It flattens the distribution, so rock becomes more likely",
+    "It removes rock from the vocabulary",
+  ]}
+  answer={1}
+  explanation="Dividing the logits by a temperature below 1 makes the gaps between them bigger, so the top token gets almost all the probability (near 0 it becomes greedy). It changes which guess you get, not whether the model knows the answer."
+/>
+
+<Quiz
+  question="Why does a GPT-style model apply a causal mask in attention?"
+  options={[
+    "To make the attention weights add up to 1",
+    "So that each token can only attend to itself and earlier tokens, and can't see the tokens it has to predict",
+    "To save memory by dropping half of the weights",
+    "To stop the model from attending to padding at the end of short texts",
+  ]}
+  answer={1}
+  explanation="The model is trained to predict each next token from what came before. Setting the scores above the diagonal to minus infinity gives future tokens zero weight, so it can't peek at the answer, and generation works the same way, one token at a time."
+/>
+
+<Exercise
+  language="python"
+  title="Tokens and attention from scratch"
+  starter={`from collections import Counter
+import numpy as np
+
+def most_frequent_pair(corpus):
+    # corpus: a list of token lists, e.g. [['l', 'o', 'w'], ...]
+    # Return the most common pair of neighbouring tokens as a
+    # tuple, e.g. ('l', 'o')
+    pass
+
+def merge_pair(tokens, pair):
+    # Replace every occurrence of pair in tokens with the two
+    # tokens glued together. Return a new list.
+    pass
+
+def attention(Q, K, V, causal=False):
+    # Scaled dot-product attention. Return (output, weights).
+    # With causal=True, token i may only attend to tokens 0..i.
+    pass
+
+corpus = [list("hug"), list("pug"), list("hugs"), list("bun")]
+pair = most_frequent_pair(corpus)
+print(pair)
+print([merge_pair(tokens, pair) for tokens in corpus])
+
+rng = np.random.default_rng(1)
+Q, K, V = rng.normal(size=(3, 3, 4))
+out, weights = attention(Q, K, V, causal=True)
+print(weights.round(2))
+`}
+  tests={[
+    { name: "most_frequent_pair finds ('u', 'g')", check: "most_frequent_pair([list('hug'), list('pug'), list('hugs'), list('bun')]) == ('u', 'g')" },
+    { name: "most_frequent_pair works on other words", check: "most_frequent_pair([list('aaab'), list('cab'), list('ab')]) == ('a', 'b') and most_frequent_pair([list('xyz'), list('zxy')]) == ('x', 'y')" },
+    { name: "merge_pair glues every occurrence", check: "merge_pair(list('hugs'), ('u', 'g')) == ['h', 'ug', 's'] and merge_pair(['a', 'b', 'a', 'b', 'c'], ('a', 'b')) == ['ab', 'ab', 'c']" },
+    { name: "merge_pair handles multi-character tokens and no match", check: "merge_pair(['lo', 'w', 'er'], ('lo', 'w')) == ['low', 'er'] and merge_pair(['b', 'u', 'n'], ('u', 'g')) == ['b', 'u', 'n']" },
+    { name: "attention weights are softmax(Q K^T / sqrt(d))", check: "(lambda Q, K, V: (lambda s: np.allclose(attention(Q, K, V)[1], np.exp(s) / np.exp(s).sum(axis=1, keepdims=True)))(Q @ K.T / np.sqrt(Q.shape[1])))(*np.random.default_rng(2).normal(size=(3, 5, 6)))" },
+    { name: "attention output is weights @ V", check: "(lambda Q, K, V: (lambda r: r[0].shape == (5, 2) and np.allclose(r[0], r[1] @ V))(attention(Q, K, V)))(np.random.default_rng(3).normal(size=(5, 3)), np.random.default_rng(4).normal(size=(5, 3)), np.random.default_rng(5).normal(size=(5, 2)))" },
+    { name: "the causal mask hides future tokens", check: "(lambda w: np.allclose(np.triu(w, k=1), 0) and np.allclose(w.sum(axis=1), 1) and np.isclose(w[0, 0], 1) and np.all(w[np.tril_indices(6)] > 0))(attention(*np.random.default_rng(6).normal(size=(3, 6, 4)), causal=True)[1])" },
+    { name: "without the mask, every token sees every token", check: "np.all(attention(*np.random.default_rng(6).normal(size=(3, 6, 4)))[1] > 0)" },
+  ]}
+>
+
+Build two of this lesson's pieces yourself. ✂️
+
+1. `most_frequent_pair(corpus)` takes a list of token lists and returns the most common pair of **neighbouring** tokens, as a tuple. If several pairs tie, return the one `Counter.most_common` gives first.
+2. `merge_pair(tokens, pair)` returns a new list in which every occurrence of `pair` (two neighbouring tokens) is replaced by the two tokens glued into one string.
+3. `attention(Q, K, V, causal=False)` computes scaled dot-product attention and returns a tuple `(output, weights)`: `weights = softmax(Q @ K.T / sqrt(d))` where `d` is the number of columns of `Q`, and `output = weights @ V`. With `causal=True`, set the scores above the diagonal to `-np.inf` before the softmax.
+
+<Hint>
+
+For the pair counts, loop over the corpus and count `zip(tokens, tokens[1:])` in a `Counter`; `counts.most_common(1)[0][0]` is the winning pair. In `merge_pair`, walk through the list with an index `i`: if `(tokens[i], tokens[i + 1])` is the pair (check `i + 1 < len(tokens)` first), append the glued string and jump by 2, otherwise append `tokens[i]` and move by 1. For the causal mask, `np.triu(np.ones((n, n), dtype=bool), k=1)` is `True` above the diagonal, and `np.where(mask, -np.inf, scores)` applies it. The softmax is per row: subtract `scores.max(axis=1, keepdims=True)` first.
+
+</Hint>
+
+<Solution>
+
+```python
+from collections import Counter
+import numpy as np
+
+def most_frequent_pair(corpus):
+    counts = Counter()
+    for tokens in corpus:
+        counts.update(zip(tokens, tokens[1:]))
+    return counts.most_common(1)[0][0]
+
+def merge_pair(tokens, pair):
+    out, i = [], 0
+    while i < len(tokens):
+        if i + 1 < len(tokens) and (tokens[i], tokens[i + 1]) == pair:
+            out.append(tokens[i] + tokens[i + 1])
+            i += 2
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+def attention(Q, K, V, causal=False):
+    d = Q.shape[1]
+    scores = Q @ K.T / np.sqrt(d)
+    if causal:
+        n = scores.shape[0]
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        scores = np.where(mask, -np.inf, scores)
+    e = np.exp(scores - scores.max(axis=1, keepdims=True))
+    weights = e / e.sum(axis=1, keepdims=True)
+    return weights @ V, weights
+
+corpus = [list("hug"), list("pug"), list("hugs"), list("bun")]
+pair = most_frequent_pair(corpus)
+print(pair)
+print([merge_pair(tokens, pair) for tokens in corpus])
+
+rng = np.random.default_rng(1)
+Q, K, V = rng.normal(size=(3, 3, 4))
+out, weights = attention(Q, K, V, causal=True)
+print(weights.round(2))
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- LLMs predict the **next token**, again and again; everything else emerges from that, plus training on vast amounts of text.
+- **Tokens** are subword pieces; **byte-pair encoding** builds them by repeatedly merging the most frequent pair, so no word is ever unknown.
+- An **embedding table** turns each token into a learned vector; similar meanings end up close together (**cosine similarity**).
+- A language model outputs a probability for every next token. Generation picks one with **greedy** decoding or **sampling**, tuned by **temperature**, **top-k** and **top-p**.
+- **Attention** lets every token look at earlier tokens: `softmax(Q @ K.T / sqrt(d)) @ V`, with a **causal mask** so no token sees the future.
+- A **transformer block** = attention + an MLP, each with **layer norm** and a **residual** connection; an LLM stacks dozens of them.
+- Real models are **pre-trained** on next-token prediction, then **instruction-tuned** and trained on human **preferences** (RLHF and its successors).
+- Models are limited by their **context window** and can **hallucinate**: they produce likely text, not checked facts. Ground them with retrieval and tools, and verify what matters.
+- Use LLMs through an **API**: a system prompt, a list of messages, a key from an environment variable, and a bill per token.

@@ -1,11 +1,12 @@
 import "server-only";
 
 import { cookies } from "next/headers";
-import { and, count, desc, eq, sql, sum } from "drizzle-orm";
+import { and, count, desc, eq, or, sql, sum } from "drizzle-orm";
 
 import { db } from "@/db";
 import { account, lessonProgress, userAchievement, xpEvent } from "@/db/schema";
 import { getAllLessons, getCourse } from "@/lib/content";
+import { getPracticeLanguages, getProblems } from "@/lib/practice";
 import { defaultLocale, type Locale } from "@/lib/i18n";
 import {
   achievements,
@@ -179,9 +180,13 @@ export async function evaluateAchievements(userId: string, tz: string) {
   };
 }
 
-/** Completed lessons and rewarded activities for one language (for the browser). */
+/**
+ * Completed lessons and rewarded activities (lesson exercises and quizzes,
+ * practice problems) for one language (for the browser).
+ */
 export async function getLanguageProgress(userId: string, language: string) {
   const prefix = `/learn/${language}/`;
+  const practice = `/practice/${language}/`;
   const [completed, events] = await Promise.all([
     db
       .select({ slug: lessonProgress.lessonSlug })
@@ -198,7 +203,10 @@ export async function getLanguageProgress(userId: string, language: string) {
       .where(
         and(
           eq(xpEvent.userId, userId),
-          sql`${xpEvent.ref} like ${`${prefix}%#%`}`,
+          or(
+            sql`${xpEvent.ref} like ${`${prefix}%#%`}`,
+            sql`${xpEvent.ref} like ${`${practice}%#%`}`,
+          ),
         ),
       ),
   ]);
@@ -208,9 +216,14 @@ export async function getLanguageProgress(userId: string, language: string) {
   };
 }
 
-/** Lesson titles by permalink, in the learner's language where translated. */
+/** Lesson and problem titles by permalink, in the learner's language where translated. */
 function lessonTitles(locale: Locale) {
   const titles = new Map(getAllLessons().map((l) => [l.permalink, l.title]));
+  for (const language of getPracticeLanguages()) {
+    for (const problem of getProblems(language, locale)) {
+      titles.set(problem.permalink, problem.title);
+    }
+  }
   if (locale !== defaultLocale) {
     for (const language of languages) {
       const course = getCourse(language.slug, locale);

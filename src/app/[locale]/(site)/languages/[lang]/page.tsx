@@ -7,6 +7,7 @@ import {
   ArrowRight,
   BookOpen,
   Clock,
+  Dumbbell,
   Layers,
   Mountain,
   PenLine,
@@ -26,6 +27,7 @@ import { GlassCard } from "@/components/ui/glass-card";
 import { GradientText } from "@/components/ui/gradient-text";
 import { Link } from "@/i18n/navigation";
 import { getCourse, getLanguage } from "@/lib/content";
+import { getProblems } from "@/lib/practice";
 import { alternates, localeParam, localizedPath } from "@/lib/i18n";
 import { languages } from "@/lib/languages";
 import { levels } from "@/lib/levels";
@@ -79,6 +81,7 @@ export default async function LanguagePage({
   const tl = await getTranslations("levels");
   const info = await getTranslations("languageInfo");
   const course = getCourse(lang, locale);
+  const practiceCount = getProblems(lang).length;
 
   const formatDuration = (minutes: number) =>
     minutes < 60
@@ -190,17 +193,26 @@ export default async function LanguagePage({
             </div>
           </div>
 
-          {course?.firstLesson ? (
-            <Button asChild variant="gradient" size="xl" className="shrink-0">
-              <Link href={course.firstLesson.permalink}>
-                {t("startFirstLesson")} <ArrowRight />
-              </Link>
-            </Button>
-          ) : (
-            <Button variant="glass" size="xl" disabled className="shrink-0">
-              <PenLine /> {t("lessonsComingSoon")}
-            </Button>
-          )}
+          <div className="flex shrink-0 flex-col gap-3">
+            {course?.firstLesson ? (
+              <Button asChild variant="gradient" size="xl">
+                <Link href={course.firstLesson.permalink}>
+                  {t("startFirstLesson")} <ArrowRight />
+                </Link>
+              </Button>
+            ) : (
+              <Button variant="glass" size="xl" disabled>
+                <PenLine /> {t("lessonsComingSoon")}
+              </Button>
+            )}
+            {practiceCount > 0 && (
+              <Button asChild variant="glass" size="lg">
+                <Link href={`/practice/${language.slug}`}>
+                  <Dumbbell /> {t("practiceProblems", { count: practiceCount })}
+                </Link>
+              </Button>
+            )}
+          </div>
         </div>
       </GlassCard>
 

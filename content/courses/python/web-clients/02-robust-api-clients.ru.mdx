@@ -1,0 +1,585 @@
+---
+title: Надёжные API-клиенты
+description: Обрабатывайте сетевые ошибки и тайм-ауты, повторяйте запросы с экспоненциальной задержкой, загружайте все страницы, пишите типизированный клиент, тестируйте его и делайте запросы конкурентно.
+duration: 20
+xp: 25
+---
+
+Один раз обратиться к API в удачный день легко. Обращаться к нему **тысячи раз** — из задачи по расписанию, через нестабильную мобильную сеть, к серверу, который как раз перезапускают, — совсем другое дело. Настоящие API-клиенты тратят большую часть кода на то, что происходит, когда всё идёт **не так**. В этом уроке вы напишете клиент, который всё это переживёт: ошибки, повторные попытки, постраничную загрузку, аккуратный класс вокруг всего этого, тесты и конкурентность (concurrency). 🛡️
+
+## Всё, что может пойти не так
+
+Запрос может завершиться неудачей несколькими совершенно разными способами, и для каждого requests выбрасывает своё исключение (exception):
+
+<CodeExample output={`/users/3    -> OK, получен dict
+/offline    -> нет соединения
+/delay/600  -> слишком медленно
+/status/404 -> 404: наша ошибка, не повторяем
+/status/503 -> 503: проблема на сервере
+/shop       -> ответ есть, но не JSON
+True`}>
+
+```python
+import requests
+
+BASE = "https://api.pandadev.test"
+
+def try_get(path):
+    try:
+        r = requests.get(BASE + path, timeout=0.3)
+        r.raise_for_status()
+        return f"OK, получен {type(r.json()).__name__}"
+    except requests.ConnectionError:
+        return "нет соединения"
+    except requests.Timeout:
+        return "слишком медленно"
+    except requests.HTTPError as error:
+        status = error.response.status_code
+        if status < 500:
+            return f"{status}: наша ошибка, не повторяем"
+        return f"{status}: проблема на сервере"
+    except requests.JSONDecodeError:
+        return "ответ есть, но не JSON"
+
+for path in ["/users/3", "/offline", "/delay/600",
+             "/status/404", "/status/503", "/shop"]:
+    print(f"{path:11} -> {try_get(path)}")
+
+print(issubclass(requests.Timeout, requests.RequestException))
+```
+
+</CodeExample>
+
+| Исключение | Что случилось |
+| --- | --- |
+| `requests.ConnectionError` | ответа нет вовсе: не сработал DNS, сервер лежит, пропал Wi-Fi |
+| `requests.Timeout` | сервер отвечал дольше, чем позволяет ваш `timeout=` |
+| `requests.HTTPError` | из `raise_for_status()`: сервер ответил 4xx или 5xx |
+| `requests.JSONDecodeError` | `r.json()` на теле, которое не является JSON (здесь — HTML-страница) |
+
+Все они наследуются от **`requests.RequestException`**, поэтому `except requests.RequestException` поймает любое из них, когда вам не важно, какое именно. (В httpx есть такое же семейство: `httpx.ConnectError`, `httpx.TimeoutException`, `httpx.HTTPStatusError`, все под `httpx.HTTPError`.)
+
+## Какие ошибки стоит повторять?
+
+Некоторые сбои **временные**: сервер перезапускался, был перегружен, или сеть на секунду моргнула. Повторная попытка чуть позже часто просто срабатывает. Другие **постоянные**: если снова спросить о несуществующем фильме, вы вечно будете получать тот же 404.
+
+| Повторять? | Ошибки |
+| --- | --- |
+| Да | `ConnectionError`, `Timeout`, **5xx** (500, 502, 503, 504), **429 Too Many Requests** |
+| Нет | остальные **4xx**: 400, 401, 403, 404, 422... Ваш запрос неверен — исправьте его |
+
+Есть ещё одно правило — про **метод**. `GET`, `PUT` и `DELETE` **идемпотентны (idempotent)**: если выполнить их дважды, результат будет тот же, что и после одного раза. `POST` — нет. Если `POST /orders` закончился тайм-аутом, сервер мог всё-таки создать заказ, а потерялся только ответ, так что слепой повтор может списать деньги с покупателя дважды. Повторяйте `POST`, только если API поддерживает **ключ идемпотентности (idempotency key)** — уникальный идентификатор, который вы отправляете вместе с запросом, чтобы сервер распознал повторы. Вы познакомитесь с ними в уроке [Паттерны отказоустойчивости](/learn/python/resilience-patterns).
+
+## Повторы с экспоненциальной задержкой
+
+Если сервер перегружен, мгновенные повторы, которые сыплются на него, только ухудшают дело. Вместо этого ждите перед каждой новой попыткой чуть дольше: 0,5 с, потом 1 с, потом 2 с... Это называется **экспоненциальной задержкой (exponential backoff)**. Эндпоинт `/flaky` учебного API дважды отвечает 503, а потом срабатывает — идеально, чтобы попробовать:
+
+<CodeExample output={`  попытка 1: 503, ждём 0.5 с
+  попытка 2: 503, ждём 1.0 с
+{'ok': True, 'attempt': 3}
+  попытка 1: ConnectionError, ждём 0.5 с
+  попытка 2: ConnectionError, ждём 1.0 с
+Сдаёмся: сети всё ещё нет
+Не повторяем: 404`}>
+
+```python
+import time
+import requests
+
+BASE = "https://api.pandadev.test"
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+def get_with_retry(session, url, attempts=4, base_delay=0.5,
+                   sleep=time.sleep):
+    for attempt in range(1, attempts + 1):
+        last_try = attempt == attempts
+        try:
+            r = session.get(url, timeout=5)
+        except (requests.ConnectionError, requests.Timeout) as error:
+            if last_try:
+                raise
+            problem = type(error).__name__
+        else:
+            if r.status_code not in RETRY_STATUSES or last_try:
+                r.raise_for_status()   # 404 и т. п. — исключение сразу
+                return r.json()
+            problem = r.status_code
+        delay = base_delay * 2 ** (attempt - 1)
+        print(f"  попытка {attempt}: {problem}, ждём {delay} с")
+        sleep(delay)
+
+def no_sleep(seconds):
+    pass  # тесты и примеры не должны ждать по-настоящему
+
+with requests.Session() as session:
+    print(get_with_retry(session, BASE + "/flaky", sleep=no_sleep))
+    try:
+        get_with_retry(session, BASE + "/offline", attempts=3,
+                       sleep=no_sleep)
+    except requests.ConnectionError:
+        print("Сдаёмся: сети всё ещё нет")
+    try:
+        get_with_retry(session, BASE + "/status/404",
+                       sleep=no_sleep)
+    except requests.HTTPError as error:
+        print("Не повторяем:", error.response.status_code)
+```
+
+</CodeExample>
+
+Самое интересное:
+
+- **`try ... except ... else`**: блок `else` выполняется, только если исключения не было, поэтому сетевые ошибки и коды ответа обрабатываются отдельно.
+- На **последней попытке** функция перестаёт повторять: она заново выбрасывает сетевую ошибку (`raise` без аргумента) или даёт `raise_for_status()` выбросить HTTP-ошибку. Никогда не повторяйте бесконечно.
+- **`sleep` — это параметр**, по умолчанию равный `time.sleep`. Настоящая программа действительно ждёт, а примеры и тесты передают функцию, которая не ждёт, поэтому выполняются мгновенно. Это тот самый трюк с внедрением зависимостей (dependency injection) из урока [Моки, покрытие и TDD](/learn/python/mocks-and-coverage).
+
+В продакшене добавьте два улучшения. **Джиттер (jitter)**: умножайте каждую задержку на что-нибудь вроде `random.uniform(0.5, 1.5)`, чтобы тысяча клиентов, упавших одновременно, не повторяли запрос в одно и то же мгновение. И **`Retry-After`**: когда сервер отвечает 429 или 503 с заголовком `Retry-After: 30`, он сообщает, сколько нужно подождать, — уважайте это.
+
+Писать цикл самостоятельно нужно не всегда. requests умеет повторять запросы сам через urllib3, а пакет **tenacity** превращает любую функцию в повторяющую с помощью декоратора:
+
+```python
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+
+retry = Retry(
+    total=4,
+    backoff_factor=0.5,                  # 0,5 с, 1 с, 2 с...
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "PUT", "DELETE"],   # без POST!
+)
+session = requests.Session()
+session.mount("https://", HTTPAdapter(max_retries=retry))
+```
+
+(Этот адаптер работает с настоящей сетью, поэтому здесь его не запустить. Один раз написать цикл самому — лучший способ понять, что значат эти настройки.)
+
+## Постраничная загрузка: получаем все страницы
+
+API редко отправляют тысячи результатов разом. Они присылают одну **страницу (page)** и объясняют, как попросить следующую. Учебный API отвечает на `/movies` полями `page`, `totalPages`, `total` и `results`, поэтому вы запрашиваете страницы, пока не станет `page == totalPages`. Для этого идеально подходит **генератор (generator)**: вызывающий код видит просто поток фильмов, а страницы загружаются только тогда, когда они нужны (вспомните урок [Генераторы и менеджеры контекста](/learn/python/generators-and-context-managers)):
+
+<CodeExample output={`  (получена страница 1 из 3)
+  (получена страница 2 из 3)
+  (получена страница 3 из 3)
+фильмов: 12, лучший: The Quiet Algorithm
+  (получена страница 1 из 3)
+Первый старый фильм: Midnight in the Forest`}>
+
+```python
+import requests
+
+BASE = "https://api.pandadev.test"
+
+def iter_movies(session, page_size=5, **filters):
+    page = 1
+    while True:
+        params = {**filters, "page": page, "limit": page_size}
+        r = session.get(f"{BASE}/movies", params=params, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        print(f"  (получена страница {data['page']} из {data['totalPages']})")
+        yield from data["results"]
+        if data["page"] >= data["totalPages"]:
+            break
+        page += 1
+
+with requests.Session() as session:
+    movies = list(iter_movies(session))
+    print(f"фильмов: {len(movies)}, лучший:",
+          max(movies, key=lambda m: m["rating"])["title"])
+
+    for movie in iter_movies(session, page_size=4):
+        if movie["year"] < 2016:
+            print("Первый старый фильм:", movie["title"])
+            break
+```
+
+</CodeExample>
+
+`list(...)` вытянул все три страницы. Цикл `for` нашёл то, что искал, на странице 1 и остановился, поэтому страницы 2 и 3 **так и не были запрошены**. `yield from data["results"]` по очереди выдаёт каждый фильм со страницы.
+
+Не все API делят результаты на страницы одинаково. Ищите в документации API такие варианты:
+
+- **Номера страниц**: `?page=2&limit=20`, как здесь.
+- **Смещение и лимит**: `?offset=40&limit=20` («пропусти 40, дай мне 20»).
+- **Курсоры (cursors)**: в ответе есть что-то вроде `"next": "eyJpZCI6NDJ9"` или полный URL в `next`, и вы передаёте его обратно, пока он не исчезнет. GitHub кладёт URL следующей страницы в заголовок `Link`, который requests разбирает в `r.links["next"]["url"]`.
+
+Форма цикла всегда одна и та же: запрос, выдать результаты, найти следующую страницу или остановиться.
+
+## Небольшой типизированный класс-клиент
+
+Если разбросать вызовы `requests.get` по всей программе, придётся повсюду повторять базовый URL, тайм-аут и обработку ошибок и передавать туда-сюда «сырые» словари. Профессионалы оборачивают API в небольшой **класс-клиент (client class)**: одно место для настроек и ошибок, а методы возвращают **dataclass-объекты** вместо словарей:
+
+<CodeExample output={`Movie(id=8, title='The Quiet Algorithm', year=2024, rating=8.4)
+Weather(city='Reykjavik', temperature=3, condition='Windy')
+ApiError 404: Movie not found
+ApiError 404: City not found`}>
+
+```python
+from dataclasses import dataclass
+import requests
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(f"{status}: {message}")
+        self.status = status
+
+@dataclass(frozen=True)
+class Movie:
+    id: int
+    title: str
+    year: int
+    rating: float
+
+@dataclass(frozen=True)
+class Weather:
+    city: str
+    temperature: int
+    condition: str
+
+class PandaClient:
+    def __init__(self, base_url="https://api.pandadev.test",
+                 timeout=5, session=None):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = session or requests.Session()
+        self.session.headers["User-Agent"] = "panda-client/1.0"
+
+    def _get(self, path, **params):
+        try:
+            r = self.session.get(self.base_url + path,
+                                 params=params, timeout=self.timeout)
+        except requests.RequestException as error:
+            raise ApiError(0, type(error).__name__) from error
+        if not r.ok:
+            raise ApiError(r.status_code, r.json().get("error"))
+        return r.json()
+
+    def movie(self, movie_id: int) -> Movie:
+        data = self._get(f"/movies/{movie_id}")
+        return Movie(data["id"], data["title"], data["year"],
+                     data["rating"])
+
+    def weather(self, city: str) -> Weather:
+        data = self._get("/weather", city=city)
+        return Weather(data["city"], data["temperature"],
+                       data["condition"])
+
+client = PandaClient()
+print(client.movie(8))
+print(client.weather("Reykjavik"))
+for call in [lambda: client.movie(99),
+             lambda: client.weather("Atlantis")]:
+    try:
+        call()
+    except ApiError as error:
+        print("ApiError", error)
+```
+
+</CodeExample>
+
+Почему такой подход окупается:
+
+- **Одно место** знает базовый URL, тайм-аут, заголовки и обработку ошибок (`_get`). Чтобы потом добавить повторы, достаточно изменить один метод.
+- Вызывающий код ловит **один тип исключения**, `ApiError`, и ему не нужно знать всё семейство исключений requests. Если однажды вы замените requests на httpx, остальная программа этого не заметит.
+- **Dataclass-объекты** дают типизированные атрибуты (`movie.title`, с автодополнением в редакторе) и хранят только нужные вам поля. Если API переименует поле, исправить придётся ровно в одном месте.
+- `base_url` и `session` — это **параметры**, поэтому тесты могут направить клиент в другое место или передать ему поддельную сессию.
+
+(Метод `_get` предполагает, что тела ответов с ошибкой — это JSON. Для API, который иногда отвечает HTML-страницами с ошибкой, ловите там же `ValueError` вокруг `r.json()`.)
+
+## Тестируем API-клиент
+
+Как тестировать код, который общается с сервером? Из урока [Моки, покрытие и TDD](/learn/python/mocks-and-coverage) вы знаете главный инструмент: заменить сессию **тестовым двойником (test double)**, который к тому же позволяет имитировать сбои, которые трудно вызвать по-настоящему. Здесь доступен ещё и учебный API, так что часть тестов можно запускать против настоящего (понарошку) сервера:
+
+<CodeExample output={`...                                                  [100%]
+3 passed in 0.01s`}>
+
+```python
+from unittest.mock import MagicMock
+import pytest
+import requests
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(f"{status}: {message}")
+        self.status = status
+
+class PandaClient:
+    def __init__(self, base_url="https://api.pandadev.test",
+                 timeout=5, session=None):
+        self.base_url = base_url
+        self.timeout = timeout
+        self.session = session or requests.Session()
+
+    def temperature(self, city):
+        try:
+            r = self.session.get(self.base_url + "/weather",
+                                 params={"city": city},
+                                 timeout=self.timeout)
+        except requests.RequestException as error:
+            raise ApiError(0, type(error).__name__) from error
+        if not r.ok:
+            raise ApiError(r.status_code, r.json().get("error"))
+        return r.json()["temperature"]
+
+# Против учебного API (на вашем компьютере — тестовый сервер)
+def test_temperature():
+    assert PandaClient().temperature("Paris") == 17
+
+def test_unknown_city():
+    with pytest.raises(ApiError) as caught:
+        PandaClient().temperature("Atlantis")
+    assert caught.value.status == 404
+
+# С тестовым двойником: никакой сети
+def test_network_error_becomes_api_error():
+    session = MagicMock()
+    session.get.side_effect = requests.ConnectionError("down")
+    with pytest.raises(ApiError) as caught:
+        PandaClient(session=session).temperature("Paris")
+    assert caught.value.status == 0
+    session.get.assert_called_once()
+
+pytest.main([__file__])
+```
+
+</CodeExample>
+
+В реальных проектах держите большинство модульных тестов **офлайн** (они быстрые и никогда не падают из-за того, что чужой сервер лежит), а несколько **интеграционных тестов** запускайте против тестового сервера или песочницы (sandbox), которую предоставляет поставщик API. Библиотеки вроде **responses** (для requests) и **respx** (для httpx) позволяют зарегистрировать поддельные ответы для URL, так что даже вызовы `requests.get` глубоко внутри вашего кода можно тестировать без сети.
+
+## Много запросов сразу с httpx.AsyncClient
+
+Если запрашивать 50 городов один за другим, придётся 50 раз подряд ждать ответа. С **`httpx.AsyncClient`** и знакомым вам по уроку [Конкурентный запуск задач](/learn/python/concurrent-tasks) `asyncio.gather` все запросы выполняются одновременно:
+
+<CodeExample output={`London: 14°C
+Tokyo: 22°C
+Atlantis: 404
+Sydney: 25°C
+Moscow: 6°C`}>
+
+```python
+import asyncio
+import httpx
+
+CITIES = ["London", "Tokyo", "Atlantis", "Sydney", "Moscow"]
+
+async def temperature(client, city):
+    r = await client.get("/weather", params={"city": city})
+    r.raise_for_status()
+    return r.json()["temperature"]
+
+async def main():
+    async with httpx.AsyncClient(
+        base_url="https://api.pandadev.test", timeout=5
+    ) as client:
+        results = await asyncio.gather(
+            *(temperature(client, city) for city in CITIES),
+            return_exceptions=True,
+        )
+    for city, result in zip(CITIES, results):
+        if isinstance(result, httpx.HTTPStatusError):
+            print(f"{city}: {result.response.status_code}")
+        else:
+            print(f"{city}: {result}°C")
+
+asyncio.run(main())
+```
+
+</CodeExample>
+
+Код читается почти как синхронная версия: `await client.get(...)` вместо `client.get(...)`. Результаты возвращаются **в порядке `CITIES`**, а благодаря `return_exceptions=True` неизвестный город не портит остальные. Один `AsyncClient` используется всеми запросами, поэтому соединения переиспользуются.
+
+<Callout type="warning" title="Берегите сервер">
+
+С конкурентностью легко отправить 1000 запросов за секунду, и многие API ответят **429 Too Many Requests** или заблокируют вас. Ограничьте число одновременных запросов с помощью `asyncio.Semaphore` (скажем, 5 или 10), соблюдайте **лимиты запросов (rate limits)** из документации API и делайте паузу при ответе 429.
+
+</Callout>
+
+## Кэширование ответов
+
+Самый быстрый запрос — тот, который вы не отправили. Если программа спрашивает одну и ту же погоду десять раз в минуту, запомните ответ на какое-то время. Простой кэш (cache) хранит каждый ответ вместе со временем сохранения и спрашивает снова, только когда сохранённая копия старше **времени жизни (time to live, TTL)**:
+
+<CodeExample output={`Сделано запросов: 2
+Сделано запросов: 3`}>
+
+```python
+import requests
+
+BASE = "https://api.pandadev.test"
+
+class CachedClient:
+    def __init__(self, session, ttl, clock):
+        self.session, self.ttl, self.clock = session, ttl, clock
+        self.cache = {}        # ключ -> (время сохранения, данные)
+        self.requests_made = 0
+
+    def get_json(self, path, **params):
+        key = (path, tuple(sorted(params.items())))
+        if key in self.cache:
+            saved_at, data = self.cache[key]
+            if self.clock() - saved_at < self.ttl:
+                return data            # ещё свежие: без запроса
+        r = self.session.get(BASE + path, params=params, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        self.cache[key] = (self.clock(), data)
+        self.requests_made += 1
+        return data
+
+now = 0
+client = CachedClient(requests.Session(), ttl=60,
+                      clock=lambda: now)
+for city in ["Paris", "Tokyo", "Paris", "Paris"]:
+    client.get_json("/weather", city=city)
+print("Сделано запросов:", client.requests_made)
+
+now = 61   # через минуту ответ для Paris устарел
+client.get_json("/weather", city="Paris")
+print("Сделано запросов:", client.requests_made)
+```
+
+</CodeExample>
+
+Ключ — это путь плюс **отсортированные** параметры, поэтому `city="Paris"`, переданный в любом порядке, попадает в одну и ту же запись. Часы внедряются снаружи (в реальном коде — `clock=time.monotonic`), так что пример может перепрыгнуть на минуту вперёд без ожидания.
+
+Кэшируйте только запросы **`GET`** и только те данные, которые могут быть немного устаревшими. `functools.cache` здесь плохо подходит: его записи никогда не устаревают, и он не принимает словари в качестве аргументов. В реальных проектах посмотрите на **requests-cache** или **hishel** (для httpx): они понимают и собственные заголовки кэширования HTTP, такие как `Cache-Control` и `ETag`.
+
+<Quiz
+  question="Какой сбой API-клиент должен повторять автоматически?"
+  options={[
+    "GET /movies/99 ответил 404 Not Found",
+    "POST /orders закончился тайм-аутом, а ключей идемпотентности в API нет",
+    "GET /weather ответил 503 Service Unavailable",
+    "GET /users ответил 401 Unauthorized",
+  ]}
+  answer={2}
+  explanation="503 — временная проблема на сервере, а GET можно безопасно повторить, так что повторяйте с задержкой. 404 и 401 не изменятся от повторного запроса, а повтор POST, который, возможно, уже сработал, может создать второй заказ."
+/>
+
+<Quiz
+  question="API отдаёт по 5 фильмов на страницу, всего 4 страницы. Ваш генератор по очереди выдаёт фильмы каждой страницы. Вызывающий код проходит по нему циклом и выходит из цикла после первых 3 фильмов. Сколько страниц было запрошено?"
+  options={["1", "3", "4", "0, генераторы никогда не делают запросов"]}
+  answer={0}
+  explanation="Генераторы ленивые: их код выполняется ровно до того места, где получается следующий элемент. На первой странице уже было 5 фильмов, поэтому цикл завершился раньше, чем генератор запросил страницу 2."
+/>
+
+<Exercise
+  language="python"
+  title="Повторы и постраничная загрузка"
+  starter={`import time
+import requests
+
+BASE = "https://api.pandadev.test"
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+def get_json(session, url, params=None, attempts=3,
+             base_delay=0.1, sleep=time.sleep):
+    # Выполните GET url с params (timeout=5) и верните r.json().
+    # Повторяйте после ConnectionError, Timeout или кода из
+    # RETRY_STATUSES; перед попыткой номер n + 1 вызовите
+    # sleep(base_delay * 2 ** (n - 1)).
+    # После \`attempts\` попыток сдайтесь и выбросьте исключение.
+    # Другие коды ошибок (например, 404) сразу выбрасывают HTTPError.
+    pass
+
+def all_movies(session, genre=None, page_size=5):
+    # С помощью get_json загрузите /movies страница за страницей
+    # и верните один список со всеми фильмами.
+    return []
+
+waits = []
+with requests.Session() as session:
+    print(get_json(session, BASE + "/flaky", sleep=waits.append))
+    print(waits)
+    movies = all_movies(session)
+    print(len(movies), "фильмов")
+    print([movie["title"] for movie in movies[:2]])
+`}
+  tests={[
+    { name: "Программа печатает ответ /flaky, паузы и фильмы", check: "__output == [\"{'ok': True, 'attempt': 3}\", '[0.1, 0.2]', '12 фильмов', \"['The Bamboo Heist', 'Panda Express to Mars']\"]" },
+    { name: "get_json сразу возвращает JSON, если запрос удался", check: "[w := [], s := requests.Session()] and get_json(s, BASE + '/users/2') == {'id': 2, 'name': 'Sam Ortiz', 'username': 'sam', 'email': 'sam@pandadev.test'} and get_json(s, BASE + '/movies', params={'genre': 'sci-fi'}, sleep=w.append)['total'] == 3 and w == []" },
+    { name: "Повторяет 503 с растущими паузами, затем выбрасывает HTTPError", check: "exec('_w, _n = [], len(_panda_requests)\\ntry:\\n    get_json(requests.Session(), BASE + \"/status/503\", attempts=4, sleep=_w.append)\\n    _ok = False\\nexcept requests.HTTPError as e:\\n    _ok = e.response.status_code == 503') or (_ok and len(_panda_requests) - _n == 4 and [round(x, 6) for x in _w] == [0.1, 0.2, 0.4])" },
+    { name: "Использует base_delay и 3 попытки по умолчанию", check: "exec('_w, _n = [], len(_panda_requests)\\ntry:\\n    get_json(requests.Session(), BASE + \"/status/500\", base_delay=1.5, sleep=_w.append)\\n    _ok = False\\nexcept requests.HTTPError:\\n    _ok = True') or (_ok and len(_panda_requests) - _n == 3 and _w == [1.5, 3.0])" },
+    { name: "Не повторяет 404", check: "exec('_w, _n = [], len(_panda_requests)\\ntry:\\n    get_json(requests.Session(), BASE + \"/status/404\", sleep=_w.append)\\n    _ok = False\\nexcept requests.HTTPError as e:\\n    _ok = e.response.status_code == 404') or (_ok and len(_panda_requests) - _n == 1 and _w == [])" },
+    { name: "Повторяет при ошибках соединения, затем выбрасывает их снова", check: "exec('_w, _n = [], len(_panda_requests)\\ntry:\\n    get_json(requests.Session(), BASE + \"/offline\", attempts=2, sleep=_w.append)\\n    _ok = False\\nexcept requests.ConnectionError:\\n    _ok = True') or (_ok and len(_panda_requests) - _n == 2 and [round(x, 6) for x in _w] == [0.1])" },
+    { name: "all_movies проходит по всем страницам", check: "[n := len(_panda_requests), m := all_movies(requests.Session())] and [x['id'] for x in m] == list(range(1, 13)) and [r['url'].split('?')[0] for r in _panda_requests[n:]] == [BASE + '/movies'] * 3 and all(f'page={i + 1}' in r['url'] for i, r in enumerate(_panda_requests[n:]))" },
+    { name: "all_movies передаёт genre и page_size", check: "[n := len(_panda_requests), m := all_movies(requests.Session(), 'drama', page_size=2)] and [x['title'] for x in m] == ['Midnight in the Forest', 'Snow Leopard Summer', 'The Quiet Algorithm', 'Mountain of Echoes'] and len(_panda_requests) - n == 2 and all('genre=drama' in r['url'] and 'limit=2' in r['url'] for r in _panda_requests[n:])" },
+    { name: "all_movies останавливается после последней страницы", check: "[n := len(_panda_requests), m := all_movies(requests.Session(), page_size=50)] and len(m) == 12 and len(_panda_requests) - n == 1 and all_movies(requests.Session(), 'horror') == []" },
+  ]}
+>
+
+Соберите две рабочие лошадки надёжного клиента.
+
+1. `get_json(session, url, params=None, attempts=3, base_delay=0.1, sleep=time.sleep)` отправляет `session.get(url, params=params, timeout=5)` и возвращает `r.json()`.
+   - После `requests.ConnectionError`, `requests.Timeout` или кода из `RETRY_STATUSES` функция ждёт и пробует снова: перед 2-й попыткой вызывает `sleep(base_delay)`, перед 3-й — `sleep(base_delay * 2)`, затем `sleep(base_delay * 4)` и так далее.
+   - Всего после `attempts` попыток она сдаётся: заново выбрасывает сетевую ошибку или выбрасывает `requests.HTTPError` для кода ответа.
+   - Любой другой код ошибки (например, 404) сразу выбрасывает `requests.HTTPError` без повторов.
+2. `all_movies(session, genre=None, page_size=5)` с помощью `get_json` загружает `/movies` страница за страницей с параметрами запроса `page`, `limit=page_size` и (только если он передан) `genre`. Она останавливается, когда `page` равен `totalPages`, и возвращает один список со всеми словарями фильмов.
+
+Программа должна напечатать `{'ok': True, 'attempt': 3}`, `[0.1, 0.2]`, `12 фильмов` и первые два названия.
+
+<Hint>
+
+Пройдите циклом `for attempt in range(1, attempts + 1):` с `last_try = attempt == attempts`. Поместите запрос в `try`, ловите `(requests.ConnectionError, requests.Timeout)` и делайте `raise`, если это последняя попытка. В блоке `else:` — если `r.status_code not in RETRY_STATUSES or last_try` — вызовите `r.raise_for_status()` и `return r.json()`. После `try` вызовите `sleep(base_delay * 2 ** (attempt - 1))`. В `all_movies` начните с `page = 1`, дополняйте список через `data["results"]`, возвращайте его, когда `data["page"] >= data["totalPages"]`, а иначе делайте `page += 1`.
+
+</Hint>
+
+<Solution>
+
+```python
+import time
+import requests
+
+BASE = "https://api.pandadev.test"
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+def get_json(session, url, params=None, attempts=3,
+             base_delay=0.1, sleep=time.sleep):
+    for attempt in range(1, attempts + 1):
+        last_try = attempt == attempts
+        try:
+            r = session.get(url, params=params, timeout=5)
+        except (requests.ConnectionError, requests.Timeout):
+            if last_try:
+                raise
+        else:
+            if r.status_code not in RETRY_STATUSES or last_try:
+                r.raise_for_status()
+                return r.json()
+        sleep(base_delay * 2 ** (attempt - 1))
+
+def all_movies(session, genre=None, page_size=5):
+    movies = []
+    page = 1
+    while True:
+        params = {"page": page, "limit": page_size}
+        if genre is not None:
+            params["genre"] = genre
+        data = get_json(session, f"{BASE}/movies", params=params)
+        movies.extend(data["results"])
+        if data["page"] >= data["totalPages"]:
+            return movies
+        page += 1
+
+waits = []
+with requests.Session() as session:
+    print(get_json(session, BASE + "/flaky", sleep=waits.append))
+    print(waits)
+    movies = all_movies(session)
+    print(len(movies), "фильмов")
+    print([movie["title"] for movie in movies[:2]])
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Запросы ломаются по-разному: **`ConnectionError`**, **`Timeout`**, **`HTTPError`** (4xx/5xx после `raise_for_status()`), **`JSONDecodeError`**; все они — наследники **`RequestException`**.
+- **Повторяйте** временные сбои (сетевые ошибки, тайм-ауты, 5xx, 429) для **идемпотентных** запросов; никогда не повторяйте остальные 4xx и никогда не повторяйте `POST` вслепую.
+- Используйте **экспоненциальную задержку** (0,5 с, 1 с, 2 с...) с ограничением числа попыток, а в продакшене — ещё джиттер и `Retry-After`. Сделайте `sleep` **параметром**, чтобы тесты выполнялись мгновенно.
+- **Постраничная загрузка**: повторяйте запросы до последней страницы (или пока есть курсор `next`); **генератор**, выдающий каждый элемент, упрощает вызывающий код и загружает только нужные страницы.
+- Оборачивайте API в небольшой **класс-клиент**: одно место для базового URL, тайм-аута и ошибок, один тип исключения (`ApiError`) и **dataclass-объекты** для результатов.
+- Тестируйте клиенты с **тестовыми двойниками** для сбоев и несколькими тестами против настоящего тестового сервера.
+- **`httpx.AsyncClient` + `asyncio.gather`** выполняет много запросов конкурентно; ограничивайте конкурентность и соблюдайте лимиты запросов.
+- **Кэшируйте** ответы на `GET` с временем жизни, когда немного устаревшие данные допустимы.

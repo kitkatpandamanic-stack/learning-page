@@ -1,0 +1,551 @@
+---
+title: "Мини-проект: генератор отчётов по данным"
+description: Соберите вместе всё из этого модуля. Получите данные из API и веб-магазина, очистите и обобщите их, а затем запишите отчёт в Markdown и CSV-файл с помощью pathlib.
+duration: 20
+xp: 30
+---
+
+Пора собрать весь модуль воедино. Ваша задача — **генератор отчётов (report generator)**: такой скрипт команды запускают каждое утро, чтобы ответить на вопросы вроде «как наши цены выглядят на фоне конкурентов?» или «как погода повлияла на продажи?». Он **собирает** данные из API и с веб-страниц, **очищает и обобщает** их и **записывает** отчёт в Markdown для людей и CSV-файл для электронных таблиц. 📊
+
+Ваш отчёт будет охватывать фильмы из учебного API и магазин Panda Books. По пути вы увидите приёмы, благодаря которым такие скрипты остаются надёжными и их легко менять.
+
+## План: конвейер из маленьких функций
+
+Генератор отчётов — это **конвейер (pipeline)**. Каждый этап получает результат предыдущего и ничего не знает об остальных:
+
+```text
+сбор               очистка и обобщение        запись
+────               ───────────────────        ──────
+API (JSON)  ──┐
+              ├──▶  списки словарей  ──▶  сводки  ──▶  report.md
+Shop (HTML) ──┘                                  └──▶  books.csv
+```
+
+В коде каждый этап — это несколько маленьких функций:
+
+- Функции **сбора** принимают `session` и `base_url` и возвращают обычные списки словарей Python. Только они обращаются к сети.
+- Функции **обобщения (агрегации)** принимают списки и возвращают сводки. Они **чистые (pure)**: никакой сети, никаких файлов, одни и те же входные данные всегда дают один и тот же результат. Поэтому тестировать их проще простого.
+- Функции **записи** принимают сводки и папку и создают файлы.
+
+Зачем делать `base_url` параметром? Чтобы один и тот же код мог работать с тестовым сервером, промежуточной копией (staging) или продакшеном, а тесты могли направить его куда угодно. В настоящем проекте этапы жили бы в отдельных модулях (`collect.py`, `analyse.py`, `report.py`), а короткий `main.py` связывал бы их вместе.
+
+## Сбор данных из API
+
+В этом модуле вы уже писали циклы постраничной загрузки и помощники для API. Вот ещё один сборщик — для погоды — с одной новой деталью: **ожидаемые** проблемы, например город, которого API не знает, собираются и попадают в отчёт, а не обрушивают весь запуск:
+
+<CodeExample output={`{'city': 'London', 'temperature': 14, 'condition': 'Cloudy'}
+{'city': 'Paris', 'temperature': 17, 'condition': 'Sunny'}
+{'city': 'Cairo', 'temperature': 31, 'condition': 'Sunny'}
+{'city': 'Moscow', 'temperature': 6, 'condition': 'Snow'}
+Не найдены: ['Atlantis']`}>
+
+```python
+import requests
+
+BASE = "https://api.pandadev.test"
+
+def fetch_weather(session, base_url, cities):
+    """Текущая погода для каждого города; неизвестные города пропускаются."""
+    found, missing = [], []
+    for city in cities:
+        r = session.get(f"{base_url}/weather",
+                        params={"city": city}, timeout=5)
+        if r.status_code == 404:
+            missing.append(city)
+            continue
+        r.raise_for_status()
+        data = r.json()
+        found.append({
+            "city": data["city"],
+            "temperature": data["temperature"],
+            "condition": data["condition"],
+        })
+    return found, missing
+
+cities = ["London", "Paris", "Atlantis", "Cairo", "Moscow"]
+with requests.Session() as session:
+    weather, missing = fetch_weather(session, BASE, cities)
+for row in weather:
+    print(row)
+print("Не найдены:", missing)
+```
+
+</CodeExample>
+
+Кроме того, сборщик **оставляет только нужные поля** и даёт им ваши собственные имена. Если однажды API добавит или переименует поля, изменится только эта функция, а не весь отчёт.
+
+404 для неизвестного города — ожидаемая ситуация, поэтому она обрабатывается. Всё остальное (500, тайм-аут) по-прежнему выбрасывает исключение: отчёт, построенный на половине данных так, что никто этого не заметил, хуже, чем отсутствие отчёта.
+
+## Сбор данных из магазина
+
+Страницы-списки магазина не сообщают, к какой категории относится книга, но сам магазин **устроен** по категориям: у каждой категории есть свой список (`/shop?category=kids`). Вместо того чтобы вписывать четыре категории в код, найдите их в навигации страницы — тогда новая категория появится в отчёте автоматически:
+
+<CodeExample output={`fiction      https://api.pandadev.test/shop?category=fiction
+science      https://api.pandadev.test/shop?category=science
+programming  https://api.pandadev.test/shop?category=programming
+kids         https://api.pandadev.test/shop?category=kids`}>
+
+```python
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+BASE = "https://api.pandadev.test"
+
+def category_links(session, base_url):
+    shop_url = base_url + "/shop"
+    r = session.get(shop_url, timeout=5)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    return {
+        a.get_text(strip=True).lower(): urljoin(shop_url, a["href"])
+        for a in soup.select("nav.categories a")
+    }
+
+with requests.Session() as session:
+    for name, url in category_links(session, BASE).items():
+        print(f"{name:12} {url}")
+```
+
+</CodeExample>
+
+Обойдите каждый из этих URL (переходя по ссылкам `rel="next"` — вдруг категория разрастётся больше чем на одну страницу), добавьте категорию к каждой книге — и у вас будет весь магазин с категориями за 5 запросов. Можно было бы зайти на все 18 страниц с подробностями и прочитать категорию из таблицы: это тоже правильно, но запросов получится больше чем втрое.
+
+## Обобщение на чистом Python
+
+Когда данные представлены списком словарей, в стандартной библиотеке есть всё для сводки: `statistics.mean`, `max`/`sorted` с `key`, `collections.Counter` для подсчёта и `defaultdict` для группировки:
+
+<CodeExample output={`Средняя: 17
+Самый тёплый: Cairo
+[('Sunny', 2), ('Cloudy', 1)]
+{'Cloudy': ['London'], 'Snow': ['Moscow'], 'Sunny': ['Paris', 'Cairo']}
+['Moscow', 'London']`}>
+
+```python
+from collections import Counter, defaultdict
+from statistics import mean
+
+weather = [
+    {"city": "London", "temperature": 14, "condition": "Cloudy"},
+    {"city": "Paris", "temperature": 17, "condition": "Sunny"},
+    {"city": "Cairo", "temperature": 31, "condition": "Sunny"},
+    {"city": "Moscow", "temperature": 6, "condition": "Snow"},
+]
+
+average = mean(row["temperature"] for row in weather)
+print("Средняя:", round(average, 1))
+
+warmest = max(weather, key=lambda row: row["temperature"])
+print("Самый тёплый:", warmest["city"])
+
+conditions = Counter(row["condition"] for row in weather)
+print(conditions.most_common(2))
+
+by_condition = defaultdict(list)
+for row in weather:
+    by_condition[row["condition"]].append(row["city"])
+print(dict(sorted(by_condition.items())))
+
+coldest_first = sorted(weather, key=lambda row: row["temperature"])
+print([row["city"] for row in coldest_first[:2]])
+```
+
+</CodeExample>
+
+Обратите внимание: здесь данные вписаны прямо в код, без единого запроса. В этом и прелесть чистых функций обобщения: их можно попробовать (и протестировать) на пяти строках, набранных вручную. В следующем модуле, [Анализ данных с pandas](/learn/python/dataframes), вы освоите библиотеку, которая группирует и усредняет миллионы строк — каждое действие в одну строку кода.
+
+При сортировке думайте о **равных значениях (ties)**. Два фильма с одинаковым рейтингом всегда должны выводиться в одном и том же порядке, иначе ваш отчёт будет без всякой причины меняться от запуска к запуску. Сортируйте по кортежу: `key=lambda m: (-m["rating"], m["title"])` означает «сначала самый высокий рейтинг, затем по названию».
+
+## Пишем Markdown
+
+**Markdown** — это обычный текст с лёгким форматированием (`# Заголовок`, `**жирный**`, `- списки`), и GitHub, GitLab, Slack, Notion и большинство вики красиво его отображают. Таблицы — это строки из ячеек между символами `|`, со строкой `---` под заголовком. Небольшая функция строит такую таблицу из любых заголовков и строк:
+
+<CodeExample output={`| Город | °C | Погода |
+| --- | --- | --- |
+| Cairo | 31 | Sunny |
+| Paris | 17 | Sunny |
+| London | 14 | Cloudy |`}>
+
+```python
+def markdown_table(headers, rows):
+    lines = [
+        "| " + " | ".join(str(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\n".join(lines)
+
+rows = [["Cairo", 31, "Sunny"], ["Paris", 17, "Sunny"],
+        ["London", 14, "Cloudy"]]
+print(markdown_table(["Город", "°C", "Погода"], rows))
+```
+
+</CodeExample>
+
+Форматируйте числа **до того**, как они попадут в таблицу: `f"{price:.2f}"` превращает `22.7` в `22.70`, так что столбец цен выравнивается и читается как денежные суммы.
+
+## Записываем файлы с pathlib
+
+`pathlib.Path` аккуратно управляется с папками и файлами: `/` соединяет части пути, `mkdir(parents=True, exist_ok=True)` создаёт папку (и родительские папки), если её ещё нет, а `write_text` записывает весь файл одним вызовом. Для CSV используйте `csv.DictWriter` из урока [CSV и JSON](/learn/python/csv-and-json):
+
+<CodeExample output={`# Отчёт о погоде
+
+- **London**: 14 °C
+- **Cairo**: 31 °C
+['city,temperature,condition', 'London,14,Cloudy', 'Cairo,31,Sunny']
+['report.md', 'weather.csv']`}>
+
+```python
+import csv
+from pathlib import Path
+
+weather = [
+    {"city": "London", "temperature": 14, "condition": "Cloudy"},
+    {"city": "Cairo", "temperature": 31, "condition": "Sunny"},
+]
+
+folder = Path("weather-report")
+folder.mkdir(parents=True, exist_ok=True)
+
+report = folder / "report.md"
+lines = ["# Отчёт о погоде", ""]
+lines += [f"- **{w['city']}**: {w['temperature']} °C"
+          for w in weather]
+report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+table = folder / "weather.csv"
+with table.open("w", newline="", encoding="utf-8") as file:
+    writer = csv.DictWriter(
+        file, fieldnames=["city", "temperature", "condition"])
+    writer.writeheader()
+    writer.writerows(weather)
+
+print(report.read_text(encoding="utf-8"), end="")
+print(table.read_text(encoding="utf-8").splitlines())
+print(sorted(p.name for p in folder.iterdir()))
+```
+
+</CodeExample>
+
+- Собирайте отчёт как **список строк** и соединяйте их один раз в конце. Это читается легче, чем одна гигантская f-строка, и в такой отчёт легко добавлять разделы.
+- Всегда передавайте `encoding="utf-8"`, иначе на некоторых компьютерах `°C`, `★` и русские буквы могут превратиться в кракозябры.
+- `DictWriter(..., extrasaction="ignore")` позволяет передавать словари, в которых ключей **больше**, чем столбцов в CSV (например, `url`, который вам не нужен в файле).
+
+<Callout type="tip" title="Запуск каждое утро">
+
+Отчёт полезнее всего, когда запускается сам. На Linux-сервере строка **cron** запускает его каждый будний день в 7:00:
+
+```bash
+0 7 * * 1-5  cd /home/mei/report && .venv/bin/python main.py
+```
+
+Многие команды вместо этого используют **GitHub Actions** с триггером `schedule:` и коммитят новый `report.md` или публикуют его в канале чата. В любом случае токены берутся из переменных окружения (или из настроек секретов платформы), скрипт завершается с ошибкой, если сбор данных не удался, чтобы кто-то получил уведомление, и записывает в лог, что он сделал.
+
+</Callout>
+
+<Quiz
+  question="Почему функции сбора принимают base_url как параметр, а не используют внутри константу BASE?"
+  options={[
+    "Потому что requests не умеет читать глобальные переменные",
+    "Чтобы один и тот же код мог работать с тестовым сервером, staging или продакшеном, а тесты могли направить его в другое место",
+    "Потому что f-строки работают только с параметрами",
+    "Так запросы выполняются быстрее",
+  ]}
+  answer={1}
+  explanation="Параметр — это «шов»: вызывающий код решает, откуда берутся данные. Для тестов, staging-окружения или нового адреса API саму функцию менять не нужно."
+/>
+
+<Quiz
+  question="Ваш отчёт сортирует фильмы с key=lambda m: -m['rating'], и у двух фильмов рейтинг 7.0. Что может пойти не так и как это исправить?"
+  options={[
+    "Ничего, sorted() всегда располагает равные элементы в алфавитном порядке",
+    "Python выбрасывает ошибку для равных ключей; используйте reverse=True",
+    "Их порядок зависит от того, в каком порядке их вернул API, поэтому отчёт может меняться от запуска к запуску; сортируйте по кортежу вроде (-m['rating'], m['title'])",
+    "Знак минус не работает с float",
+  ]}
+  answer={2}
+  explanation="sorted() — устойчивая сортировка: равные элементы сохраняют порядок, в котором пришли, а он зависит от API. Если добавить в ключ дополнительный критерий (название), порядок станет полностью определённым."
+/>
+
+<Exercise
+  language="python"
+  title="Мини-проект: генератор отчётов по данным"
+  starter={`import csv
+from pathlib import Path
+from statistics import mean
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+BASE = "https://api.pandadev.test"
+
+# --- уже знакомые вам помощники (готовы к использованию) ----
+
+def get_soup(session, url):
+    r = session.get(url, timeout=5)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
+
+def crawl_books(session, url):
+    """Все книги со страницы-списка магазина и следующих за ней страниц."""
+    books = []
+    while url:
+        soup = get_soup(session, url)
+        for li in soup.select("li.book"):
+            price = li.select_one(".price").get_text(strip=True)
+            books.append({
+                "id": int(li["data-id"]),
+                "title": li.select_one(".title a").get_text(strip=True),
+                "price": float(price.removeprefix("$")),
+                "stars": int(li.select_one(".rating")["data-stars"]),
+                "in_stock": "in-stock" in li.select_one(".stock")["class"],
+            })
+        next_link = soup.select_one('a[rel="next"]')
+        url = urljoin(url, next_link["href"]) if next_link else None
+    return books
+
+def markdown_table(headers, rows):
+    lines = [
+        "| " + " | ".join(str(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\\n".join(lines)
+
+# --- ваша часть ---------------------------------------------
+
+def fetch_all_movies(session, base_url):
+    # Все фильмы из GET /movies, страница за страницей, до последней
+    return []
+
+def fetch_all_books(session, base_url):
+    # Все книги магазина, у каждой — ключ "category"
+    # ("fiction", "kids", ...); используйте ссылки на категории
+    # из nav.categories магазина и crawl_books
+    return []
+
+def summarise_books(books):
+    # {category: {"books": количество, "avg_price": среднее,
+    #  округлённое до 2 знаков, "in_stock": количество}},
+    # категории от A до Z
+    return {}
+
+def top_movies(movies, n=3):
+    # n фильмов с самым высоким рейтингом (при равенстве — по title, от A до Z)
+    return []
+
+def write_report(folder, movies, books):
+    # Запишите report.md и books.csv в folder (создайте её),
+    # затем верните путь к report.md
+    pass
+
+with requests.Session() as session:
+    session.headers["User-Agent"] = "panda-report/1.0"
+    movies = fetch_all_movies(session, BASE)
+    books = fetch_all_books(session, BASE)
+report = write_report(Path("panda-report"), movies, books)
+if report:
+    print(report.read_text(encoding="utf-8"), end="")
+`}
+  tests={[
+    { name: "Программа печатает весь отчёт", check: "__output[0] == '# Panda Data Report' and '12 movies, average rating 7.21.' in __output and '| The Quiet Algorithm | 2024 | 8.4 |' in __output and '18 books, 15 in stock.' in __output and '| fiction | 5 | 10.55 | 5 |' in __output and '| kids | 4 | 6.68 | 3 |' in __output" },
+    { name: "fetch_all_movies получает все 12 фильмов, страницу за страницей", check: "[n := len(_panda_requests), m := fetch_all_movies(requests.Session(), BASE), qs := [__import__('urllib.parse').parse.parse_qs(__import__('urllib.parse').parse.urlsplit(r['url']).query) for r in _panda_requests[n:]]] and sorted(x['id'] for x in m) == list(range(1, 13)) and all(r['url'].startswith(BASE + '/movies') for r in _panda_requests[n:]) and [int(q.get('page', ['1'])[0]) for q in qs] == list(range(1, len(qs) + 1))" },
+    { name: "fetch_all_movies ориентируется на totalPages (даже при 1 фильме на странице)", check: "[S := type('S', (requests.Session,), {'request': lambda self, method, url, params=None, **kw: requests.Session.request(self, method, url, params={**(params or {}), 'limit': 1}, **kw)}), m := fetch_all_movies(S(), BASE)] and sorted(x['id'] for x in m) == list(range(1, 13))" },
+    { name: "fetch_all_books получает все 18 книг с их категориями", check: "[n := len(_panda_requests), b := fetch_all_books(requests.Session(), BASE)] and sorted(x['id'] for x in b) == list(range(1, 19)) and all(x['category'] == ['kids', 'programming', 'fiction', 'science'][x['id'] % 4] for x in b) and all(type(x['price']) is float for x in b) and sum('category=' in r['url'] for r in _panda_requests[n:]) == 4" },
+    { name: "summarise_books считает, усредняет и сортирует категории", check: "summarise_books([{'category': 'zoo', 'price': 2.0, 'in_stock': True}, {'category': 'art', 'price': 1.0, 'in_stock': False}, {'category': 'zoo', 'price': 3.5, 'in_stock': False}, {'category': 'zoo', 'price': 4.0, 'in_stock': True}]) == {'art': {'books': 1, 'avg_price': 1.0, 'in_stock': 0}, 'zoo': {'books': 3, 'avg_price': 3.17, 'in_stock': 2}} and list(summarise_books([{'category': 'zoo', 'price': 2.0, 'in_stock': True}, {'category': 'art', 'price': 1.0, 'in_stock': False}])) == ['art', 'zoo']" },
+    { name: "top_movies выбирает лучшие n, при равенстве — по названию", check: "[mv := [{'title': 'B', 'rating': 7.0, 'year': 1}, {'title': 'A', 'rating': 7.0, 'year': 2}, {'title': 'C', 'rating': 9.1, 'year': 3}, {'title': 'D', 'rating': 2.0, 'year': 4}]] and [x['title'] for x in top_movies(mv)] == ['C', 'A', 'B'] and [x['title'] for x in top_movies(mv, 2)] == ['C', 'A'] and len(top_movies(mv, 10)) == 4" },
+    { name: "write_report записывает report.md с обеими таблицами (другие данные)", check: "[mv := [{'title': 'X', 'year': 2001, 'rating': 5.5}, {'title': 'Y', 'year': 2002, 'rating': 9.0}], bk := [{'id': 2, 'title': 'Two', 'category': 'zoo', 'price': 4.0, 'stars': 3, 'in_stock': True}, {'id': 1, 'title': 'One', 'category': 'art', 'price': 2.5, 'stars': 5, 'in_stock': False}], p := write_report(Path('pd-check-report/a'), mv, bk), text := Path(p).read_text(encoding='utf-8')] and Path(p) == Path('pd-check-report/a/report.md') and text.startswith('# Panda Data Report') and '2 movies, average rating 7.25.' in text and '2 books, 1 in stock.' in text and markdown_table(['Title', 'Year', 'Rating'], [['Y', 2002, 9.0], ['X', 2001, 5.5]]) in text and markdown_table(['Category', 'Books', 'Average price', 'In stock'], [['art', 1, '2.50', 0], ['zoo', 1, '4.00', 1]]) in text" },
+    { name: "write_report записывает books.csv, отсортированный по id", check: "[mv := [{'title': 'X', 'year': 2001, 'rating': 5.5}], bk := [{'id': 2, 'title': 'Two', 'category': 'zoo', 'price': 4.0, 'stars': 3, 'in_stock': True, 'url': 'u2'}, {'id': 1, 'title': 'One', 'category': 'art', 'price': 2.5, 'stars': 5, 'in_stock': False, 'url': 'u1'}], write_report(Path('pd-check-report/b'), mv, bk)] and Path('pd-check-report/b/books.csv').read_text(encoding='utf-8').splitlines() == ['id,title,category,price,stars,in_stock', '1,One,art,2.5,5,False', '2,Two,zoo,4.0,3,True']" },
+  ]}
+>
+
+Соберите генератор отчётов. Помощники `get_soup`, `crawl_books` (краулер вроде вашего из прошлого урока) и `markdown_table` уже готовы; вы пишете пять функций ниже. Передавайте `timeout=5` в каждый запрос.
+
+1. `fetch_all_movies(session, base_url)` возвращает все фильмы из `GET /movies`. Запрашивайте страницы 1, 2, 3... через `params=` (используйте параметр `page` и, если хотите, `limit`) и остановитесь, когда `page` дойдёт до `totalPages`. Не вписывайте число страниц в код.
+2. `fetch_all_books(session, base_url)` возвращает все книги магазина, у каждой — дополнительный ключ `"category"` в нижнем регистре (`"fiction"`, `"kids"`...). Возьмите ссылки на категории из `nav.categories a` на странице `/shop`, превратите каждый `href` в полный URL с помощью `urljoin`, обойдите его через `crawl_books` и добавьте категорию к его книгам.
+3. `summarise_books(books)` возвращает словарь с одной записью на категорию **в алфавитном порядке**: `{"books": <количество>, "avg_price": <средняя цена, округлённая до 2 знаков>, "in_stock": <сколько в наличии>}`.
+4. `top_movies(movies, n=3)` возвращает `n` фильмов с самым высоким `rating`; фильмы с равным рейтингом упорядочены по `title` (от A до Z).
+5. `write_report(folder, movies, books)` создаёт папку (вместе с родительскими), записывает в неё два файла и возвращает `Path` файла `report.md`:
+   - `report.md` — ровно в таком виде (таблицы строит `markdown_table`; в таблице фильмов — `top_movies(movies)`, средние цены и средний рейтинг — с 2 знаками после точки). Текст отчёта оставьте на английском, как в образце: его сверяют проверки.
+
+     ```text
+     # Panda Data Report
+
+     ## Movies
+
+     12 movies, average rating 7.21.
+
+     | Title | Year | Rating |
+     | --- | --- | --- |
+     | The Quiet Algorithm | 2024 | 8.4 |
+     ...
+
+     ## Books
+
+     18 books, 15 in stock.
+
+     | Category | Books | Average price | In stock |
+     | --- | --- | --- | --- |
+     | fiction | 5 | 10.55 | 5 |
+     ...
+     ```
+
+   - `books.csv` со столбцами `id,title,category,price,stars,in_stock`, по одной строке на книгу, **отсортированный по id**.
+
+<Hint>
+
+`fetch_all_movies`: цикл `while True:` с `page = 1`, `session.get(f"{base_url}/movies", params={"page": page, "limit": 5}, timeout=5)`, `movies += data["results"]` и `return movies`, когда `page >= data["totalPages"]`. `fetch_all_books`: `shop_url = base_url + "/shop"`; для каждого `a` из `get_soup(session, shop_url).select("nav.categories a")` возьмите `a.get_text(strip=True).lower()` и добавьте `{**book, "category": category}` для каждой книги из `crawl_books(session, urljoin(shop_url, a["href"]))`. `summarise_books`: цикл по `sorted({b["category"] for b in books})`. `top_movies`: `sorted(movies, key=lambda m: (-m["rating"], m["title"]))[:n]`. `write_report`: соберите список строк, `"\n".join(lines)`, `write_text` и `csv.DictWriter(file, fieldnames=[...], extrasaction="ignore")`.
+
+</Hint>
+
+<Solution>
+
+```python
+import csv
+from pathlib import Path
+from statistics import mean
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+BASE = "https://api.pandadev.test"
+
+# --- уже знакомые вам помощники (готовы к использованию) ----
+
+def get_soup(session, url):
+    r = session.get(url, timeout=5)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
+
+def crawl_books(session, url):
+    """Все книги со страницы-списка магазина и следующих за ней страниц."""
+    books = []
+    while url:
+        soup = get_soup(session, url)
+        for li in soup.select("li.book"):
+            price = li.select_one(".price").get_text(strip=True)
+            books.append({
+                "id": int(li["data-id"]),
+                "title": li.select_one(".title a").get_text(strip=True),
+                "price": float(price.removeprefix("$")),
+                "stars": int(li.select_one(".rating")["data-stars"]),
+                "in_stock": "in-stock" in li.select_one(".stock")["class"],
+            })
+        next_link = soup.select_one('a[rel="next"]')
+        url = urljoin(url, next_link["href"]) if next_link else None
+    return books
+
+def markdown_table(headers, rows):
+    lines = [
+        "| " + " | ".join(str(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\n".join(lines)
+
+# --- ваша часть ---------------------------------------------
+
+def fetch_all_movies(session, base_url):
+    movies = []
+    page = 1
+    while True:
+        r = session.get(f"{base_url}/movies",
+                        params={"page": page, "limit": 5}, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        movies += data["results"]
+        if page >= data["totalPages"]:
+            return movies
+        page += 1
+
+def fetch_all_books(session, base_url):
+    shop_url = base_url + "/shop"
+    books = []
+    for a in get_soup(session, shop_url).select("nav.categories a"):
+        category = a.get_text(strip=True).lower()
+        for book in crawl_books(session, urljoin(shop_url, a["href"])):
+            books.append({**book, "category": category})
+    return books
+
+def summarise_books(books):
+    summary = {}
+    for category in sorted({book["category"] for book in books}):
+        group = [b for b in books if b["category"] == category]
+        summary[category] = {
+            "books": len(group),
+            "avg_price": round(mean(b["price"] for b in group), 2),
+            "in_stock": sum(b["in_stock"] for b in group),
+        }
+    return summary
+
+def top_movies(movies, n=3):
+    ranked = sorted(movies, key=lambda m: (-m["rating"], m["title"]))
+    return ranked[:n]
+
+def write_report(folder, movies, books):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    average = mean(m["rating"] for m in movies)
+    in_stock = sum(b["in_stock"] for b in books)
+    lines = [
+        "# Panda Data Report",
+        "",
+        "## Movies",
+        "",
+        f"{len(movies)} movies, average rating {average:.2f}.",
+        "",
+        markdown_table(
+            ["Title", "Year", "Rating"],
+            [[m["title"], m["year"], m["rating"]]
+             for m in top_movies(movies)],
+        ),
+        "",
+        "## Books",
+        "",
+        f"{len(books)} books, {in_stock} in stock.",
+        "",
+        markdown_table(
+            ["Category", "Books", "Average price", "In stock"],
+            [[c, s["books"], f"{s['avg_price']:.2f}", s["in_stock"]]
+             for c, s in summarise_books(books).items()],
+        ),
+    ]
+    report = folder / "report.md"
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    fields = ["id", "title", "category", "price", "stars", "in_stock"]
+    with (folder / "books.csv").open("w", newline="",
+                                     encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields,
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(sorted(books, key=lambda b: b["id"]))
+    return report
+
+with requests.Session() as session:
+    session.headers["User-Agent"] = "panda-report/1.0"
+    movies = fetch_all_movies(session, BASE)
+    books = fetch_all_books(session, BASE)
+report = write_report(Path("panda-report"), movies, books)
+if report:
+    print(report.read_text(encoding="utf-8"), end="")
+```
+
+</Solution>
+
+</Exercise>
+
+Идеи, как развить проект на своём компьютере: добавьте третьим разделом погоду для списка городов, сохраняйте вчерашний CSV и показывайте, что изменилось (новые книги, снижение цен), добавьте повторы с задержкой из урока [Надёжные API-клиенты](/learn/python/robust-api-clients) или собирайте фильмы конкурентно с `httpx.AsyncClient`.
+
+## Итоги
+
+- Стройте генератор отчётов как **конвейер**: сбор → очистка и обобщение → запись, и каждый этап — несколько маленьких функций.
+- **Сборщики** принимают `session` и `base_url`, оставляют только нужные поля, обрабатывают **ожидаемые** проблемы (например, 404 для неизвестного города), а настоящим сбоям позволяют выбросить исключение.
+- Следуйте собственной структуре данных: **загружайте страницы** до `totalPages` и **находите** категории и следующие страницы в HTML, а не вписывайте их в код.
+- Функции **обобщения** — чистые (на входе списки, на выходе сводки), поэтому их легко тестировать; `mean`, `sorted` с ключом-кортежем (дополнительный критерий при равенстве!), `Counter` и `defaultdict` покрывают большинство задач.
+- Пишите **Markdown** для людей (заголовки, таблицы, отформатированные числа) и **CSV** для электронных таблиц с помощью `pathlib` (`mkdir(parents=True, exist_ok=True)`, `/`, `write_text`) и `encoding="utf-8"`.
+- Запускайте генератор **по расписанию** (cron, GitHub Actions), храните секреты в переменных окружения, а сбои делайте громкими.

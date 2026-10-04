@@ -19,6 +19,7 @@ import type course from "../../messages/en/course.json";
 import type lesson from "../../messages/en/lesson.json";
 import type runner from "../../messages/en/runner.json";
 import type playground from "../../messages/en/playground.json";
+import type practice from "../../messages/en/practice.json";
 import type notFound from "../../messages/en/notFound.json";
 
 type Messages = {
@@ -40,6 +41,7 @@ type Messages = {
   lesson: typeof lesson;
   runner: typeof runner;
   playground: typeof playground;
+  practice: typeof practice;
   notFound: typeof notFound;
 };
 

@@ -12,12 +12,16 @@ export const siteConfig = {
   contactUrl: "https://github.com/kitkatpandamanic-stack/learning-page/issues",
 };
 
-/** `label` is a key in the "nav" translations. */
-export type NavLink = { label: string; href: string };
+/**
+ * `label` is a key in the "nav" translations. `wideOnly` links are left out
+ * of the top bar on tablet widths (they stay in the mobile menu and footer).
+ */
+export type NavLink = { label: string; href: string; wideOnly?: boolean };
 
 export const mainNav: NavLink[] = [
   { label: "languages", href: "/languages" },
-  { label: "roadmap", href: "/#roadmap" },
+  { label: "practice", href: "/practice" },
+  { label: "roadmap", href: "/#roadmap", wideOnly: true },
   { label: "playground", href: "/playground" },
   { label: "pricing", href: "/pricing" },
 ];
@@ -37,6 +41,7 @@ export const footerNav: { title: string; links: NavLink[] }[] = [
     title: "platform",
     links: [
       { label: "roadmap", href: "/#roadmap" },
+      { label: "practice", href: "/practice" },
       { label: "playground", href: "/playground" },
       { label: "dashboard", href: "/dashboard" },
       { label: "pricing", href: "/pricing" },
