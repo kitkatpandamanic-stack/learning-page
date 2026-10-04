@@ -144,6 +144,25 @@ createRoot(document.getElementById("root")!).render(
   <Counter label="Clicks" step={2} />,
 );
 `,
+    sql: ru
+      ? `-- Песочница SQL: настоящий PostgreSQL прямо в браузере. 🐘
+-- В базе уже есть таблицы customers, products, orders, order_items,
+-- departments, employees и movies. Каждый запуск начинается с чистой копии.
+
+SELECT category, count(*) AS products, round(avg(price), 2) AS avg_price
+FROM products
+GROUP BY category
+ORDER BY avg_price DESC;
+`
+      : `-- SQL playground: real PostgreSQL, running in your browser. 🐘
+-- The database has customers, products, orders, order_items,
+-- departments, employees and movies. Every run starts from a fresh copy.
+
+SELECT category, count(*) AS products, round(avg(price), 2) AS avg_price
+FROM products
+GROUP BY category
+ORDER BY avg_price DESC;
+`,
   };
 }
 
@@ -159,31 +178,32 @@ export function Playground() {
         aria-label={t("language")}
         className="inline-flex max-w-full self-start overflow-x-auto rounded-full p-1 glass"
       >
-        {(["javascript", "python", "typescript", "react", "tsx"] as const).map(
-          (lang) => (
-            <button
-              key={lang}
-              type="button"
-              aria-pressed={language === lang}
-              onClick={() => setLanguage(lang)}
-              className={cn(
-                "shrink-0 rounded-full px-4 py-1.5 text-sm font-medium text-white/70 transition hover:text-white",
-                language === lang &&
-                  "bg-gradient-brand text-white shadow-glow-violet",
-              )}
-            >
+        {(
+          ["javascript", "python", "typescript", "react", "tsx", "sql"] as const
+        ).map((lang) => (
+          <button
+            key={lang}
+            type="button"
+            aria-pressed={language === lang}
+            onClick={() => setLanguage(lang)}
+            className={cn(
+              "shrink-0 rounded-full px-4 py-1.5 text-sm font-medium text-white/70 transition hover:text-white",
+              language === lang &&
+                "bg-gradient-brand text-white shadow-glow-violet",
+            )}
+          >
+            {
               {
-                {
-                  javascript: "JavaScript",
-                  python: "Python",
-                  typescript: "TypeScript",
-                  react: "React",
-                  tsx: "React + TS",
-                }[lang]
-              }
-            </button>
-          ),
-        )}
+                javascript: "JavaScript",
+                python: "Python",
+                typescript: "TypeScript",
+                react: "React",
+                tsx: "React + TS",
+                sql: "SQL",
+              }[lang]
+            }
+          </button>
+        ))}
       </div>
       {/* Remount per language so each keeps its own saved code */}
       <LazyCodeRunner

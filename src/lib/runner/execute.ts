@@ -19,7 +19,7 @@ import { createWsNetwork } from "./ws-shim";
  * "tsx" is the same in TypeScript, type-checked first.
  */
 export type RunLanguage =
-  "javascript" | "typescript" | "python" | "react" | "tsx";
+  "javascript" | "typescript" | "python" | "react" | "tsx" | "sql";
 export type LogLevel = "log" | "info" | "warn" | "error";
 export type OutputLine = {
   level: LogLevel;

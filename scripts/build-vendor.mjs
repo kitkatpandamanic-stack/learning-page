@@ -19,6 +19,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildSync, transformSync } from "esbuild";
 
 import {
+  pgliteDir,
+  pgliteVendorName,
   reactTypePackages,
   reactTypesVendorName,
   reactVendorName,
@@ -141,8 +143,36 @@ export function buildReactTypesVendor({ force = false } = {}) {
   return reactTypesVendorDir;
 }
 
+/**
+ * PGlite (PostgreSQL in WebAssembly) for SQL lessons. The SQL worker imports
+ * it from here instead of from the bundle: PGlite finds its .wasm and .data
+ * files next to its own script, and bundling it breaks that. Only what the
+ * browser needs is copied (no source maps, CommonJS or extensions).
+ */
+export const pgliteVendorDir = join(root, "public", "vendor", pgliteVendorName);
+
+export function buildPgliteVendor({ force = false } = {}) {
+  if (!force && existsSync(join(pgliteVendorDir, "index.js"))) {
+    return pgliteVendorDir;
+  }
+  const dist = join(pgliteDir, "dist");
+  for (const folder of ["", "fs"]) {
+    mkdirSync(join(pgliteVendorDir, folder), { recursive: true });
+    for (const file of readdirSync(join(dist, folder))) {
+      if (/\.(js|wasm|data)$/.test(file)) {
+        copyFileSync(
+          join(dist, folder, file),
+          join(pgliteVendorDir, folder, file),
+        );
+      }
+    }
+  }
+  return pgliteVendorDir;
+}
+
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   console.log(`Built ${buildReactVendor({ force: true })}`);
   console.log(`Built ${buildTypeScriptVendor({ force: true })}`);
   console.log(`Built ${buildReactTypesVendor({ force: true })}`);
+  console.log(`Built ${buildPgliteVendor({ force: true })}`);
 }

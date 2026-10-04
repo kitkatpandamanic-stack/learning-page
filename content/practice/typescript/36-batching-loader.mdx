@@ -1,0 +1,223 @@
+---
+title: One trip for many requests
+description: Write a typed Loader<K, V> that batches loads made at the same time into one call, deduplicates keys and caches results.
+difficulty: hard
+topic: async
+lesson: /learn/typescript/typing-promises-and-async
+---
+
+A page shows 50 comments, and each comment loads its author: 50 requests for maybe 6 different users. A **batching loader** (the idea behind the popular DataLoader library) collects every `load` made in the same moment, asks the server once for all of those keys, and hands each caller its own result. Write a typed version.
+
+```ts
+type BatchFn<K, V> = (keys: readonly K[]) => Promise<readonly (V | Error)[]>;
+```
+
+`new Loader<K, V>(batch, options?)` where `options` may contain `maxBatchSize`:
+
+- `load(key)` returns a `Promise<V>`. All `load` calls made one after another without awaiting (in the same turn of the event loop) are sent in **one** `batch` call, with each key once, in the order they were first requested.
+- `batch` must resolve with one result per key, in the same order. A result that is an `Error` rejects that key's promise with it. If `batch` rejects, every key of that batch rejects with the same error. If it returns the wrong number of results, every key of that batch rejects with a `TypeError`: `"Batch returned 2 results for 3 keys"`.
+- Results are **cached** per key: loading a key that's already loaded or on its way returns the same promise without a new batch. Keys that failed (for any of the reasons above) are removed from the cache, so loading them again tries again.
+- With `maxBatchSize`, a batch with more keys is split into several `batch` calls of at most that many keys, all started at once.
+- `loadMany(keys)` loads several keys and resolves with all values in order (rejecting if any of them fails). `clear(key)` removes a key from the cache and returns the loader.
+
+```ts
+const calls: number[][] = [];
+const users = new Loader<number, string>(async (ids) => {
+  calls.push([...ids]);
+  return ids.map((id) => "panda " + id);
+});
+const [a, b, c] = await Promise.all([users.load(1), users.load(2), users.load(1)]);
+// a = "panda 1", b = "panda 2", c = "panda 1", calls = [[1, 2]]
+await users.load(2); // cached: calls is still [[1, 2]]
+```
+
+<Exercise
+  language="typescript"
+  title="One trip for many requests"
+  starter={`type BatchFn<K, V> = (
+  keys: readonly K[],
+) => Promise<readonly (V | Error)[]>;
+
+// Make this class generic: Loader<K, V>
+class Loader {
+  constructor(
+    batch: (keys: any[]) => Promise<any[]>,
+    options: { maxBatchSize?: number } = {},
+  ) {}
+
+  load(key: any): Promise<any> {
+    return Promise.resolve(undefined);
+  }
+
+  loadMany(keys: any[]): Promise<any[]> {
+    return Promise.all(keys.map((key) => this.load(key)));
+  }
+
+  clear(key: any): this {
+    return this;
+  }
+}
+
+// ===== Type tests: don't change these =====
+type User = { id: number; name: string };
+
+function typeTests() {
+  const users = new Loader<number, User>(async (ids) =>
+    ids.map((id) => ({ id, name: "panda " + id })),
+  );
+  const user: Promise<User> = users.load(1);
+  // @ts-expect-error: the keys are numbers
+  users.load("1");
+  // @ts-expect-error: load resolves with a User
+  const count: Promise<number> = users.load(1);
+  // @ts-expect-error: the batch must return Users (or Errors)
+  new Loader<number, User>(async (ids) => ids.map((id) => id));
+  return [user, count];
+}
+
+const calls: number[][] = [];
+const users = new Loader<number, string>(async (ids) => {
+  calls.push([...ids]);
+  return ids.map((id) => "panda " + id);
+});
+const names = await Promise.all([users.load(1), users.load(2), users.load(1)]);
+console.log(names, calls); // [ 'panda 1', 'panda 2', 'panda 1' ] [ [ 1, 2 ] ]
+`}
+  tests={[
+    { name: "Loads made together share one batch with unique keys", check: "(async () => { const calls = []; const l = new Loader(async (keys) => { calls.push([...keys]); return keys.map((k) => k * 10); }); const r = await Promise.all([l.load(3), l.load(1), l.load(3), l.load(2)]); return r.join() === '30,10,30,20' && JSON.stringify(calls) === '[[3,1,2]]'; })()" },
+    { name: "Results are cached, even while still loading", check: "(async () => { let calls = 0; const l = new Loader(async (keys) => { calls++; return keys.map((k) => k + '!'); }); const p1 = l.load('a'); const p2 = l.load('a'); await p1; const v = await l.load('a'); return p1 === p2 && v === 'a!' && calls === 1; })()" },
+    { name: "An Error result rejects only that key, and isn't cached", check: "(async () => { const calls = []; let fail = true; const l = new Loader(async (keys) => { calls.push([...keys]); return keys.map((k) => (k === 2 && fail ? new Error('no user 2') : 'u' + k)); }); const r = await Promise.allSettled([l.load(1), l.load(2)]); fail = false; const again = await l.load(2); await l.load(1); return r[0].status === 'fulfilled' && r[0].value === 'u1' && r[1].status === 'rejected' && r[1].reason.message === 'no user 2' && again === 'u2' && JSON.stringify(calls) === '[[1,2],[2]]'; })()" },
+    { name: "A failed batch rejects all its keys", check: "(async () => { let n = 0; const boom = new Error('server down'); const l = new Loader(async (keys) => { n++; if (n === 1) throw boom; return keys.map(String); }); const r = await Promise.allSettled([l.load(1), l.load(2)]); const v = await l.load(1); return r.every((x) => x.status === 'rejected' && x.reason === boom) && v === '1' && n === 2; })()" },
+    { name: "The wrong number of results is a TypeError", check: "(async () => { const l = new Loader(async (keys) => keys.slice(1)); const r = await Promise.allSettled([l.load('a'), l.load('b'), l.load('c')]); return r.every((x) => x.status === 'rejected' && x.reason instanceof TypeError && x.reason.message === 'Batch returned 2 results for 3 keys'); })()" },
+    { name: "maxBatchSize splits big batches", check: "(async () => { const calls = []; const l = new Loader(async (keys) => { calls.push([...keys]); return keys.map((k) => -k); }, { maxBatchSize: 2 }); const r = await l.loadMany([1, 2, 3, 4, 5, 1]); return r.join() === '-1,-2,-3,-4,-5,-1' && JSON.stringify(calls) === '[[1,2],[3,4],[5]]'; })()" },
+    { name: "Later loads make a new batch; clear forgets a key", check: "(async () => { const calls = []; const l = new Loader(async (keys) => { calls.push([...keys]); return keys.map((k) => k + calls.length); }); await l.load('x'); await l.loadMany(['x', 'y']); const same = l.clear('x') === l; const fresh = await l.load('x'); return same && fresh === 'x3' && JSON.stringify(calls) === '[[\"x\"],[\"y\"],[\"x\"]]'; })()" },
+  ]}
+>
+
+Make `Loader` generic and implement batching, caching and the error rules. The `@ts-expect-error` lines are type tests: they pass only when that line **is** an error.
+
+<Hint>
+
+Keep a `Map<K, Promise<V>>` cache and a queue of pending items `{ key, resolve, reject }`. In `load`, return the cached promise if there is one; otherwise create a promise, remember its `resolve`/`reject` in the queue, cache it, and if the queue was empty, schedule one dispatch with `queueMicrotask(() => this.dispatch())`. Every `load` before that microtask runs joins the same queue.
+
+</Hint>
+
+<Hint>
+
+In `dispatch`, take the queue (and start a new empty one), split it into chunks of `maxBatchSize`, and call `batch` for each chunk. The cache already makes keys unique within a batch. For each chunk, handle three outcomes: the results array (check its length, then resolve or reject each key), and a rejection. Whenever a key fails, `this.cache.delete(key)` before rejecting.
+
+</Hint>
+
+<Solution>
+
+```ts
+type BatchFn<K, V> = (
+  keys: readonly K[],
+) => Promise<readonly (V | Error)[]>;
+
+type Pending<K, V> = {
+  key: K;
+  resolve: (value: V) => void;
+  reject: (error: unknown) => void;
+};
+
+class Loader<K, V> {
+  private cache = new Map<K, Promise<V>>();
+  private queue: Pending<K, V>[] = [];
+  private readonly batch: BatchFn<K, V>;
+  private readonly maxBatchSize: number;
+
+  constructor(
+    batch: BatchFn<K, V>,
+    options: { maxBatchSize?: number } = {},
+  ) {
+    this.batch = batch;
+    this.maxBatchSize = options.maxBatchSize ?? Infinity;
+  }
+
+  load(key: K): Promise<V> {
+    const cached = this.cache.get(key);
+    if (cached) return cached;
+    const promise = new Promise<V>((resolve, reject) => {
+      this.queue.push({ key, resolve, reject });
+    });
+    this.cache.set(key, promise);
+    if (this.queue.length === 1) queueMicrotask(() => this.dispatch());
+    return promise;
+  }
+
+  loadMany(keys: readonly K[]): Promise<V[]> {
+    return Promise.all(keys.map((key) => this.load(key)));
+  }
+
+  clear(key: K): this {
+    this.cache.delete(key);
+    return this;
+  }
+
+  private dispatch(): void {
+    const queue = this.queue;
+    this.queue = [];
+    for (let i = 0; i < queue.length; i += this.maxBatchSize) {
+      this.run(queue.slice(i, i + this.maxBatchSize));
+    }
+  }
+
+  private async run(items: Pending<K, V>[]): Promise<void> {
+    const fail = (item: Pending<K, V>, error: unknown) => {
+      this.cache.delete(item.key);
+      item.reject(error);
+    };
+    let results: readonly (V | Error)[];
+    try {
+      results = await this.batch(items.map((item) => item.key));
+    } catch (error) {
+      for (const item of items) fail(item, error);
+      return;
+    }
+    if (results.length !== items.length) {
+      const error = new TypeError(
+        `Batch returned ${results.length} results for ${items.length} keys`,
+      );
+      for (const item of items) fail(item, error);
+      return;
+    }
+    items.forEach((item, i) => {
+      const result = results[i];
+      if (result instanceof Error) fail(item, result);
+      else item.resolve(result);
+    });
+  }
+}
+
+// ===== Type tests: don't change these =====
+type User = { id: number; name: string };
+
+function typeTests() {
+  const users = new Loader<number, User>(async (ids) =>
+    ids.map((id) => ({ id, name: "panda " + id })),
+  );
+  const user: Promise<User> = users.load(1);
+  // @ts-expect-error: the keys are numbers
+  users.load("1");
+  // @ts-expect-error: load resolves with a User
+  const count: Promise<number> = users.load(1);
+  // @ts-expect-error: the batch must return Users (or Errors)
+  new Loader<number, User>(async (ids) => ids.map((id) => id));
+  return [user, count];
+}
+
+const calls: number[][] = [];
+const users = new Loader<number, string>(async (ids) => {
+  calls.push([...ids]);
+  return ids.map((id) => "panda " + id);
+});
+const names = await Promise.all([users.load(1), users.load(2), users.load(1)]);
+console.log(names, calls); // [ 'panda 1', 'panda 2', 'panda 1' ] [ [ 1, 2 ] ]
+```
+
+The first `load` of a turn schedules a microtask, and every `load` before it runs lands in the same queue, so one turn of synchronous calls becomes one batch. The cache stores promises rather than values, which deduplicates keys inside a batch and across batches for free; deleting failed keys keeps errors from sticking. Each key costs O(1) to queue, and `batch` is called ⌈n / maxBatchSize⌉ times per turn.
+
+</Solution>
+
+</Exercise>

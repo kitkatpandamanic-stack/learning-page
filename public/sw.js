@@ -1,7 +1,7 @@
 // PandaDev's service worker: keeps the heavy, never-changing files (Python,
 // the TypeScript compiler, React, the site's hashed scripts and styles) after
 // their first download, so the code editor starts instantly on later visits,
-// and keeps the last copy of each lesson page so visited lessons open offline.
+// and keeps the last copy of each lesson and practice page so visited ones open offline.
 // Registered by src/components/layout/service-worker.tsx (production only).
 
 const VERSION = "v2";
@@ -44,7 +44,7 @@ self.addEventListener("fetch", (event) => {
   } else if (
     request.mode === "navigate" &&
     url.origin === self.location.origin &&
-    /^\/(ru\/)?learn\//.test(url.pathname)
+    /^\/(ru\/)?(learn|practice)\//.test(url.pathname)
   ) {
     event.respondWith(networkFirst(request));
   }

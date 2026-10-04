@@ -38,5 +38,11 @@ for (const dir of Object.values(reactTypePackages)) {
   typesHash.update(readFileSync(join(dir, "package.json")));
 }
 
+/** PostgreSQL in WebAssembly, for SQL lessons: served as-is from /vendor/pglite-<version>/. */
+export const pgliteDir = join(root, "node_modules", "@electric-sql", "pglite");
+export const pgliteVendorName = `pglite-${
+  JSON.parse(readFileSync(join(pgliteDir, "package.json"), "utf8")).version
+}`;
+
 /** e.g. react-types-19.3.0-1a2b3c4d: a new folder whenever a package changes */
 export const reactTypesVendorName = `react-types-${require("@types/react/package.json").version}-${typesHash.digest("hex").slice(0, 8)}`;

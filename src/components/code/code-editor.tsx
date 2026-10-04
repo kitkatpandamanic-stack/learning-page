@@ -4,6 +4,7 @@ import * as React from "react";
 import CodeMirror, { type ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
+import { PostgreSQL, sql } from "@codemirror/lang-sql";
 import { indentUnit } from "@codemirror/language";
 import { setDiagnostics } from "@codemirror/lint";
 import { EditorView } from "@codemirror/view";
@@ -102,10 +103,12 @@ export function CodeEditor({
       language === "python"
         ? // Python style (PEP 8) and all our lessons use 4-space indents.
           [python(), indentUnit.of("    ")]
-        : javascript({
-            typescript: language === "typescript" || language === "tsx",
-            jsx: language === "react" || language === "tsx",
-          }),
+        : language === "sql"
+          ? sql({ dialect: PostgreSQL, upperCaseKeywords: true })
+          : javascript({
+              typescript: language === "typescript" || language === "tsx",
+              jsx: language === "react" || language === "tsx",
+            }),
       glassTheme,
       EditorView.contentAttributes.of({ "aria-label": label }),
     ],
