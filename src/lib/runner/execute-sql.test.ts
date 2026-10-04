@@ -141,6 +141,23 @@ describe("executeSql", () => {
     ]);
   }, 30_000);
 
+  it("keeps sequences where the sample data left them", async () => {
+    const r = await run(
+      "INSERT INTO products (name, category, price) VALUES ('Oolong', 'tea', 7) RETURNING id;",
+    );
+    expect(texts(r)).toEqual([" id", "----", " 16", "(1 row)"]);
+  }, 30_000);
+
+  it("shows columns that share a name", async () => {
+    const r = await run("SELECT 1 AS a, 2 AS a, NULL::int AS n;");
+    expect(texts(r)).toEqual([
+      " a | a |  n",
+      "---+---+------",
+      " 1 | 2 | NULL",
+      "(1 row)",
+    ]);
+  }, 30_000);
+
   it("shows notices", async () => {
     const r = await run("DO $$ BEGIN RAISE NOTICE 'hi %', 42; END $$");
     expect(texts(r)).toEqual(["NOTICE:  hi 42", "DO"]);
@@ -167,6 +184,11 @@ describe("executeSql", () => {
           check:
             "(await query('SELECT joined_on FROM customers WHERE id = 1'))[0].joined_on === '2024-01-15'",
         },
+        {
+          name: "isolated from the rerun before",
+          check:
+            "(await query('SELECT count(*) AS n FROM products'))[0].n === 15",
+        },
         { name: "fails", check: "rows.length === 99" },
         { name: "throws", check: "(await query('SELECT nope'))" },
       ],
@@ -177,10 +199,11 @@ describe("executeSql", () => {
       true,
       true,
       true,
+      true,
       false,
       false,
     ]);
-    expect(r.tests?.[6].error).toBe('ERROR: column "nope" does not exist');
+    expect(r.tests?.[7].error).toBe('ERROR: column "nope" does not exist');
   }, 30_000);
 
   it("fails every check when the code has an error", async () => {

@@ -159,7 +159,7 @@ function exercisesIn(file: string): Exercise[] {
     if (typeof attrs.starter !== "string") return [];
     const body = block.slice(0, block.indexOf("</Exercise>"));
     const solution =
-      /<Solution>\s*```(?:js|jsx|ts|tsx|python)[^\n]*\n([\s\S]*?)```/.exec(
+      /<Solution>\s*```(?:js|jsx|ts|tsx|python|sql)[^\n]*\n([\s\S]*?)```/.exec(
         body,
       )?.[1];
     return [

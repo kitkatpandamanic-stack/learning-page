@@ -196,7 +196,7 @@ export function formatTable(
     ...cells.map((row) =>
       line(
         row.map((value, i) =>
-          columns[i].numeric && row[i] !== "NULL"
+          columns[i].numeric
             ? value.padStart(widths[i])
             : value.padEnd(widths[i]),
         ),
@@ -340,8 +340,10 @@ export async function executeSql(
   for (const [index, statement] of statements.entries()) {
     if (index > 0) emit("log", ""); // a blank line between results
     try {
+      // Rows as arrays: two columns can share a name (SELECT c.id, o.id …).
       const [result] = await db.exec(statement.text, {
         parsers: RAW_TEXT,
+        rowMode: "array",
         onNotice: (notice) => emit("info", `NOTICE:  ${notice.message}`),
       });
       if (result && result.fields.length > 0) {
@@ -349,9 +351,7 @@ export async function executeSql(
           name: f.name,
           numeric: NUMERIC_TYPES.has(f.dataTypeID),
         }));
-        const raw = (result.rows as Record<string, string | null>[]).map(
-          (row) => result.fields.map((f) => row[f.name] ?? null),
-        );
+        const raw = result.rows as unknown as (string | null)[][];
         for (const text of formatTable(columns, raw)) emit("log", text);
         lastQuery = statement.text;
         results.push({
@@ -392,13 +392,16 @@ export async function executeSql(
   if (tests.length) {
     const last = [...results].reverse().find((r) => r.columns.length > 0);
     const query = async (sql: string) => {
-      const [result] = await db.exec(sql, { parsers: RAW_TEXT });
+      const [result] = await db.exec(sql, {
+        parsers: RAW_TEXT,
+        rowMode: "array",
+      });
       if (!result) return [];
-      return (result.rows as Record<string, string | null>[]).map((row) =>
+      return (result.rows as unknown as (string | null)[][]).map((row) =>
         Object.fromEntries(
-          result.fields.map((f) => [
+          result.fields.map((f, i) => [
             f.name,
-            checkValue(row[f.name] ?? null, f.dataTypeID),
+            checkValue(row[i], f.dataTypeID),
           ]),
         ),
       );
@@ -420,6 +423,9 @@ export async function executeSql(
         });
         continue;
       }
+      // Each check runs in a transaction that is rolled back afterwards, so
+      // rows one check inserts (e.g. with rerun) don't affect the next.
+      await db.exec("BEGIN");
       try {
         const check = new Function(
           "rows",
@@ -449,6 +455,8 @@ export async function executeSql(
           // PostgreSQL's errors are named "error"; JavaScript's keep their name.
           error: `${/^error$/i.test(e.name) ? "ERROR" : e.name}: ${e.message}`,
         });
+      } finally {
+        await db.exec("ROLLBACK");
       }
     }
   }
@@ -466,6 +474,9 @@ export async function createSqlSandbox(
 ) {
   const base = await create();
   await base.exec(seed);
+  // Without a checkpoint, opening the copy replays the log like after a
+  // crash, and sequences jump ahead (the next product id would be 34, not 16).
+  await base.exec("CHECKPOINT");
   const snapshot = await base.dumpDataDir("none");
   await base.close();
   return () => create({ loadDataDir: snapshot });
