@@ -1,0 +1,503 @@
+---
+title: Backups, Replication & Connection Pooling
+description: Plan for failure with RPO and RTO, take logical and physical backups, use replicas and failover for high availability, and protect the server with connection pooling.
+duration: 24
+xp: 30
+---
+
+On 31 January 2017, an engineer at GitLab was fighting replication problems late at night and ran a delete command on what he thought was the broken replica. It was the **primary**. About 300 GB of production data were gone in seconds. Then the team found that, of five backup and replication methods, none could simply restore the data: dumps had been silently failing for a while, and nobody had noticed. They recovered from a disk snapshot that happened to be six hours old, and six hours of users' work was lost for good. GitLab published the whole story, and it's still required reading. 🔥
+
+Nothing in that story is about SQL syntax. It's about **operations**: what happens when a disk dies, a region goes down, or someone runs the wrong command. In this lesson you'll learn how PostgreSQL is backed up, replicated and kept available, and how to stop your own application from overwhelming it with connections.
+
+## RPO and RTO: decide what you need first
+
+Before choosing any tool, agree on two numbers with the business:
+
+- **RPO, recovery point objective**: how much data you can afford to **lose**, measured in time. "RPO 5 minutes" means after a disaster, at most the last five minutes of changes may be gone.
+- **RTO, recovery time objective**: how long you can afford to be **down**. "RTO 1 hour" means the database must be serving again within an hour.
+
+Both cost money, and they push the design in different directions:
+
+| Setup | Typical RPO | Typical RTO |
+| --- | --- | --- |
+| Nightly `pg_dump` only | Up to 24 hours | Hours (restore + rebuild indexes) |
+| Base backup + WAL archiving | Seconds to minutes | Tens of minutes to hours |
+| + streaming replica, manual failover | Seconds | Minutes (someone must act) |
+| + synchronous replica, automatic failover | Zero (committed data) | Under a minute |
+
+A hobby project is happy with the first row. A payments system needs the last one **and** backups, because, as you'll see, replicas don't protect you from mistakes.
+
+## The WAL: how PostgreSQL remembers every change
+
+Almost everything in this lesson builds on one mechanism. Before PostgreSQL changes a data file, it writes a description of the change to the **write-ahead log (WAL)**, a sequence of files in the `pg_wal` directory. On `COMMIT`, PostgreSQL makes sure the WAL is safely on disk; the data files themselves can be updated later. If the server crashes, it replays the WAL from the last checkpoint and nothing committed is lost.
+
+Each position in the WAL is a **log sequence number (LSN)**, like `0/3A0F2C8`, and you can measure how much WAL a statement wrote by comparing LSNs before and after. Let's compare deleting 50,000 rows with dropping a table of the same size:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE TABLE AS
+
+CREATE TABLE
+
+INSERT 0 1
+
+DELETE 50000
+
+INSERT 0 1
+
+DROP TABLE
+
+INSERT 0 1
+
+     step     | wal_kb
+--------------+--------
+ after delete |   2743
+ after drop   |      3
+(2 rows)`}>
+
+```sql
+CREATE TABLE logs_old AS
+SELECT g AS id, 'event ' || g AS message
+FROM generate_series(1, 50000) AS g;
+CREATE TABLE logs_copy AS TABLE logs_old;
+
+-- remember the WAL position after each step
+CREATE TABLE wal_marks (step text, lsn pg_lsn);
+INSERT INTO wal_marks VALUES ('start', pg_current_wal_lsn());
+
+DELETE FROM logs_old;
+INSERT INTO wal_marks VALUES ('after delete', pg_current_wal_lsn());
+
+DROP TABLE logs_copy;
+INSERT INTO wal_marks VALUES ('after drop', pg_current_wal_lsn());
+
+SELECT step, wal_kb
+FROM (
+  SELECT
+    step,
+    lsn,
+    round(pg_wal_lsn_diff(lsn, lag(lsn) OVER (ORDER BY lsn)) / 1024)
+      AS wal_kb
+  FROM wal_marks
+) AS steps
+WHERE step <> 'start'
+ORDER BY lsn;
+```
+
+</CodeExample>
+
+`pg_wal_lsn_diff(a, b)` gives the number of bytes between two positions. The `DELETE` wrote over 2.5 MB of WAL (a record for every row), while `DROP TABLE` wrote about 3 kB. That's the retention argument from [Partitioning Big Tables](/learn/sql/table-partitioning), seen from another angle: every byte of WAL also has to be archived for backups and shipped to every replica.
+
+The WAL is why three different things work:
+
+1. **Crash recovery**: replay the WAL after a crash.
+2. **Point-in-time recovery**: restore an old copy of the files, then replay archived WAL up to any moment you choose.
+3. **Replication**: send the WAL to another server and replay it there, continuously.
+
+## Logical backups with pg_dump
+
+**`pg_dump`** connects like a normal client and writes out the SQL (or a compressed archive) needed to recreate one database: `CREATE TABLE` statements, the data, indexes, constraints. It reads everything inside one transaction, so the dump is a **consistent snapshot** even while the app keeps writing.
+
+```bash
+# custom format (-Fc): compressed, and pg_restore can pick parts of it
+pg_dump --format=custom --file=shop_2025-06-01.dump shop
+
+# restore into a new, empty database with 4 parallel jobs
+createdb shop_restored
+pg_restore --jobs=4 --dbname=shop_restored shop_2025-06-01.dump
+
+# one table only, as plain SQL you can read
+pg_dump --table=orders --data-only shop > orders.sql
+
+# roles and tablespaces are not in pg_dump: dump them separately
+pg_dumpall --globals-only > globals.sql
+```
+
+Logical backups are portable: you can restore them into a **newer major version** of PostgreSQL, another machine or another platform, which makes them great for migrations and for copying data to a test environment. Their limits:
+
+- They're a snapshot of **one moment**. With nightly dumps your RPO is up to 24 hours.
+- Restoring a big database is slow: every row is inserted again and every index rebuilt. A 1 TB database can take many hours, which may blow your RTO.
+
+## Physical backups and point-in-time recovery
+
+A **physical backup** copies the database's files instead. **`pg_basebackup`** takes a consistent copy of the whole cluster (every database on the server) while it keeps running. On its own, that's another snapshot. Combined with **WAL archiving**, it becomes something much more powerful:
+
+```text
+                          continuous WAL archive
+base backup (Sunday)  -->  WAL WAL WAL WAL WAL WAL WAL ...  --> now
+         |                                    ^
+     restore files,                 replay up to Wednesday 14:31:59,
+     then replay WAL...             one second before the bad DELETE
+```
+
+```bash
+# 1. postgresql.conf on the primary: archive every finished WAL file
+#    archive_mode = on
+#    archive_command = 'pgbackrest --stanza=main archive-push %p'
+
+# 2. a base backup, e.g. weekly
+pg_basebackup --pgdata=/backups/base_2025-06-01 \
+  --wal-method=stream --checkpoint=fast --progress
+
+# 3. disaster: restore the base backup into a fresh data directory,
+#    then in postgresql.conf of the restored server:
+#    restore_command = 'pgbackrest --stanza=main archive-get %f "%p"'
+#    recovery_target_time = '2025-06-04 14:31:59+00'
+touch /var/lib/postgresql/data/recovery.signal
+pg_ctl start   # replays WAL, stops at the target, then waits
+```
+
+This is **point-in-time recovery (PITR)**: you can restore the database to **any second** covered by the archive, for example one second before someone ran `DELETE` without a `WHERE`. RPO drops to the time since the last archived WAL file (seconds to minutes; `archive_timeout` forces a switch at least every N seconds on a quiet server).
+
+Nobody writes `archive_command` scripts by hand any more. Tools such as **pgBackRest**, **Barman** and **WAL-G** handle compression, encryption, parallel transfers, storage in S3 or similar, retention and verification. Managed services (Amazon RDS, Google Cloud SQL, Azure, Supabase, Neon…) do the same behind a "restore to time" button.
+
+<Callout type="danger" title="An untested backup is not a backup">
+
+GitLab had backups configured. What they didn't have was proof that they worked. Production practice:
+
+- **Restore regularly and automatically**, e.g. every week into a scratch server, then run sanity queries (row counts, the latest `created_at`) and alert if anything is off.
+- **Monitor** the last successful backup and the WAL archive (`pg_stat_archiver` shows `last_archived_time` and `failed_count`).
+- Keep backups in **another account and region**, so one mistake or one compromised key can't delete both the database and its backups.
+- Measure how long a restore takes. That number **is** your real RTO.
+
+</Callout>
+
+## Replication: a live copy of the database
+
+**Streaming replication** connects a **standby** (replica) server to the **primary**. The primary streams its WAL as it's written, and the standby replays it continuously, so it's an almost-live, byte-for-byte copy of the whole cluster. With `hot_standby` on (the default), the standby also answers **read-only** queries.
+
+```text
+           writes + reads                     reads only
+ app  ------------------->  PRIMARY  ----WAL---->  STANDBY (replica)
+                              |                       |
+                              +-------WAL------>  STANDBY 2 (other zone)
+```
+
+You can check which side you're connected to with `pg_is_in_recovery()`, which is `false` on a primary and `true` on a standby. On the primary, **`pg_stat_replication`** has a row per connected standby, with the LSNs it has received and replayed. Here are rows like the ones it shows, turned into a lag report:
+
+<CodeExample output={`   standby    |   state   | lag_kb
+--------------+-----------+--------
+ replica-b    | catchup   |  20480
+ replica-a    | streaming |     64
+ replica-west | streaming |      0
+(3 rows)`}>
+
+```sql
+-- on a real primary: FROM pg_stat_replication
+WITH replication_status (standby, state, sent_lsn, replay_lsn) AS (
+  VALUES
+    ('replica-a', 'streaming', pg_lsn '0/5A010000', pg_lsn '0/5A000000'),
+    ('replica-b', 'catchup', pg_lsn '0/5A010000', pg_lsn '0/58C10000'),
+    ('replica-west', 'streaming', pg_lsn '0/5A010000',
+      pg_lsn '0/5A010000')
+)
+SELECT
+  standby,
+  state,
+  round(pg_wal_lsn_diff(sent_lsn, replay_lsn) / 1024) AS lag_kb
+FROM replication_status
+ORDER BY lag_kb DESC, standby;
+```
+
+</CodeExample>
+
+`pg_stat_replication` also has the columns `write_lag`, `flush_lag` and `replay_lag` as intervals, which are what most dashboards alert on.
+
+### Asynchronous or synchronous
+
+By default replication is **asynchronous**: `COMMIT` returns as soon as the WAL is on the primary's disk, and the standby catches up a moment later. It's fast, but if the primary dies, the last few transactions that hadn't reached the standby are lost when you fail over. RPO is small but not zero.
+
+With **synchronous** replication, `COMMIT` waits until a standby confirms it has the WAL too:
+
+```text
+# postgresql.conf on the primary
+synchronous_standby_names = 'ANY 1 (replica_a, replica_b)'
+synchronous_commit = on   # or remote_apply: wait until it's replayed
+```
+
+Now a committed transaction exists on two servers, so failover loses nothing. The price is that every commit waits for a network round trip, so put the synchronous standby close by (another zone, not another continent). Use `ANY 1 (…)` with **two** candidates: with a single synchronous standby, if that standby goes down, every commit on the primary **hangs** until it's back.
+
+`synchronous_commit` can even be changed per transaction (`SET LOCAL synchronous_commit = off` for a log insert you can afford to lose), so important and unimportant writes can pay different prices.
+
+### Read replicas and stale reads
+
+Sending read-only queries (reports, search pages) to replicas takes load off the primary. But replicas are always a little behind, which causes a classic bug:
+
+```text
+1. user saves a new profile photo   -> UPDATE on the primary
+2. page reloads                     -> SELECT on a replica
+3. replica is 300 ms behind         -> the old photo is shown
+4. user uploads the photo again...
+```
+
+Common fixes: read **your own recent writes** from the primary (e.g. for a few seconds after a user changes something), keep critical reads (payments, permissions) on the primary, or have the app remember the LSN of its write and only read from a replica whose `pg_last_wal_replay_lsn()` has passed it.
+
+### Logical replication
+
+Streaming replication copies **everything**, and only between servers of the same major version. **Logical replication** sends row changes for chosen tables instead:
+
+```sql
+-- on the source
+CREATE PUBLICATION shop_pub FOR TABLE orders, order_items;
+
+-- on the target (which already has the tables)
+CREATE SUBSCRIPTION shop_sub
+  CONNECTION 'host=old-db dbname=shop user=replicator'
+  PUBLICATION shop_pub;
+```
+
+It works across major versions, so it's the standard way to **upgrade with almost no downtime**: replicate into the new version, let it catch up, then switch the app over. Change-data-capture tools such as **Debezium** read the same stream to feed search indexes, caches and data warehouses.
+
+<Callout type="warning" title="Replication is not a backup">
+
+A replica copies **every** change, including the mistakes. `DROP TABLE orders` on the primary is replayed on every standby within milliseconds. Replicas protect you from **hardware** failure; only backups with PITR protect you from **people and bugs**. You need both.
+
+</Callout>
+
+## High availability and failover
+
+**High availability (HA)** means the database keeps serving when a server dies. With a standby in place, **failover** is: notice the primary is gone, **promote** a standby (`pg_ctl promote` or `SELECT pg_promote()`), and point the application at it.
+
+Doing this automatically is harder than it sounds. The danger is **split brain**: the old primary wasn't dead, just cut off from the network, and now two servers both accept writes, and their data diverges. Real HA tools solve this with a **consensus store** that decides who's the leader, plus **fencing** to make sure the old primary stops accepting writes:
+
+- **Patroni** (with etcd or Consul) is the most common open-source choice; it also rebuilds failed nodes as new standbys.
+- Kubernetes operators such as **CloudNativePG** do the same on Kubernetes.
+- Managed services do it for you (e.g. RDS Multi-AZ, Cloud SQL HA), typically failing over in about a minute.
+
+Applications need their part too. Drivers built on libpq accept several hosts and can find the writable one:
+
+```text
+postgresql://db1,db2,db3/shop?target_session_attrs=read-write
+```
+
+And apps must **retry** a transaction that fails because the connection dropped during failover, so make writes safe to retry (idempotent).
+
+## Connection pooling
+
+The last scaling problem usually arrives earlier than the others. Every PostgreSQL connection is a separate **server process** with its own memory, and `max_connections` (100 by default) caps how many can exist:
+
+<CodeExample output={` max_connections
+-----------------
+ 100
+(1 row)`}>
+
+```sql
+SHOW max_connections;
+```
+
+</CodeExample>
+
+Now do the maths for a typical deployment: 20 app servers, each with a pool of 10 connections, plus background workers and cron jobs. That's well over 200 connections, most of them idle at any moment. Raising `max_connections` to 2,000 doesn't fix it: thousands of processes compete for CPU and memory, and throughput goes **down**. A database with 16 CPU cores can only run about 16 queries at the very same moment anyway. Serverless functions make it worse, since each instance may open its own connection.
+
+The fix is a **connection pooler** such as **PgBouncer** (or PgCat, Supavisor, RDS Proxy) between the apps and the database. Thousands of client connections share a small pool of real server connections:
+
+```text
+ app 1 ──┐
+ app 2 ──┤  2,000 client          ┌── 40 server
+   ...   ├──connections──> PgBouncer ──connections──> PostgreSQL
+ app 20 ─┘                        └──
+```
+
+PgBouncer has three **pooling modes**:
+
+| Mode | A server connection is yours for… | Notes |
+| --- | --- | --- |
+| `session` | the whole client connection | Safe for everything, but saves little |
+| `transaction` | one transaction | The usual choice: huge savings |
+| `statement` | one statement | No multi-statement transactions at all |
+
+In **transaction mode**, your next transaction may run on a **different** server connection. So anything that lives in the **session** breaks or leaks between clients: `SET` without `LOCAL`, session advisory locks, `LISTEN`, temporary tables kept between transactions, and (in older PgBouncer versions) prepared statements. Settings must be made **per transaction**:
+
+<CodeExample output={`BEGIN
+
+SET
+
+ statement_timeout
+-------------------
+ 2s
+(1 row)
+
+COMMIT
+
+ statement_timeout
+-------------------
+ 0
+(1 row)
+
+ tenant
+--------
+ 42
+(1 row)
+
+ tenant
+--------
+
+(1 row)`}>
+
+```sql
+BEGIN;
+SET LOCAL statement_timeout = '2s';
+SHOW statement_timeout;
+COMMIT;
+
+-- back to the default once the transaction ends
+SHOW statement_timeout;
+
+-- set_config(name, value, is_local => true) is the same as
+-- SET LOCAL, and works with any value, e.g. a parameter
+SELECT set_config('app.tenant_id', '42', true) AS tenant;
+SELECT current_setting('app.tenant_id', true) AS tenant;
+```
+
+</CodeExample>
+
+Outside an explicit transaction each statement is its own transaction, so the second `current_setting` call already sees an empty value. You'll rely on exactly this behaviour in the capstone, where each request tells PostgreSQL which tenant it acts for.
+
+<Callout type="tip" title="Smaller pools are faster">
+
+A good starting point for the total number of active server connections is a small multiple of the database's CPU cores (for example, cores × 2 to 4), not hundreds. Extra requests wait briefly in the pooler's queue, which is cheaper than hundreds of processes fighting over the CPU. Add timeouts so one bad client can't hold a connection forever: `statement_timeout`, `idle_in_transaction_session_timeout` and `lock_timeout`.
+
+</Callout>
+
+<Quiz
+  question="A developer runs DELETE FROM invoices without a WHERE at 14:32. The database has an asynchronous streaming replica, nightly pg_dump files and continuous WAL archiving with weekly base backups. What restores the data with the least loss?"
+  options={[
+    "Fail over to the replica",
+    "Restore last night's pg_dump",
+    "Point-in-time recovery from the base backup plus archived WAL, to just before 14:32",
+    "Run VACUUM to bring the deleted rows back",
+  ]}
+  answer={2}
+  explanation="The replica already replayed the DELETE, so it has lost the rows too. The nightly dump would lose everything since last night. PITR replays the archived WAL up to a moment just before the mistake, losing almost nothing. VACUUM removes dead rows; it never restores them."
+/>
+
+<Quiz
+  question="The app goes through PgBouncer in transaction mode and runs SET statement_timeout = '1s' once after connecting. What can happen?"
+  options={[
+    "Nothing: the setting applies to all of this client's transactions",
+    "PgBouncer rejects every SET statement",
+    "The setting stays on one server connection, so other clients' transactions may get the 1 s timeout while this client's later transactions may not",
+    "PostgreSQL resets the timeout after each statement",
+  ]}
+  answer={2}
+  explanation="In transaction mode, server connections are shared between clients transaction by transaction. A session-level SET stays on whatever server connection ran it and leaks to other clients. Use SET LOCAL or set_config(..., true) inside each transaction instead."
+/>
+
+<Exercise
+  language="sql"
+  title="Backup health report"
+  starter={`-- Backup runs from the team's backup tool (keep this as it is)
+CREATE TABLE backup_runs (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  db_name text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('full', 'wal')),
+  finished_at timestamp NOT NULL,
+  ok boolean NOT NULL
+);
+
+INSERT INTO backup_runs (db_name, kind, finished_at, ok) VALUES
+  ('billing', 'full', '2025-06-01 02:00', true),
+  ('billing', 'wal', '2025-06-01 11:58', true),
+  ('shop', 'full', '2025-06-01 03:00', true),
+  ('shop', 'wal', '2025-06-01 09:30', true),
+  ('shop', 'wal', '2025-06-01 11:59', false),
+  ('analytics', 'full', '2025-05-29 04:00', true),
+  ('analytics', 'full', '2025-06-01 04:00', false),
+  ('analytics', 'wal', '2025-06-01 11:57', true),
+  ('auth', 'full', '2025-06-01 01:00', true),
+  ('auth', 'wal', '2025-06-01 11:59', true);
+
+-- Write the report for 2025-06-01 12:00 below
+SELECT db_name
+FROM backup_runs
+GROUP BY db_name
+ORDER BY db_name;
+`}
+  tests={[
+    { name: "Columns are db_name, hours_since_full, data_loss_minutes, at_risk", check: "columns.join() === 'db_name,hours_since_full,data_loss_minutes,at_risk'" },
+    { name: "One row per database, by name", check: "rows.map(r => r.db_name).join() === 'analytics,auth,billing,shop'" },
+    { name: "hours_since_full counts only successful full backups", check: "rows.map(r => r.hours_since_full).join() === '80,11,10,9'" },
+    { name: "data_loss_minutes uses the latest successful backup of any kind", check: "rows.map(r => r.data_loss_minutes).join() === '3,1,2,150'" },
+    { name: "at_risk flags analytics and shop", check: "rows.filter(r => r.at_risk === true).map(r => r.db_name).join() === 'analytics,shop' && rows.every(r => typeof r.at_risk === 'boolean')" },
+    { name: "A database whose only backup failed is at risk", check: "(await rerun(\"INSERT INTO backup_runs (db_name, kind, finished_at, ok) VALUES ('search', 'full', '2025-06-01 05:00', false)\")).some(r => r.db_name === 'search' && r.at_risk === true && r.hours_since_full === null)" },
+  ]}
+>
+
+Your team's RPO is **15 minutes** and the rule is "a successful full backup at least every **24 hours**". Write the report the on-call engineer sees, as of **`2025-06-01 12:00`** (use that fixed time, not `now()`), one row per database sorted by `db_name`, with these columns:
+
+- **`db_name`**
+- **`hours_since_full`**: whole hours (rounded) since the latest **successful** full backup, or `NULL` if there's none.
+- **`data_loss_minutes`**: whole minutes (rounded) since the latest successful backup of **any** kind (full or WAL). That's how much data you'd lose if the server died right now.
+- **`at_risk`**: `true` when `hours_since_full` is over 24, **or** `data_loss_minutes` is over 15, **or** there's no successful backup to measure at all; otherwise `false`. It must never be `NULL`.
+
+<Hint>
+
+Use aggregates with `FILTER`: `max(finished_at) FILTER (WHERE kind = 'full' AND ok)` is the latest good full backup, and `max(finished_at) FILTER (WHERE ok)` the latest good backup of any kind. Turn an interval into hours with `extract(epoch FROM timestamp '2025-06-01 12:00' - …) / 3600`, then `round(…)`. Computing the two values in a CTE first keeps the `at_risk` expression readable. Wrap the comparisons in `coalesce(…, true)` so a missing backup counts as a risk.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE backup_runs (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  db_name text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('full', 'wal')),
+  finished_at timestamp NOT NULL,
+  ok boolean NOT NULL
+);
+
+INSERT INTO backup_runs (db_name, kind, finished_at, ok) VALUES
+  ('billing', 'full', '2025-06-01 02:00', true),
+  ('billing', 'wal', '2025-06-01 11:58', true),
+  ('shop', 'full', '2025-06-01 03:00', true),
+  ('shop', 'wal', '2025-06-01 09:30', true),
+  ('shop', 'wal', '2025-06-01 11:59', false),
+  ('analytics', 'full', '2025-05-29 04:00', true),
+  ('analytics', 'full', '2025-06-01 04:00', false),
+  ('analytics', 'wal', '2025-06-01 11:57', true),
+  ('auth', 'full', '2025-06-01 01:00', true),
+  ('auth', 'wal', '2025-06-01 11:59', true);
+
+WITH latest AS (
+  SELECT
+    db_name,
+    max(finished_at) FILTER (WHERE kind = 'full' AND ok) AS last_full,
+    max(finished_at) FILTER (WHERE ok) AS last_good
+  FROM backup_runs
+  GROUP BY db_name
+),
+ages AS (
+  SELECT
+    db_name,
+    round(extract(epoch FROM timestamp '2025-06-01 12:00'
+      - last_full) / 3600) AS hours_since_full,
+    round(extract(epoch FROM timestamp '2025-06-01 12:00'
+      - last_good) / 60) AS data_loss_minutes
+  FROM latest
+)
+SELECT
+  db_name,
+  hours_since_full,
+  data_loss_minutes,
+  coalesce(hours_since_full > 24 OR data_loss_minutes > 15, true)
+    AS at_risk
+FROM ages
+ORDER BY db_name;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Agree on **RPO** (how much data you may lose) and **RTO** (how long you may be down) first; they decide the design.
+- The **WAL** records every change before it happens; it powers crash recovery, point-in-time recovery and replication. Big `DELETE`s write a lot of it.
+- **`pg_dump`/`pg_restore`**: portable logical snapshots of one database, good for upgrades and copies, slow to restore when big.
+- **`pg_basebackup` + WAL archiving** (via pgBackRest, Barman or WAL-G) give **PITR** to any second. **Test restores** regularly and monitor the archive.
+- **Streaming replicas** give HA and read scaling; async can lose the last transactions, **synchronous** (`ANY 1 (a, b)`) can't but adds commit latency. Watch for **stale reads** on replicas.
+- **Logical replication** copies chosen tables across versions: zero-downtime upgrades and CDC.
+- **Replication is not a backup**: mistakes replicate instantly.
+- Automatic **failover** needs consensus and fencing (Patroni, operators, managed services) and apps that retry.
+- Use a **connection pooler** (PgBouncer, transaction mode) with small pools; keep session state per transaction with **`SET LOCAL`** / **`set_config(…, true)`**.

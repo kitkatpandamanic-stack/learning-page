@@ -1,0 +1,439 @@
+---
+title: "Part 3: Rankings, moving averages and the final dashboard"
+description: Rank products within categories, find the customers that matter most, smooth weekly revenue with a moving average, and package the dashboard as views.
+duration: 25
+xp: 30
+---
+
+The dashboard can already tell the team how many customers are active, how fast revenue grows, whether customers come back and where visitors drop off. Two kinds of tile are still missing: **leaderboards** ("what sells best?") and **trend lines** that don't jump around every week. Then we'll package all the queries as **views**, so the dashboard tool only ever runs `SELECT * FROM something`. 🏁
+
+## Leaderboards: three ways to rank
+
+"Best sellers per category" needs a ranking **inside** each category: a window function with `PARTITION BY category`. The three ranking functions differ only in how they treat **ties**. Here they are side by side, ranking products by units sold:
+
+<CodeExample output={` category |        product         | units | row_number | rank | dense_rank
+----------+------------------------+-------+------------+------+------------
+ books    | Algorithms in Pictures |    17 |          1 |    1 |          1
+ books    | Clean Python           |     9 |          2 |    2 |          2
+ books    | The Bamboo Code        |     9 |          3 |    2 |          2
+ kitchen  | Bamboo Chopsticks      |    15 |          1 |    1 |          1
+ kitchen  | Rice Cooker            |     9 |          2 |    2 |          2
+ kitchen  | Tea Pot                |     9 |          3 |    2 |          2
+(6 rows)`}>
+
+```sql
+WITH product_sales AS (
+  SELECT p.category, p.name AS product,
+    sum(oi.quantity) AS units
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  JOIN products AS p ON p.id = oi.product_id
+  WHERE o.status <> 'cancelled'
+  GROUP BY p.id
+)
+SELECT category, product, units,
+  row_number() OVER (PARTITION BY category
+    ORDER BY units DESC, product) AS row_number,
+  rank() OVER w AS rank,
+  dense_rank() OVER w AS dense_rank
+FROM product_sales
+WHERE category IN ('books', 'kitchen')
+WINDOW w AS (PARTITION BY category ORDER BY units DESC)
+ORDER BY category, units DESC, product;
+```
+
+</CodeExample>
+
+Clean Python and The Bamboo Code both sold 9 copies:
+
+- **`row_number()`** always numbers rows 1, 2, 3, ties or not. Here it has its own tie-breaker (`ORDER BY units DESC, product`), so Clean Python gets 2 and The Bamboo Code 3. Without a tie-breaker, which of the two gets 2 is arbitrary and can change between runs, and a "top 2" built on it silently drops one of two equal products.
+- **`rank()`** gives both 2, and the next product would get 4: it **skips**, like a sports table.
+- **`dense_rank()`** gives both 2, and the next product would get 3: no gaps.
+
+For a "top N" tile, `rank()` or `dense_rank()` is usually right: a tie for second place should show both products. Use `row_number()` when you need exactly N rows, and then add a tie-breaker (`ORDER BY units DESC, product`) so the result is at least stable.
+
+## Top 2 per category, with their share
+
+A window function can't go in `WHERE`, because `WHERE` runs **before** windows are computed. So the classic "top N per group" query ranks in a CTE and filters outside. While we're at it, `sum(…) OVER (PARTITION BY category)` gives each category's total on every row, which turns revenue into a **share of the category**:
+
+<CodeExample output={` category |        product         | revenue | category_rank | share_pct
+----------+------------------------+---------+---------------+-----------
+ books    | Algorithms in Pictures |  493.00 |             1 |        59
+ books    | Clean Python           |  224.91 |             2 |        27
+ kitchen  | Rice Cooker            |  809.10 |             1 |        70
+ kitchen  | Tea Pot                |  288.00 |             2 |        25
+ snacks   | Panda Cookies          |   60.00 |             1 |        69
+ snacks   | Bamboo Crisps          |   26.91 |             2 |        31
+ tea      | Earl Grey              |   42.00 |             1 |        52
+ tea      | Jasmine Tea            |   39.00 |             2 |        48
+ toys     | Wooden Puzzle          |  182.40 |             1 |        63
+ toys     | Kite                   |  105.00 |             2 |        37
+(10 rows)`}>
+
+```sql
+WITH product_sales AS (
+  SELECT p.category, p.name AS product,
+    sum(oi.quantity * oi.unit_price) AS revenue
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  JOIN products AS p ON p.id = oi.product_id
+  WHERE o.status <> 'cancelled'
+  GROUP BY p.id
+),
+ranked AS (
+  SELECT category, product, revenue,
+    dense_rank() OVER (PARTITION BY category
+      ORDER BY revenue DESC) AS category_rank,
+    round(100 * revenue
+      / sum(revenue) OVER (PARTITION BY category)) AS share_pct
+  FROM product_sales
+)
+SELECT *
+FROM ranked
+WHERE category_rank <= 2
+ORDER BY category, category_rank, product;
+```
+
+</CodeExample>
+
+The Rice Cooker alone makes 70% of kitchen revenue. That's a risk worth a tile of its own: if its supplier has a problem, the whole category collapses.
+
+## Which customers matter most?
+
+Another favourite tile: "our top customers bring X% of revenue". A **running total** of revenue, sorted from the biggest customer down, divided by the grand total `sum(…) OVER ()`, gives the cumulative share:
+
+<CodeExample output={`    name     | revenue | cumulative_pct | quartile
+-------------+---------+----------------+----------
+ Ravi Patel  |  282.23 |           11.5 |        1
+ Sam Ortiz   |  273.83 |           22.7 |        1
+ Sofia Rossi |  260.13 |           33.4 |        1
+ Diego López |  258.17 |           43.9 |        1
+ Kenji Mori  |  207.67 |           52.4 |        1
+ Mei Lin     |  200.17 |           60.6 |        2
+(6 rows)`}>
+
+```sql
+WITH customer_revenue AS (
+  SELECT c.name, sum(oi.quantity * oi.unit_price) AS revenue
+  FROM customers AS c
+  JOIN orders AS o ON o.customer_id = c.id
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY c.id
+)
+SELECT name, revenue,
+  round(100 * sum(revenue) OVER (ORDER BY revenue DESC, name)
+    / sum(revenue) OVER (), 1) AS cumulative_pct,
+  ntile(4) OVER (ORDER BY revenue DESC, name) AS quartile
+FROM customer_revenue
+ORDER BY revenue DESC, name
+LIMIT 6;
+```
+
+</CodeExample>
+
+The top 5 of 17 customers bring in over half the revenue. Businesses call this the **Pareto** pattern ("80/20"), and it decides where the effort goes: those five deserve a personal thank-you email. **`ntile(4)`** splits the customers into four nearly equal groups (quartiles), handy for "top 25% customers" segments.
+
+Notice the tie-breaker `name` in **both** window `ORDER BY`s. Without it, two customers with equal revenue could be summed in either order, and the running total would differ between runs.
+
+## Trend lines: a 4-week moving average
+
+Weekly revenue jumps around: one big Rice Cooker order makes a week look amazing. A **moving average** smooths the line by averaging each week with the three before it. It needs two things you've seen already: a **gap-free calendar** (a missing week would make "the three weeks before" wrong) and a **window frame**:
+
+<CodeExample output={`    week    | revenue | avg_4_weeks
+------------+---------+-------------
+ 2025-04-07 |   52.20 |       98.11
+ 2025-04-14 |  114.74 |      124.69
+ 2025-04-21 |   22.80 |       92.96
+ 2025-04-28 |   17.85 |       51.90
+ 2025-05-05 |  109.50 |       66.22
+ 2025-05-12 |  200.17 |       87.58
+ 2025-05-19 |    8.40 |       83.98
+ 2025-05-26 |  207.73 |      131.45
+ 2025-06-02 |  124.10 |      135.10
+ 2025-06-09 |   52.20 |       98.11
+ 2025-06-16 |   36.24 |      105.07
+(11 rows)`}>
+
+```sql
+WITH paid_orders AS (
+  SELECT o.id, o.ordered_at,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+),
+weeks AS (
+  SELECT generate_series(date '2025-01-06', date '2025-06-16',
+    interval '1 week')::date AS week
+),
+weekly AS (
+  SELECT w.week, coalesce(sum(p.total), 0) AS revenue
+  FROM weeks AS w
+  LEFT JOIN paid_orders AS p
+    ON p.ordered_at >= w.week AND p.ordered_at < w.week + 7
+  GROUP BY w.week
+),
+smoothed AS (
+  SELECT week, revenue,
+    CASE WHEN count(*) OVER last_4 = 4
+      THEN round(avg(revenue) OVER last_4, 2)
+    END AS avg_4_weeks
+  FROM weekly
+  WINDOW last_4 AS (ORDER BY week
+    ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
+)
+SELECT *
+FROM smoothed
+WHERE week >= '2025-04-07'
+ORDER BY week;
+```
+
+</CodeExample>
+
+- **`ROWS BETWEEN 3 PRECEDING AND CURRENT ROW`** is the frame: this week and the three rows before it. `ROWS` counts rows, which is why the calendar must have one row per week with no gaps.
+- The first three weeks of the year don't have three weeks before them, so their average would be built from fewer weeks. The `CASE` with **`count(*) OVER last_4 = 4`** shows NULL instead of a misleading partial average.
+- The **date filter is in the outer query**, after the window has done its work. Putting `WHERE week >= '2025-04-07'` inside `weekly` would make April's first average NULL, because the March weeks it needs would be gone.
+
+Weekly revenue swings from 8.40 to 207.73, while the average stays between about 50 and 135, so the trend is much easier to read.
+
+## Packaging the dashboard as views
+
+The dashboard tool (Metabase, Grafana, Superset, Looker…) shouldn't contain 40-line queries: nobody reviews them there, and the same "paid order" logic would be copied into every tile. Instead, each building block becomes a **view** in the database, and the tiles query the views:
+
+<CodeExample output={`CREATE VIEW
+
+CREATE VIEW
+
+   month    | orders | active_customers | revenue
+------------+--------+------------------+---------
+ 2025-04-01 |      6 |                6 |  331.69
+ 2025-05-01 |      5 |                5 |  467.80
+ 2025-06-01 |      4 |                4 |  270.54
+(3 rows)`}>
+
+```sql
+CREATE VIEW paid_orders AS
+SELECT o.id, o.customer_id, o.ordered_at,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY o.id;
+
+CREATE VIEW monthly_kpis AS
+SELECT date_trunc('month', ordered_at)::date AS month,
+  count(*) AS orders,
+  count(DISTINCT customer_id) AS active_customers,
+  sum(total) AS revenue
+FROM paid_orders
+GROUP BY 1;
+
+SELECT *
+FROM monthly_kpis
+WHERE month >= '2025-04-01'
+ORDER BY month;
+```
+
+</CodeExample>
+
+Views stack: `monthly_kpis` is built on `paid_orders`, and the definition of a paid order now lives in **exactly one place**. When finance decides that `paid` orders shouldn't count until they ship, you change one view and every tile follows.
+
+A view runs its query **every time** it's read. That's perfect for small, fast queries. For heavy ones (the cohort table over millions of orders, say) use a **materialized view**: it stores the result like a table, and you refresh it on a schedule. The price is that it can be **stale**:
+
+<CodeExample output={`CREATE MATERIALIZED VIEW
+
+INSERT 0 1
+
+INSERT 0 1
+
+   month    | revenue
+------------+---------
+ 2025-06-01 |  270.54
+(1 row)
+
+REFRESH
+
+   month    | revenue
+------------+---------
+ 2025-06-01 |  360.44
+(1 row)`}>
+
+```sql
+CREATE MATERIALIZED VIEW monthly_revenue AS
+SELECT date_trunc('month', o.ordered_at)::date AS month,
+  sum(oi.quantity * oi.unit_price) AS revenue
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY 1;
+
+-- A new order arrives...
+INSERT INTO orders (customer_id, ordered_at, status)
+VALUES (3, '2025-06-20 12:00', 'paid');
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+SELECT max(id), 15, 1, 89.90 FROM orders;
+
+SELECT * FROM monthly_revenue WHERE month = '2025-06-01';
+
+REFRESH MATERIALIZED VIEW monthly_revenue;
+
+SELECT * FROM monthly_revenue WHERE month = '2025-06-01';
+```
+
+</CodeExample>
+
+The first `SELECT` still shows the old June revenue; only after `REFRESH` does the new Rice Cooker appear. Dashboards built on materialized views say so on screen: "Data as of 06:00 today".
+
+<Callout type="tip" title="Making the dashboard fast in production">
+
+- **Index the time column**: almost every tile filters on `ordered_at` ranges, so an index on `orders (ordered_at)` turns a full scan into a range scan. Keep the filters sargable (`ordered_at >= …`, never `date_trunc(…, ordered_at) = …`).
+- **Refresh without blocking readers**: plain `REFRESH MATERIALIZED VIEW` locks out readers while it runs. `REFRESH MATERIALIZED VIEW CONCURRENTLY` doesn't, but it needs a **unique index** on the materialized view (here on `month`).
+- **Pre-aggregate**: at millions of events a day, teams keep a `daily_stats` table that a nightly job fills with one row per day, and the dashboard reads only that.
+- **Use a replica**: heavy analytics queries run on a read replica, so they can't slow down customers' checkouts on the primary.
+
+</Callout>
+
+## The final dashboard query set
+
+Here's the whole dashboard, tile by tile, with the technique behind each one:
+
+| Tile | Query | Built with |
+| --- | --- | --- |
+| Revenue, orders, active customers this month (vs last month) | `monthly_kpis` + `lag()` | `date_trunc`, `count(DISTINCT)`, `nullif` |
+| Daily active customers chart | calendar + LEFT JOIN | `generate_series`, conditions in `ON` |
+| Active in the last 30 days | range join | `count(DISTINCT)` per calendar day |
+| Cohort retention triangle | grid + pivot | `age()`, `max(…) FILTER`, NULL for the future |
+| Conversion funnel (by device) | steps `VALUES` + LEFT JOIN | `first_value`, `lag`, `PARTITION BY` |
+| Best sellers per category | rank in a CTE, filter outside | `dense_rank`, `sum() OVER (PARTITION BY)` |
+| Top customers | running share | `sum() OVER (ORDER BY)`, `ntile` |
+| Weekly revenue trend | calendar + moving average | `ROWS BETWEEN 3 PRECEDING AND CURRENT ROW` |
+
+Every row of that table is something you've now written yourself. 🐼
+
+<Quiz
+  question="Why does a top-N-per-group query rank rows in a CTE and filter with WHERE in the outer query?"
+  options={["Because CTEs are faster than subqueries", "Because window functions are computed after WHERE, so they can't be used in the same query's WHERE clause", "Because dense_rank() only works inside a CTE", "Because ORDER BY must come before WHERE"]}
+  answer={1}
+  explanation="PostgreSQL evaluates FROM, WHERE, GROUP BY and HAVING first, then window functions, then ORDER BY and LIMIT. A filter on a window function's result needs another query level around it: a CTE or a subquery."
+/>
+
+<Quiz
+  question="A dashboard tile reads from a materialized view that is refreshed every night at 06:00. An order is placed at 10:00. When does the tile show it?"
+  options={["Immediately, like a normal view", "After the next refresh, at 06:00 the next day", "Never, materialized views can't change", "As soon as someone runs SELECT on the view"]}
+  answer={1}
+  explanation="A materialized view stores the query's result when it is created or refreshed. Reads return that stored result, so new rows only appear after the next REFRESH MATERIALIZED VIEW."
+/>
+
+<Exercise
+  language="sql"
+  title="Final task: the dashboard views"
+  starter={`-- 1. Paid orders with their totals (done)
+CREATE VIEW paid_orders AS
+SELECT o.id, o.customer_id, o.ordered_at,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY o.id;
+
+-- 2. product_leaderboard:
+--    category, product, revenue, category_rank
+
+
+-- 3. weekly_revenue:
+--    week, revenue, avg_4_weeks
+
+
+-- 4. The best-sellers tile: top 2 per category
+SELECT 'todo' AS category;`}
+  tests={[
+    { name: "product_leaderboard has the columns category, product, revenue, category_rank", check: "(await query(\"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) AS c FROM information_schema.columns WHERE table_name = 'product_leaderboard'\"))[0].c === 'category,product,revenue,category_rank'" },
+    { name: "The leaders of each category are right", check: "(await query(\"SELECT product, revenue FROM product_leaderboard WHERE category_rank = 1 ORDER BY category\")).map(r => r.product + ' ' + r.revenue).join() === 'Algorithms in Pictures 493,Rice Cooker 809.1,Panda Cookies 60,Earl Grey 42,Wooden Puzzle 182.4'" },
+    { name: "The tile shows the top 2 per category, sorted by category, rank and product", check: "columns.join() === 'category,product,revenue,category_rank' && rows.length === 10 && rows.map(r => r.category_rank).join() === '1,2,1,2,1,2,1,2,1,2' && rows[1].product === 'Clean Python'" },
+    { name: "weekly_revenue has 24 gap-free weeks with a 4-week average (NULL for the first 3)", check: "(rs => rs.length === 24 && rs.map(r => r.week + ' ' + r.revenue + ' ' + r.avg_4_weeks).filter((r, i) => i < 4 || i === 23).join() === '2025-01-06 302.17 null,2025-01-13 8.4 null,2025-01-20 149.73 null,2025-01-27 182.1 160.6,2025-06-16 36.24 105.07')(await query(\"SELECT week, revenue, avg_4_weeks FROM weekly_revenue ORDER BY week\"))" },
+    { name: "A week without paid orders shows 0 revenue", check: "(await query(\"UPDATE orders SET status = 'cancelled' WHERE id = 3\"), await query(\"SELECT revenue, avg_4_weeks FROM weekly_revenue WHERE week = '2025-01-27'\")).map(r => r.revenue + ' ' + r.avg_4_weeks).join() === '182.1 158.5'" },
+    { name: "Ties share a rank, with no gap after them (dense_rank)", check: "(await rerun(\"INSERT INTO orders (customer_id, ordered_at, status) VALUES (3, '2025-06-18 12:00', 'paid'); INSERT INTO order_items SELECT max(id), 12, 1, 77.40 FROM orders\")).filter(r => r.category === 'toys').map(r => r.product + ' ' + r.category_rank).join() === 'Kite 1,Wooden Puzzle 1'" },
+    { name: "The views are live: new orders show up in weekly_revenue", check: "(await query(\"INSERT INTO orders (customer_id, ordered_at, status) VALUES (3, '2025-06-18 12:00', 'paid')\"), await query(\"INSERT INTO order_items SELECT max(id), 12, 1, 77.40 FROM orders\"), (await query(\"SELECT revenue FROM weekly_revenue WHERE week = '2025-06-16'\"))[0].revenue === 113.64)" },
+  ]}
+>
+
+Time to ship the dashboard. 🚀 The starter already has the `paid_orders` view. Add two more views on top of it, then the query for the best-sellers tile:
+
+1. **`product_leaderboard`** with the columns `category`, `product` (the product's name), `revenue` (from paid orders) and `category_rank`: the `dense_rank()` of the product's revenue within its category, highest first. Only products that sold something appear.
+2. **`weekly_revenue`** with the columns `week` (a date, the Monday of each week from `2025-01-06` to `2025-06-16`), `revenue` (`0` for a week without paid orders) and `avg_4_weeks`: the average revenue of that week and the 3 before it, rounded to 2 decimals, or NULL when there aren't 4 weeks yet.
+3. Finally, the **best-sellers tile**: select everything from `product_leaderboard` where `category_rank` is at most 2, sorted by category, rank and product.
+
+The checks change the data afterwards and read your views again, so they must be views, not tables.
+
+<Hint>
+
+`product_leaderboard`: join `paid_orders` to `order_items` and `products`, group by `p.id` in a CTE, then add `dense_rank() OVER (PARTITION BY category ORDER BY revenue DESC)`. `weekly_revenue`: copy the moving-average query from this lesson: a `weeks` calendar with `generate_series(date '2025-01-06', date '2025-06-16', interval '1 week')::date`, a LEFT JOIN on the half-open week range with `coalesce(sum(p.total), 0)`, then `CASE WHEN count(*) OVER last_4 = 4 THEN round(avg(revenue) OVER last_4, 2) END` with the `ROWS BETWEEN 3 PRECEDING AND CURRENT ROW` frame. A view can start with `WITH`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE VIEW paid_orders AS
+SELECT o.id, o.customer_id, o.ordered_at,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY o.id;
+
+CREATE VIEW product_leaderboard AS
+WITH product_sales AS (
+  SELECT p.category, p.name AS product,
+    sum(oi.quantity * oi.unit_price) AS revenue
+  FROM paid_orders AS po
+  JOIN order_items AS oi ON oi.order_id = po.id
+  JOIN products AS p ON p.id = oi.product_id
+  GROUP BY p.id
+)
+SELECT category, product, revenue,
+  dense_rank() OVER (PARTITION BY category
+    ORDER BY revenue DESC) AS category_rank
+FROM product_sales;
+
+CREATE VIEW weekly_revenue AS
+WITH weeks AS (
+  SELECT generate_series(date '2025-01-06', date '2025-06-16',
+    interval '1 week')::date AS week
+),
+weekly AS (
+  SELECT w.week, coalesce(sum(p.total), 0) AS revenue
+  FROM weeks AS w
+  LEFT JOIN paid_orders AS p
+    ON p.ordered_at >= w.week AND p.ordered_at < w.week + 7
+  GROUP BY w.week
+)
+SELECT week, revenue,
+  CASE WHEN count(*) OVER last_4 = 4
+    THEN round(avg(revenue) OVER last_4, 2)
+  END AS avg_4_weeks
+FROM weekly
+WINDOW last_4 AS (ORDER BY week
+  ROWS BETWEEN 3 PRECEDING AND CURRENT ROW);
+
+SELECT *
+FROM product_leaderboard
+WHERE category_rank <= 2
+ORDER BY category, category_rank, product;
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+Over three parts you wrote every query behind a real product dashboard:
+
+- **Part 1**: metric **definitions**, monthly and daily **active customers** on a gap-free calendar, **growth** vs the previous period with `lag()`, and like-for-like comparisons for unfinished months.
+- **Part 2**: **cohorts** and a **retention triangle** that knows "not yet" from "never", and a **conversion funnel**, overall and per device.
+- **Part 3**: **leaderboards** with `rank`/`dense_rank`, a **Pareto** running share, a **moving average** with a window frame, and the whole thing packaged as **views** and **materialized views**.
+
+🎉 **Congratulations, you've finished Level 2!** You can rank, compare and smooth data with window functions, pivot with `FILTER`, walk hierarchies with recursive CTEs, work with JSON, read query plans, choose indexes, and build views, functions and triggers. That's the toolkit of a professional data analyst and a solid backend developer. Level 3 goes where senior engineers live: what happens when **many** users change the same data at the same moment, starting with transactions and concurrency.

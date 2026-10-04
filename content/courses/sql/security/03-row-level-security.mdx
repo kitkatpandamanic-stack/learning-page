@@ -1,0 +1,462 @@
+---
+title: Row-Level Security
+description: Let the database decide which rows each user or tenant can see and change, with policies, USING and WITH CHECK, FORCE ROW LEVEL SECURITY, and tests with SET ROLE.
+duration: 25
+xp: 30
+---
+
+Privileges work per table and per column: a role can read `notes` or it can't. Most apps need something finer: **every user can read the notes table, but only their own rows**. Usually that rule lives in application code, as a `WHERE owner_id = …` that every query has to remember. Forget it once (in a new endpoint, a report or an admin tool) and one customer sees another customer's data. That's one of the most common serious bugs in multi-tenant software. **Row-level security** (RLS) moves the rule into the database, where it applies to every query automatically. 🧱
+
+All the examples use this small table of notes, owned by the sample customers, and a role `app_user` that stands for the web application:
+
+```sql
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL REFERENCES customers (id),
+  body text NOT NULL
+);
+
+INSERT INTO notes (owner_id, body) VALUES
+  (1, 'Mei: buy jasmine tea'),
+  (1, 'Mei: call Sam'),
+  (2, 'Sam: fix the kite'),
+  (3, 'Ada: read The Bamboo Code');
+
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+```
+
+## Turning it on: deny by default
+
+`ALTER TABLE … ENABLE ROW LEVEL SECURITY` switches RLS on. From then on, a normal role sees only the rows that some **policy** allows. With no policies at all, that's **nothing**:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+CREATE ROLE
+
+GRANT
+
+ALTER TABLE
+
+SET
+
+ visible
+---------
+       0
+(1 row)
+
+RESET
+
+ visible_to_postgres
+---------------------
+                   4
+(1 row)`}>
+
+```sql
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL REFERENCES customers (id),
+  body text NOT NULL
+);
+INSERT INTO notes (owner_id, body) VALUES
+  (1, 'Mei: buy jasmine tea'), (1, 'Mei: call Sam'),
+  (2, 'Sam: fix the kite'), (3, 'Ada: read The Bamboo Code');
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+SET ROLE app_user;
+SELECT count(*) AS visible FROM notes;
+RESET ROLE;
+
+SELECT count(*) AS visible_to_postgres FROM notes;
+```
+
+</CodeExample>
+
+No error, just no rows: RLS works by **filtering**, like an invisible `WHERE`. The second count shows the main exception: **superusers**, roles with `BYPASSRLS`, and (as you'll see soon) the **table's owner** aren't affected.
+
+## Who is the current user?
+
+A policy needs to know who's asking. There are two common answers:
+
+1. **One database role per user** (`current_user`). Simple, but it's rare for web apps: you'd need thousands of roles and a connection per user.
+2. **One role for the app, plus a setting** that the app sets at the start of each request: `set_config('app.user_id', '42', …)`. Policies read it with `current_setting('app.user_id', true)`. Settings with a dot in their name, like `app.user_id`, are free for you to invent.
+
+## Writing policies: USING and WITH CHECK
+
+A policy has two parts:
+
+- **`USING (…)`**: which **existing** rows the role can see, update or delete.
+- **`WITH CHECK (…)`**: which **new** rows (inserted, or the result of an update) are allowed. If you leave it out, `USING` is used for both.
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+CREATE ROLE
+
+GRANT
+
+ALTER TABLE
+
+CREATE POLICY
+
+SET
+
+ set_config
+------------
+ 1
+(1 row)
+
+ id |         body
+----+----------------------
+  1 | Mei: buy jasmine tea
+  2 | Mei: call Sam
+(2 rows)
+
+UPDATE 0
+
+DELETE 2
+
+ERROR:  new row violates row-level security policy for table "notes"`}>
+
+```sql
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL REFERENCES customers (id),
+  body text NOT NULL
+);
+INSERT INTO notes (owner_id, body) VALUES
+  (1, 'Mei: buy jasmine tea'), (1, 'Mei: call Sam'),
+  (2, 'Sam: fix the kite'), (3, 'Ada: read The Bamboo Code');
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY notes_own ON notes
+  TO app_user
+  USING (owner_id = current_setting('app.user_id', true)::integer)
+  WITH CHECK (owner_id = current_setting('app.user_id', true)::integer);
+
+-- A request from Mei (customer 1)
+SET ROLE app_user;
+SELECT set_config('app.user_id', '1', false);
+
+SELECT id, body FROM notes ORDER BY id;
+
+-- Sam's note is invisible, so it can't be changed either
+UPDATE notes SET body = 'hacked' WHERE id = 3;
+DELETE FROM notes;
+
+-- Writing a note for someone else: refused by WITH CHECK
+INSERT INTO notes (owner_id, body) VALUES (2, 'Mei was here');
+```
+
+</CodeExample>
+
+Read the results carefully. `UPDATE 0`: Sam's note doesn't exist as far as Mei is concerned. `DELETE 2` without a `WHERE` deleted **only Mei's own notes**: the policy is added to every statement. And the `INSERT` fails loudly, because `WITH CHECK` failures are errors, not filters.
+
+### Policies per command, and combining policies
+
+`CREATE POLICY … FOR SELECT | INSERT | UPDATE | DELETE | ALL` limits a policy to one kind of statement, and `TO role` limits it to some roles. When several **permissive** policies (the default) apply, a row is allowed if **any** of them allows it (they're combined with `OR`). A **`RESTRICTIVE`** policy must **also** pass (it's combined with `AND`), which is handy for rules that apply on top of everything else:
+
+<TryIt language="sql" code={`CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL,
+  body text NOT NULL,
+  shared boolean NOT NULL DEFAULT false,
+  archived boolean NOT NULL DEFAULT false
+);
+INSERT INTO notes (owner_id, body, shared, archived) VALUES
+  (1, 'Mei: private', false, false),
+  (2, 'Sam: shared with everyone', true, false),
+  (2, 'Sam: private', false, false),
+  (2, 'Sam: old shared note', true, true);
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+-- Permissive: your own notes OR shared ones (for reading)
+CREATE POLICY own_notes ON notes TO app_user
+  USING (owner_id = current_setting('app.user_id', true)::integer);
+CREATE POLICY read_shared ON notes FOR SELECT TO app_user
+  USING (shared);
+
+-- Restrictive: archived notes are hidden from everyone, always
+CREATE POLICY hide_archived ON notes AS RESTRICTIVE TO app_user
+  USING (NOT archived);
+
+SET ROLE app_user;
+SELECT set_config('app.user_id', '1', false);
+SELECT id, body FROM notes ORDER BY id;`} />
+
+## The table owner, and FORCE
+
+RLS doesn't apply to the table's **owner**. That's convenient for migrations, and dangerous when the application connects **as the owner**, which is very common in small projects: you enable RLS, write careful policies, and they silently do nothing. Here's the trap, and the fix, **`FORCE ROW LEVEL SECURITY`**:
+
+<CodeExample output={`CREATE ROLE
+
+CREATE TABLE
+
+INSERT 0 2
+
+ALTER TABLE
+
+ALTER TABLE
+
+CREATE POLICY
+
+ set_config
+------------
+ 1
+(1 row)
+
+SET
+
+ owner_sees
+------------
+          2
+(1 row)
+
+RESET
+
+ALTER TABLE
+
+SET
+
+ owner_sees_with_force
+-----------------------
+                     1
+(1 row)`}>
+
+```sql
+CREATE ROLE app_owner NOLOGIN;
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL,
+  body text NOT NULL
+);
+INSERT INTO notes (owner_id, body) VALUES
+  (1, 'Mei: buy jasmine tea'), (2, 'Sam: fix the kite');
+ALTER TABLE notes OWNER TO app_owner;
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY notes_own ON notes
+  USING (owner_id = current_setting('app.user_id', true)::integer);
+
+SELECT set_config('app.user_id', '1', false);
+
+SET ROLE app_owner;
+SELECT count(*) AS owner_sees FROM notes;
+RESET ROLE;
+
+ALTER TABLE notes FORCE ROW LEVEL SECURITY;
+
+SET ROLE app_owner;
+SELECT count(*) AS owner_sees_with_force FROM notes;
+```
+
+</CodeExample>
+
+The best setup combines both lessons of this module: the app connects as a role that **doesn't own** the tables (least privilege), **and** you `FORCE` RLS on tenant tables as a second safety net. Superusers and `BYPASSRLS` roles still bypass it, which is what you want for backups and admin work, and another reason the app must never be a superuser.
+
+## Setting the user safely with connection pools
+
+Apps share a few database connections between many requests (a **connection pool**). If request A sets `app.user_id = 1` for the whole session and forgets to reset it, request B on the same connection runs as user 1. Set it **per transaction** instead: the third argument of `set_config` is `is_local`, and `true` means "until the end of this transaction" (same as `SET LOCAL`):
+
+<CodeExample output={`BEGIN
+
+ set_config
+------------
+ 1
+(1 row)
+
+ during
+--------
+ 1
+(1 row)
+
+COMMIT
+
+ after | is_empty_text
+-------+---------------
+       | t
+(1 row)
+
+ as_integer
+------------
+       NULL
+(1 row)`}>
+
+```sql
+BEGIN;
+SELECT set_config('app.user_id', '1', true);
+SELECT current_setting('app.user_id', true) AS during;
+COMMIT;
+
+SELECT current_setting('app.user_id', true) AS after,
+  current_setting('app.user_id', true) = '' AS is_empty_text;
+
+SELECT nullif(current_setting('app.user_id', true), '')::integer
+  AS as_integer;
+```
+
+</CodeExample>
+
+Two details matter here:
+
+- `current_setting(name, true)`: the `true` means "missing is OK, return NULL" instead of raising an error. A policy comparing with NULL matches nothing, so a request that forgot to set the user **fails closed**: it sees no rows.
+- After a transaction-local value ends, the setting exists but is the **empty string**, and `''::integer` is an error. Wrap it: `nullif(current_setting('app.user_id', true), '')::integer`.
+
+In application code a request then looks like this:
+
+```js
+// node-postgres: one transaction per request, user set inside it
+const client = await pool.connect();
+try {
+  await client.query("BEGIN");
+  await client.query("SELECT set_config('app.user_id', $1, true)", [
+    String(session.userId),
+  ]);
+  const { rows } = await client.query("SELECT * FROM notes");
+  await client.query("COMMIT");
+} finally {
+  client.release();
+}
+```
+
+## Pitfalls that bypass your policies
+
+- **Views** run with the privileges of the view's **owner** by default. A view created by a superuser or the table owner shows every row to everyone who may read the view. Create views with `WITH (security_invoker = true)` (PostgreSQL 15+) so RLS applies to the person querying.
+- **`SECURITY DEFINER` functions** also run as their owner, so they skip RLS too. Write them carefully, or avoid them on RLS tables.
+- **Uniqueness and foreign keys leak existence.** Inserting a duplicate email fails even if the other row is invisible, which tells the user it exists. Foreign key checks also ignore RLS.
+- **Performance**: a policy becomes part of every query's `WHERE`, so **index** the columns it uses (`owner_id`, `tenant_id`). Writing the setting as a sub-select, `(SELECT current_setting(…))`, lets PostgreSQL compute it once per query instead of once per row:
+
+```text
+EXPLAIN SELECT * FROM notes WHERE body LIKE '%tea%';   -- as app_user
+ Bitmap Heap Scan on notes
+   Recheck Cond: (owner_id = (InitPlan 1).col1)      ← the policy
+   Filter: (body ~~ '%tea%'::text)                   ← your WHERE
+   InitPlan 1                                        ← setting read once
+   ->  Bitmap Index Scan on notes_owner_id_idx
+```
+
+<Callout type="tip" title="Test policies like code">
+
+Policies are security code, so give them tests: for each role and user, `SET ROLE`, set the user, and assert what's visible and what's refused: own rows visible, other rows invisible, cross-tenant inserts and updates rejected, no user set means no rows. Run them in CI against every migration. You'll write exactly such a test matrix in the exercise below.
+
+</Callout>
+
+<Quiz
+  question="RLS is enabled on invoices with a correct policy, but the app still sees every tenant's invoices. The app connects as the role that created the table. Why?"
+  options={["Policies only apply to SELECT", "Table owners bypass RLS unless FORCE ROW LEVEL SECURITY is set", "RLS needs a restart to take effect", "The policy needs WITH CHECK"]}
+  answer={1}
+  explanation="The owner of a table isn't subject to its policies by default. Use ALTER TABLE ... FORCE ROW LEVEL SECURITY, and better still, connect the app as a role that doesn't own the tables."
+/>
+
+<Quiz
+  question="A policy uses USING (owner_id = current_setting('app.user_id', true)::integer) and no WITH CHECK. A user runs UPDATE notes SET owner_id = 99 WHERE id = 5 on their own note. What happens?"
+  options={["The update succeeds and the note moves to user 99", "It fails: without WITH CHECK, the USING expression also checks the new row", "Nothing: UPDATE 0", "RLS is ignored for UPDATE"]}
+  answer={1}
+  explanation="When a policy has no WITH CHECK, its USING expression is used for new rows too. The updated row would have owner_id 99, which doesn't match the current user, so the update is refused with an error."
+/>
+
+<Exercise
+  language="sql"
+  title="Isolate the tenants"
+  starter={`CREATE TABLE tasks (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id integer NOT NULL,
+  title text NOT NULL,
+  done boolean NOT NULL DEFAULT false
+);
+INSERT INTO tasks (tenant_id, title) VALUES
+  (1, 'Write the brief'), (2, 'Order bamboo'),
+  (1, 'Review the design'), (2, 'Fix the kite'),
+  (3, 'Plan the launch'), (1, 'Ship it');
+
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tasks TO app_user;
+
+-- Your RLS setup goes here.
+
+-- Test: a request from tenant 1
+SET ROLE app_user;
+SELECT set_config('app.tenant_id', '1', false);
+SELECT id, title FROM tasks ORDER BY id;
+`}
+  tests={[
+    { name: "RLS is enabled and forced on tasks", check: "(await query(\"SELECT relrowsecurity AND relforcerowsecurity AS ok FROM pg_class WHERE relname = 'tasks'\"))[0].ok === true" },
+    { name: "Tenant 1 sees exactly its 3 tasks", check: "rows.map(r => r.title).join() === 'Write the brief,Review the design,Ship it'" },
+    { name: "Tenant 2 sees its own 2 tasks", check: "await (async () => { await query('RESET ROLE'); await query('SET ROLE app_user'); await query(\"SELECT set_config('app.tenant_id', '2', false)\"); const r = await query('SELECT title FROM tasks ORDER BY id'); await query('RESET ROLE'); return r.map(x => x.title).join() === 'Order bamboo,Fix the kite'; })()" },
+    { name: "No tenant set (or an empty setting) means no rows, not an error", check: "await (async () => { await query('RESET ROLE'); await query('SET ROLE app_user'); await query(\"SELECT set_config('app.tenant_id', '', false)\"); const r = await query('SELECT count(*) AS n FROM tasks').then(x => x[0].n, () => -1); await query('RESET ROLE'); return r === 0; })()" },
+    { name: "Tenant 1 can't insert a task for tenant 2", check: "await (async () => { await query('RESET ROLE'); await query('SET ROLE app_user'); await query(\"SELECT set_config('app.tenant_id', '1', false)\"); const allowed = await query(\"INSERT INTO tasks (tenant_id, title) VALUES (1, 'Mine')\").then(() => true, () => false); const refused = await query(\"INSERT INTO tasks (tenant_id, title) VALUES (2, 'Sneaky')\").then(() => false, () => true); return allowed && refused; })()" },
+    { name: "Tenant 1 can't change tenant 2's tasks or move its own to tenant 2", check: "await (async () => { await query('RESET ROLE'); await query('SET ROLE app_user'); await query(\"SELECT set_config('app.tenant_id', '1', false)\"); const other = await query(\"UPDATE tasks SET done = true WHERE id = 2 RETURNING id\"); await query('RESET ROLE'); const untouched = (await query('SELECT done FROM tasks WHERE id = 2'))[0].done === false; await query('SET ROLE app_user'); const moved = await query('UPDATE tasks SET tenant_id = 2 WHERE id = 1').then(() => false, () => true); return other.length === 0 && untouched && moved; })()" },
+  ]}
+>
+
+A project tool keeps every customer company's tasks in one table, separated by `tenant_id`. The app connects as `app_user` and sets `app.tenant_id` for each request. Make the database enforce the separation:
+
+1. Enable **and force** row-level security on `tasks`.
+2. Add a policy for `app_user` so that it can only see, insert, update and delete rows of the tenant in `app.tenant_id`, and can't move a row to another tenant.
+3. If `app.tenant_id` is missing **or empty**, the app must see **no rows** (and get no error).
+
+Keep the test at the end: tenant 1 should see its 3 tasks.
+
+<Hint>
+
+One policy covers everything: `CREATE POLICY tenant_isolation ON tasks TO app_user USING (…) WITH CHECK (…);` with the same condition in both: `tenant_id = nullif(current_setting('app.tenant_id', true), '')::integer`. Then `ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;` and `ALTER TABLE tasks FORCE ROW LEVEL SECURITY;`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE tasks (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id integer NOT NULL,
+  title text NOT NULL,
+  done boolean NOT NULL DEFAULT false
+);
+INSERT INTO tasks (tenant_id, title) VALUES
+  (1, 'Write the brief'), (2, 'Order bamboo'),
+  (1, 'Review the design'), (2, 'Fix the kite'),
+  (3, 'Plan the launch'), (1, 'Ship it');
+
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tasks TO app_user;
+
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON tasks
+  TO app_user
+  USING (
+    tenant_id = nullif(current_setting('app.tenant_id', true), '')::integer
+  )
+  WITH CHECK (
+    tenant_id = nullif(current_setting('app.tenant_id', true), '')::integer
+  );
+
+CREATE INDEX tasks_tenant ON tasks (tenant_id);
+
+-- Test: a request from tenant 1
+SET ROLE app_user;
+SELECT set_config('app.tenant_id', '1', false);
+SELECT id, title FROM tasks ORDER BY id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **`ENABLE ROW LEVEL SECURITY`** turns a table into deny-by-default; **policies** say which rows each role may use. Superusers, `BYPASSRLS` roles and the **owner** (unless you **`FORCE`** it) bypass RLS.
+- **`USING`** filters existing rows (invisible rows can't be updated or deleted); **`WITH CHECK`** validates new rows and raises an error. Permissive policies combine with `OR`, `RESTRICTIVE` ones with `AND`.
+- Identify the user with a setting: `set_config('app.user_id', …, true)` per transaction, read with `nullif(current_setting('app.user_id', true), '')`, so a missing user sees nothing.
+- Watch for bypasses: views (use `security_invoker`), `SECURITY DEFINER` functions, unique and foreign key checks. Index the policy columns.
+- Test policies with **`SET ROLE`** and different users, like any other security code.

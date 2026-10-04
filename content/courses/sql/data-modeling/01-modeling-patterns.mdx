@@ -1,0 +1,484 @@
+---
+title: Modelling Patterns
+description: Soft deletes, history tables, trees stored two ways, and when to pick JSONB, real columns or EAV, with the trade-offs each one brings.
+duration: 22
+xp: 30
+---
+
+In Level 1 you normalised tables until every fact lived in exactly one place. Real products soon ask harder questions. "The customer deleted their account, but we still need their old invoices." "What did this tea cost last March?" "Show every category under Food, however deep." "Each product type has different attributes." There's a well-known **pattern** for each of these, and each pattern has a cost. This lesson covers the four you'll meet most often, and how to choose between the options. 🧱
+
+## Soft deletes
+
+A **hard delete** removes the row. In a real shop that often isn't allowed, and the database itself will stop you when other rows still point at it:
+
+<CodeExample output={`ERROR:  update or delete on table "customers" violates foreign key constraint "orders_customer_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".`}>
+
+```sql
+DELETE FROM customers
+WHERE id = 1;
+```
+
+</CodeExample>
+
+Mei's orders reference her row, so the foreign key refuses. A **soft delete** keeps the row and marks it as gone instead. A nullable timestamp works better than a boolean, because it also records *when* the row was deleted:
+
+<CodeExample output={`ALTER TABLE
+
+UPDATE 1
+
+CREATE VIEW
+
+ stored | active
+--------+--------
+     20 |     19
+(1 row)`}>
+
+```sql
+ALTER TABLE customers
+  ADD COLUMN deleted_at timestamptz;
+
+UPDATE customers
+SET deleted_at = '2025-07-01 10:00+00'
+WHERE id = 1;
+
+-- What the rest of the app should read
+CREATE VIEW active_customers AS
+SELECT id, name, email, city, country, joined_on
+FROM customers
+WHERE deleted_at IS NULL;
+
+SELECT count(*) AS stored,
+  (SELECT count(*) FROM active_customers) AS active
+FROM customers;
+```
+
+</CodeExample>
+
+The view does the hard part. With soft deletes, **every** query must remember `WHERE deleted_at IS NULL`, and the one that forgets will show deleted data, send emails to deleted users or count them in revenue. Point the application at the view (or use the row-level security you'll meet in the security module) so that forgetting isn't possible.
+
+### Unique values only among live rows
+
+Soft deletes break `UNIQUE`. The deleted Mei still owns `mei@pandadev.test`, so she can never sign up again with her own email. The fix is a **partial unique index**: it enforces uniqueness only over the rows that match its `WHERE`:
+
+<CodeExample output={`ALTER TABLE
+
+ALTER TABLE
+
+CREATE INDEX
+
+UPDATE 1
+
+INSERT 0 1
+
+ERROR:  duplicate key value violates unique constraint "customers_email_live"
+DETAIL:  Key (email)=(mei@pandadev.test) already exists.`}>
+
+```sql
+ALTER TABLE customers ADD COLUMN deleted_at timestamptz;
+ALTER TABLE customers DROP CONSTRAINT customers_email_key;
+
+CREATE UNIQUE INDEX customers_email_live
+  ON customers (email)
+  WHERE deleted_at IS NULL;
+
+UPDATE customers SET deleted_at = '2025-07-01' WHERE id = 1;
+
+-- Mei comes back: allowed, the old row is deleted
+INSERT INTO customers (name, email, country, joined_on)
+VALUES ('Mei Lin', 'mei@pandadev.test', 'UK', '2025-07-02');
+
+-- A second live account with the same email: refused
+INSERT INTO customers (name, email, country, joined_on)
+VALUES ('Mei Again', 'mei@pandadev.test', 'UK', '2025-07-03');
+```
+
+</CodeExample>
+
+### Or: move deleted rows to an archive
+
+The alternative is to really delete the row but keep a copy in an **archive table**. One statement can do both, because `DELETE … RETURNING` can feed an `INSERT` inside a CTE:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+         title          | year
+------------------------+------
+ The Great Bamboo Race  | 2014
+ Midnight in the Forest | 2015
+(2 rows)`}>
+
+```sql
+CREATE TABLE movies_archive (
+  LIKE movies,
+  archived_at timestamptz NOT NULL DEFAULT now()
+);
+
+WITH gone AS (
+  DELETE FROM movies
+  WHERE year < 2016
+  RETURNING *
+)
+INSERT INTO movies_archive
+SELECT * FROM gone;
+
+SELECT title, year
+FROM movies_archive
+ORDER BY year;
+```
+
+</CodeExample>
+
+| | Soft delete (`deleted_at`) | Archive table |
+| --- | --- | --- |
+| Undo a delete | One `UPDATE` | Copy the row back |
+| Everyday queries | Must filter (use a view) | Nothing to remember |
+| Foreign keys | Keep working | The live table must allow it |
+| Table and index size | Grows with deleted rows | Live table stays small |
+
+<Callout type="warning" title="Soft delete isn't erasure">
+
+Privacy laws like the GDPR give people the right to have their data **erased**. A row with `deleted_at` set still contains the name, email and address. Plan a real deletion path too: delete the row, or **anonymise** it (`name = 'Deleted user'`, `email = 'deleted-' || id || '@invalid'`) while keeping the ids the invoices need.
+
+</Callout>
+
+## History: what was true, and when
+
+`products.price` holds today's price only. Change it, and the old one is gone. Two patterns keep history:
+
+1. **Snapshot the value where it's used.** The sample database already does this: `order_items.unit_price` copies the price at the moment of the order, so old orders keep their totals when prices change. Do this for anything legally or financially frozen: prices on invoices, addresses on shipments, tax rates.
+2. **A history table with validity ranges.** Each row says "this value was true **during** this period". A `daterange` with an open end means "still true now":
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 5
+
+     name      | price
+---------------+-------
+ Jasmine Tea   |  5.90
+ Matcha Powder | 13.00
+(2 rows)
+
+ product_id | price
+------------+-------
+          1 |  6.50
+          2 | 14.00
+(2 rows)`}>
+
+```sql
+CREATE TABLE price_history (
+  product_id integer NOT NULL REFERENCES products (id),
+  price numeric(8, 2) NOT NULL,
+  valid daterange NOT NULL
+);
+
+INSERT INTO price_history (product_id, price, valid) VALUES
+  (1, 5.90, '[2024-01-01,2025-03-01)'),
+  (1, 6.50, '[2025-03-01,)'),
+  (2, 12.00, '[2024-01-01,2025-02-01)'),
+  (2, 13.00, '[2025-02-01,2025-05-01)'),
+  (2, 14.00, '[2025-05-01,)');
+
+-- Prices as they were on 15 February 2025
+SELECT p.name, h.price
+FROM price_history AS h
+JOIN products AS p ON p.id = h.product_id
+WHERE h.valid @> date '2025-02-15'
+ORDER BY p.id;
+
+-- Current prices: the ranges with no end yet
+SELECT product_id, price
+FROM price_history
+WHERE upper_inf(valid)
+ORDER BY product_id;
+```
+
+</CodeExample>
+
+`@>` means "contains", and `[` / `)` mean "start included, end excluded", so `[2025-02-01,2025-05-01)` and `[2025-05-01,)` touch without overlapping. Changing a price becomes two writes in **one transaction**: close the open range, then insert the new one:
+
+```sql
+BEGIN;
+UPDATE price_history
+SET valid = daterange(lower(valid), '2025-07-01')
+WHERE product_id = 1 AND upper_inf(valid);
+
+INSERT INTO price_history (product_id, price, valid)
+VALUES (1, 6.90, '[2025-07-01,)');
+COMMIT;
+```
+
+Nothing above stops two rows for the same product from overlapping. You'll add that rule with an **exclusion constraint** in the next lesson. PostgreSQL 18 also adds SQL-standard **temporal keys**, `PRIMARY KEY (product_id, valid WITHOUT OVERLAPS)`, and foreign keys with `PERIOD`. For a plain `integer` column they need the `btree_gist` extension, which this in-browser database doesn't have.
+
+<Callout type="note" title="Audit log or temporal table?">
+
+An **audit log** (built with a trigger in Level 2) records *who changed what and when*: great for investigations, awkward to query ("what was the price on 15 Feb?" means replaying changes). A **temporal table** stores *what was true when* and answers as-of questions with one `WHERE`. Many systems have both.
+
+</Callout>
+
+## Hierarchies: two ways to store a tree
+
+Categories, folders, comment threads and org charts are all **trees**. The simplest way to store one is the **adjacency list**: each row points at its parent, exactly like `employees.manager_id`. Reading a whole subtree then needs a recursive CTE (you wrote these in Level 2):
+
+<CodeExample output={`       org_chart
+-----------------------
+ Alan Turing
+   Ada Lovelace
+   Barbara Liskov
+     Linus Park
+     Margaret Hamilton
+     Ken Thompson
+(6 rows)`}>
+
+```sql
+WITH RECURSIVE team AS (
+  SELECT id, name, 0 AS depth
+  FROM employees
+  WHERE name = 'Alan Turing'
+  UNION ALL
+  SELECT e.id, e.name, t.depth + 1
+  FROM employees AS e
+  JOIN team AS t ON e.manager_id = t.id
+)
+SELECT repeat('  ', depth) || name AS org_chart
+FROM team
+ORDER BY depth, id;
+```
+
+</CodeExample>
+
+The adjacency list is easy to write to (moving a team means changing one `manager_id`), but every subtree read walks the tree level by level. When reads dominate, store the **materialised path** instead: each row keeps the ids from the root down to itself. An `integer[]` array works well (it sorts numerically, unlike a text path where `'1.10'` sorts before `'1.2'`):
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 7
+
+      tree
+-----------------
+ Shop
+   Food & drink
+     Tea
+       Green tea
+     Snacks
+   Home
+     Kitchen
+(7 rows)
+
+   name
+-----------
+ Tea
+ Green tea
+ Snacks
+(3 rows)
+
+              breadcrumb
+---------------------------------------
+ Shop > Food & drink > Tea > Green tea
+(1 row)`}>
+
+```sql
+CREATE TABLE categories (
+  id integer PRIMARY KEY,
+  name text NOT NULL,
+  path integer[] NOT NULL  -- ids from the root to this row
+);
+
+INSERT INTO categories (id, name, path) VALUES
+  (1, 'Shop', '{1}'),
+  (2, 'Food & drink', '{1,2}'),
+  (3, 'Tea', '{1,2,3}'),
+  (4, 'Green tea', '{1,2,3,4}'),
+  (5, 'Snacks', '{1,2,5}'),
+  (6, 'Home', '{1,6}'),
+  (7, 'Kitchen', '{1,6,7}');
+
+-- The whole tree, in order, indented by depth
+SELECT repeat('  ', cardinality(path) - 1) || name AS tree
+FROM categories
+ORDER BY path;
+
+-- Everything under 'Food & drink' (id 2), at any depth
+SELECT name
+FROM categories
+WHERE path @> ARRAY[2] AND id <> 2
+ORDER BY path;
+
+-- The breadcrumb for 'Green tea': its ancestors
+SELECT string_agg(a.name, ' > ' ORDER BY cardinality(a.path))
+  AS breadcrumb
+FROM categories AS c
+JOIN categories AS a ON a.id = ANY (c.path)
+WHERE c.id = 4;
+```
+
+</CodeExample>
+
+Every question is now a single, non-recursive query, and `path @> ARRAY[2]` can use a **GIN index** on `path`. The price is paid on writes: moving "Tea" under "Home" means rewriting the path of Tea **and every descendant**, in one transaction.
+
+| Pattern | Read a subtree | Move a subtree | Notes |
+| --- | --- | --- | --- |
+| Adjacency list (`parent_id`) | Recursive CTE | Update one row | Simple, always consistent; the default |
+| Materialised path | One indexed query | Update every descendant | Great for read-heavy trees (categories, folders) |
+| Closure table | One join | Many rows change | A row for every ancestor–descendant pair |
+
+The `ltree` extension gives PostgreSQL a dedicated path type with fast operators. It isn't available in this browser database, but it's worth a look on a real server.
+
+## Flexible attributes: columns, JSONB or EAV
+
+A kettle has a capacity and a colour; a book has an author and pages; a toy has an age range. How do you store attributes that differ per product? There are three options.
+
+**Real columns** are the best choice whenever you know the attributes: they have types, constraints, statistics and simple queries. Adding a nullable column is instant (as you'll see in the migrations lesson), so "we might add attributes later" isn't a reason to avoid them.
+
+**EAV** (entity–attribute–value) stores one row per attribute: `(product_id, attribute, value)`. It looks infinitely flexible, but every value is `text` (no types, no `CHECK`, no foreign keys), and every attribute you want to read is another join. It's widely seen as an **anti-pattern** for anything but sparse, user-defined data.
+
+**JSONB** keeps the flexible part in one typed, indexable document per row:
+
+<CodeExample output={`ALTER TABLE
+
+UPDATE 1
+
+UPDATE 1
+
+UPDATE 1
+
+    name     | colour | litres
+-------------+--------+--------
+ Tea Pot     | blue   |    1.2
+ Rice Cooker | white  |    1.8
+(2 rows)
+
+    name
+-------------
+ Plush Panda
+(1 row)`}>
+
+```sql
+ALTER TABLE products
+  ADD COLUMN specs jsonb NOT NULL DEFAULT '{}';
+
+UPDATE products SET specs = '{"litres": 1.8, "colour": "white"}'
+WHERE name = 'Rice Cooker';
+UPDATE products SET specs = '{"litres": 1.2, "colour": "blue"}'
+WHERE name = 'Tea Pot';
+UPDATE products SET specs = '{"colour": "black", "washable": true}'
+WHERE name = 'Plush Panda';
+
+SELECT name,
+  specs ->> 'colour' AS colour,
+  (specs ->> 'litres')::numeric AS litres
+FROM products
+WHERE specs ? 'litres'
+ORDER BY id;
+
+SELECT name
+FROM products
+WHERE specs @> '{"washable": true}';
+```
+
+</CodeExample>
+
+A good rule: **core, queried, constrained fields are columns; the long tail is JSONB.** When one JSON key becomes important, promote it to a real column (a generated column, coming up in the next lesson, can do it without changing the writers). You can also guard JSONB with `CHECK` constraints: `CHECK (jsonb_typeof(specs -> 'litres') = 'number')` rejects `"litres": "1.8"` but still allows products without that key (the check is NULL for them, and only `false` fails a `CHECK`).
+
+| | Real columns | JSONB | EAV |
+| --- | --- | --- | --- |
+| Types and constraints | Full | `CHECK` only | None (all text) |
+| Query | Simple | Operators (`->>`, `@>`) | A join per attribute |
+| Indexes | B-tree on anything | GIN on the document | Weak |
+| New attribute | `ALTER TABLE` (fast) | Just write it | Just write it |
+
+<Callout type="tip" title="A real incident pattern">
+
+Teams that put everything in one `data jsonb` column usually discover it the day someone stores `"price": "12.50"` (a string) next to `"price": 12.5` (a number), and every report silently drops half the rows. If a field matters to the business, give it a column and a type.
+
+</Callout>
+
+<Quiz
+  question="Customers are soft deleted with deleted_at. What keeps emails unique among live customers while letting a deleted customer sign up again?"
+  options={["UNIQUE (email, deleted_at)", "A unique index on email WHERE deleted_at IS NULL", "A CHECK constraint on email", "A view that filters deleted rows"]}
+  answer={1}
+  explanation="A partial unique index only covers rows matching its WHERE, so deleted rows don't count. UNIQUE (email, deleted_at) fails because NULLs are distinct: two live rows with the same email would both have deleted_at NULL and be allowed."
+/>
+
+<Quiz
+  question="Your category tree is read thousands of times per second and almost never reorganised. Which model fits best?"
+  options={["Adjacency list with a recursive CTE on every read", "Materialised path (an array of ancestor ids) with a GIN index", "EAV", "One table per level of the tree"]}
+  answer={1}
+  explanation="A materialised path turns subtree and breadcrumb reads into single indexed queries. Its cost, rewriting descendants when a subtree moves, barely matters when moves are rare."
+/>
+
+<Exercise
+  language="sql"
+  title="Retire products, softly"
+  starter={`-- 1. Add a nullable timestamptz column retired_at to products.
+
+-- 2. Retire 'Earl Grey' and 'Clean Python' (set retired_at).
+
+-- 3. Create a view on_sale (id, name, category, price) of the
+--    products that are not retired.
+
+-- 4. Names must be unique among products that aren't retired,
+--    ignoring case. A retired product's name may be reused.
+
+-- 5. Show the view, cheapest first.
+SELECT * FROM products;
+`}
+  tests={[
+    { name: "products has a timestamptz column retired_at", check: "(await query(\"SELECT data_type FROM information_schema.columns WHERE table_name = 'products' AND column_name = 'retired_at'\"))[0]?.data_type === 'timestamp with time zone'" },
+    { name: "Exactly Earl Grey and Clean Python are retired", check: "(await query(\"SELECT string_agg(name, ',' ORDER BY id) AS s FROM products WHERE retired_at IS NOT NULL\"))[0].s === 'Earl Grey,Clean Python'" },
+    { name: "The view on_sale has id, name, category, price and 13 rows", check: "(await query(\"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) AS s FROM information_schema.columns WHERE table_name = 'on_sale'\"))[0].s === 'id,name,category,price' && (await query(\"SELECT count(*) AS n FROM on_sale\"))[0].n === 13" },
+    { name: "The last query shows on_sale, cheapest first", check: "/on_sale/i.test(lastQuery) && rows.length === 13 && rows.every((r, i) => i === 0 || rows[i - 1].price <= r.price) && rows[0].name === 'Rice Crackers'" },
+    { name: "A second live 'jasmine tea' is refused (case-insensitive)", check: "await query(\"INSERT INTO products (name, category, price) VALUES ('jasmine tea', 'tea', 7)\").then(() => false, () => true)" },
+    { name: "A retired name can be reused", check: "await query(\"INSERT INTO products (name, category, price) VALUES ('Earl Grey', 'tea', 5.5)\").then(() => true, () => false)" },
+    { name: "Newly retired products disappear from the view", check: "(await rerun(\"UPDATE products SET retired_at = '2025-07-01' WHERE name IN ('Kite', 'Tea Pot')\")).length === 11" },
+  ]}
+>
+
+The shop stops selling a product now and then, but old orders still point at it, so it can't be deleted. Give `products` a soft delete:
+
+1. Add a nullable `timestamptz` column `retired_at`.
+2. Retire **Earl Grey** and **Clean Python** (any timestamp, e.g. `'2025-07-01'`).
+3. Create a view **`on_sale`** with the columns `id, name, category, price` of the products that aren't retired.
+4. Make product names unique among products that aren't retired, **ignoring case**, while a retired name can be reused.
+5. Finish with a query on `on_sale`, cheapest first.
+
+<Hint>
+
+Step 4 is a unique index that is both an **expression** index and a **partial** index: `CREATE UNIQUE INDEX … ON products (lower(name)) WHERE retired_at IS NULL;`. Step 5: `SELECT * FROM on_sale ORDER BY price, id;`.
+
+</Hint>
+
+<Solution>
+
+```sql
+ALTER TABLE products
+  ADD COLUMN retired_at timestamptz;
+
+UPDATE products
+SET retired_at = '2025-07-01'
+WHERE name IN ('Earl Grey', 'Clean Python');
+
+CREATE VIEW on_sale AS
+SELECT id, name, category, price
+FROM products
+WHERE retired_at IS NULL;
+
+CREATE UNIQUE INDEX products_name_on_sale
+  ON products (lower(name))
+  WHERE retired_at IS NULL;
+
+SELECT *
+FROM on_sale
+ORDER BY price, id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Soft deletes** (`deleted_at timestamptz`) keep rows that other rows reference. Hide them behind a **view**, keep uniqueness with a **partial unique index**, and still plan real erasure for privacy laws. An **archive table** filled by `DELETE … RETURNING` is the alternative.
+- Keep **history** by snapshotting values where they're used (`order_items.unit_price`) or with **validity ranges** (`daterange`, `@>`, `upper_inf`); change a value by closing the old range and opening a new one in one transaction.
+- Trees: the **adjacency list** is simple and cheap to change but needs recursive reads; a **materialised path** (`integer[]`, `@>`, GIN) makes reads one query but moves rewrite descendants.
+- Flexible attributes: **columns** for what matters, **JSONB** for the long tail, and avoid **EAV** unless the attributes really are user-defined.

@@ -1,0 +1,582 @@
+---
+title: JSONB and Arrays
+description: Store lists and flexible documents in PostgreSQL with arrays and JSONB, query them with operators like ->>, @> and ANY, build JSON for APIs, and know when a GIN index helps.
+duration: 25
+xp: 25
+---
+
+So far every value has been a single number, string or date: one value per cell. PostgreSQL can also store **several values in one cell**: an **array** (`{vegan,quick}`) or a whole **JSON document** (`{"type": "purchase", "items": [2, 5]}`).
+
+That's useful in two directions. **Out**: aggregate rows into a list or a JSON document that your app or API can send straight to the browser. **In**: keep flexible data, like event payloads or settings, whose shape changes too often for fixed columns. This lesson covers both, plus the indexes that keep them fast. 🧺
+
+## Rows into lists: array_agg and string_agg
+
+Two aggregates turn the rows of a group into one value. **`string_agg(text, separator)`** joins text, and **`array_agg(value)`** builds an array. Both take an `ORDER BY` inside the brackets to control the order of the items:
+
+<CodeExample output={` category |    ids     |                    cheapest_first
+----------+------------+-------------------------------------------------------
+ books    | {7,9,8}    | The Bamboo Code, Clean Python, Algorithms in Pictures
+ kitchen  | {14,13,15} | Bamboo Chopsticks, Tea Pot, Rice Cooker
+ snacks   | {6,4,5}    | Rice Crackers, Bamboo Crisps, Panda Cookies
+ tea      | {3,1,2}    | Earl Grey, Jasmine Tea, Matcha Powder
+ toys     | {11,12,10} | Wooden Puzzle, Kite, Plush Panda
+(5 rows)`}>
+
+```sql
+SELECT category,
+  array_agg(id ORDER BY price) AS ids,
+  string_agg(name, ', ' ORDER BY price) AS cheapest_first
+FROM products
+GROUP BY category
+ORDER BY category;
+```
+
+</CodeExample>
+
+PostgreSQL prints arrays in curly braces: `{14,13,15}`. Text items that contain spaces or commas get double quotes in that printout, like `{"Earl Grey",Kite}`. Without the `ORDER BY` inside the aggregate the items come in whatever order the rows happened to arrive, so add it whenever order matters (it usually does).
+
+## Array columns
+
+A column can hold an array of any type: `text[]`, `integer[]`, `date[]`. Tags are the classic example:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+       title       |         tags         | first_tag | tag_count
+-------------------+----------------------+-----------+-----------
+ Bamboo stir-fry   | {vegan,quick,wok}    | vegan     |         3
+ Dumpling soup     | {comfort,soup}       | comfort   |         2
+ Matcha cookies    | {vegan,baking,sweet} | vegan     |         3
+ Green tea noodles | {quick,vegan}        | quick     |         2
+(4 rows)`}>
+
+```sql
+CREATE TABLE recipes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  tags text[] NOT NULL DEFAULT '{}'
+);
+
+INSERT INTO recipes (title, tags) VALUES
+  ('Bamboo stir-fry', ARRAY['vegan', 'quick', 'wok']),
+  ('Dumpling soup', ARRAY['comfort', 'soup']),
+  ('Matcha cookies', ARRAY['vegan', 'baking', 'sweet']),
+  ('Green tea noodles', ARRAY['quick', 'vegan']);
+
+SELECT title, tags, tags[1] AS first_tag,
+  cardinality(tags) AS tag_count
+FROM recipes
+ORDER BY id;
+```
+
+</CodeExample>
+
+Write arrays with **`ARRAY[...]`** (or as the text `'{vegan,quick}'`). Get one item with **`tags[1]`**. Careful: PostgreSQL arrays start at **1**, not 0, and asking for an item that doesn't exist gives `NULL`, not an error. **`cardinality(tags)`** counts the items.
+
+## Searching arrays: ANY, @> and &&
+
+Three ways to ask "which recipes have this tag?":
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+       title
+-------------------
+ Bamboo stir-fry
+ Green tea noodles
+ Matcha cookies
+(3 rows)
+
+       title
+-------------------
+ Bamboo stir-fry
+ Green tea noodles
+(2 rows)
+
+     title
+----------------
+ Dumpling soup
+ Matcha cookies
+(2 rows)`}>
+
+```sql
+CREATE TABLE recipes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  tags text[] NOT NULL DEFAULT '{}'
+);
+
+INSERT INTO recipes (title, tags) VALUES
+  ('Bamboo stir-fry', ARRAY['vegan', 'quick', 'wok']),
+  ('Dumpling soup', ARRAY['comfort', 'soup']),
+  ('Matcha cookies', ARRAY['vegan', 'baking', 'sweet']),
+  ('Green tea noodles', ARRAY['quick', 'vegan']);
+
+-- has this one tag
+SELECT title FROM recipes
+WHERE 'vegan' = ANY (tags)
+ORDER BY title;
+
+-- has ALL of these tags (contains)
+SELECT title FROM recipes
+WHERE tags @> ARRAY['vegan', 'quick']
+ORDER BY title;
+
+-- has ANY of these tags (overlaps)
+SELECT title FROM recipes
+WHERE tags && ARRAY['soup', 'sweet']
+ORDER BY title;
+```
+
+</CodeExample>
+
+- **`value = ANY (array)`** is true if the value equals at least one item. It's also how apps pass a list of ids as **one** parameter: `WHERE id = ANY ($1)`.
+- **`@>`** means "contains": the left array has every item of the right one.
+- **`&&`** means "overlaps": the arrays share at least one item.
+
+## Lists back into rows: unnest
+
+**`unnest(array)`** does the opposite of `array_agg`: it turns each item into a row. Used in `FROM`, it gives one row per (recipe, tag) pair, ready for a normal `GROUP BY`:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+   tag   | recipes
+---------+---------
+ vegan   |       3
+ quick   |       2
+ baking  |       1
+ comfort |       1
+ soup    |       1
+ sweet   |       1
+ wok     |       1
+(7 rows)`}>
+
+```sql
+CREATE TABLE recipes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  tags text[] NOT NULL DEFAULT '{}'
+);
+
+INSERT INTO recipes (title, tags) VALUES
+  ('Bamboo stir-fry', ARRAY['vegan', 'quick', 'wok']),
+  ('Dumpling soup', ARRAY['comfort', 'soup']),
+  ('Matcha cookies', ARRAY['vegan', 'baking', 'sweet']),
+  ('Green tea noodles', ARRAY['quick', 'vegan']);
+
+SELECT tag, count(*) AS recipes
+FROM recipes
+CROSS JOIN unnest(tags) AS tag
+GROUP BY tag
+ORDER BY recipes DESC, tag;
+```
+
+</CodeExample>
+
+That's a tag cloud in five lines. `unnest(tags) WITH ORDINALITY AS t (tag, position)` adds each item's position, if you need it.
+
+<Callout type="note" title="Arrays or a separate table?">
+
+An array column is handy for small lists that belong to one row and are read together (tags, a few phone numbers). But you can't put a foreign key on array items, and changing one item rewrites the whole array. If items need their own data, integrity or frequent updates ("tags have colours and owners"), use a separate table with one row per item: the normalised design from Level 1.
+
+</Callout>
+
+## JSONB: documents inside a column
+
+**JSON** is the format apps and APIs speak. PostgreSQL has two JSON types:
+
+- **`json`** stores the text exactly as given (spaces, key order, even duplicate keys) and re-reads it every time.
+- **`jsonb`** ("JSON binary") parses it once into an efficient binary form: faster to query, indexable, and it removes duplicate keys (the last one wins) and keeps keys in its own order.
+
+<CodeExample output={`         as_json          |     as_jsonb
+--------------------------+------------------
+ {"b": 1, "a": 2, "a": 3} | {"a": 3, "b": 1}
+(1 row)`}>
+
+```sql
+SELECT '{"b": 1, "a": 2, "a": 3}'::json AS as_json,
+  '{"b": 1, "a": 2, "a": 3}'::jsonb AS as_jsonb;
+```
+
+</CodeExample>
+
+Use **`jsonb`** unless you must keep the exact original text. Let's store some app **events**, the kind every analytics system collects, where each event type has its own fields:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 5
+
+ id |   type_json   |  type_text  |   os    | os_again
+----+---------------+-------------+---------+----------
+  1 | "page_view"   | page_view   | ios     | ios
+  2 | "add_to_cart" | add_to_cart | ios     | ios
+  3 | "purchase"    | purchase    | ios     | ios
+  4 | "page_view"   | page_view   | android | android
+  5 | "purchase"    | purchase    | web     | web
+(5 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  happened_at timestamp NOT NULL,
+  payload jsonb NOT NULL
+);
+
+INSERT INTO events (happened_at, payload) VALUES
+  ('2025-06-01 09:00', '{"type": "page_view", "page": "/tea",
+    "device": {"os": "ios"}}'),
+  ('2025-06-01 09:02', '{"type": "add_to_cart", "product_id": 2,
+    "qty": 1, "device": {"os": "ios"}}'),
+  ('2025-06-01 09:05', '{"type": "purchase", "total": 28.00,
+    "items": [2, 5], "coupon": "PANDA10", "device": {"os": "ios"}}'),
+  ('2025-06-01 10:30', '{"type": "page_view", "page": "/books",
+    "device": {"os": "android"}}'),
+  ('2025-06-01 11:15', '{"type": "purchase", "total": 89.90,
+    "items": [15], "device": {"os": "web"}}');
+
+SELECT id,
+  payload -> 'type' AS type_json,
+  payload ->> 'type' AS type_text,
+  payload -> 'device' ->> 'os' AS os,
+  payload #>> '{device,os}' AS os_again
+FROM events
+ORDER BY id;
+```
+
+</CodeExample>
+
+The operators to remember:
+
+- **`->`** gets a field (or an array item by number, from 0) **as `jsonb`**. That's why `type_json` keeps its quotes: it's still JSON.
+- **`->>`** gets it **as `text`**. Use it for comparing, displaying and casting.
+- Chain them to go deeper: `payload -> 'device' ->> 'os'`. Or give **`#>>`** a path: `payload #>> '{device,os}'`.
+
+Missing fields don't cause errors; they give `NULL`, like a missing array item.
+
+## Filtering JSONB: ->>, @> and ?
+
+Here are the three usual ways to filter. Every snippet that runs here starts from a fresh database, so this one creates the `events` table again:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 5
+
+ id | with_vat
+----+----------
+  3 |    33.60
+  5 |   107.88
+(2 rows)
+
+ id |    type
+----+-------------
+  1 | page_view
+  2 | add_to_cart
+  3 | purchase
+(3 rows)
+
+ id | coupon
+----+---------
+  3 | PANDA10
+(1 row)
+
+ id | product_id
+----+------------
+  3 |          2
+  3 |          5
+  5 |         15
+(3 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  happened_at timestamp NOT NULL,
+  payload jsonb NOT NULL
+);
+
+INSERT INTO events (happened_at, payload) VALUES
+  ('2025-06-01 09:00', '{"type": "page_view", "page": "/tea",
+    "device": {"os": "ios"}}'),
+  ('2025-06-01 09:02', '{"type": "add_to_cart", "product_id": 2,
+    "qty": 1, "device": {"os": "ios"}}'),
+  ('2025-06-01 09:05', '{"type": "purchase", "total": 28.00,
+    "items": [2, 5], "coupon": "PANDA10", "device": {"os": "ios"}}'),
+  ('2025-06-01 10:30', '{"type": "page_view", "page": "/books",
+    "device": {"os": "android"}}'),
+  ('2025-06-01 11:15', '{"type": "purchase", "total": 89.90,
+    "items": [15], "device": {"os": "web"}}');
+
+-- compare a field as text, cast to calculate
+SELECT id,
+  round((payload ->> 'total')::numeric * 1.2, 2) AS with_vat
+FROM events
+WHERE payload ->> 'type' = 'purchase'
+ORDER BY id;
+
+-- containment: does the document include this piece?
+SELECT id, payload ->> 'type' AS type
+FROM events
+WHERE payload @> '{"device": {"os": "ios"}}'
+ORDER BY id;
+
+-- key exists
+SELECT id, payload ->> 'coupon' AS coupon
+FROM events
+WHERE payload ? 'coupon';
+
+-- one row per item of a JSON array
+SELECT e.id, item::int AS product_id
+FROM events AS e
+CROSS JOIN jsonb_array_elements_text(e.payload -> 'items') AS item
+ORDER BY e.id, product_id;
+```
+
+</CodeExample>
+
+- `->>` always returns text, so **cast** before doing maths or comparing numbers: `(payload ->> 'total')::numeric`. Comparing numbers as text gives surprises (`'9' > '10'` is true).
+- **`@>`** (contains) checks that the right-hand document is "inside" the left one, nesting included. It's the operator a GIN index speeds up, as you'll see below.
+- **`?`** checks that a top-level key exists.
+- **`jsonb_array_elements_text`** (or `jsonb_array_elements`, which keeps the items as `jsonb`) unnests a JSON array into rows.
+
+<Quiz
+  question={"payload is {\"total\": 28.00}. Which expression gives a number you can add 5 to?"}
+  options={[
+    "payload -> 'total' + 5",
+    "(payload ->> 'total')::numeric + 5",
+    "payload ->> 'total' + 5",
+    "payload @> 'total' + 5",
+  ]}
+  answer={1}
+  explanation="->> returns the value as text, and ::numeric turns that text into a number. -> returns jsonb, which has no + operator, and @> is a containment test that returns true or false."
+/>
+
+## Building JSON for an API
+
+The other direction is just as useful: let the database shape the JSON your API returns. **`jsonb_build_object(key, value, ...)`** builds an object, and **`jsonb_agg(value)`** aggregates rows into a JSON array:
+
+<CodeExample output={`                        customer_json
+--------------------------------------------------------------
+ {"name": "Mei Lin", "orders": [17, 34], "cancelled": 1}
+ {"name": "Sam Ortiz", "orders": [5, 22, 39], "cancelled": 1}
+ {"name": "Ada Brooks", "orders": [10, 27], "cancelled": 0}
+(3 rows)`}>
+
+```sql
+SELECT jsonb_build_object(
+    'name', c.name,
+    'orders', jsonb_agg(o.id ORDER BY o.id),
+    'cancelled', count(*) FILTER (WHERE o.status = 'cancelled')
+  ) AS customer_json
+FROM customers AS c
+JOIN orders AS o ON o.customer_id = c.id
+WHERE c.id <= 3
+GROUP BY c.id
+ORDER BY c.id;
+```
+
+</CodeExample>
+
+One query, one round trip, and the result is ready to send. Nest `jsonb_build_object` inside `jsonb_agg` to get an array of objects, and use `to_jsonb(row)` to turn a whole row into an object with a key per column. **`jsonb_object_agg(key, value)`** builds one object from many rows, like `{"tea": 3, "toys": 3}`.
+
+## Changing JSONB
+
+You can't edit part of a value in place; you build a new document and store it:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 1
+
+UPDATE 1
+
+UPDATE 1
+
+                              prefs
+-----------------------------------------------------------------
+ {"theme": "dark", "notify": {"email": false}, "language": "en"}
+(1 row)`}>
+
+```sql
+CREATE TABLE settings (
+  user_id integer PRIMARY KEY,
+  prefs jsonb NOT NULL
+);
+
+INSERT INTO settings VALUES
+  (1, '{"theme": "dark", "notify": {"email": true}, "beta": true}');
+
+UPDATE settings
+SET prefs = jsonb_set(prefs, '{notify,email}', 'false')
+WHERE user_id = 1;
+
+UPDATE settings
+SET prefs = (prefs - 'beta') || '{"language": "en"}'
+WHERE user_id = 1;
+
+SELECT prefs FROM settings;
+```
+
+</CodeExample>
+
+- **`jsonb_set(doc, path, new_value)`** replaces the value at a path (the new value must be JSON, hence `'false'`, or `'"text"'` with inner quotes for a string).
+- **`||`** merges two objects (keys on the right win), and **`-`** removes a key. Mind the brackets: `-` binds more tightly than `||`, so `prefs || '{...}' - 'beta'` fails with "operator is not unique".
+
+## Indexes for JSONB and arrays: GIN
+
+A normal B-tree index sorts whole values, which is no help for "does this document contain `{"os": "ios"}`?". For that, PostgreSQL has **GIN** (Generalised Inverted Index), which indexes every key and value **inside** each document or array, like the index at the back of a book. You'll learn to read query plans properly in the next module, but here's a preview with 20,000 events:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE INDEX
+
+ANALYZE
+
+                           QUERY PLAN
+----------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on big_events
+         Recheck Cond: (payload @> '{"user_id": 7}'::jsonb)
+         ->  Bitmap Index Scan on big_events_payload_idx
+               Index Cond: (payload @> '{"user_id": 7}'::jsonb)
+(5 rows)
+
+                         QUERY PLAN
+-------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on big_events
+         Filter: ((payload ->> 'user_id'::text) = '7'::text)
+(3 rows)`}>
+
+```sql
+CREATE TABLE big_events AS
+SELECT jsonb_build_object(
+  'type', (ARRAY['page_view', 'add_to_cart', 'purchase'])[g % 3 + 1],
+  'user_id', g % 1000
+) AS payload
+FROM generate_series(1, 20000) AS g;
+
+CREATE INDEX big_events_payload_idx
+  ON big_events USING gin (payload);
+ANALYZE big_events;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM big_events WHERE payload @> '{"user_id": 7}';
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM big_events WHERE payload ->> 'user_id' = '7';
+```
+
+</CodeExample>
+
+The `@>` query uses the index (**Bitmap Index Scan on big_events_payload_idx**). The `->>` query, which asks the same question, reads **every row** (**Seq Scan**), because a GIN index on `payload` supports `@>`, `?`, `?|` and `?&`, not `->>` comparisons. So:
+
+- Filter JSONB with **`@>`** when you rely on a GIN index. `USING gin (payload jsonb_path_ops)` makes a smaller, faster index that supports only `@>`.
+- For one hot field, a normal **expression index** works too: `CREATE INDEX ON events ((payload ->> 'type'))`, which helps `WHERE payload ->> 'type' = 'purchase'`.
+- Arrays get GIN indexes the same way: `CREATE INDEX ON recipes USING gin (tags)` speeds up `@>` and `&&`.
+
+<Callout type="warning" title="JSONB is not a free pass on design">
+
+It's tempting to put everything in one `jsonb` column and skip table design. Don't. JSONB has no `NOT NULL`, no foreign keys and no types per field unless you add `CHECK` constraints; the planner has poor statistics about what's inside; and every update rewrites the whole document. A good rule: fields you **filter, join or sort on**, or that **every row has**, deserve real columns. JSONB is for the genuinely variable part: event payloads, third-party webhooks, user settings. Level 3's data modelling module compares JSONB, columns and EAV designs in depth.
+
+</Callout>
+
+Play with the events: count purchases per device OS, sum the totals, or build a JSON summary with `jsonb_object_agg`.
+
+<TryIt language="sql" code={`CREATE TABLE events (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  payload jsonb NOT NULL
+);
+
+INSERT INTO events (payload) VALUES
+  ('{"type": "page_view", "device": {"os": "ios"}}'),
+  ('{"type": "purchase", "total": 28.00, "device": {"os": "ios"}}'),
+  ('{"type": "page_view", "device": {"os": "android"}}'),
+  ('{"type": "purchase", "total": 89.90, "device": {"os": "web"}}'),
+  ('{"type": "purchase", "total": 12.50, "device": {"os": "ios"}}');
+
+SELECT payload #>> '{device,os}' AS os,
+  count(*) AS events,
+  count(*) FILTER (WHERE payload @> '{"type": "purchase"}')
+    AS purchases,
+  sum((payload ->> 'total')::numeric) AS revenue
+FROM events
+GROUP BY os
+ORDER BY os;`} />
+
+<Quiz
+  question="A table has a GIN index on its jsonb column payload. Which filter can use that index?"
+  options={[
+    "WHERE payload ->> 'type' = 'purchase'",
+    "WHERE payload @> '{\"type\": \"purchase\"}'",
+    "WHERE (payload ->> 'total')::numeric > 50",
+    "WHERE payload::text LIKE '%purchase%'",
+  ]}
+  answer={1}
+  explanation="A default GIN index on a jsonb column supports containment (@>) and key-exists (?, ?|, ?&). The ->> comparisons need an expression index on that field instead, and LIKE on the text form can't use either."
+/>
+
+<Exercise
+  language="sql"
+  title="A JSON product catalogue"
+  starter={`-- One row per category with its products as a JSON array
+SELECT category, count(*) AS product_count
+FROM products
+GROUP BY category
+ORDER BY category;`}
+  tests={[
+    { name: "Columns are category, product_count, products", check: "columns.join() === 'category,product_count,products'" },
+    { name: "One row per category, sorted", check: "rows.map(r => r.category + ':' + r.product_count).join() === 'books:3,kitchen:3,snacks:3,tea:3,toys:3'" },
+    { name: "products is a JSON array of objects with name, price and in_stock", check: "rows.every(r => Array.isArray(r.products) && r.products.every(p => Object.keys(p).sort().join() === 'in_stock,name,price'))" },
+    { name: "Most expensive first", check: "rows.find(r => r.category === 'tea').products.map(p => p.name).join() === 'Matcha Powder,Jasmine Tea,Earl Grey'" },
+    { name: "price is a number and in_stock a boolean", check: "(p => p.name === 'Earl Grey' && p.price === 5.25 && p.in_stock === false)(rows.find(r => r.category === 'tea').products[2])" },
+    { name: "Works when the catalogue changes", check: "(await rerun(\"INSERT INTO products (name, category, price, stock) VALUES ('Gyokuro', 'tea', 21.00, 3)\")).find(r => r.category === 'tea').products.map(p => p.name + ':' + p.in_stock).join() === 'Gyokuro:true,Matcha Powder:true,Jasmine Tea:true,Earl Grey:false'" },
+  ]}
+>
+
+The shop's new mobile app wants the catalogue as JSON, straight from the database. Return one row per category with:
+
+- `category` and `product_count`,
+- `products`: a **JSON array** of objects, one per product, each with exactly three keys: `name`, `price` (a number) and `in_stock` (`true` if `stock > 0`, a JSON boolean),
+- the products in each array sorted by price, **most expensive first**,
+- rows sorted by category.
+
+For tea, `products` should look like `[{"name": "Matcha Powder", "price": 14.00, "in_stock": true}, ...]`.
+
+<Hint>
+
+Inside the `GROUP BY category` query, add `jsonb_agg(jsonb_build_object('name', name, 'price', price, 'in_stock', stock > 0) ORDER BY price DESC) AS products`. A boolean expression like `stock > 0` becomes a JSON `true` or `false` automatically.
+
+</Hint>
+
+<Solution>
+
+```sql
+SELECT category,
+  count(*) AS product_count,
+  jsonb_agg(
+    jsonb_build_object(
+      'name', name,
+      'price', price,
+      'in_stock', stock > 0
+    )
+    ORDER BY price DESC
+  ) AS products
+FROM products
+GROUP BY category
+ORDER BY category;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **`array_agg(x ORDER BY ...)`** and **`string_agg(text, ', ' ORDER BY ...)`** turn a group's rows into a list; **`unnest(array)`** turns a list back into rows.
+- Array columns (`text[]`) start at index **1**; search them with `x = ANY (arr)`, `@>` (contains all) and `&&` (overlaps).
+- Prefer **`jsonb`** over `json`. **`->`** returns `jsonb`, **`->>`** returns `text` (cast it for maths), **`#>>`** follows a path; missing keys give `NULL`.
+- Filter with `->>`, **`@>`** (containment) and **`?`** (key exists); expand JSON arrays with `jsonb_array_elements(_text)`.
+- Build API-ready JSON with **`jsonb_build_object`**, **`jsonb_agg`** and `to_jsonb(row)`; change it with `jsonb_set`, `||` and `-`.
+- **GIN** indexes make `@>` and `?` fast on `jsonb` and arrays; use expression indexes for `->>` filters. Keep fields you filter, join or sort on in real columns.

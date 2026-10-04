@@ -1,0 +1,494 @@
+---
+title: MVCC, VACUUM and Long Transactions
+description: See how PostgreSQL keeps several versions of every row, why UPDATE never overwrites in place, what VACUUM and autovacuum clean up, and how one forgotten transaction bloats a whole database.
+duration: 25
+xp: 30
+---
+
+A team noticed their `sessions` table was getting slow. It had about 10,000 rows, yet it took **9 GB** on disk, and even `SELECT count(*)` took seconds. Rows were updated every few seconds (each session's `last_seen_at`), which is normal. What wasn't normal: a developer had opened a transaction in a SQL console **three weeks earlier**, run one query and gone on holiday with the window open. That single idle transaction stopped PostgreSQL from cleaning up **any** old row versions in the whole database. Ending it and running `VACUUM` brought things back to normal; getting the disk space back took a maintenance window. 🧹
+
+To understand how one idle session can do that, you need the machinery under every transaction in PostgreSQL: **MVCC**, multi-version concurrency control.
+
+## Every row has hidden columns
+
+Every table has **system columns** you don't see with `SELECT *`, but can ask for by name:
+
+- **`xmin`**: the id of the transaction that **created** this row version,
+- **`xmax`**: the id of the transaction that **deleted or locked** it (0 if none),
+- **`ctid`**: the version's physical address: (page number, slot on the page).
+
+Every transaction that changes something gets a **transaction id** (xid), a number that keeps counting up. Let's look:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+ ctid  | xmin | xmax | id | hits
+-------+------+------+----+------
+ (0,1) | 754  | 0    |  1 |    0
+ (0,2) | 754  | 0    |  2 |    0
+ (0,3) | 754  | 0    |  3 |    0
+(3 rows)`}>
+
+```sql
+CREATE TABLE counters (
+  id integer PRIMARY KEY,
+  hits integer NOT NULL
+);
+INSERT INTO counters VALUES (1, 0), (2, 0), (3, 0);
+
+SELECT ctid, xmin, xmax, id, hits
+FROM counters
+ORDER BY id;
+```
+
+</CodeExample>
+
+All three rows were created by the same transaction (the `INSERT`), so they share one `xmin`, and they sit in slots 1 to 3 of page 0. (The xid numbers depend on how many transactions the server has run before, so yours will differ on a real server. What matters is how they relate.)
+
+## UPDATE writes a new version
+
+Now the key fact of this lesson. PostgreSQL **never changes a row in place**. An `UPDATE` writes a **new version** of the row and marks the old one as deleted by setting its `xmax`:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+UPDATE 1
+
+ ctid  | xmin | xmax | id | hits
+-------+------+------+----+------
+ (0,1) | 754  | 0    |  1 |    0
+ (0,4) | 755  | 0    |  2 |    1
+ (0,3) | 754  | 0    |  3 |    0
+(3 rows)`}>
+
+```sql
+CREATE TABLE counters (
+  id integer PRIMARY KEY,
+  hits integer NOT NULL
+);
+INSERT INTO counters VALUES (1, 0), (2, 0), (3, 0);
+
+UPDATE counters SET hits = hits + 1 WHERE id = 2;
+
+SELECT ctid, xmin, xmax, id, hits
+FROM counters
+ORDER BY id;
+```
+
+</CodeExample>
+
+Row 2 now lives in **slot 4** with a new `xmin` (the `UPDATE`'s transaction). Slot 2 still holds the old version with `hits = 0`, its `xmax` set to the same transaction. Nobody can see it with a query any more, but it takes up space on the page: it's a **dead tuple** ("tuple" is PostgreSQL's word for a row version). A `DELETE` works the same way: it only sets `xmax`, and the row stays on disk until it is cleaned up.
+
+Why such a roundabout design? Because it makes reads and writes independent. A transaction that started **before** the update still needs the **old** version, and it's right there.
+
+## Snapshots: who sees which version
+
+When a statement (in read committed) or a transaction (in repeatable read) starts, it takes a **snapshot**: a note of which transactions had committed at that moment. A row version is visible to you if:
+
+- the transaction in its `xmin` **committed before your snapshot** (or it's your own transaction), and
+- its `xmax` is 0, or belongs to a transaction that **aborted** or that **hadn't committed** when your snapshot was taken.
+
+That's how the timelines of the last two lessons work:
+
+```text
+A: BEGIN ISOLATION LEVEL REPEATABLE READ;
+A: SELECT hits FROM counters WHERE id = 2;  -- 0 (snapshot taken)
+                                B: UPDATE counters SET hits = 1
+                                     WHERE id = 2;   -- new version
+                                B: COMMIT;
+A: SELECT hits FROM counters WHERE id = 2;  -- still 0: B's version
+                                            -- is newer than A's
+                                            -- snapshot
+A: COMMIT;
+```
+
+No locks were needed for A to read a consistent picture while B wrote: each just looks at a different version. That's the "readers never block writers" rule from the last lesson.
+
+An **aborted** transaction leaves traces too. Its versions stay on disk, but their xid is marked as aborted, so everyone ignores them:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+BEGIN
+
+UPDATE 1
+
+ROLLBACK
+
+ ctid  | xmin | xmax | id | hits
+-------+------+------+----+------
+ (0,1) | 754  | 0    |  1 |    0
+ (0,2) | 754  | 0    |  2 |    0
+ (0,3) | 754  | 755  |  3 |    0
+(3 rows)`}>
+
+```sql
+CREATE TABLE counters (
+  id integer PRIMARY KEY,
+  hits integer NOT NULL
+);
+INSERT INTO counters VALUES (1, 0), (2, 0), (3, 0);
+
+BEGIN;
+UPDATE counters SET hits = 99 WHERE id = 3;
+ROLLBACK;
+
+SELECT ctid, xmin, xmax, id, hits
+FROM counters
+ORDER BY id;
+```
+
+</CodeExample>
+
+Row 3 has a non-zero `xmax`, yet it's alive with `hits = 0`: the transaction that tried to replace it rolled back. That's also why `ROLLBACK` is instant in PostgreSQL, however much work the transaction did: nothing has to be undone, the versions just never become visible.
+
+<Callout type="tip" title="A trick built on xmax: inserted or updated?">
+
+An `INSERT … ON CONFLICT DO UPDATE` writes the updated version with its `xmax` set (the row was locked during the conflict), while a freshly inserted row has `xmax = 0`. So `RETURNING (xmax = 0) AS inserted` has been a popular way to tell the two apart. It relies on an implementation detail, though. PostgreSQL 18 added a documented way: **`RETURNING old.*, new.*`**, where `old` is NULL for an inserted row. You'll use it in the exercise.
+
+</Callout>
+
+## Dead tuples and table bloat
+
+Every `UPDATE` leaves a dead tuple behind. Update every row of a table once, and it holds **two** versions of each row. Watch the size of a 20,000-row table:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 20000
+
+ before
+--------
+ 712 kB
+(1 row)
+
+UPDATE 20000
+
+ after_update
+--------------
+ 1416 kB
+(1 row)
+
+DO
+
+ n_live_tup | n_dead_tup
+------------+------------
+      20000 |      20000
+(1 row)`}>
+
+```sql
+CREATE TABLE visits (id integer, hits integer);
+INSERT INTO visits SELECT g, 0 FROM generate_series(1, 20000) AS g;
+
+SELECT pg_size_pretty(pg_relation_size('visits')) AS before;
+
+UPDATE visits SET hits = hits + 1;
+
+SELECT pg_size_pretty(pg_relation_size('visits')) AS after_update;
+
+-- statistics are sent in batches; publish them now
+DO $$ BEGIN PERFORM pg_stat_force_next_flush(); END $$;
+
+SELECT n_live_tup, n_dead_tup
+FROM pg_stat_user_tables
+WHERE relname = 'visits';
+```
+
+</CodeExample>
+
+The table doubled, and `pg_stat_user_tables` counts 20,000 **dead tuples**: old versions nobody can see any more. Extra size isn't just disk space: every sequential scan reads the dead tuples too, and indexes point at them. A table with a lot of dead space is called **bloated**.
+
+## VACUUM cleans up
+
+**`VACUUM`** finds dead tuples that **no running transaction can still need**, and marks their space as free for new versions. It doesn't usually give the space back to the operating system; it makes it **reusable**:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 20000
+
+UPDATE 20000
+
+DO
+
+VACUUM
+
+ n_dead_tup |  size
+------------+---------
+          0 | 1416 kB
+(1 row)
+
+UPDATE 20000
+
+  size
+---------
+ 1416 kB
+(1 row)
+
+VACUUM
+
+  size
+--------
+ 712 kB
+(1 row)`}>
+
+```sql
+CREATE TABLE visits (id integer, hits integer);
+INSERT INTO visits SELECT g, 0 FROM generate_series(1, 20000) AS g;
+UPDATE visits SET hits = hits + 1;
+DO $$ BEGIN PERFORM pg_stat_force_next_flush(); END $$;
+
+VACUUM visits;
+SELECT n_dead_tup,
+  pg_size_pretty(pg_relation_size('visits')) AS size
+FROM pg_stat_user_tables
+WHERE relname = 'visits';
+
+-- the next full update reuses the freed space
+UPDATE visits SET hits = hits + 1;
+SELECT pg_size_pretty(pg_relation_size('visits')) AS size;
+
+-- VACUUM FULL rewrites the table compactly
+VACUUM FULL visits;
+SELECT pg_size_pretty(pg_relation_size('visits')) AS size;
+```
+
+</CodeExample>
+
+- After `VACUUM`, no dead tuples are left, but the file is the same size.
+- The next full `UPDATE` doesn't grow the table at all: the new versions go into the space `VACUUM` freed. A table that's vacuumed regularly settles at a stable size.
+- **`VACUUM FULL`** writes a brand-new, compact copy of the table and gives the space back. It takes an **`ACCESS EXCLUSIVE`** lock for the whole time, which blocks even `SELECT`s, so on a busy production table it's an outage. Teams use the `pg_repack` extension instead, which does the same online.
+
+`VACUUM` has other jobs too: it updates the **visibility map** (which lets index-only scans skip the table) and **freezes** old rows, which brings us to a scary word.
+
+### Transaction id wraparound
+
+Transaction ids are 32-bit numbers, so they run out after about 4 billion and **wrap around**. To keep "older" meaning older, `VACUUM` **freezes** rows whose `xmin` is old enough, marking them as visible to everyone forever. If freezing falls too far behind (because vacuum can't run or keeps getting cancelled), PostgreSQL warns loudly and, in the end, **refuses new transactions** to protect your data. Several well-known companies have had multi-hour outages from this. Monitoring is one query: `SELECT datname, age(datfrozenxid) FROM pg_database;` and alert when it passes a few hundred million.
+
+## Autovacuum
+
+Nobody runs `VACUUM` by hand on a schedule any more. The **autovacuum** daemon watches the statistics and vacuums a table when its dead tuples exceed a threshold:
+
+<CodeExample output={`              name              | setting
+--------------------------------+---------
+ autovacuum                     | on
+ autovacuum_naptime             | 60
+ autovacuum_vacuum_scale_factor | 0.2
+ autovacuum_vacuum_threshold    | 50
+(4 rows)`}>
+
+```sql
+SELECT name, setting
+FROM pg_settings
+WHERE name IN ('autovacuum', 'autovacuum_vacuum_threshold',
+  'autovacuum_vacuum_scale_factor', 'autovacuum_naptime')
+ORDER BY name;
+```
+
+</CodeExample>
+
+A table is vacuumed when `dead tuples > threshold + scale_factor × rows`: 50 + 20% of the table. For a 1,000-row table that's 250 dead rows, great. For a **100-million-row** table it's 20 million dead rows before anything happens, which is far too late. The fix is per-table settings for the big, busy tables:
+
+```sql
+ALTER TABLE events SET (
+  autovacuum_vacuum_scale_factor = 0.01,  -- 1% instead of 20%
+  autovacuum_vacuum_cost_limit = 2000     -- let it work faster
+);
+```
+
+<Callout type="warning" title="Never turn autovacuum off">
+
+When autovacuum shows up in `pg_stat_activity` during a busy period, it's tempting to disable it. Don't: the dead tuples keep piling up, queries slow down, and eventually wraparound protection forces an emergency vacuum at the worst possible time. If autovacuum can't keep up, make it **more** aggressive, not less.
+
+</Callout>
+
+## HOT updates and fillfactor
+
+There's one more trick that saves a lot of work. If an `UPDATE` changes **no indexed column** and the new version **fits on the same page**, PostgreSQL makes a **HOT** update (heap-only tuple): the indexes aren't touched at all, and the old version can be cleaned up on the spot by later reads of that page, without waiting for `VACUUM`.
+
+To leave room on each page for HOT updates, set a lower **`fillfactor`** for tables that are updated a lot. Compare the same update on two tables:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 10000
+
+INSERT 0 10000
+
+ packed_before | roomy_before
+---------------+--------------
+ 360 kB        | 712 kB
+(1 row)
+
+UPDATE 10000
+
+UPDATE 10000
+
+DO
+
+ relname | n_tup_upd | n_tup_hot_upd |  size
+---------+-----------+---------------+--------
+ packed  |     10000 |             0 | 712 kB
+ roomy   |     10000 |         10000 | 712 kB
+(2 rows)`}>
+
+```sql
+CREATE TABLE packed (id integer PRIMARY KEY, hits integer);
+CREATE TABLE roomy (id integer PRIMARY KEY, hits integer)
+  WITH (fillfactor = 50);
+INSERT INTO packed SELECT g, 0 FROM generate_series(1, 10000) AS g;
+INSERT INTO roomy SELECT g, 0 FROM generate_series(1, 10000) AS g;
+
+SELECT pg_size_pretty(pg_relation_size('packed')) AS packed_before,
+  pg_size_pretty(pg_relation_size('roomy')) AS roomy_before;
+
+UPDATE packed SET hits = hits + 1;
+UPDATE roomy SET hits = hits + 1;
+
+DO $$ BEGIN PERFORM pg_stat_force_next_flush(); END $$;
+SELECT relname, n_tup_upd, n_tup_hot_upd,
+  pg_size_pretty(pg_relation_size(relid)) AS size
+FROM pg_stat_user_tables
+WHERE relname IN ('packed', 'roomy')
+ORDER BY relname;
+```
+
+</CodeExample>
+
+`packed` fills its pages completely, so no new version fits next to its old one: none of its updates is HOT, every one also wrote a new entry into the primary key index, and the table doubled. `roomy` starts out twice as big (each page half empty), but every one of its updates is HOT, and it doesn't grow at all. For a table like `sessions`, updated constantly on a non-indexed column, that's exactly the trade you want. It's also a reason to think twice before indexing a column that changes all the time: it makes HOT updates impossible.
+
+## Long transactions: the silent killer
+
+Back to the opening story. `VACUUM` may only remove a dead tuple when **no running transaction could still need it**. PostgreSQL tracks the oldest snapshot still in use, the **xmin horizon**. Anything deleted after that point must be kept, in **every** table of the database, because that old transaction might still read any of them:
+
+```text
+09:00  A: BEGIN; SELECT ... ;   -- then the developer goes to lunch
+09:00 - 17:00  the app updates 2 million rows across many tables
+               autovacuum runs every minute, and removes... nothing:
+               every dead tuple is newer than A's snapshot
+17:00  tables have grown, queries are slower
+17:05  A: ROLLBACK;            -- horizon moves, VACUUM can finally clean
+```
+
+The usual causes, roughly in order of how often they bite:
+
+- **Idle in transaction**: an app or console that ran `BEGIN` and never finished (a forgotten `commit()`, an HTTP call inside the transaction, a crashed worker holding its connection).
+- **Long-running queries** on the primary: a huge report, a `pg_dump`, a migration's backfill in one transaction.
+- **Abandoned replication slots** and replicas with `hot_standby_feedback` running long queries: they hold the horizon back too.
+
+The defence is configuration plus monitoring:
+
+```sql
+-- End sessions that sit idle inside a transaction
+ALTER DATABASE shop SET idle_in_transaction_session_timeout = '5min';
+-- Cap a single statement, and (PostgreSQL 17+) a whole transaction
+ALTER ROLE app SET statement_timeout = '30s';
+ALTER ROLE app SET transaction_timeout = '5min';
+
+-- The oldest open transactions right now
+SELECT pid, usename, state, now() - xact_start AS open_for,
+  left(query, 50) AS query
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+ORDER BY xact_start
+LIMIT 5;
+```
+
+A dashboard tile with "oldest transaction age" and an alert at, say, 30 minutes would have caught the three-week transaction on day one.
+
+<Quiz
+  question="A table with 1,000 rows has every row updated once. VACUUM has not run yet. How many row versions does the table hold, and why?"
+  options={["1,000, because UPDATE changes rows in place", "2,000, because each UPDATE wrote a new version and the old one stays until VACUUM removes it", "1,000, because ROLLBACK segments store the old values elsewhere", "500, because PostgreSQL compresses identical rows"]}
+  answer={1}
+  explanation="PostgreSQL's MVCC never overwrites a row: UPDATE writes a new version and sets xmax on the old one. The old versions are dead tuples until VACUUM finds that no transaction needs them and marks their space as reusable."
+/>
+
+<Quiz
+  question="Autovacuum runs every minute, yet dead tuples keep growing in every table of the database. What is the most likely cause?"
+  options={["The tables have no primary key", "A long-running or idle-in-transaction session is holding back the xmin horizon", "autovacuum_naptime is too short", "Too many indexes"]}
+  answer={1}
+  explanation="VACUUM can only remove versions that no running transaction might still need. One old snapshot anywhere in the database keeps every newer dead tuple alive in every table. Find it in pg_stat_activity by xact_start and end it."
+/>
+
+<Exercise
+  language="sql"
+  title="Sync the price list without useless versions"
+  starter={`CREATE TABLE prices (
+  sku text PRIMARY KEY,
+  price numeric(8, 2) NOT NULL
+);
+INSERT INTO prices VALUES
+  ('tea-jasmine', 6.50),
+  ('tea-matcha', 14.00),
+  ('tea-earl-grey', 5.25);
+
+-- Today's list from the supplier: apply it in one statement
+INSERT INTO prices (sku, price) VALUES
+  ('tea-jasmine', 6.50),
+  ('tea-matcha', 15.00),
+  ('tea-oolong', 9.00)
+ON CONFLICT (sku) DO UPDATE SET price = excluded.price
+RETURNING sku, price;`}
+  tests={[
+    { name: "Returns the columns sku, price, inserted", check: "columns.join() === 'sku,price,inserted'" },
+    { name: "Returns only what changed: matcha updated, oolong inserted", check: "rows.map(r => r.sku + ' ' + r.price + ' ' + r.inserted).sort().join() === 'tea-matcha 15 false,tea-oolong 9 true'" },
+    { name: "The table ends up with the new prices", check: "(await query(\"SELECT string_agg(sku || '=' || price, ',' ORDER BY sku) AS s FROM prices\"))[0].s === 'tea-earl-grey=5.25,tea-jasmine=6.50,tea-matcha=15.00,tea-oolong=9.00'" },
+    { name: "Unchanged rows get no new version (same xmin as an untouched row)", check: "(await query(\"SELECT count(DISTINCT xmin::text) AS n FROM prices WHERE sku IN ('tea-jasmine', 'tea-earl-grey')\"))[0].n === 1" },
+    { name: "Running the same list again changes nothing and returns nothing", check: "(await rerun()).length === 0" },
+    { name: "Works for new changes: a price edited in between is restored", check: "(await rerun(\"UPDATE prices SET price = 1 WHERE sku = 'tea-oolong'\")).map(r => r.sku + ' ' + r.price + ' ' + r.inserted).join() === 'tea-oolong 9 false'" },
+    { name: "Works for new changes: a deleted product is inserted again", check: "(await rerun(\"DELETE FROM prices WHERE sku = 'tea-matcha'\")).map(r => r.sku + ' ' + r.inserted).join() === 'tea-matcha true'" },
+  ]}
+>
+
+Every morning a job applies the supplier's price list with an upsert. It works, but it **updates every row in the list**, even when the price didn't change. On the real table (200,000 products, about 1% changing per day) that's 200,000 new row versions and 198,000 dead tuples a day for nothing, plus a report that can't tell what actually happened. Change the statement so that:
+
+1. a row whose price is **the same** is not updated at all (no new version), using a `WHERE` on the `DO UPDATE`,
+2. it returns `sku`, `price` and `inserted`: `true` for a new product, `false` for an updated one. Unchanged rows aren't returned, because they weren't touched.
+
+Use `IS DISTINCT FROM` rather than `<>` in the comparison, so it also works if a price can ever be NULL.
+
+<Hint>
+
+`ON CONFLICT (sku) DO UPDATE SET price = excluded.price WHERE prices.price IS DISTINCT FROM excluded.price` updates only real changes (inside `DO UPDATE`, `prices` is the existing row and `excluded` the proposed one). For the flag, PostgreSQL 18 lets `RETURNING` use `old` and `new`: `old.sku IS NULL AS inserted` is true when there was no old row. (`xmax = 0 AS inserted` works too.)
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE prices (
+  sku text PRIMARY KEY,
+  price numeric(8, 2) NOT NULL
+);
+INSERT INTO prices VALUES
+  ('tea-jasmine', 6.50),
+  ('tea-matcha', 14.00),
+  ('tea-earl-grey', 5.25);
+
+INSERT INTO prices (sku, price) VALUES
+  ('tea-jasmine', 6.50),
+  ('tea-matcha', 15.00),
+  ('tea-oolong', 9.00)
+ON CONFLICT (sku) DO UPDATE SET price = excluded.price
+WHERE prices.price IS DISTINCT FROM excluded.price
+RETURNING new.sku, new.price, old.sku IS NULL AS inserted;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Every row version carries **`xmin`** (who created it), **`xmax`** (who deleted or locked it) and a **`ctid`** (where it lives).
+- **`UPDATE` writes a new version** and `DELETE` only sets `xmax`; the old versions become **dead tuples**. `ROLLBACK` is instant because aborted versions are simply ignored.
+- **Snapshots** decide which versions each statement or transaction sees, so readers and writers never block each other.
+- **`VACUUM`** makes dead tuples' space reusable, updates the visibility map and **freezes** old rows to prevent xid wraparound. `VACUUM FULL` shrinks the file but locks the table completely.
+- **Autovacuum** does this automatically; tune `autovacuum_vacuum_scale_factor` down for big, busy tables, and never turn it off.
+- **HOT updates** skip the indexes when no indexed column changes and the page has room; a lower **`fillfactor`** leaves that room.
+- One **long or idle transaction** holds back the xmin horizon and stops cleanup in the whole database: set `idle_in_transaction_session_timeout`, watch `pg_stat_activity` and alert on old transactions.
+- Don't write versions you don't need: skip no-op updates with `WHERE … IS DISTINCT FROM …`.
+
+That's the engine room of PostgreSQL concurrency. Next up in Level 3 is advanced data modelling.

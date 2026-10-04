@@ -1,0 +1,413 @@
+---
+title: Views and Materialized Views
+description: Save queries as views that behave like tables, keep them in sync with your data, and cache expensive results in materialized views you refresh on your terms.
+duration: 20
+xp: 25
+---
+
+By now you can write long, clever queries: joins, groups, window functions. Then the same 12-line "order totals" query turns up in the dashboard, the invoice job, the admin page and three reports. Someone fixes a bug in one copy (cancelled orders shouldn't count!), and the other five quietly keep the bug. 😬
+
+A **view** gives a query a name, so you write it once and use it everywhere like a table. A **materialized view** goes further and stores the result, so an expensive query runs once instead of on every page load. This module is about packaging logic inside the database: views first, then functions and triggers.
+
+## Creating a view
+
+`CREATE VIEW name AS` followed by any `SELECT` saves that query under a name:
+
+<CodeExample output={`CREATE VIEW
+
+ order_id | customer_id |  status   | total
+----------+-------------+-----------+--------
+        2 |          15 | shipped   | 200.17
+       17 |           1 | shipped   | 200.17
+       32 |           4 | shipped   | 200.17
+        5 |           2 | delivered | 149.73
+(4 rows)`}>
+
+```sql
+CREATE VIEW order_totals AS
+SELECT o.id AS order_id,
+  o.customer_id,
+  o.ordered_at,
+  o.status,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+GROUP BY o.id;
+
+SELECT order_id, customer_id, status, total
+FROM order_totals
+ORDER BY total DESC, order_id
+LIMIT 4;
+```
+
+</CodeExample>
+
+From the outside, `order_totals` looks exactly like a table: you can select columns from it, filter it with `WHERE`, sort it, group it and join it to other tables. The people using it don't need to know there's a join and a `GROUP BY` inside.
+
+Views are great for:
+
+- **Reuse**: one definition of "order total" or "active customer" for the whole team.
+- **Simplicity**: analysts query `order_totals` instead of re-deriving it.
+- **A stable interface**: you can reorganise the tables underneath and keep the view's columns the same, so reports don't break.
+- **Security**: a view can show some columns (no emails, no salaries) and some rows, and users can be allowed to read the view but not the table. You'll do this in the security module.
+
+## A view stores the query, not the data
+
+A plain view holds **no rows**. Every time you query it, PostgreSQL runs the saved query on the current data, so a view is always up to date:
+
+<CodeExample output={`CREATE VIEW
+
+ order_id | total
+----------+--------
+        1 | 102.00
+(1 row)
+
+INSERT 0 1
+
+ order_id | total
+----------+--------
+        1 | 191.90
+(1 row)`}>
+
+```sql
+CREATE VIEW order_totals AS
+SELECT o.id AS order_id, sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+GROUP BY o.id;
+
+SELECT * FROM order_totals WHERE order_id = 1;
+
+-- Add a rice cooker to order 1
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (1, 15, 1, 89.90);
+
+SELECT * FROM order_totals WHERE order_id = 1;
+```
+
+</CodeExample>
+
+Because a view is just a saved query, it costs nothing to store and it's never stale. It also isn't any **faster** than the query inside it. When you query a view, the planner **inlines** its definition into your query and plans the whole thing together, so `WHERE order_id = 1` can still use the primary key index of `orders`. A view that hides a slow query is still a slow query.
+
+You can find a view's definition with `pg_get_viewdef('order_totals')`, or in the `information_schema.views` catalog view (in psql, `\d+ order_totals` shows it).
+
+### Views on views
+
+Views can use other views. A `customer_stats` view can build on `order_totals`, and each layer stays short and readable:
+
+<CodeExample output={`CREATE VIEW
+
+CREATE VIEW
+
+    name     | orders | spent
+-------------+--------+--------
+ Ravi Patel  |      3 | 282.23
+ Sam Ortiz   |      2 | 273.83
+ Sofia Rossi |      3 | 260.13
+(3 rows)`}>
+
+```sql
+CREATE VIEW order_totals AS
+SELECT o.id AS order_id, o.customer_id, o.status,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+GROUP BY o.id;
+
+CREATE VIEW customer_stats AS
+SELECT c.id, c.name,
+  count(*) AS orders,
+  sum(t.total) AS spent
+FROM customers AS c
+JOIN order_totals AS t ON t.customer_id = c.id
+WHERE t.status <> 'cancelled'
+GROUP BY c.id;
+
+SELECT name, orders, spent
+FROM customer_stats
+ORDER BY spent DESC, name
+LIMIT 3;
+```
+
+</CodeExample>
+
+Don't stack them too deep, though. Five layers of views on views make it hard to see what a query really does, and easy to join the same tables several times without noticing.
+
+## Changing and dropping views
+
+**`CREATE OR REPLACE VIEW`** updates a view's query, with one restriction: the new version must keep the existing columns, with the same names and types, in the same order. It may only **add** columns at the end. Anything else needs `DROP VIEW` and `CREATE VIEW`.
+
+PostgreSQL also tracks **dependencies**: it won't let you break a view by dropping something it uses:
+
+<CodeExample output={`CREATE VIEW
+
+ERROR:  cannot drop column status of table orders because other objects depend on it
+DETAIL:  view order_summary depends on column status of table orders
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.`}>
+
+```sql
+CREATE VIEW order_summary AS
+SELECT id, customer_id, status
+FROM orders;
+
+ALTER TABLE orders DROP COLUMN status;
+```
+
+</CodeExample>
+
+That's a feature: the alternative would be a view that fails at 3 a.m. when the nightly report runs. `CASCADE` would drop the view along with the column, which is rarely what you want. Instead, drop or change the view first, then the column, then recreate the view, ideally in one migration inside a transaction.
+
+<Callout type="warning" title="SELECT * in a view is frozen">
+
+`CREATE VIEW v AS SELECT * FROM products` expands the `*` **once**, when the view is created. Columns added to `products` later won't appear in the view. List the columns explicitly in views, so what the view returns is written down and reviewable.
+
+</Callout>
+
+## Updatable views and WITH CHECK OPTION
+
+A **simple view**, one that selects from a single table without `GROUP BY`, `DISTINCT`, aggregates, `UNION` or `LIMIT`, is automatically **updatable**: `INSERT`, `UPDATE` and `DELETE` on the view change the underlying table.
+
+Let's try it on a small `teas` table. That raises a question: what if you insert a row through the view that the view itself wouldn't show? By default PostgreSQL allows it, and the row "disappears" into the table. **`WITH CHECK OPTION`** forbids it:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+CREATE VIEW
+
+UPDATE 1
+
+UPDATE 0
+
+INSERT 0 1
+
+ in_view
+---------
+       0
+(1 row)
+
+CREATE VIEW
+
+ERROR:  new row violates check option for view "in_stock"
+DETAIL:  Failing row contains (4, Sencha, 8.50, 0).`}>
+
+```sql
+CREATE TABLE teas (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  price numeric(6, 2) NOT NULL,
+  stock integer NOT NULL
+);
+INSERT INTO teas (name, price, stock) VALUES
+  ('Jasmine', 6.50, 40), ('Earl Grey', 5.25, 0);
+
+CREATE VIEW in_stock AS
+SELECT id, name, price, stock
+FROM teas
+WHERE stock > 0;
+
+-- Updates go through to the table...
+UPDATE in_stock SET price = 6.75 WHERE name = 'Jasmine';
+-- ...but only for rows the view can see
+UPDATE in_stock SET price = 6.00 WHERE name = 'Earl Grey';
+
+-- A row the view can't see: inserted, then invisible
+INSERT INTO in_stock (name, price, stock) VALUES ('Oolong', 9, 0);
+SELECT count(*) AS in_view FROM in_stock WHERE name = 'Oolong';
+
+-- With the check option, such rows are refused
+CREATE OR REPLACE VIEW in_stock AS
+SELECT id, name, price, stock
+FROM teas
+WHERE stock > 0
+WITH CHECK OPTION;
+
+INSERT INTO in_stock (name, price, stock) VALUES ('Sencha', 8.50, 0);
+```
+
+</CodeExample>
+
+Views that aggregate or join aren't automatically updatable. If you really need to write through one, an `INSTEAD OF` trigger can translate the change (you'll meet triggers [two lessons from now](/learn/sql/triggers)), but it's usually simpler to write to the tables directly.
+
+<Quiz
+  question="You create a plain view top_customers, then insert new orders into the orders table. What does SELECT * FROM top_customers show?"
+  options={[
+    "The data as it was when the view was created",
+    "The current data including the new orders, because the view's query runs each time",
+    "Nothing until you run REFRESH VIEW top_customers",
+    "An error, because the table changed after the view was created",
+  ]}
+  answer={1}
+  explanation="A plain view stores only its query. Every SELECT on the view runs that query against the tables as they are right now, so it always reflects the latest data. Only materialized views store results and need refreshing."
+/>
+
+## Materialized views: store the result
+
+Sometimes the query behind a view is genuinely expensive: a dashboard that aggregates millions of orders by month, recomputed for every visitor. A **materialized view** runs the query **once** and stores the result like a table. Reading it is as fast as reading a small table, but the data is a **snapshot**: it changes only when you **refresh** it.
+
+<CodeExample output={`CREATE MATERIALIZED VIEW
+
+   month    | orders | revenue
+------------+--------+---------
+ 2025-01-01 |      5 |  518.30
+ 2025-02-01 |      6 |  331.69
+ 2025-03-01 |      6 |  525.80
+ 2025-04-01 |      6 |  331.69
+ 2025-05-01 |      5 |  467.80
+ 2025-06-01 |      4 |  270.54
+(6 rows)
+
+INSERT 0 1
+
+ revenue
+---------
+  270.54
+(1 row)
+
+REFRESH
+
+ revenue
+---------
+ 1169.54
+(1 row)`}>
+
+```sql
+CREATE MATERIALIZED VIEW monthly_revenue AS
+SELECT date_trunc('month', o.ordered_at)::date AS month,
+  count(DISTINCT o.id) AS orders,
+  sum(oi.quantity * oi.unit_price) AS revenue
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY 1;
+
+SELECT * FROM monthly_revenue ORDER BY month;
+
+-- A big new sale in June: 10 rice cookers
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (40, 15, 10, 89.90);
+
+-- Still the old number: the snapshot hasn't changed
+SELECT revenue FROM monthly_revenue WHERE month = '2025-06-01';
+
+REFRESH MATERIALIZED VIEW monthly_revenue;
+
+SELECT revenue FROM monthly_revenue WHERE month = '2025-06-01';
+```
+
+</CodeExample>
+
+**`REFRESH MATERIALIZED VIEW`** re-runs the query and replaces the stored rows. Who runs it, and when? Usually a scheduled job: every few minutes, every night, or right after the data import that feeds it (the `pg_cron` extension or your app's job scheduler can do it).
+
+Things to know about refreshing:
+
+- A plain `REFRESH` **locks** the materialized view: anyone reading it waits until the refresh finishes.
+- **`REFRESH MATERIALIZED VIEW CONCURRENTLY`** lets reads continue during the refresh, by computing the new result and applying only the differences. It needs a **unique index** on the materialized view, so PostgreSQL can match old and new rows:
+
+```sql
+CREATE UNIQUE INDEX monthly_revenue_month_idx
+  ON monthly_revenue (month);
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_revenue;
+```
+
+- You can add **other indexes** to a materialized view too, like to any table, which makes it a great base for fast dashboards and searches.
+
+<Callout type="tip" title="View, materialized view or table?">
+
+- **View**: always fresh, no storage, as fast as its query. Use it to name and share logic.
+- **Materialized view**: fast to read, stale until refreshed, refreshed all at once. Use it for expensive reports where "as of 5 minutes ago" is fine.
+- **Summary table updated by your code or a trigger**: fresh and fast, but you write and maintain the update logic. Use it when you need both, and accept the complexity.
+
+</Callout>
+
+<Quiz
+  question="REFRESH MATERIALIZED VIEW CONCURRENTLY sales_summary fails with an error asking for a unique index. Why does PostgreSQL need one?"
+  options={[
+    "Unique indexes make every materialized view faster to read",
+    "A concurrent refresh compares the new result with the old rows and must match them up one to one, which needs a unique key",
+    "Materialized views can't have any other kind of index",
+    "It doesn't: the error means the view's query has duplicate rows",
+  ]}
+  answer={1}
+  explanation="A concurrent refresh keeps the old rows readable while it computes the new result, then inserts, updates and deletes only the rows that changed. To know which old row corresponds to which new one, it needs a unique index on the materialized view."
+/>
+
+<Exercise
+  language="sql"
+  title="Sales views for the shop"
+  starter={`-- 1. A view: one row per product, sold or not
+CREATE VIEW product_sales AS
+SELECT p.id AS product_id,
+  p.name,
+  p.category
+FROM products AS p;
+
+-- 2. A materialized view: totals per category,
+--    built on product_sales
+
+
+-- 3. Show the categories, best revenue first
+`}
+  tests={[
+    { name: "product_sales is a view with the right columns", check: "(await query(\"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) AS cols FROM information_schema.columns WHERE table_name = 'product_sales'\"))[0].cols === 'product_id,name,category,units_sold,revenue' && (await query(\"SELECT count(*) AS n FROM information_schema.views WHERE table_name = 'product_sales'\"))[0].n === 1" },
+    { name: "product_sales has every product with its units and revenue", check: "await (async () => { const r = await query('SELECT * FROM product_sales ORDER BY product_id'); return r.length === 15 && r[1].units_sold === 17 && r[1].revenue === 238 && r[14].units_sold === 9 && r[14].revenue === 809.1; })()" },
+    { name: "category_sales is a materialized view", check: "(await query(\"SELECT count(*) AS n FROM pg_matviews WHERE matviewname = 'category_sales'\"))[0].n === 1" },
+    { name: "The last query shows category, units_sold, revenue", check: "columns.join() === 'category,units_sold,revenue' && rows.length === 5" },
+    { name: "Categories are sorted by revenue, highest first", check: "rows.map(r => r.category).join() === 'kitchen,books,toys,tea,snacks' && rows[0].revenue === 1160.1" },
+    { name: "Unsold products show 0, not NULL, and the view stays live", check: "await (async () => { await query(\"INSERT INTO products (name, category, price, stock) VALUES ('Oolong', 'tea', 9, 5)\"); const r = await query(\"SELECT units_sold, revenue FROM product_sales WHERE name = 'Oolong'\"); return r.length === 1 && r[0].units_sold === 0 && r[0].revenue === 0; })()" },
+  ]}
+>
+
+The shop's managers want two things: a live **per-product** sales view, and a fast **per-category** summary for their dashboard, refreshed at night.
+
+1. Finish the view **`product_sales`** with the columns `product_id, name, category, units_sold, revenue`, one row for **every** product. `units_sold` is the total quantity in `order_items` and `revenue` the total of `quantity * unit_price`. Products that were never sold must show `0` for both, not `NULL`.
+2. Create a **materialized view** `category_sales` (columns `category, units_sold, revenue`) by selecting from `product_sales` and grouping by category.
+3. Finish with `SELECT * FROM category_sales` sorted by `revenue`, highest first.
+
+<Hint>
+
+For products that were never sold to appear, join `order_items` with a **`LEFT JOIN`** and `GROUP BY p.id`. A product with no items gets `NULL` sums, so wrap them: `coalesce(sum(oi.quantity), 0) AS units_sold`. Step 2 starts with `CREATE MATERIALIZED VIEW category_sales AS SELECT category, sum(units_sold) AS units_sold, …`.
+
+</Hint>
+
+<Solution>
+
+```sql
+-- 1. A view: one row per product, sold or not
+CREATE VIEW product_sales AS
+SELECT p.id AS product_id,
+  p.name,
+  p.category,
+  coalesce(sum(oi.quantity), 0) AS units_sold,
+  coalesce(sum(oi.quantity * oi.unit_price), 0) AS revenue
+FROM products AS p
+LEFT JOIN order_items AS oi ON oi.product_id = p.id
+GROUP BY p.id;
+
+-- 2. A materialized view: totals per category,
+--    built on product_sales
+CREATE MATERIALIZED VIEW category_sales AS
+SELECT category,
+  sum(units_sold) AS units_sold,
+  sum(revenue) AS revenue
+FROM product_sales
+GROUP BY category;
+
+-- 3. Show the categories, best revenue first
+SELECT *
+FROM category_sales
+ORDER BY revenue DESC;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **view** (`CREATE VIEW name AS SELECT …`) is a saved query you use like a table: one shared definition, simpler queries, a stable interface, and a way to hide columns and rows.
+- Views store **no data**: they're always current, and no faster than their query (the planner inlines them).
+- `CREATE OR REPLACE VIEW` can only **add** columns at the end; dependencies stop you dropping columns a view uses. List columns instead of `SELECT *`.
+- Simple single-table views are **updatable**; `WITH CHECK OPTION` refuses rows the view couldn't show.
+- A **materialized view** stores its result: fast to read, but a snapshot until **`REFRESH MATERIALIZED VIEW`**. `CONCURRENTLY` keeps it readable during the refresh and needs a unique index.

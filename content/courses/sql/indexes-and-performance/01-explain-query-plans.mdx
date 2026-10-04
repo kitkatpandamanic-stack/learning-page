@@ -1,0 +1,470 @@
+---
+title: Reading Query Plans with EXPLAIN
+description: See how PostgreSQL really runs your query. Read EXPLAIN plans, tell a Seq Scan from an Index Scan, and recognise nested loop, hash and merge joins.
+duration: 22
+xp: 25
+---
+
+Here's a story almost every backend developer has lived through. A query takes 3 ms on your laptop, where the table has 200 rows. It ships. Six months later the table has 20 million rows, the same query takes 9 seconds, and the whole site slows down with it. Nothing in the SQL changed: only the amount of data did. 🐢
+
+SQL is **declarative**: you describe **what** you want, and PostgreSQL decides **how** to get it. That's wonderful until it's slow, and then you need to see the "how". This module is about making queries fast, and it starts with the most important tool: **`EXPLAIN`**.
+
+## How PostgreSQL runs a query
+
+Every query goes through three steps:
+
+1. The **parser** checks the SQL and works out which tables and columns it means.
+2. The **planner** (also called the optimiser) thinks of many ways to run it: read the whole table or use an index? Which table first in a join? Hash or sort? It **estimates the cost** of each plan using statistics about your data, and picks the cheapest.
+3. The **executor** runs that plan and produces the rows.
+
+`EXPLAIN` in front of a query stops after step 2 and shows you the plan the planner chose, without running the query:
+
+<CodeExample output={`                        QUERY PLAN
+----------------------------------------------------------
+ Seq Scan on products  (cost=0.00..18.88 rows=4 width=86)
+   Filter: (category = 'tea'::text)
+(2 rows)`}>
+
+```sql
+EXPLAIN
+SELECT *
+FROM products
+WHERE category = 'tea';
+```
+
+</CodeExample>
+
+This plan has one step, called a **node**: **Seq Scan on products**, a **sequential scan** that reads every row of the table, one after another, and keeps the ones that pass the **Filter**. The numbers in brackets are the planner's **estimates**:
+
+- **`cost=0.00..18.88`**: the startup cost (before the first row comes out) and the total cost (all rows). Costs are in made-up units, roughly "reading one page from disk = 1". They're only useful to compare plans with each other, not as milliseconds.
+- **`rows=4`**: how many rows the planner **expects** this node to return. (The real answer is 3; it's a guess, made without statistics on this brand-new table.)
+- **`width=86`**: the expected average size of a row in bytes.
+
+The costs depend on the table's size and statistics, so they would change as the data changes. In the rest of this module we'll write **`EXPLAIN (COSTS OFF)`**, which shows just the shape of the plan.
+
+## A table big enough to matter
+
+The sample tables are tiny, and for a tiny table reading everything **is** the best plan. To see real decisions, we need real volume. `generate_series` makes a table with 100,000 rows in a fraction of a second:
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+        QUERY PLAN
+--------------------------
+ Seq Scan on events
+   Filter: (user_id = 42)
+(2 rows)`}>
+
+```sql
+CREATE TABLE events AS
+SELECT g AS id,
+  g % 2500 AS user_id,
+  (ARRAY['view', 'click', 'buy'])[g % 3 + 1] AS kind,
+  timestamp '2025-01-01' + g * interval '1 minute' AS created_at
+FROM generate_series(1, 100000) AS g;
+
+ANALYZE events;
+
+EXPLAIN (COSTS OFF)
+SELECT *
+FROM events
+WHERE user_id = 42;
+```
+
+</CodeExample>
+
+Two things to notice:
+
+- **`ANALYZE events`** collects **statistics** about the table: how many rows, how many different values each column has, the most common values and so on. The planner's estimates are only as good as these statistics. PostgreSQL normally does this automatically in the background (autovacuum), but right after loading data it's good practice to run it yourself.
+- The plan is a **Seq Scan**. To find one user's 40 events, PostgreSQL reads all 100,000 rows and throws away the rest. That's the 9-second query from the story, waiting to happen.
+
+## EXPLAIN ANALYZE: what really happened
+
+`EXPLAIN` shows the plan. **`EXPLAIN ANALYZE`** also **runs** the query and adds what actually happened at each node. Real output includes timings, which change on every run, so here we switch them off with `TIMING OFF` (along with costs, the summary and buffer counts):
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+                   QUERY PLAN
+------------------------------------------------
+ Seq Scan on events (actual rows=40.00 loops=1)
+   Filter: (user_id = 42)
+   Rows Removed by Filter: 99960
+(3 rows)`}>
+
+```sql
+CREATE TABLE events AS
+SELECT g AS id,
+  g % 2500 AS user_id,
+  (ARRAY['view', 'click', 'buy'])[g % 3 + 1] AS kind,
+  timestamp '2025-01-01' + g * interval '1 minute' AS created_at
+FROM generate_series(1, 100000) AS g;
+
+ANALYZE events;
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT *
+FROM events
+WHERE user_id = 42;
+```
+
+</CodeExample>
+
+**`actual rows=40.00`** is how many rows the node really returned, and **`loops=1`** how many times it ran. **`Rows Removed by Filter: 99960`** is the smoking gun: the database did 100,000 rows' worth of work to return 40. Whenever you see a big "Rows Removed by Filter" next to a small "actual rows", an index will probably help.
+
+<Callout type="danger" title="EXPLAIN ANALYZE really runs the statement">
+
+`EXPLAIN ANALYZE DELETE FROM orders` deletes your orders, and `EXPLAIN ANALYZE` on a 10-minute report takes 10 minutes. To analyse a statement that changes data, wrap it in a transaction you throw away:
+
+```sql
+BEGIN;
+EXPLAIN ANALYZE DELETE FROM sessions WHERE expires_at < '2025-01-01';
+ROLLBACK;
+```
+
+</Callout>
+
+## Index scans
+
+An **index** is a separate, sorted data structure that points to rows in the table, like the index at the back of a book: instead of reading every page to find "panda", you look it up and jump to page 212. You'll study indexes properly in [the next lesson](/learn/sql/choosing-indexes); for now, let's add one and watch the plan change:
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+CREATE INDEX
+
+CREATE INDEX
+
+                  QUERY PLAN
+-----------------------------------------------
+ Bitmap Heap Scan on events
+   Recheck Cond: (user_id = 42)
+   ->  Bitmap Index Scan on events_user_id_idx
+         Index Cond: (user_id = 42)
+(4 rows)
+
+                QUERY PLAN
+------------------------------------------
+ Index Scan using events_id_idx on events
+   Index Cond: (id = 1234)
+(2 rows)`}>
+
+```sql
+CREATE TABLE events AS
+SELECT g AS id,
+  g % 2500 AS user_id,
+  (ARRAY['view', 'click', 'buy'])[g % 3 + 1] AS kind,
+  timestamp '2025-01-01' + g * interval '1 minute' AS created_at
+FROM generate_series(1, 100000) AS g;
+
+ANALYZE events;
+
+CREATE INDEX events_user_id_idx ON events (user_id);
+CREATE INDEX events_id_idx ON events (id);
+
+EXPLAIN (COSTS OFF)
+SELECT *
+FROM events
+WHERE user_id = 42;
+
+EXPLAIN (COSTS OFF)
+SELECT *
+FROM events
+WHERE id = 1234;
+```
+
+</CodeExample>
+
+Now the plan has **two levels**. Indented lines that start with **`->`** are **child nodes**: they produce rows for the node above them. Read a plan **from the innermost node outwards**:
+
+1. **Bitmap Index Scan** looks up `user_id = 42` in the index and marks which table pages contain matching rows (a "bitmap" of pages).
+2. **Bitmap Heap Scan** then reads just those pages from the table (the **heap**) and re-checks the condition on each row.
+
+The second query finds a single row, so PostgreSQL uses a plain **Index Scan**: find the entry in the index, jump straight to the row. Here are the scan types you'll meet most:
+
+| Node | What it does | Good when |
+| --- | --- | --- |
+| **Seq Scan** | Reads the whole table | Small tables, or most rows are needed |
+| **Index Scan** | Walks the index, fetches each matching row | A few rows, or rows wanted in index order |
+| **Bitmap Index + Heap Scan** | Collects matching pages first, then reads them in order | Hundreds to thousands of rows |
+| **Index Only Scan** | Answers from the index alone, never touching the table | All needed columns are in the index |
+
+<Callout type="tip" title="A Seq Scan isn't always bad">
+
+If a query needs 30% of a table, reading it all in order is faster than jumping around for each row through an index, and PostgreSQL knows it. The same goes for small tables: the sample `products` table fits in one 8 KB page, so a Seq Scan is the cheapest plan there is. Worry about a Seq Scan on a **big** table that returns **few** rows.
+
+</Callout>
+
+## Sorting and limiting
+
+Plans also show the other work a query does. **Sort** sorts its input, and **Limit** stops after the first N rows:
+
+<CodeExample output={`           QUERY PLAN
+--------------------------------
+ Limit
+   ->  Sort
+         Sort Key: ordered_at
+         ->  Seq Scan on orders
+(4 rows)
+
+                      QUERY PLAN
+-------------------------------------------------------
+ Limit
+   ->  Index Scan Backward using orders_pkey on orders
+(2 rows)`}>
+
+```sql
+EXPLAIN (COSTS OFF)
+SELECT *
+FROM orders
+ORDER BY ordered_at
+LIMIT 5;
+
+EXPLAIN (COSTS OFF)
+SELECT *
+FROM orders
+ORDER BY id DESC
+LIMIT 5;
+```
+
+</CodeExample>
+
+Read the first plan from the inside: scan all orders, sort them by `ordered_at`, return the first 5. The second is cleverer. An index is **already sorted**, so to get the 5 highest ids PostgreSQL reads the primary key's index **backwards** and stops after 5 entries: no Sort node at all. Keep that in mind: an index can serve an `ORDER BY` as well as a `WHERE`.
+
+## How joins are planned
+
+For each join, the planner picks one of three **join algorithms**. To see all three, let's build two bigger tables, accounts and their payments:
+
+<CodeExample output={`CREATE TABLE AS
+
+ALTER TABLE
+
+CREATE TABLE AS
+
+ALTER TABLE
+
+ANALYZE
+
+ANALYZE
+
+                     QUERY PLAN
+----------------------------------------------------
+ Nested Loop
+   ->  Index Scan using payments_pkey on payments p
+         Index Cond: (id < 10)
+   ->  Index Scan using accounts_pkey on accounts a
+         Index Cond: (id = p.account_id)
+(5 rows)
+
+                QUERY PLAN
+------------------------------------------
+ HashAggregate
+   Group Key: a.country
+   ->  Hash Join
+         Hash Cond: (p.account_id = a.id)
+         ->  Seq Scan on payments p
+         ->  Hash
+               ->  Seq Scan on accounts a
+(7 rows)
+
+                       QUERY PLAN
+---------------------------------------------------------
+ Merge Join
+   Merge Cond: (a.id = p.id)
+   ->  Index Only Scan using accounts_pkey on accounts a
+   ->  Index Only Scan using payments_pkey on payments p
+(4 rows)`}>
+
+```sql
+CREATE TABLE accounts AS
+SELECT g AS id,
+  'user' || g || '@example.com' AS email,
+  (ARRAY['UK', 'Spain', 'Japan', 'India', 'Brazil'])[g % 5 + 1]
+    AS country
+FROM generate_series(1, 20000) AS g;
+ALTER TABLE accounts ADD PRIMARY KEY (id);
+
+CREATE TABLE payments AS
+SELECT g AS id,
+  g % 20000 + 1 AS account_id,
+  round((g % 997) / 10.0, 2) AS amount
+FROM generate_series(1, 100000) AS g;
+ALTER TABLE payments ADD PRIMARY KEY (id);
+
+ANALYZE accounts;
+ANALYZE payments;
+
+-- 1. A few payments, each with its account
+EXPLAIN (COSTS OFF)
+SELECT a.email, p.amount
+FROM payments AS p
+JOIN accounts AS a ON a.id = p.account_id
+WHERE p.id < 10;
+
+-- 2. Every payment, totalled per country
+EXPLAIN (COSTS OFF)
+SELECT a.country, sum(p.amount) AS total
+FROM accounts AS a
+JOIN payments AS p ON p.account_id = a.id
+GROUP BY a.country;
+
+-- 3. Two big inputs, both already sorted by the join key
+EXPLAIN (COSTS OFF)
+SELECT a.id, p.id
+FROM accounts AS a
+JOIN payments AS p ON p.id = a.id;
+```
+
+</CodeExample>
+
+- **Nested Loop**: for **each** row of the outer (first) input, look up matches in the inner one. Brilliant when the outer side is small and the inner side has an index: 9 payments, so 9 quick primary-key lookups. Terrible when both sides are big and there's no index: a million times a million.
+- **Hash Join**: read the smaller table once and build an in-memory **hash table** keyed on the join column (the **Hash** node), then stream through the bigger table and look each row up in it. The workhorse for joining large sets on `=`.
+- **Merge Join**: walk two inputs that are **sorted on the join key** side by side, like zipping two sorted lists. Great when indexes already provide the order; otherwise it needs a Sort on each side first.
+
+The first plan also shows **`loops`** in action: with `EXPLAIN ANALYZE`, the inner Index Scan would say `loops=9`, because it ran once per outer row. When you read `actual rows` on an inner node, multiply by `loops` to get the total.
+
+Aggregates have their own nodes too: **HashAggregate** groups rows in a hash table (as above), **GroupAggregate** groups input that's already sorted, and plain **Aggregate** computes a single total such as `count(*)`.
+
+<Quiz
+  question="A plan shows Nested Loop with an outer Seq Scan returning 50000 rows and an inner Seq Scan on a 200000-row table with no index. What's the problem?"
+  options={[
+    "Nothing, nested loops are always the fastest join",
+    "The inner table is scanned once for every outer row, so the work is about 50000 x 200000 rows",
+    "Seq Scans can't be used in joins",
+    "The query will return 50000 x 200000 rows",
+  ]}
+  answer={1}
+  explanation="A nested loop runs its inner side once per outer row (loops=50000). With a full scan inside, that's 10 billion row visits. It usually means a missing index on the join column, or bad estimates that made the planner think the outer side was tiny."
+/>
+
+## Estimates versus reality
+
+The planner chooses a plan using **estimated** row counts. When estimates are far from reality, it can pick a terrible plan, for example a Nested Loop because it expects 1 row when there are really 80,000. That's why `EXPLAIN ANALYZE` on a real server is so useful: it prints the estimate and the actual count side by side. Here's a typical line with costs and timings switched on:
+
+```text
+Index Scan using orders_customer_id_idx on orders
+  (cost=0.43..8.45 rows=1 width=40)
+  (actual time=0.031..212.904 rows=81234.00 loops=1)
+```
+
+`rows=1` estimated, `rows=81234` actual: the planner was wrong by a factor of 80,000. The usual causes are **stale statistics** (a big import since the last `ANALYZE`), conditions on related columns that the planner assumes are independent, or conditions it can't estimate, such as a function applied to a column. You'll fix these in [the tuning lesson](/learn/sql/query-tuning).
+
+`actual time=0.031..212.904` is in milliseconds: time to the first row, and time to the last row. To find where the time goes, look for the node where the time **jumps**, compared to its children.
+
+## On a real server
+
+A few things you'll see in production that this in-browser database doesn't show:
+
+- **Parallel plans**: a big Seq Scan often appears as `Gather` → `Parallel Seq Scan`, with several worker processes each reading part of the table.
+- **Buffers**: `EXPLAIN (ANALYZE, BUFFERS)` shows how many 8 KB pages came from memory (`shared hit`) versus disk (`read`). Lots of reads means the data wasn't cached.
+- **Finding slow queries in the first place**: the `pg_stat_statements` extension records every query's total and average time, so you can sort by "total time spent" and fix the top few. `auto_explain` logs the plans of slow queries automatically.
+
+```sql
+-- On a server with pg_stat_statements enabled
+SELECT calls, round(mean_exec_time::numeric, 1) AS avg_ms, query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+```
+
+Long plans are hard to read as text. Paste them into a visualiser such as **explain.dalibo.com** or **explain.depesz.com**, which highlight the slowest nodes.
+
+<Quiz
+  question="Which plan node tells you that PostgreSQL used an index to find rows and then visited the table pages that contain them?"
+  options={[
+    "Seq Scan with a Filter",
+    "Bitmap Index Scan feeding a Bitmap Heap Scan",
+    "Hash feeding a Hash Join",
+    "Sort feeding a Limit",
+  ]}
+  answer={1}
+  explanation="The Bitmap Index Scan reads the index and builds a bitmap of matching pages; its parent, the Bitmap Heap Scan, then reads only those pages of the table (the heap) and rechecks the condition."
+/>
+
+<Exercise
+  language="sql"
+  title="Speed up the activity feed"
+  starter={`-- 100,000 page views by 5,000 users
+CREATE TABLE page_views AS
+SELECT g AS id,
+  g % 5000 AS user_id,
+  '/page/' || g % 50 AS path,
+  timestamp '2025-01-01' + g * interval '1 minute' AS viewed_at
+FROM generate_series(1, 100000) AS g;
+ANALYZE page_views;
+
+-- Add your index here
+
+
+-- The activity feed: a user's 5 most recent page views
+EXPLAIN (COSTS OFF)
+SELECT path, viewed_at
+FROM page_views
+WHERE user_id = 1234
+ORDER BY viewed_at DESC
+LIMIT 5;
+`}
+  tests={[
+    { name: "The last statement is EXPLAIN of the feed query", check: "columns.join() === 'QUERY PLAN' && rows.some(r => r['QUERY PLAN'].includes('1234'))" },
+    { name: "There is an index on page_views", check: "(await query(\"SELECT count(*) AS n FROM pg_indexes WHERE tablename = 'page_views'\"))[0].n >= 1" },
+    { name: "The plan uses an index", check: "rows.some(r => /Index/.test(r['QUERY PLAN']))" },
+    { name: "No Seq Scan of the whole table", check: "!rows.some(r => r['QUERY PLAN'].includes('Seq Scan'))" },
+    { name: "No Sort node: the index delivers rows in order", check: "!rows.some(r => /^\\s*(->\\s*)?Sort\\b/.test(r['QUERY PLAN']))" },
+    { name: "The feed still returns the right 5 rows", check: "(await query(\"SELECT path, viewed_at FROM page_views WHERE user_id = 1234 ORDER BY viewed_at DESC LIMIT 5\")).map(r => r.path).join() === '/page/34,/page/34,/page/34,/page/34,/page/34'" },
+  ]}
+>
+
+Every time a user opens their profile, the app runs the "activity feed" query at the bottom: their 5 most recent page views. Right now it reads all 100,000 rows **and** sorts the matches.
+
+1. Press **Run** and read the plan from the inside out: which nodes do the work?
+2. Add **one** `CREATE INDEX` so that the plan has **no Seq Scan and no Sort node**.
+3. Run again and check the new plan.
+
+<Hint>
+
+An index on `user_id` alone gets rid of the Seq Scan, but the matching rows still come out in the wrong order, so a Sort stays. Remember that an index is sorted: if its entries are sorted by `user_id` **and then** by `viewed_at`, all of user 1234's views sit next to each other, already in time order. A multicolumn index looks like `CREATE INDEX name ON table (col1, col2);`.
+
+</Hint>
+
+<Solution>
+
+```sql
+-- 100,000 page views by 5,000 users
+CREATE TABLE page_views AS
+SELECT g AS id,
+  g % 5000 AS user_id,
+  '/page/' || g % 50 AS path,
+  timestamp '2025-01-01' + g * interval '1 minute' AS viewed_at
+FROM generate_series(1, 100000) AS g;
+ANALYZE page_views;
+
+-- Sorted by user, then by time: the newest views of a user
+-- are the last entries in their group
+CREATE INDEX page_views_user_time_idx
+  ON page_views (user_id, viewed_at);
+
+-- The activity feed: a user's 5 most recent page views
+EXPLAIN (COSTS OFF)
+SELECT path, viewed_at
+FROM page_views
+WHERE user_id = 1234
+ORDER BY viewed_at DESC
+LIMIT 5;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- SQL says **what**; the **planner** decides **how**, choosing the cheapest plan it can find using **statistics** (collected by `ANALYZE`).
+- **`EXPLAIN`** shows the plan without running it; **`EXPLAIN ANALYZE`** runs the query and adds actual row counts, loops and (on a real server) timings. Wrap data-changing statements in `BEGIN` … `ROLLBACK`.
+- Read plans **from the innermost node outwards**; each `->` child feeds its parent.
+- Scans: **Seq Scan** (whole table), **Index Scan**, **Bitmap Index/Heap Scan**, **Index Only Scan**. A big "Rows Removed by Filter" for few actual rows hints at a missing index.
+- Joins: **Nested Loop** (small outer side + index on the inner), **Hash Join** (big sets, equality), **Merge Join** (inputs sorted on the key).
+- Indexes are sorted, so they can replace a **Sort** for `ORDER BY … LIMIT`.
+- Compare **estimated** and **actual** rows: big differences lead to bad plans.

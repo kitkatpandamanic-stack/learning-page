@@ -1,0 +1,560 @@
+---
+title: "Part 2: Isolating tenants"
+description: Give the app its own role, tell PostgreSQL which tenant each request acts for, and enforce isolation on every table with row-level security, so a forgotten WHERE can't leak data.
+duration: 25
+xp: 35
+---
+
+In Part 1 you made it impossible for a row to **point** into another tenant. But nothing stops the application from **reading** another tenant's rows. PandaTasks will have hundreds of queries written by a dozen developers over the years, and each one must remember `WHERE tenant_id = …`. Data leaks in multi-tenant products very often come down to exactly one forgotten condition: an endpoint like `GET /tasks/:id` that checks the user is logged in, but not that the task belongs to their company. 🕳️
+
+In this part you'll make PostgreSQL enforce the tenant boundary itself, with **row-level security (RLS)** from [Row-Level Security](/learn/sql/row-level-security), so a forgotten filter returns nothing instead of someone else's data. Application checks stay, and RLS is the **second line of defence** underneath them.
+
+## The plan
+
+Three roles, three jobs:
+
+| Role | Used by | Can |
+| --- | --- | --- |
+| Owner (the migration role) | Migrations, run by your deploy pipeline | Create and alter tables; owns them |
+| `app_user` | The application, through the pooler | Read and write rows, **only of the current tenant** |
+| `support_admin` | An audited internal support tool | Read across tenants (`BYPASSRLS`) |
+
+And one rule for every request the app handles:
+
+```ts
+// in the app: every request runs in one transaction,
+// and tells PostgreSQL which tenant it acts for
+await db.transaction(async (tx) => {
+  await tx.query("SELECT set_config('app.tenant_id', $1, true)", [
+    String(session.tenantId), // from the verified login, never the URL
+  ]);
+  return handler(tx);
+});
+```
+
+`set_config(…, true)` is **transaction-local**, like `SET LOCAL`: it disappears at `COMMIT`, so it's safe with PgBouncer in transaction mode, as you saw in [Backups, Replication & Connection Pooling](/learn/sql/backups-and-replication). A session-level `SET` would stay on a pooled connection and could be inherited by the **next tenant's** request: the exact bug we're trying to prevent.
+
+## Step 1: who is the current tenant?
+
+Policies need one question answered: which tenant is this transaction acting for? A small function reads the setting. The important detail is what happens when it's **missing**:
+
+<CodeExample output={`CREATE FUNCTION
+
+ not_set
+---------
+    NULL
+(1 row)
+
+BEGIN
+
+ set_config
+------------
+ 1
+(1 row)
+
+ in_transaction
+----------------
+              1
+(1 row)
+
+COMMIT
+
+ after_commit
+--------------
+         NULL
+(1 row)`}>
+
+```sql
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+
+SELECT current_tenant_id() AS not_set;
+
+BEGIN;
+SELECT set_config('app.tenant_id', '1', true);
+SELECT current_tenant_id() AS in_transaction;
+COMMIT;
+
+SELECT current_tenant_id() AS after_commit;
+```
+
+</CodeExample>
+
+- `current_setting('app.tenant_id', true)`: the second argument, `missing_ok`, returns `NULL` instead of an error when the setting was never set.
+- After a transaction-local setting ends, the value becomes an **empty string**, not `NULL`; `nullif(…, '')` turns that into `NULL` too.
+- A policy `tenant_id = current_tenant_id()` with `NULL` is never true, so a request that forgot to set the tenant sees **no rows** and can't write any. The design **fails closed**.
+- `STABLE` tells the planner the result doesn't change during a query, so it's computed once per query, not once per row, and it can even be used in index lookups.
+
+## Step 2: the app role and the policies
+
+Now the full setup: a role for the app with only the privileges it needs, then RLS on each tenant table. Every example in this part starts with Part 1's schema, shortened to three tables:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 2
+
+INSERT 0 3
+
+INSERT 0 5
+
+CREATE ROLE
+
+GRANT
+
+GRANT
+
+CREATE FUNCTION
+
+ALTER TABLE
+
+ALTER TABLE
+
+CREATE POLICY
+
+ALTER TABLE
+
+ALTER TABLE
+
+CREATE POLICY
+
+SET
+
+ set_config
+------------
+ 1
+(1 row)
+
+ id |         title
+----+------------------------
+  1 | Design the home page
+  2 | Write the pricing page
+  3 | Fix the login crash
+(3 rows)
+
+ set_config
+------------
+ 2
+(1 row)
+
+ id |        title
+----+----------------------
+  4 | Pick a domain name
+  5 | Draft the about page
+(2 rows)
+
+ set_config
+------------
+
+(1 row)
+
+ count
+-------
+     0
+(1 row)
+
+ set_config
+------------
+ 2
+(1 row)
+
+ERROR:  new row violates row-level security policy for table "tasks"`}>
+
+```sql
+-- Part 1's schema, shortened
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id)
+);
+INSERT INTO tenants (slug) VALUES ('acme'), ('globex');
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+INSERT INTO tasks (tenant_id, project_id, title) VALUES
+  (1, 1, 'Design the home page'),
+  (1, 1, 'Write the pricing page'),
+  (1, 2, 'Fix the login crash'),
+  (2, 3, 'Pick a domain name'),
+  (2, 3, 'Draft the about page');
+
+-- the app's role: not a superuser, not the owner, no BYPASSRLS
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT ON tenants TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON projects, tasks TO app_user;
+
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON projects
+  USING (tenant_id = current_tenant_id())
+  WITH CHECK (tenant_id = current_tenant_id());
+
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON tasks
+  USING (tenant_id = current_tenant_id())
+  WITH CHECK (tenant_id = current_tenant_id());
+
+-- now act like the app: no WHERE tenant_id anywhere below
+SET ROLE app_user;
+
+SELECT set_config('app.tenant_id', '1', false);
+SELECT id, title FROM tasks ORDER BY id;
+
+SELECT set_config('app.tenant_id', '2', false);
+SELECT id, title FROM tasks ORDER BY id;
+
+-- a request that forgot to set the tenant
+SELECT set_config('app.tenant_id', '', false);
+SELECT count(*) FROM tasks;
+
+-- Globex (tenant 2) tries to write into Acme's project
+SELECT set_config('app.tenant_id', '2', false);
+INSERT INTO tasks (tenant_id, project_id, title)
+VALUES (1, 1, 'Sneaky task');
+```
+
+</CodeExample>
+
+(To keep the demo short, it sets the tenant for the whole session with `false`. The real app uses `true` inside each transaction, as above.)
+
+Every query ran **without** `WHERE tenant_id = …`, and each tenant saw only its own tasks. The two parts of a policy do different jobs:
+
+- **`USING (…)`** filters the rows a statement can **see**: `SELECT`, and the rows an `UPDATE` or `DELETE` can touch. Rows that fail it are silently invisible, as if they didn't exist.
+- **`WITH CHECK (…)`** is tested on rows being **written**: new rows from `INSERT`, and the new version of a row after `UPDATE`. Rows that fail it raise an error. Without it, a tenant could `UPDATE tasks SET tenant_id = 2` and push its rows into another tenant.
+
+A policy without a `FOR` clause applies to all commands (`FOR ALL`). You can also write separate policies `FOR SELECT`, `FOR INSERT` and so on, for example to let members read but only admins delete.
+
+### FORCE, and who skips RLS
+
+Three kinds of roles are **not** affected by policies:
+
+- **superusers**, always;
+- roles with the **`BYPASSRLS`** attribute (that's how `support_admin` reads across tenants);
+- the **table's owner**, unless the table has **`FORCE ROW LEVEL SECURITY`**.
+
+The third one bites real teams: the app connects with the same role that ran the migrations, so it owns the tables, and RLS quietly does nothing. `FORCE` closes that gap, but the better fix is the one above: a separate, unprivileged `app_user`. And since superusers skip RLS entirely, **the app must never connect as a superuser**.
+
+<Callout type="warning" title="Views can leak through RLS">
+
+A view normally runs with the privileges of its **owner**. If the owner is the migration role (a superuser or the table owner), RLS is skipped **inside** the view, and `SELECT count(*) FROM task_titles` through a view would count every tenant's tasks. Since PostgreSQL 15, create views for the app with **`WITH (security_invoker = true)`**, so they check RLS as the role that queries them. The same goes for `SECURITY DEFINER` functions: they run as their owner, so only use them on purpose, and filter by `current_tenant_id()` inside.
+
+</Callout>
+
+## Step 3: protect every table, and keep it that way
+
+PandaTasks will gain tables for comments, attachments, labels, invoices… and one day someone will add a table and forget its policy. Two habits prevent that. First, generate the policies the same way for every table that has a `tenant_id` column, with `format('%I')` quoting the names safely:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE FUNCTION
+
+NOTICE:  protected comments
+NOTICE:  protected projects
+NOTICE:  protected tasks
+DO
+
+ tablename |    policyname    |               qual
+-----------+------------------+-----------------------------------
+ comments  | tenant_isolation | (tenant_id = current_tenant_id())
+ projects  | tenant_isolation | (tenant_id = current_tenant_id())
+ tasks     | tenant_isolation | (tenant_id = current_tenant_id())
+(3 rows)
+
+CREATE TABLE
+
+ unprotected
+-------------
+ attachments
+(1 row)`}>
+
+```sql
+CREATE TABLE projects (tenant_id bigint NOT NULL, name text);
+CREATE TABLE tasks (tenant_id bigint NOT NULL, title text);
+CREATE TABLE comments (tenant_id bigint NOT NULL, body text);
+
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+
+DO $$
+DECLARE
+  t text;
+BEGIN
+  FOR t IN
+    SELECT table_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND column_name = 'tenant_id'
+    ORDER BY table_name
+  LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+    EXECUTE format(
+      'CREATE POLICY tenant_isolation ON %I
+         USING (tenant_id = current_tenant_id())
+         WITH CHECK (tenant_id = current_tenant_id())', t);
+    RAISE NOTICE 'protected %', t;
+  END LOOP;
+END
+$$;
+
+SELECT tablename, policyname, qual
+FROM pg_policies
+ORDER BY tablename;
+
+-- months later, a new migration forgets RLS
+CREATE TABLE attachments (tenant_id bigint NOT NULL, url text);
+
+-- the guard query: tenant tables without RLS
+SELECT c.relname AS unprotected
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relkind IN ('r', 'p')
+  AND NOT c.relrowsecurity
+  AND EXISTS (
+    SELECT 1
+    FROM pg_attribute AS a
+    WHERE a.attrelid = c.oid
+      AND a.attname = 'tenant_id'
+      AND NOT a.attisdropped
+  )
+ORDER BY c.relname;
+```
+
+</CodeExample>
+
+Second, run that **guard query in CI** after the migrations: if it returns any row, the build fails. `pg_class.relrowsecurity` and `relforcerowsecurity` say whether RLS is enabled and forced, and `relkind` `'r'` and `'p'` are ordinary and partitioned tables.
+
+Better still, write an **isolation test**: create two tenants with data, then run your app's real queries as `app_user` for tenant A and assert that not one row of tenant B comes back. That test catches bugs that the guard query can't, like a policy with a typo.
+
+## Global tables and the edges of RLS
+
+Not every table has a `tenant_id`. `users` is global, but a member of Acme should only see the users of Acme. A policy can use a subquery:
+
+```sql
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY same_tenant_users ON users FOR SELECT
+  USING (EXISTS (
+    SELECT 1
+    FROM memberships AS m
+    WHERE m.user_id = users.id
+      AND m.tenant_id = current_tenant_id()
+  ));
+```
+
+`memberships` is protected by its own policy too, so the subquery only sees the current tenant's members. Keep subqueries in policies simple and indexed, because they run for every row checked.
+
+A few edges to know about:
+
+- **Constraint checks see all rows.** Foreign keys and unique constraints are checked without RLS, which is why Part 1's composite keys still work. It also means a global `UNIQUE (slug)` tells a tenant that "globex" is taken. That's fine for slugs; for anything sensitive, make uniqueness per tenant.
+- **Background jobs** (emails, exports, nightly reports) need a tenant too. Run them per tenant with the setting, or with a separate, deliberately privileged role, never by quietly using the owner.
+- **Performance**: the policy is added to every query, so every index on a tenant table should **start with `tenant_id`**. You'll check the plans in Part 3.
+
+<Quiz
+  question="PandaTasks enables RLS on tasks with a policy USING (tenant_id = current_tenant_id()), but the app still sees all tenants' tasks. The app connects as the role that ran the migrations and owns the tables. What is the most likely fix?"
+  options={[
+    "Add WITH CHECK to the policy",
+    "Run ANALYZE on the tasks table",
+    "Connect the app as a separate, non-owner role without BYPASSRLS (and FORCE ROW LEVEL SECURITY on the tables)",
+    "Make current_tenant_id() VOLATILE",
+  ]}
+  answer={2}
+  explanation="Table owners skip RLS unless the table has FORCE ROW LEVEL SECURITY, and superusers always skip it. The robust fix is an unprivileged app role, plus FORCE as a safety net. WITH CHECK only affects writes, and ANALYZE or the function's volatility don't change who RLS applies to."
+/>
+
+<Quiz
+  question="A request handler forgot to call set_config('app.tenant_id', ...). With PandaTasks' current_tenant_id() and policies, what does SELECT * FROM tasks return for app_user?"
+  options={[
+    "All tasks of all tenants",
+    "An error: unrecognized configuration parameter",
+    "No rows, because tenant_id = NULL is never true",
+    "The tasks of the tenant used by the previous request",
+  ]}
+  answer={2}
+  explanation="current_setting('app.tenant_id', true) returns NULL (or an empty string after a local setting ended), nullif turns '' into NULL, and tenant_id = NULL is never true. The design fails closed. The previous tenant's value can't leak either, because the app sets it with is_local = true, so it ends with each transaction."
+/>
+
+<Exercise
+  language="sql"
+  title="Lock every tenant into its own rows"
+  starter={`CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id)
+);
+INSERT INTO tenants (slug) VALUES ('acme'), ('globex');
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+INSERT INTO tasks (tenant_id, project_id, title) VALUES
+  (1, 1, 'Design the home page'),
+  (1, 1, 'Write the pricing page'),
+  (1, 2, 'Fix the login crash'),
+  (2, 3, 'Pick a domain name'),
+  (2, 3, 'Draft the about page');
+
+-- 1. The app_user role and its privileges
+
+-- 2. current_tenant_id()
+
+-- 3. RLS (enabled and forced) with a policy on projects and tasks
+
+-- 4. The guard query: tenant tables without RLS, as table_name
+SELECT 'todo' AS table_name;
+`}
+  tests={[
+    { name: "app_user is not a superuser and can't bypass RLS", check: "(await query(\"SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'app_user'\")).some(r => r.rolsuper === false && r.rolbypassrls === false)" },
+    { name: "RLS is enabled and forced on projects and tasks", check: "(await query(\"SELECT relname FROM pg_class WHERE relname IN ('projects', 'tasks') AND relrowsecurity AND relforcerowsecurity ORDER BY relname\")).map(r => r.relname).join() === 'projects,tasks'" },
+    { name: "The guard query finds no unprotected tables (column table_name)", check: "columns.join() === 'table_name' && rows.length === 0" },
+    { name: "The guard query catches a new table without RLS", check: "(await rerun(\"CREATE TABLE invoices (tenant_id bigint NOT NULL, total numeric)\")).map(r => r.table_name).join() === 'invoices'" },
+    { name: "Acme sees only its own tasks and projects", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '1', false)\"), await query('SET ROLE app_user'), (await query('SELECT title FROM tasks ORDER BY id')).map(r => r.title).join() === 'Design the home page,Write the pricing page,Fix the login crash' && (await query('SELECT count(*) AS n FROM projects'))[0].n === 2)" },
+    { name: "Globex sees only its own tasks", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '2', false)\"), await query('SET ROLE app_user'), (await query('SELECT title FROM tasks ORDER BY id')).map(r => r.title).join() === 'Pick a domain name,Draft the about page')" },
+    { name: "No tenant set: no rows at all", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '', false)\"), await query('SET ROLE app_user'), (await query('SELECT count(*) AS n FROM tasks'))[0].n === 0 && (await query('SELECT count(*) AS n FROM projects'))[0].n === 0)" },
+    { name: "Writing into another tenant is rejected", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '2', false)\"), await query('SET ROLE app_user'), await query(\"INSERT INTO tasks (tenant_id, project_id, title) VALUES (1, 1, 'Sneaky')\").then(() => false, e => /row-level security/.test(e.message)))" },
+    { name: "The app can still add tasks to its own tenant", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '2', false)\"), await query('SET ROLE app_user'), (await query(\"INSERT INTO tasks (tenant_id, project_id, title) VALUES (2, 3, 'Launch!') RETURNING title\")).length === 1)" },
+  ]}
+>
+
+Secure the PandaTasks tables so the database enforces isolation. Keep the setup at the top, then: 🛡️
+
+1. Create the role **`app_user`** (`NOLOGIN` is fine here) and grant it `SELECT` on `tenants` and `SELECT, INSERT, UPDATE, DELETE` on `projects` and `tasks`.
+2. Create **`current_tenant_id()`**, returning the `app.tenant_id` setting as a `bigint`, or `NULL` when it's missing or empty.
+3. **Enable and force** row-level security on `projects` and `tasks`, each with a policy so rows are visible and writable only when `tenant_id = current_tenant_id()`.
+4. Replace the last query with the **guard query** from this lesson: tables in `public` that have a `tenant_id` column but RLS **not enabled**, as one column named **`table_name`**, sorted. When everything is protected, it returns no rows.
+
+The checks then act as the app: they switch to `app_user`, set different tenants, and try to read and write across the boundary.
+
+<Hint>
+
+`CREATE ROLE app_user NOLOGIN;` and two `GRANT` statements. The function is the one from Step 1. For each table: `ALTER TABLE … ENABLE ROW LEVEL SECURITY;`, `ALTER TABLE … FORCE ROW LEVEL SECURITY;` and `CREATE POLICY tenant_isolation ON … USING (tenant_id = current_tenant_id()) WITH CHECK (tenant_id = current_tenant_id());`. For the guard query, copy the one from Step 3 and rename its column `AS table_name`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id)
+);
+INSERT INTO tenants (slug) VALUES ('acme'), ('globex');
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+INSERT INTO tasks (tenant_id, project_id, title) VALUES
+  (1, 1, 'Design the home page'),
+  (1, 1, 'Write the pricing page'),
+  (1, 2, 'Fix the login crash'),
+  (2, 3, 'Pick a domain name'),
+  (2, 3, 'Draft the about page');
+
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT ON tenants TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON projects, tasks TO app_user;
+
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON projects
+  USING (tenant_id = current_tenant_id())
+  WITH CHECK (tenant_id = current_tenant_id());
+
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON tasks
+  USING (tenant_id = current_tenant_id())
+  WITH CHECK (tenant_id = current_tenant_id());
+
+SELECT c.relname AS table_name
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relkind IN ('r', 'p')
+  AND NOT c.relrowsecurity
+  AND EXISTS (
+    SELECT 1
+    FROM pg_attribute AS a
+    WHERE a.attrelid = c.oid
+      AND a.attname = 'tenant_id'
+      AND NOT a.attisdropped
+  )
+ORDER BY c.relname;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- RLS is the **second line of defence**: application checks stay, and a forgotten `WHERE tenant_id` returns nothing instead of leaking.
+- The app connects as an **unprivileged role** (not superuser, not owner, no `BYPASSRLS`); support tools use a separate, audited `BYPASSRLS` role.
+- Each request sets the tenant **inside its transaction** with `set_config('app.tenant_id', …, true)`: safe with transaction pooling.
+- **`current_tenant_id()`** returns `NULL` when the setting is missing or empty, so the policies **fail closed**.
+- **`USING`** filters what a statement sees; **`WITH CHECK`** rejects rows written outside the tenant. **`FORCE ROW LEVEL SECURITY`** applies policies to the owner too.
+- Views need **`security_invoker = true`**; `SECURITY DEFINER` functions and background jobs need care.
+- Generate policies for **every** `tenant_id` table, and run a **guard query** and isolation tests in CI.

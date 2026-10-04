@@ -1,0 +1,310 @@
+---
+title: "Shop Analytics: Revenue by Month"
+description: "Level 1 capstone, part 1: turn raw orders into order totals, revenue, average order value and a month-by-month revenue report for the shop's board."
+duration: 18
+xp: 30
+---
+
+Welcome to the Level 1 capstone! 🎉 The panda-themed online shop from the sample database has its first **board meeting** next week, and the founder has sent you a list of questions:
+
+> 1. How much did we actually sell, month by month?
+> 2. Who are our best customers, and do people come back?
+> 3. Which products never sell, and what's about to run out?
+> 4. Can you put the headline numbers on one page?
+
+Over three parts you'll answer all of them with the tools from Level 1: **joins**, **subqueries**, **CTEs**, **changing data** and **your own tables**. This part covers question 1: revenue.
+
+## Know your data first
+
+Before computing anything, look at what's there. Analysts who skip this step end up presenting wrong numbers with great confidence. How many orders are there, over which period, and in which states?
+
+<CodeExample output={` orders | first_order | last_order
+--------+-------------+------------
+     40 | 2025-01-07  | 2025-06-17
+(1 row)
+
+  status   | orders
+-----------+--------
+ delivered |     16
+ cancelled |      8
+ paid      |      8
+ shipped   |      8
+(4 rows)`}>
+
+```sql
+SELECT count(*) AS orders,
+  min(ordered_at)::date AS first_order,
+  max(ordered_at)::date AS last_order
+FROM orders;
+
+SELECT status, count(*) AS orders
+FROM orders
+GROUP BY status
+ORDER BY orders DESC, status;
+```
+
+</CodeExample>
+
+Forty orders from January to June 2025, and **eight were cancelled**. A cancelled order brought in no money, so the first rule of this report is: **revenue ignores cancelled orders**. Paid, shipped and delivered orders all count.
+
+The second thing to notice: `orders` has **no total column**. The money lives in `order_items`, one row per product in an order, with the `quantity` and the `unit_price` at the time of sale. An order's total is the sum of `quantity * unit_price` over its items.
+
+## Step 1: a total for every order
+
+Most of the board's questions start from the same building block: one row per order with its total. That's a perfect job for a **CTE**, a named step you can build on (see [CTEs](/learn/sql/common-table-expressions)):
+
+<CodeExample output={` id |    day     |  status   | items | total
+----+------------+-----------+-------+--------
+  1 | 2025-01-07 | delivered |     4 | 102.00
+  2 | 2025-01-11 | shipped   |     6 | 200.17
+  3 | 2025-01-15 | paid      |     2 |   8.40
+  4 | 2025-01-19 | cancelled |     4 |  44.50
+  5 | 2025-01-24 | delivered |     6 | 149.73
+  6 | 2025-01-28 | delivered |     2 |  58.00
+(6 rows)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.ordered_at, o.status,
+    sum(oi.quantity) AS items,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT id, ordered_at::date AS day, status, items, total
+FROM order_totals
+ORDER BY id
+LIMIT 6;
+```
+
+</CodeExample>
+
+`GROUP BY o.id` is enough to select the other `orders` columns too: because `id` is the primary key, PostgreSQL knows each group has exactly one customer, date and status.
+
+## Step 2: the headline numbers
+
+With `order_totals` in place, the headline figures are simple aggregates over the orders that weren't cancelled. **Average order value** (AOV) is a favourite of every shop owner: how much a typical order is worth.
+
+<CodeExample output={` orders | revenue | avg_order | customers
+--------+---------+-----------+-----------
+     32 | 2445.82 |     76.43 |        17
+(1 row)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT count(*) AS orders,
+  sum(total) AS revenue,
+  round(avg(total), 2) AS avg_order,
+  count(DISTINCT customer_id) AS customers
+FROM order_totals
+WHERE status <> 'cancelled';
+```
+
+</CodeExample>
+
+32 real orders from 17 different customers brought in 2445.82, an average of 76.43 per order.
+
+<Callout type="warning" title="The join fan-out trap">
+
+Why not skip the CTE and write `count(*)` straight after joining `orders` to `order_items`? Because a join produces **one row per item**, not one per order: an order with three products appears three times. `count(*)` would count items, and `avg()` would average items instead of orders. This is called **fan-out**, and it quietly breaks reports everywhere. Aggregate the items **per order first** (as `order_totals` does), or use `count(DISTINCT o.id)` when you only need a count.
+
+</Callout>
+
+Here's the trap in action, next to the correct numbers:
+
+<CodeExample output={` orders | avg_order
+--------+-----------
+     65 |     37.63
+(1 row)
+
+ orders | avg_order
+--------+-----------
+     32 |     76.43
+(1 row)`}>
+
+```sql
+-- wrong: rows are items, not orders
+SELECT count(*) AS orders,
+  round(avg(oi.quantity * oi.unit_price), 2) AS avg_order
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled';
+
+-- right: count distinct orders, divide revenue by them
+SELECT count(DISTINCT o.id) AS orders,
+  round(sum(oi.quantity * oi.unit_price)
+    / count(DISTINCT o.id), 2) AS avg_order
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled';
+```
+
+</CodeExample>
+
+The wrong version claims 65 orders worth 37.63 each: about twice the orders at half the value. Nothing errored, and the numbers even look plausible. That's what makes fan-out dangerous.
+
+## Step 3: revenue by month
+
+The board wants a trend, so group the order totals by **month**. `to_char(ordered_at, 'YYYY-MM')` turns a timestamp into a sortable label such as `2025-03`:
+
+<CodeExample output={`  month  | orders | revenue | avg_order
+---------+--------+---------+-----------
+ 2025-01 |      5 |  518.30 |    103.66
+ 2025-02 |      6 |  331.69 |     55.28
+ 2025-03 |      6 |  525.80 |     87.63
+ 2025-04 |      6 |  331.69 |     55.28
+ 2025-05 |      5 |  467.80 |     93.56
+ 2025-06 |      4 |  270.54 |     67.64
+(6 rows)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.ordered_at, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT to_char(ordered_at, 'YYYY-MM') AS month,
+  count(*) AS orders,
+  sum(total) AS revenue,
+  round(avg(total), 2) AS avg_order
+FROM order_totals
+WHERE status <> 'cancelled'
+GROUP BY month
+ORDER BY month;
+```
+
+</CodeExample>
+
+March was the best month and June the weakest, although June's last order was on the 17th, so the month may not be over in the data. Always check whether the **last period is complete** before you call it a decline!
+
+`date_trunc('month', ordered_at)` is the other common way to group by month. It keeps a real timestamp (`2025-03-01 00:00:00`), which is handy for further date maths; `to_char` gives a nicer label.
+
+<Quiz
+  question="An order has 3 items. You join orders to order_items and compute count(*) over 10 such orders. What do you get?"
+  options={["10", "3", "30", "13"]}
+  answer={2}
+  explanation="The join produces one row per item, so 10 orders with 3 items each become 30 rows, and count(*) counts all 30. Use count(DISTINCT o.id), or aggregate per order first, to count orders."
+/>
+
+## Step 4: where the money comes from
+
+The founder will ask which **categories** earn the money. Join items to products, and compare each category with the total using a **scalar subquery**:
+
+<CodeExample output={` category | revenue | pct
+----------+---------+------
+ kitchen  | 1160.10 | 47.4
+ books    |  830.41 | 34.0
+ toys     |  287.40 | 11.8
+ snacks   |   86.91 |  3.6
+ tea      |   81.00 |  3.3
+(5 rows)`}>
+
+```sql
+SELECT p.category,
+  sum(oi.quantity * oi.unit_price) AS revenue,
+  round(100 * sum(oi.quantity * oi.unit_price) / (
+    SELECT sum(oi2.quantity * oi2.unit_price)
+    FROM order_items AS oi2
+    JOIN orders AS o2 ON o2.id = oi2.order_id
+    WHERE o2.status <> 'cancelled'
+  ), 1) AS pct
+FROM order_items AS oi
+JOIN orders AS o ON o.id = oi.order_id
+JOIN products AS p ON p.id = oi.product_id
+WHERE o.status <> 'cancelled'
+GROUP BY p.category
+ORDER BY revenue DESC;
+```
+
+</CodeExample>
+
+Kitchen and books bring in over 80% of revenue, while tea and snacks barely register. That's the kind of sentence a board remembers. (Grouping by category is safe from fan-out here, because every row really is an item and we're adding up item revenue.)
+
+<Callout type="tip" title="Write the definition down">
+
+"Revenue" sounds obvious until two reports disagree. Do cancelled orders count? Refunds? Shipping? Tax? Real analytics teams write a one-line definition next to every metric ("revenue = sum of item prices of paid, shipped and delivered orders"), and every query uses the same one. A shared CTE like `order_totals` is how that definition lives in SQL.
+
+</Callout>
+
+<Exercise
+  language="sql"
+  title="The monthly revenue report"
+  starter={`WITH order_totals AS (
+  SELECT o.id, o.ordered_at, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT to_char(ordered_at, 'YYYY-MM') AS month,
+  sum(total) AS revenue
+FROM order_totals
+GROUP BY month;
+`}
+  tests={[
+    { name: "Columns: month, orders, items_sold, revenue", check: "columns.join() === 'month,orders,items_sold,revenue'" },
+    { name: "One row per month, January to June, in order", check: "rows.map(r => r.month).join() === '2025-01,2025-02,2025-03,2025-04,2025-05,2025-06'" },
+    { name: "Cancelled orders are left out", check: "rows.map(r => r.revenue).join() === '518.3,331.69,525.8,331.69,467.8,270.54'" },
+    { name: "orders counts orders and items_sold adds up quantities", check: "rows.map(r => r.orders).join() === '5,6,6,6,5,4' && rows.map(r => r.items_sold).join() === '20,26,22,26,20,16'" },
+    { name: "New orders show up in the right month", check: "(r => r.length === 7 && r[6].month === '2025-07' && r[6].orders === 1 && r[6].items_sold === 4 && r[6].revenue === 56)(await rerun(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (18, '2025-07-02 10:00', 'paid') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, 1, 4, 14.00 FROM o\"))" },
+    { name: "A cancelled order doesn't add a month", check: "(await rerun(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (19, '2025-08-02 10:00', 'cancelled') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, 2, 1, 14.00 FROM o\")).every(r => r.month !== '2025-08')" },
+  ]}
+>
+
+Finish the report the board will see first. For every month with sales, show:
+
+- `month`: the month as `'YYYY-MM'`,
+- `orders`: how many orders were placed,
+- `items_sold`: how many units were sold in total (the sum of the quantities),
+- `revenue`: the month's revenue,
+
+counting only orders that weren't **cancelled**, with the months in date order. Make sure `orders` counts **orders**, not items!
+
+<Hint>
+
+Add `sum(oi.quantity) AS items` to the `order_totals` CTE, so each order carries its unit count. Then, in the outer query, filter with `WHERE status <> 'cancelled'`, select `count(*) AS orders` and `sum(items) AS items_sold` next to the revenue, and finish with `ORDER BY month`. Because the outer query reads one row per order, `count(*)` counts orders.
+
+</Hint>
+
+<Solution>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.ordered_at, o.status,
+    sum(oi.quantity) AS items,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT to_char(ordered_at, 'YYYY-MM') AS month,
+  count(*) AS orders,
+  sum(items) AS items_sold,
+  sum(total) AS revenue
+FROM order_totals
+WHERE status <> 'cancelled'
+GROUP BY month
+ORDER BY month;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Look at the data before computing: counts, date ranges and statuses tell you what "revenue" should include.
+- Build reports on a shared CTE such as `order_totals`: **one row per order** with its total.
+- Revenue, order counts and average order value come from aggregates over that CTE, **without cancelled orders**.
+- Joins **fan out**: after joining `order_items`, rows are items. Aggregate per order first, or use `count(DISTINCT ...)`.
+- Group by `to_char(ordered_at, 'YYYY-MM')` for monthly trends, and check whether the last period is complete.
+- A scalar subquery gives each group its share of the total.

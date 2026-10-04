@@ -1,0 +1,356 @@
+---
+title: Upserts and Transactions
+description: Insert-or-update in one step with ON CONFLICT, and make several changes all-or-nothing with BEGIN, COMMIT, ROLLBACK and SAVEPOINT.
+duration: 18
+xp: 25
+---
+
+Two problems come up as soon as an app writes real data.
+
+First: "add this row, **or update it if it's already there**". A customer re-imports their address book. A shopper clicks "add to basket" on something that's already in the basket. You could check first and then decide, but there's a cleaner, safer way: the **upsert** (update + insert).
+
+Second: placing an order means inserting the order, inserting its items **and** reducing the stock. If the app crashes halfway, you'd have an order without items, or items that were never taken out of stock. **Transactions** make a group of changes happen **all together or not at all**.
+
+## ON CONFLICT DO NOTHING
+
+A new batch of sign-ups arrives. One of them, Mei, is already a customer (her email is taken), so a plain `INSERT` would fail with a duplicate key error and add **nobody**. Add `ON CONFLICT … DO NOTHING` and PostgreSQL skips the clashing rows and inserts the rest:
+
+<CodeExample output={`INSERT 0 1
+
+ customers
+-----------
+        21
+(1 row)`}>
+
+```sql
+INSERT INTO customers (name, email, city, country, joined_on)
+VALUES
+  ('Mei Lin', 'mei@pandadev.test', 'London', 'UK', '2025-07-01'),
+  ('Ola Nowak', 'ola@pandadev.test', 'Warsaw', 'Poland', '2025-07-01')
+ON CONFLICT (email) DO NOTHING;
+
+SELECT count(*) AS customers FROM customers;
+```
+
+</CodeExample>
+
+`INSERT 0 1`: one row added, one skipped, no error. The `(email)` in brackets is the **conflict target**: the column (or columns) whose uniqueness decides whether a row "already exists".
+
+## ON CONFLICT DO UPDATE
+
+Often you don't want to skip the existing row but **update** it with the new data. Mei has moved to Edinburgh, and the import says so:
+
+<CodeExample output={` id |   name    |   city    | joined_on
+----+-----------+-----------+------------
+  1 | Mei Lin   | Edinburgh | 2024-01-15
+ 22 | Ola Nowak | Warsaw    | 2025-07-01
+(2 rows)`}>
+
+```sql
+INSERT INTO customers (name, email, city, country, joined_on)
+VALUES
+  ('Mei Lin', 'mei@pandadev.test', 'Edinburgh', 'UK', '2025-07-01'),
+  ('Ola Nowak', 'ola@pandadev.test', 'Warsaw', 'Poland', '2025-07-01')
+ON CONFLICT (email) DO UPDATE
+SET city = EXCLUDED.city
+RETURNING id, name, city, joined_on;
+```
+
+</CodeExample>
+
+Mei kept her id (1) and her original `joined_on`, and only her city changed. Ola was inserted as a new customer.
+
+Did you notice Ola got id 22, not 21? Mei's attempted insert took number 21 before the conflict was spotted, and numbers are never handed out twice. Ids can have **gaps**, so never count on them being consecutive.
+
+**`EXCLUDED`** is the row you **tried** to insert, the one that was "excluded" by the conflict. So `EXCLUDED.city` is `'Edinburgh'`, while plain `city` (or `customers.city`) is the value already in the table. You choose exactly which columns to overwrite; here `joined_on` stays as it was.
+
+## Adding to a basket
+
+`EXCLUDED` really shines when you **combine** old and new values. In `order_items`, each order can have each product only once: its key is `(order_id, product_id)`. Order 3 already has 2 × Bamboo Chopsticks (product 14). The customer adds one more pack, and 2 × Jasmine Tea (product 1):
+
+<CodeExample output={`INSERT 0 2
+
+ product_id | quantity | unit_price
+------------+----------+------------
+          1 |        2 |       6.50
+         14 |        3 |       4.20
+(2 rows)`}>
+
+```sql
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES
+  (3, 14, 1, 4.20),
+  (3, 1, 2, 6.50)
+ON CONFLICT (order_id, product_id) DO UPDATE
+SET quantity = order_items.quantity + EXCLUDED.quantity;
+
+SELECT product_id, quantity, unit_price
+FROM order_items
+WHERE order_id = 3
+ORDER BY product_id;
+```
+
+</CodeExample>
+
+The chopsticks went from 2 to 3 (old quantity + new quantity), and the tea became a new line. One statement, whatever was in the basket before.
+
+## The conflict target needs a unique rule
+
+`ON CONFLICT (column)` only works if there's a **unique constraint** (or primary key) on exactly those columns. Product names in the sample database aren't declared unique, so this fails:
+
+<CodeExample output={`ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification`}>
+
+```sql
+INSERT INTO products (name, category, price)
+VALUES ('Kite', 'toys', 16.00)
+ON CONFLICT (name) DO UPDATE
+SET price = EXCLUDED.price;
+```
+
+</CodeExample>
+
+That's PostgreSQL protecting you: without a unique rule, "the row that already exists" isn't well defined. You'll add `UNIQUE` constraints yourself in the Designing Tables module.
+
+<Callout type="tip" title="Why not check first, then insert or update?">
+
+An app could run `SELECT … WHERE email = …` and then decide to `INSERT` or `UPDATE`. But between the check and the write, **another request** can sneak in and insert the same email, so one of the two fails, or you get a duplicate where nothing enforces uniqueness. `INSERT … ON CONFLICT` does the check and the write as one atomic step, so it's safe even when thousands of requests arrive at once. (PostgreSQL also has a `MERGE` statement for bigger "sync this table with that one" jobs.)
+
+</Callout>
+
+## Transactions: all or nothing
+
+A **transaction** is a group of statements that succeed or fail **together**. You start one with `BEGIN` and finish it with `COMMIT`:
+
+<CodeExample output={`BEGIN
+
+INSERT 0 1
+
+INSERT 0 1
+
+UPDATE 1
+
+COMMIT`}>
+
+```sql
+BEGIN;
+
+INSERT INTO orders (customer_id, ordered_at, status)
+VALUES (19, '2025-07-01 10:00', 'paid');
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (currval('orders_id_seq'), 13, 1, 32.00);
+
+UPDATE products
+SET stock = stock - 1
+WHERE id = 13;
+
+COMMIT;
+```
+
+</CodeExample>
+
+`currval('orders_id_seq')` is the id that the `INSERT` into `orders` just generated in **your** session, so the item points at the new order without guessing its number. (The CTE trick from [the INSERT lesson](/learn/sql/insert-rows) works too.)
+
+Until the `COMMIT`, nobody else can see these changes, and if anything fails (an error, a crash, a lost connection) **none** of them happen. After the `COMMIT`, all of them are saved for good, even if the server loses power a millisecond later.
+
+You've actually been using transactions all along: outside `BEGIN … COMMIT`, PostgreSQL wraps **every single statement** in its own little transaction. That's why a multi-row `INSERT` is all or nothing.
+
+## ROLLBACK: the undo button
+
+`ROLLBACK` ends a transaction by **throwing away** everything it did. Remember the scary statements without a `WHERE`? Inside a transaction, you get a second chance:
+
+<CodeExample output={`BEGIN
+
+DELETE 80
+
+ items_left
+------------
+          0
+(1 row)
+
+ROLLBACK
+
+ items_left
+------------
+         80
+(1 row)`}>
+
+```sql
+BEGIN;
+
+DELETE FROM order_items;
+
+SELECT count(*) AS items_left FROM order_items;
+
+ROLLBACK;
+
+SELECT count(*) AS items_left FROM order_items;
+```
+
+</CodeExample>
+
+Inside the transaction the items were gone; after `ROLLBACK` all 80 are back. That's why careful people run risky fixes on a real database like this: `BEGIN`, run the change, check the result with a `SELECT`, then `COMMIT` if it's right or `ROLLBACK` if it isn't.
+
+When a statement inside a transaction **fails**, PostgreSQL marks the whole transaction as failed. Everything after that is refused until you end it, and even `COMMIT` then rolls back. In `psql` it looks like this:
+
+```text
+shop=# BEGIN;
+BEGIN
+shop=*# UPDATE products SET stock = stock - 1 WHERE id = 13;
+UPDATE 1
+shop=*# INSERT INTO orders (customer_id, ordered_at, status)
+shop-*#   VALUES (999, '2025-07-01 10:00', 'paid');
+ERROR:  insert or update on table "orders" violates foreign key
+constraint "orders_customer_id_fkey"
+DETAIL:  Key (customer_id)=(999) is not present in table "customers".
+shop=!# UPDATE products SET stock = stock - 1 WHERE id = 1;
+ERROR:  current transaction is aborted, commands ignored until end of
+transaction block
+shop=!# COMMIT;
+ROLLBACK
+```
+
+Notice the last line: you asked for `COMMIT`, PostgreSQL answered `ROLLBACK`. The stock change from the first `UPDATE` is gone too. All or nothing. (The runner on this site stops at the first error, so you'll only see the first `ERROR` here.)
+
+## SAVEPOINT: undo part of a transaction
+
+Sometimes you want to undo just the **last few** steps, not the whole transaction. A **savepoint** is a bookmark inside a transaction; `ROLLBACK TO SAVEPOINT` jumps back to it and keeps everything before it:
+
+<CodeExample output={`BEGIN
+
+UPDATE 1
+
+SAVEPOINT
+
+UPDATE 15
+
+ROLLBACK
+
+COMMIT
+
+     name      | price | stock
+---------------+-------+-------
+ Earl Grey     |  5.25 |    20
+ Bamboo Crisps |  2.99 |   120
+(2 rows)`}>
+
+```sql
+BEGIN;
+
+UPDATE products SET stock = stock + 20 WHERE id = 3;
+
+SAVEPOINT before_sale;
+
+UPDATE products SET price = price / 2;  -- oops, no WHERE!
+
+ROLLBACK TO SAVEPOINT before_sale;
+
+COMMIT;
+
+SELECT name, price, stock
+FROM products
+WHERE id IN (3, 4)
+ORDER BY id;
+```
+
+</CodeExample>
+
+The restock of Earl Grey (before the savepoint) was committed; the half-price disaster (after it) was undone. Apps and libraries use savepoints to retry one step, or to let one part of a big job fail without losing the rest.
+
+<Callout type="warning" title="Keep transactions short">
+
+While a transaction is open, the rows it changed are **locked**: other sessions that want to change them have to wait. Never leave a transaction open while waiting for a user to click something, or while calling a slow outside service. `BEGIN`, do the database work, `COMMIT`, straight away. What happens when two transactions touch the same rows at the same time (isolation levels, locks and deadlocks) is a whole Level 3 module.
+
+</Callout>
+
+<Quiz
+  question="In INSERT … ON CONFLICT (email) DO UPDATE SET city = EXCLUDED.city, what is EXCLUDED.city?"
+  options={["The city already stored in the table", "The city from the row you tried to insert", "NULL, because the row was excluded", "The city of the first customer in the table"]}
+  answer={1}
+  explanation="EXCLUDED is the row your INSERT proposed, which was excluded because of the conflict. The existing value is plain city (or customers.city)."
+/>
+
+<Quiz
+  question="You run BEGIN, then an UPDATE that succeeds, then an INSERT that fails, then COMMIT. What happens to the UPDATE?"
+  options={["It is saved, because it succeeded", "It is undone, because the transaction failed", "It is saved only if you run COMMIT twice", "PostgreSQL asks which statements to keep"]}
+  answer={1}
+  explanation="An error makes the whole transaction fail. COMMIT then rolls back, so the successful UPDATE is undone as well: all or nothing."
+/>
+
+<Exercise
+  language="sql"
+  title="Add to an order in one transaction"
+  starter={`BEGIN;
+
+-- 1. Add the two lines to order 3 (one is already there!)
+
+-- 2. Take the quantities out of stock
+
+COMMIT;
+
+SELECT product_id, quantity, unit_price
+FROM order_items
+WHERE order_id = 3
+ORDER BY product_id;
+`}
+  tests={[
+    { name: "Order 3 now has 3 × Bamboo Chopsticks", check: "(await query(\"SELECT quantity FROM order_items WHERE order_id = 3 AND product_id = 14\"))[0].quantity === 3" },
+    { name: "Order 3 has a new line: 2 × Jasmine Tea at 6.50", check: "(await query(\"SELECT quantity, unit_price FROM order_items WHERE order_id = 3 AND product_id = 1\")).map(r => r.quantity + '@' + r.unit_price).join() === '2@6.5'" },
+    { name: "Stock went down: Jasmine Tea 38, Bamboo Chopsticks 199", check: "(await query(\"SELECT stock FROM products WHERE id IN (1, 14) ORDER BY id\")).map(r => r.stock).join() === '38,199'" },
+    { name: "No other product's stock changed", check: "(await query(\"SELECT sum(stock) AS s FROM products WHERE id NOT IN (1, 14)\"))[0].s === 345" },
+    { name: "The changes run between BEGIN and COMMIT", check: "results.findIndex(r => r.command === 'BEGIN') >= 0 && results.findIndex(r => r.command === 'BEGIN') < results.findIndex(r => r.command.startsWith('INSERT')) && results.findIndex(r => r.command === 'COMMIT') > results.findLastIndex(r => r.command.startsWith('UPDATE'))" },
+    { name: "The final SELECT lists the order's 2 lines", check: "columns.join() === 'product_id,quantity,unit_price' && rows.map(r => r.product_id).join() === '1,14'" },
+  ]}
+>
+
+The customer behind order 3 adds **1 × Bamboo Chopsticks** (product 14, 4.20) and **2 × Jasmine Tea** (product 1, 6.50) to their order. Order 3 already contains 2 × Bamboo Chopsticks, so that line must grow to 3 rather than be added twice.
+
+Inside the transaction:
+
+1. Add both lines to `order_items` with **one** `INSERT … ON CONFLICT`, adding the quantities when the product is already in the order.
+2. Take the quantities out of stock: Jasmine Tea goes down by 2, Bamboo Chopsticks by 1.
+
+The `COMMIT` and the final `SELECT` are already there.
+
+<Hint>
+
+Step 1 is the basket example from this lesson: `ON CONFLICT (order_id, product_id) DO UPDATE SET quantity = order_items.quantity + EXCLUDED.quantity`. For step 2, two small updates are fine: `UPDATE products SET stock = stock - 2 WHERE id = 1;` and the same for product 14 with 1.
+
+</Hint>
+
+<Solution>
+
+```sql
+BEGIN;
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES
+  (3, 14, 1, 4.20),
+  (3, 1, 2, 6.50)
+ON CONFLICT (order_id, product_id) DO UPDATE
+SET quantity = order_items.quantity + EXCLUDED.quantity;
+
+UPDATE products SET stock = stock - 2 WHERE id = 1;
+UPDATE products SET stock = stock - 1 WHERE id = 14;
+
+COMMIT;
+
+SELECT product_id, quantity, unit_price
+FROM order_items
+WHERE order_id = 3
+ORDER BY product_id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- `INSERT … ON CONFLICT (cols) DO NOTHING` skips rows that would break a unique rule.
+- `ON CONFLICT (cols) DO UPDATE SET col = EXCLUDED.col` turns the clash into an update; `EXCLUDED` is the row you tried to insert.
+- The conflict target must match a **unique constraint** or primary key.
+- An upsert is one atomic step: safer than "check, then insert or update" from an app.
+- `BEGIN … COMMIT` makes several statements **all or nothing**; every statement on its own is already a tiny transaction.
+- `ROLLBACK` throws the transaction's changes away; after an error, the whole transaction is rolled back.
+- `SAVEPOINT name` and `ROLLBACK TO SAVEPOINT name` undo just part of a transaction. Keep transactions short.

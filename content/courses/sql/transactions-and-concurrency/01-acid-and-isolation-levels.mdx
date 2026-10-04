@@ -1,0 +1,457 @@
+---
+title: ACID, Transactions and Isolation Levels
+description: What ACID really guarantees, how transactions behave when things fail, the anomalies concurrent users cause, and how each isolation level in PostgreSQL deals with them.
+duration: 25
+xp: 30
+---
+
+A shop sells concert tickets. The code is simple: read how many tickets are left, and if there's at least one, sell it and write back `left - 1`. It passed every test. On the day the tickets went on sale, 2,000 people clicked "Buy" in the same second, and the shop sold **2,140 tickets for 2,000 seats**. Nothing crashed, no error was logged, and every single request did exactly what the code said. 🎫
+
+Bugs like this only exist when **many transactions run at the same time**, which is the normal state of every real database. This module is about understanding them: transactions and isolation levels (this lesson), locks (next) and the machinery underneath, MVCC (the one after).
+
+## ACID, one letter at a time
+
+You met transactions in the changing-data module: `BEGIN`, some statements, then `COMMIT` or `ROLLBACK`. The promises a transaction makes are called **ACID**:
+
+| Letter | Promise | How PostgreSQL keeps it |
+| --- | --- | --- |
+| **Atomicity** | All of the transaction's changes happen, or none of them | Uncommitted row versions are simply never shown (MVCC) |
+| **Consistency** | A transaction takes the data from one valid state to another | Constraints: `CHECK`, `FOREIGN KEY`, `UNIQUE`, `NOT NULL`… |
+| **Isolation** | Concurrent transactions don't see each other's half-done work | Snapshots (MVCC) and locks |
+| **Durability** | Once `COMMIT` returns, the change survives a crash | The write-ahead log (WAL), flushed to disk at commit |
+
+Two of these deserve a closer look. **Consistency** is only as strong as your constraints: PostgreSQL can't know that a balance mustn't go negative unless a `CHECK` says so. And **isolation** is the one with a dial: it comes in levels, and the default level is **not** full isolation, which is where the ticket bug came from.
+
+## Atomicity in action
+
+Here's a bank with a rule written as a constraint: balances can't go below zero. A transfer is two updates, and the second one breaks the rule. In PL/pgSQL, a block with an `EXCEPTION` clause runs as a **subtransaction**, so we can catch the error and look at what survived:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+NOTICE:  transfer cancelled: new row for relation "accounts" violates check constraint "accounts_balance_check"
+DO
+
+ id | owner | balance
+----+-------+---------
+  1 | Mei   |  100.00
+  2 | Sam   |   50.00
+(2 rows)`}>
+
+```sql
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  owner text NOT NULL,
+  balance numeric(10, 2) NOT NULL CHECK (balance >= 0)
+);
+INSERT INTO accounts VALUES (1, 'Mei', 100), (2, 'Sam', 50);
+
+DO $$
+BEGIN
+  UPDATE accounts SET balance = balance + 500 WHERE id = 2;
+  UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+EXCEPTION WHEN check_violation THEN
+  RAISE NOTICE 'transfer cancelled: %', SQLERRM;
+END $$;
+
+SELECT * FROM accounts ORDER BY id;
+```
+
+</CodeExample>
+
+The first `UPDATE` **succeeded**: Sam's balance really was 550 for a moment. But when the second one failed, the whole block was rolled back, including the successful credit. Nobody, not even this session, ever sees Sam's 550. That's atomicity: no half-done transfers, no money created from nothing.
+
+## Transactions in depth
+
+A few facts that bite people in production:
+
+- **Every statement is a transaction.** Without `BEGIN`, PostgreSQL wraps each statement in its own transaction (**autocommit**). A single `UPDATE` of a million rows is all-or-nothing on its own.
+- **Drivers differ.** psql and most Node.js drivers autocommit. Python's psycopg opens a transaction for you on the first statement and waits for `conn.commit()`: forget it, and your changes vanish when the connection closes.
+
+### An error poisons the transaction
+
+After any error inside `BEGIN … COMMIT`, PostgreSQL refuses everything else until the transaction ends:
+
+```text
+BEGIN;
+UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+ERROR:  new row for relation "accounts" violates check constraint ...
+SELECT * FROM accounts;
+ERROR:  current transaction is aborted, commands ignored until end of
+        transaction block
+COMMIT;
+ROLLBACK
+```
+
+Look at the last line: `COMMIT` of a failed transaction answers `ROLLBACK`. Apps that don't check that answer believe they saved data they didn't. To recover from an expected error **inside** a transaction, set a `SAVEPOINT` first and `ROLLBACK TO SAVEPOINT` after the error, which is exactly what PL/pgSQL's `EXCEPTION` block did for us above.
+
+### Time stands still inside a transaction
+
+`now()` is the time the transaction **started**, however long it runs. `clock_timestamp()` is the real time:
+
+<CodeExample output={`BEGIN
+
+DO
+
+ now_is_start | clock_moved_on
+--------------+----------------
+ t            | t
+(1 row)
+
+COMMIT`}>
+
+```sql
+BEGIN;
+
+DO $$ BEGIN PERFORM pg_sleep(0.05); END $$;
+
+SELECT now() = transaction_timestamp() AS now_is_start,
+  clock_timestamp() > now() AS clock_moved_on;
+
+COMMIT;
+```
+
+</CodeExample>
+
+That's usually what you want (every row inserted by one transaction gets the same `created_at`), but it surprises anyone who measures durations with `now()` inside a long transaction.
+
+## What goes wrong when transactions overlap
+
+When two transactions touch the same data at the same time, the possible surprises have names. These timelines show two sessions, **A** and **B**, side by side; time flows downwards. (This in-browser database has one connection, so read these as diagrams; you can replay any of them with two `psql` windows on your own computer.)
+
+**Non-repeatable read**: the same query gives different answers within one transaction.
+
+```text
+A: BEGIN;
+A: SELECT balance FROM accounts WHERE id = 1;    -- 100
+                                    B: UPDATE accounts SET balance = 40
+                                         WHERE id = 1;     -- autocommit
+A: SELECT balance FROM accounts WHERE id = 1;    -- 40 (read committed)
+A: COMMIT;
+```
+
+**Phantom read**: new rows appear in a range you already read. A report counts 40 orders, then sums the totals of "all" orders and gets a 41st order's money in it.
+
+**Lost update**: the ticket bug. Both sessions read the same value, both compute a new one from it, and the second write silently replaces the first:
+
+```text
+A: BEGIN;                           B: BEGIN;
+A: SELECT left FROM events
+     WHERE id = 7;         -- 1
+                                    B: SELECT left FROM events
+                                         WHERE id = 7;     -- 1
+A: UPDATE events SET left = 0
+     WHERE id = 7;
+A: COMMIT;              -- sold!
+                                    B: UPDATE events SET left = 0
+                                         WHERE id = 7;
+                                    B: COMMIT;         -- sold again!
+```
+
+Two tickets sold, `left` went from 1 to 0, and nothing looks wrong in the table.
+
+**Write skew**: two transactions read the **same** rows, then each writes a **different** row, and together they break a rule neither one broke alone. The textbook case: a hospital requires at least one doctor on call. Alice and Bob are both on call and both feel ill:
+
+```text
+A (Alice): BEGIN;                   B (Bob): BEGIN;
+A: SELECT count(*) FROM doctors
+     WHERE on_call;        -- 2
+                                    B: SELECT count(*) FROM doctors
+                                         WHERE on_call;    -- 2
+A: UPDATE doctors SET on_call = false
+     WHERE name = 'Alice';
+                                    B: UPDATE doctors
+                                         SET on_call = false
+                                         WHERE name = 'Bob';
+A: COMMIT;                          B: COMMIT;
+-- nobody is on call
+```
+
+A **dirty read** (seeing another transaction's **uncommitted** changes) is the fifth classic anomaly, but you can forget it: PostgreSQL never allows it, at any level.
+
+## Isolation levels in PostgreSQL
+
+The SQL standard defines four isolation levels by which anomalies they forbid. PostgreSQL implements three of them (it treats `READ UNCOMMITTED` as `READ COMMITTED`):
+
+| Level | Snapshot | Non-repeatable read | Phantom | Lost update | Write skew |
+| --- | --- | --- | --- | --- | --- |
+| **Read committed** (default) | new one per **statement** | possible | possible | possible (read-modify-write) | possible |
+| **Repeatable read** | one per **transaction** | prevented | prevented | **error** 40001 | possible |
+| **Serializable** | one per transaction + conflict tracking | prevented | prevented | **error** 40001 | **error** 40001 |
+
+- **Read committed** gives each **statement** a fresh snapshot of all committed data. It's fast and good for most work, as long as you don't read a value in one statement and write a value computed from it in another.
+- **Repeatable read** takes one snapshot at the transaction's **first query** and uses it until the end: perfect for reports that run several queries and must agree with each other. If the transaction tries to update a row that someone else changed since the snapshot, it fails with `could not serialize access due to concurrent update`.
+- **Serializable** guarantees that the result is the same as if the transactions had run **one after another**, in some order. PostgreSQL tracks which transactions read what (Serializable Snapshot Isolation) and aborts one transaction of any dangerous pattern, write skew included.
+
+You choose the level per transaction, and it must be set before the first query:
+
+<CodeExample output={` default_transaction_isolation
+-------------------------------
+ read committed
+(1 row)
+
+BEGIN
+
+ transaction_isolation
+-----------------------
+ repeatable read
+(1 row)
+
+ orders
+--------
+     40
+(1 row)
+
+COMMIT
+
+BEGIN
+
+ orders
+--------
+     40
+(1 row)
+
+ERROR:  SET TRANSACTION ISOLATION LEVEL must be called before any query`}>
+
+```sql
+SHOW default_transaction_isolation;
+
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SHOW transaction_isolation;
+SELECT count(*) AS orders FROM orders;
+COMMIT;
+
+BEGIN;
+SELECT count(*) AS orders FROM orders;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+```
+
+</CodeExample>
+
+The last statement fails on purpose: once a transaction has run a query, its snapshot rules are fixed. Write `BEGIN ISOLATION LEVEL …` (or `SET TRANSACTION` straight after `BEGIN`). Add **`READ ONLY`** for reports: PostgreSQL then rejects any write, and at the serializable level it can skip some bookkeeping.
+
+<Callout type="warning" title="Higher isolation means you must retry">
+
+Repeatable read and serializable don't make conflicts disappear: they turn silent corruption into **errors** with SQLSTATE `40001` (`serialization_failure`). Your application must catch that code and **run the whole transaction again** from the start, including the reads. Code that sets `SERIALIZABLE` without a retry loop just converts wrong data into failed requests. Deadlocks (`40P01`, next lesson) deserve the same treatment.
+
+</Callout>
+
+A retry loop in application code looks like this (Python with psycopg):
+
+```python
+from psycopg import errors
+
+def run_in_transaction(conn, work, attempts=5):
+    for attempt in range(attempts):
+        try:
+            with conn.transaction():       # BEGIN ... COMMIT
+                return work(conn)
+        except (errors.SerializationFailure,
+                errors.DeadlockDetected):
+            if attempt == attempts - 1:
+                raise                      # give up, report the error
+            # otherwise: loop and run the whole thing again
+```
+
+## Fixing the lost update
+
+Back to the tickets. There are four standard fixes, from simplest to heaviest:
+
+1. **Let the database do the arithmetic, and check in the same statement.** `UPDATE events SET left = left - 1 WHERE id = 7 AND left > 0` reads and writes in **one** statement. Under read committed, if another transaction updated the row meanwhile, PostgreSQL waits for it, then **re-checks the `WHERE` against the new version**. The second buyer gets `UPDATE 0`: sold out.
+2. **Lock the row while you think**: `SELECT … FOR UPDATE` makes the other session wait until you commit. That's the next lesson.
+3. **Optimistic locking**: keep a `version` column, and update only if it hasn't changed since you read it. No locks are held while the user is editing; a conflict shows up as `UPDATE 0`.
+4. **Repeatable read or serializable with retries**: the database detects the conflict and you run the transaction again.
+
+Here are fixes 1 and 3 in action. Each `UPDATE` reports how many rows it changed, and **that number is the answer**:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 1
+
+UPDATE 1
+
+UPDATE 0
+
+UPDATE 1
+
+UPDATE 0
+
+ id |       name       | seats_left | version
+----+------------------+------------+---------
+  7 | Panda Jazz Night |          0 |       2
+(1 row)`}>
+
+```sql
+CREATE TABLE gigs (
+  id integer PRIMARY KEY,
+  name text NOT NULL,
+  seats_left integer NOT NULL CHECK (seats_left >= 0),
+  version integer NOT NULL DEFAULT 1
+);
+INSERT INTO gigs (id, name, seats_left) VALUES (7, 'Panda Jazz', 1);
+
+-- Fix 1: two buyers, one seat
+UPDATE gigs SET seats_left = seats_left - 1
+WHERE id = 7 AND seats_left > 0;
+UPDATE gigs SET seats_left = seats_left - 1
+WHERE id = 7 AND seats_left > 0;
+
+-- Fix 3: two editors both loaded version 1
+UPDATE gigs SET name = 'Panda Jazz Night', version = version + 1
+WHERE id = 7 AND version = 1;
+UPDATE gigs SET name = 'Jazz with Pandas', version = version + 1
+WHERE id = 7 AND version = 1;
+
+SELECT * FROM gigs;
+```
+
+</CodeExample>
+
+The second buyer and the second editor both get **0 rows**, and the app turns that into "Sold out" or "Someone else changed this page, please reload". Notice what isn't there: no `SELECT` first. The check and the write are one atomic statement.
+
+<Quiz
+  question="Under READ COMMITTED, two sessions run UPDATE gigs SET seats_left = seats_left - 1 WHERE id = 7 AND seats_left > 0 at the same moment, with seats_left = 1. What happens?"
+  options={["Both succeed and seats_left becomes -1", "Both succeed and seats_left becomes 0, so one seat was sold twice", "The second waits for the first to commit, re-checks the WHERE on the new row, and updates 0 rows", "The second fails with a serialization error"]}
+  answer={2}
+  explanation="A row being updated is locked until its transaction ends, so the second UPDATE waits. In READ COMMITTED it then re-evaluates its WHERE clause against the newly committed version (seats_left = 0), which no longer matches, so it reports UPDATE 0. Read-modify-write in one statement is safe; split across a SELECT and an UPDATE it isn't."
+/>
+
+<Quiz
+  question="Which anomaly does REPEATABLE READ in PostgreSQL still allow?"
+  options={["Dirty reads", "Non-repeatable reads", "Phantom reads", "Write skew"]}
+  answer={3}
+  explanation="PostgreSQL's repeatable read uses one snapshot for the whole transaction, which prevents non-repeatable and phantom reads (and it never allows dirty reads). Write skew, where two transactions read the same rows and update different ones, is only caught at SERIALIZABLE."
+/>
+
+<Exercise
+  language="sql"
+  title="A transfer that can't lose money"
+  starter={`CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  owner text NOT NULL,
+  balance numeric(10, 2) NOT NULL CHECK (balance >= 0)
+);
+INSERT INTO accounts VALUES (1, 'Mei', 100), (2, 'Sam', 50);
+
+CREATE TABLE transfers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  from_id integer NOT NULL,
+  to_id integer NOT NULL,
+  amount numeric(10, 2) NOT NULL
+);
+
+-- Fix this function: see the task
+CREATE FUNCTION transfer(from_id integer, to_id integer,
+  amount numeric)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  current_balance numeric;
+BEGIN
+  SELECT balance INTO current_balance
+  FROM accounts WHERE id = from_id;
+
+  UPDATE accounts SET balance = current_balance - amount
+  WHERE id = from_id;
+  UPDATE accounts SET balance = balance + amount
+  WHERE id = to_id;
+
+  INSERT INTO transfers (from_id, to_id, amount)
+  VALUES (from_id, to_id, amount);
+END;
+$$;
+
+SELECT transfer(1, 2, 30);
+SELECT * FROM accounts ORDER BY id;`}
+  tests={[
+    { name: "transfer(1, 2, 30) leaves Mei with 70 and Sam with 80", check: "rows.map(r => r.owner + ' ' + r.balance).join() === 'Mei 70,Sam 80'" },
+    { name: "Each transfer is recorded in transfers", check: "(await query(\"SELECT transfer(2, 1, 5)\"), (await query(\"SELECT from_id, to_id, amount FROM transfers ORDER BY id\")).map(r => r.from_id + '>' + r.to_id + ' ' + r.amount).join() === '1>2 30,2>1 5')" },
+    { name: "Too little money: fails with 'insufficient funds'", check: "await query(\"SELECT transfer(1, 2, 500)\").then(() => false, e => /insufficient funds/.test(e.message))" },
+    { name: "Unknown receiver: fails with 'unknown account' instead of losing the money", check: "await query(\"SELECT transfer(1, 99, 10)\").then(() => false, e => /unknown account/.test(e.message))" },
+    { name: "Unknown sender: fails with 'unknown account'", check: "await query(\"SELECT transfer(42, 1, 10)\").then(() => false, e => /unknown account/.test(e.message))" },
+    { name: "Negative amounts are rejected (they would move money backwards)", check: "await query(\"SELECT transfer(2, 1, -20)\").then(() => false, () => true)" },
+    { name: "The debit checks and subtracts in one UPDATE (no SELECT … INTO)", check: "!/SELECT[^;]*\\bINTO\\b/i.test((await query(\"SELECT prosrc FROM pg_proc WHERE proname = 'transfer'\"))[0].prosrc)" },
+  ]}
+>
+
+The bank's `transfer` function has three bugs: a **lost update** waiting to happen (it reads the balance, then writes back a value computed in the app's head), it lets money **vanish** when the receiving account doesn't exist (an `UPDATE` that matches no rows isn't an error!), and it fails with an unhelpful constraint message when there isn't enough money. Rewrite `transfer(from_id, to_id, amount)` so that:
+
+1. an `amount` of zero or less raises an exception,
+2. the debit is **one** guarded `UPDATE` that subtracts and checks in the same statement (`… SET balance = balance - amount WHERE id = from_id AND balance >= amount`), with no `SELECT … INTO` first,
+3. if the debit changed no row, it raises `insufficient funds` (or `unknown account` if the sender doesn't exist),
+4. if the credit changed no row, it raises `unknown account`, which also undoes the debit,
+5. successful transfers are recorded in `transfers`.
+
+Keep the last two lines that run a transfer and show the balances.
+
+<Hint>
+
+In PL/pgSQL, **`FOUND`** is true after an `UPDATE` that changed at least one row. `RAISE EXCEPTION 'insufficient funds';` aborts the function, and because the function runs inside the statement's transaction, everything it already did is rolled back. To tell "no money" from "no account" after a failed debit, use `IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = from_id) THEN … END IF;`. Parameter names are the same as the column names here, so qualify the columns: `WHERE accounts.id = transfer.from_id`, or rename the parameters.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  owner text NOT NULL,
+  balance numeric(10, 2) NOT NULL CHECK (balance >= 0)
+);
+INSERT INTO accounts VALUES (1, 'Mei', 100), (2, 'Sam', 50);
+
+CREATE TABLE transfers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  from_id integer NOT NULL,
+  to_id integer NOT NULL,
+  amount numeric(10, 2) NOT NULL
+);
+
+CREATE FUNCTION transfer(p_from integer, p_to integer,
+  p_amount numeric)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF p_amount IS NULL OR p_amount <= 0 THEN
+    RAISE EXCEPTION 'amount must be positive';
+  END IF;
+
+  UPDATE accounts SET balance = balance - p_amount
+  WHERE id = p_from AND balance >= p_amount;
+  IF NOT FOUND THEN
+    IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = p_from) THEN
+      RAISE EXCEPTION 'unknown account %', p_from;
+    END IF;
+    RAISE EXCEPTION 'insufficient funds in account %', p_from;
+  END IF;
+
+  UPDATE accounts SET balance = balance + p_amount
+  WHERE id = p_to;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'unknown account %', p_to;
+  END IF;
+
+  INSERT INTO transfers (from_id, to_id, amount)
+  VALUES (p_from, p_to, p_amount);
+END;
+$$;
+
+SELECT transfer(1, 2, 30);
+SELECT * FROM accounts ORDER BY id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **ACID**: atomicity (all or nothing), consistency (only as strong as your constraints), isolation (comes in levels), durability (the WAL).
+- Every statement is its own transaction unless you `BEGIN`; an error aborts the whole transaction until `ROLLBACK`, and `SAVEPOINT` (or a PL/pgSQL `EXCEPTION` block) lets you recover part-way.
+- `now()` is the transaction's start time; `clock_timestamp()` is the real time.
+- Concurrency anomalies: non-repeatable reads, phantoms, **lost updates** and **write skew**. PostgreSQL never shows dirty reads.
+- **Read committed** (default) takes a snapshot per statement; **repeatable read** one per transaction; **serializable** also detects dangerous patterns. The stricter levels report conflicts as `40001` errors, so the application must **retry**.
+- The cheapest lost-update fix is one atomic statement: `UPDATE … SET x = x - 1 WHERE … AND x > 0`, then check the row count. Optimistic locking with a `version` column does the same for longer edits.

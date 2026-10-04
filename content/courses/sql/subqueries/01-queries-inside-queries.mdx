@@ -1,0 +1,411 @@
+---
+title: Queries Inside Queries
+description: Use one query's answer inside another with scalar subqueries, IN, EXISTS and correlated subqueries, and dodge the NOT IN trap.
+duration: 18
+xp: 25
+---
+
+Some questions need another answer first. "Which products cost **more than average**?" Before you can answer, you need to know what the average is. You could run two queries and copy the number across by hand, but SQL has a better way: put one query **inside** another.
+
+A query inside another query is called a **subquery**. You write it in brackets, and PostgreSQL works it out for you as part of the bigger query. In this lesson you'll meet the four shapes you'll use all the time: a single value, a list with `IN`, a yes/no check with `EXISTS`, and **correlated** subqueries that run once for each row.
+
+## A subquery that returns one value
+
+Start with the inner question on its own: what is the average product price?
+
+<CodeExample output={` average
+---------
+   18.13
+(1 row)`}>
+
+```sql
+SELECT round(avg(price), 2) AS average
+FROM products;
+```
+
+</CodeExample>
+
+Now put that query, in brackets, exactly where you would have typed the number:
+
+<CodeExample output={`          name          | price
+------------------------+-------
+ Rice Cooker            | 89.90
+ Tea Pot                | 32.00
+ Algorithms in Pictures | 29.00
+ Clean Python           | 24.99
+(4 rows)`}>
+
+```sql
+SELECT name, price
+FROM products
+WHERE price > (SELECT avg(price) FROM products)
+ORDER BY price DESC;
+```
+
+</CodeExample>
+
+PostgreSQL runs the inner query first, gets one number (18.13…), and then uses it in the `WHERE` clause like any other value. A subquery that returns **exactly one row with one column** is called a **scalar subquery**, and you can use it anywhere a single value fits.
+
+That includes the `SELECT` list. Here each product shows how far its price is from the average:
+
+<CodeExample output={`          name          | price | vs_average
+------------------------+-------+------------
+ Rice Cooker            | 89.90 |      71.77
+ Tea Pot                | 32.00 |      13.87
+ Algorithms in Pictures | 29.00 |      10.87
+(3 rows)`}>
+
+```sql
+SELECT
+  name,
+  price,
+  round(price - (SELECT avg(price) FROM products), 2) AS vs_average
+FROM products
+ORDER BY price DESC
+LIMIT 3;
+```
+
+</CodeExample>
+
+<Callout type="warning" title="One value means one value">
+
+A scalar subquery must return at most one row. If it returns more, PostgreSQL can't decide which value to use and stops with an error:
+
+<CodeExample output={`ERROR:  more than one row returned by a subquery used as an expression`}>
+
+```sql
+SELECT name
+FROM products
+WHERE price > (SELECT price FROM products WHERE category = 'tea');
+```
+
+</CodeExample>
+
+If the inner query returns **no** rows, the value is `NULL`, and a comparison with `NULL` is never true, so the outer query quietly returns nothing.
+
+</Callout>
+
+## A list of values with IN
+
+You already know `IN` with a fixed list: `WHERE country IN ('UK', 'Japan')`. The list can also come from a subquery that returns **one column with any number of rows**.
+
+Which customers have placed at least one order? The `orders` table knows their ids:
+
+<CodeExample output={` id |    name
+----+------------
+  1 | Mei Lin
+  2 | Sam Ortiz
+  3 | Ada Brooks
+  4 | Kenji Mori
+  5 | Ravi Patel
+(5 rows)`}>
+
+```sql
+SELECT id, name
+FROM customers
+WHERE id IN (SELECT customer_id FROM orders)
+ORDER BY id
+LIMIT 5;
+```
+
+</CodeExample>
+
+Notice that customers with three orders still appear only once. `IN` just asks "is this id somewhere in the list?", so duplicates in the list don't matter. That's one advantage over a join, which would repeat a customer once per order.
+
+`NOT IN` flips the question. Who has **never** ordered?
+
+<CodeExample output={` id |    name    | joined_on
+----+------------+------------
+ 18 | Grace Kim  | 2024-11-23
+ 19 | Tom Baker  | 2024-12-12
+ 20 | Nina Novak | 2025-01-05
+(3 rows)`}>
+
+```sql
+SELECT id, name, joined_on
+FROM customers
+WHERE id NOT IN (SELECT customer_id FROM orders)
+ORDER BY id;
+```
+
+</CodeExample>
+
+That worked. But `NOT IN` hides a nasty trap.
+
+## The NOT IN trap: NULL in the list
+
+Let's find the employees who **don't manage anyone**. Every manager's id appears in someone's `manager_id`, so it looks like this should work:
+
+<CodeExample output={` name
+------
+(0 rows)`}>
+
+```sql
+SELECT name
+FROM employees
+WHERE id NOT IN (SELECT manager_id FROM employees);
+```
+
+</CodeExample>
+
+No rows at all? Plenty of employees manage nobody. The culprit is Grace Hopper, the CEO: she has no manager, so her `manager_id` is `NULL`, and that `NULL` ends up in the list.
+
+`x NOT IN (1, 2, NULL)` means `x <> 1 AND x <> 2 AND x <> NULL`. A comparison with `NULL` is **unknown**, never true, so the whole condition can never be true, for any row. One `NULL` in the list and `NOT IN` returns nothing.
+
+The quick fix is to keep `NULL`s out of the list:
+
+<CodeExample output={`       name
+-------------------
+ Linus Park
+ Margaret Hamilton
+ Ken Thompson
+(3 rows)`}>
+
+```sql
+SELECT name
+FROM employees
+WHERE id NOT IN (
+  SELECT manager_id
+  FROM employees
+  WHERE manager_id IS NOT NULL
+)
+ORDER BY id
+LIMIT 3;
+```
+
+</CodeExample>
+
+The better fix is `NOT EXISTS`, which you'll meet next: it has no `NULL` trap at all.
+
+<Callout type="danger" title="Never trust NOT IN on a column that allows NULL">
+
+`NOT IN (subquery)` silently returns **zero rows** if the subquery returns even one `NULL`. There's no error, just a wrong answer. If the column can be `NULL`, filter the `NULL`s out or use `NOT EXISTS`. `IN` (without `NOT`) doesn't have this problem.
+
+</Callout>
+
+## Yes or no with EXISTS
+
+`EXISTS (subquery)` is true if the subquery returns **at least one row**, and false if it returns none. It doesn't care what the rows contain, so people usually write `SELECT 1` inside.
+
+The interesting part: the subquery can refer to the **outer** row. Here, for each customer `c`, the subquery looks for a cancelled order belonging to that customer:
+
+<CodeExample output={`     name
+--------------
+ Mei Lin
+ Sam Ortiz
+ Chloe Martin
+ Noah Smith
+ Zara Khan
+(5 rows)`}>
+
+```sql
+SELECT c.name
+FROM customers AS c
+WHERE EXISTS (
+  SELECT 1
+  FROM orders AS o
+  WHERE o.customer_id = c.id
+    AND o.status = 'cancelled'
+)
+ORDER BY c.id
+LIMIT 5;
+```
+
+</CodeExample>
+
+Read it like a sentence: "customers where there exists an order of theirs that was cancelled". And `NOT EXISTS` answers the employee question from before, `NULL`s and all:
+
+<CodeExample output={`      name      |    job_title
+----------------+-----------------
+ Aiko Suzuki    | Support Agent
+ Barbara Liskov | Architect
+ Carlos Ruiz    | Account Manager
+ Dieter Rams    | Designer
+ Elena Gomez    | Account Manager
+(5 rows)`}>
+
+```sql
+SELECT e.name, e.job_title
+FROM employees AS e
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM employees AS report
+  WHERE report.manager_id = e.id
+)
+ORDER BY e.name
+LIMIT 5;
+```
+
+</CodeExample>
+
+PostgreSQL also stops looking as soon as it finds the first matching row, so `EXISTS` is a cheap way to ask "is there any…?".
+
+## Correlated subqueries: one answer per row
+
+A subquery that uses a column from the outer query, like `c.id` above, is called a **correlated subquery**. Conceptually it runs again for **every row** of the outer query, with that row's values plugged in.
+
+That lets you compare each row with **its own group**. Which employees earn more than the average in **their own** department?
+
+<CodeExample output={`      name      | department_id | salary
+----------------+---------------+--------
+ Alan Turing    |             1 | 130000
+ Barbara Liskov |             1 | 105000
+ Ada Lovelace   |             1 |  98000
+ Don Norman     |             2 |  95000
+ Mary Kay       |             3 |  90000
+ Hana Sato      |             4 |  70000
+ Marie Curie    |             5 | 112000
+(7 rows)`}>
+
+```sql
+SELECT e.name, e.department_id, e.salary
+FROM employees AS e
+WHERE e.salary > (
+  SELECT avg(colleague.salary)
+  FROM employees AS colleague
+  WHERE colleague.department_id = e.department_id
+)
+ORDER BY e.department_id, e.salary DESC;
+```
+
+</CodeExample>
+
+For Alan Turing (department 1) the inner query averages department 1; for Don Norman it averages department 2, and so on. Giving the two copies of `employees` different aliases (`e` and `colleague`) is what makes this readable.
+
+Grace Hopper is missing, and that's correct: her `department_id` is `NULL`, so the inner query finds no colleagues, its average is `NULL`, and `salary > NULL` is never true.
+
+Correlated subqueries work in the `SELECT` list too. Here's each customer's number of orders, with zero for those who never ordered:
+
+<CodeExample output={`    name    | orders
+------------+--------
+ Mei Lin    |      2
+ Sam Ortiz  |      3
+ Grace Kim  |      0
+ Tom Baker  |      0
+ Nina Novak |      0
+(5 rows)`}>
+
+```sql
+SELECT
+  c.name,
+  (SELECT count(*)
+   FROM orders AS o
+   WHERE o.customer_id = c.id) AS orders
+FROM customers AS c
+WHERE c.id IN (1, 2, 18, 19, 20)
+ORDER BY c.id;
+```
+
+</CodeExample>
+
+<Callout type="tip" title="Subquery or join?">
+
+Many questions can be answered either way: "customers with an order" is `IN`/`EXISTS` or a `JOIN` with `DISTINCT`; the order count above is also a `LEFT JOIN` with `GROUP BY`. PostgreSQL's planner often turns both into the same plan, so choose whichever **reads** more clearly. A rule of thumb: use a join when you need columns **from** the other table, and `EXISTS` / `IN` when you only need to **filter** by it.
+
+</Callout>
+
+## Subqueries in FROM
+
+A subquery can also stand in for a **table**. Its result becomes a temporary table you can query, filter and join. This is called a **derived table**, and it must have an alias.
+
+What's the average order value? First total each order, then average the totals:
+
+<CodeExample output={` orders | average_order
+--------+---------------
+     40 |         70.23
+(1 row)`}>
+
+```sql
+SELECT count(*) AS orders, round(avg(total), 2) AS average_order
+FROM (
+  SELECT order_id, sum(quantity * unit_price) AS total
+  FROM order_items
+  GROUP BY order_id
+) AS order_totals;
+```
+
+</CodeExample>
+
+You can't write `avg(sum(...))` directly, because aggregates don't nest, so the two-step query is the way to go. Once you stack a few of these, the brackets get hard to read; the next lesson shows how `WITH` gives each step a name.
+
+<TryIt language="sql" code={`-- Change the inner query and see how the outer one follows.
+SELECT name, category, price
+FROM products
+WHERE category IN (
+  SELECT category
+  FROM products
+  WHERE price > 20
+)
+ORDER BY category, price DESC;`} />
+
+<Quiz
+  question="The subquery SELECT manager_id FROM employees returns 1, 2, 3 and NULL. How many rows does WHERE id NOT IN (that subquery) keep?"
+  options={["Every row except ids 1, 2 and 3", "Only the row whose id is NULL", "None at all", "It raises an error"]}
+  answer={2}
+  explanation="NOT IN compares with every value in the list, and id <> NULL is unknown, never true. So the condition is never true and no rows come back, without any error. Use NOT EXISTS or filter out the NULLs."
+/>
+
+<Quiz
+  question="What makes a subquery correlated?"
+  options={["It returns more than one row", "It refers to a column of the outer query", "It is written in the FROM clause", "It uses EXISTS"]}
+  answer={1}
+  explanation="A correlated subquery uses a value from the outer row (like WHERE o.customer_id = c.id), so its result can be different for every outer row."
+/>
+
+<Exercise
+  language="sql"
+  title="Above their category's average"
+  starter={`-- Products priced above the average price of THEIR category.
+SELECT p.name, p.category, p.price
+FROM products AS p
+WHERE p.price > (
+  SELECT avg(price)
+  FROM products
+)
+ORDER BY p.category, p.price DESC;
+`}
+  tests={[
+    { name: "Shows the columns name, category, price", check: "columns.join() === 'name,category,price'" },
+    { name: "Finds the 7 products above their category average", check: "rows.length === 7" },
+    { name: "Includes the cheap-but-pricey-for-snacks Panda Cookies", check: "rows.some(r => r.name === 'Panda Cookies')" },
+    { name: "Sorted by category, then price from highest", check: "rows.map(r => r.name).join() === 'Algorithms in Pictures,Clean Python,Rice Cooker,Panda Cookies,Matcha Powder,Plush Panda,Kite'" },
+    { name: "Follows the data when a new product arrives", check: "(await rerun(\"INSERT INTO products (name, category, price) VALUES ('Lucky Socks', 'clothes', 9), ('Silk Scarf', 'clothes', 30)\")).some(r => r.name === 'Silk Scarf')" },
+  ]}
+>
+
+The query in the editor compares every product with the average of **all** products. Change it so each product is compared with the average price of **its own category**: a Panda Cookies packet at 3.75 isn't expensive overall, but it's the priciest snack.
+
+Keep the columns `name, category, price`, sorted by category and then by price, highest first.
+
+<Hint>
+
+Give the inner `products` its own alias, for example `AS same_cat`, and add a `WHERE` that links it to the outer row: `WHERE same_cat.category = p.category`. That makes the subquery correlated.
+
+</Hint>
+
+<Solution>
+
+```sql
+SELECT p.name, p.category, p.price
+FROM products AS p
+WHERE p.price > (
+  SELECT avg(same_cat.price)
+  FROM products AS same_cat
+  WHERE same_cat.category = p.category
+)
+ORDER BY p.category, p.price DESC;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **subquery** is a query in brackets inside another query.
+- A **scalar subquery** returns one value and can go anywhere a value fits, e.g. `WHERE price > (SELECT avg(price) FROM products)`. More than one row is an error.
+- `IN (subquery)` checks against a one-column list; duplicates in the list don't matter.
+- `NOT IN` returns **nothing** if the list contains a `NULL`. Prefer `NOT EXISTS`.
+- `EXISTS (subquery)` is true when the subquery finds at least one row.
+- A **correlated** subquery uses the outer row's columns, so it can compare each row with its own group.
+- A subquery in `FROM` is a **derived table** and needs an alias.

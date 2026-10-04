@@ -1,0 +1,367 @@
+---
+title: Roles and Privileges
+description: Create login and group roles, GRANT and REVOKE exactly what each one needs, set default privileges for future tables and design a least-privilege role layout.
+duration: 22
+xp: 30
+---
+
+Here's a pattern that turns up in many breach reports: the web app connects to the database as `postgres`, the superuser. One SQL injection bug later, the attacker can read every table, drop the database, and even run shell commands on the server (a superuser may run `COPY … TO PROGRAM`). The bug was in the app, but the **damage** came from the privileges. This module is about database security, and it starts with the most effective defence there is: **least privilege**, where every connection can do exactly what its job needs and nothing more. 🔐
+
+## Roles: users and groups in one idea
+
+PostgreSQL has a single concept for both users and groups: the **role**. A role with the `LOGIN` attribute can connect, so it's a "user"; a role without it is a "group" that other roles join to collect its privileges. Roles belong to the whole server, not one database.
+
+<CodeExample output={`CREATE ROLE
+
+CREATE ROLE
+
+CREATE ROLE
+
+   rolname   | rolcanlogin | rolsuper | rolconnlimit
+-------------+-------------+----------+--------------
+ analyst_mei | t           | f        |           -1
+ postgres    | t           | t        |           -1
+ readers     | f           | f        |           -1
+ shop_app    | t           | f        |           50
+(4 rows)
+
+   member    | member_of
+-------------+-----------
+ analyst_mei | readers
+(1 row)`}>
+
+```sql
+CREATE ROLE readers NOLOGIN;
+CREATE ROLE analyst_mei LOGIN IN ROLE readers;
+CREATE ROLE shop_app LOGIN CONNECTION LIMIT 50;
+
+SELECT rolname, rolcanlogin, rolsuper, rolconnlimit
+FROM pg_roles
+WHERE rolname IN ('readers', 'analyst_mei', 'shop_app', 'postgres')
+ORDER BY rolname;
+
+-- Who is a member of which group?
+SELECT m.rolname AS member, g.rolname AS member_of
+FROM pg_auth_members AS am
+JOIN pg_roles AS m ON m.oid = am.member
+JOIN pg_roles AS g ON g.oid = am.roleid
+WHERE m.rolname = 'analyst_mei';
+```
+
+</CodeExample>
+
+You're connected as `postgres`, a **superuser**: it skips every permission check. That's fine for this sandbox and for emergencies; it's never fine for an application. The attributes worth knowing:
+
+| Attribute | Means |
+| --- | --- |
+| `LOGIN` | Can connect (a "user") |
+| `SUPERUSER` | Bypasses all checks. Keep it for DBAs only |
+| `CREATEDB`, `CREATEROLE` | Can create databases / manage roles |
+| `BYPASSRLS` | Ignores row-level security (lesson 3) |
+| `INHERIT` | Automatically uses the privileges of the groups it's in (the default) |
+| `CONNECTION LIMIT n`, `VALID UNTIL '…'` | Connection cap, expiry date |
+
+In real life you'd give a login role a password, and keep that password out of your migration files. In `psql`, the `\password` command asks for it and sends only a hash:
+
+```text
+postgres=# CREATE ROLE shop_app LOGIN;
+postgres=# \password shop_app
+Enter new password for user "shop_app":
+```
+
+Group membership is usually granted after the fact. Since PostgreSQL 16 you can also say **how** the member may use the group: `INHERIT` (use its privileges automatically), `SET` (may `SET ROLE` to it) and `ADMIN` (may add other members):
+
+<TryIt language="sql" code={`CREATE ROLE readers NOLOGIN;
+CREATE ROLE analyst_sam LOGIN;
+
+GRANT readers TO analyst_sam WITH INHERIT TRUE, SET FALSE;
+
+SELECT r.rolname AS member, g.rolname AS member_of,
+  am.inherit_option, am.set_option, am.admin_option
+FROM pg_auth_members AS am
+JOIN pg_roles AS r ON r.oid = am.member
+JOIN pg_roles AS g ON g.oid = am.roleid
+WHERE r.rolname = 'analyst_sam';
+
+-- Undo it with: REVOKE readers FROM analyst_sam;`} />
+
+## GRANT and REVOKE
+
+Every object has an **owner** (the role that created it), and the owner can do anything with it. Everyone else starts with **no** privileges on tables. You hand them out with `GRANT` and take them back with `REVOKE`. To test what another role can do, switch to it with **`SET ROLE`** (as a superuser you can become anyone) and back with `RESET ROLE`:
+
+<CodeExample output={`CREATE ROLE
+
+GRANT
+
+SET
+
+ current_user
+--------------
+ analyst
+(1 row)
+
+ category | products
+----------+----------
+ books    |        3
+ kitchen  |        3
+ snacks   |        3
+ tea      |        3
+ toys     |        3
+(5 rows)
+
+ERROR:  permission denied for table employees`}>
+
+```sql
+CREATE ROLE analyst NOLOGIN;
+GRANT SELECT ON products, orders, order_items TO analyst;
+
+SET ROLE analyst;
+SELECT current_user;
+
+SELECT category, count(*) AS products
+FROM products
+GROUP BY category
+ORDER BY category;
+
+SELECT name, salary FROM employees;
+```
+
+</CodeExample>
+
+The table privileges are `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES` (create a foreign key pointing at it), `TRIGGER` and, since PostgreSQL 17, `MAINTAIN` (`VACUUM`, `ANALYZE`, `REINDEX`…). `GRANT ALL` means all of them, which is rarely what you want.
+
+### Column privileges
+
+Privileges can be narrower than a table. A support team needs to look customers up, but has no reason to see their emails:
+
+<CodeExample output={`CREATE ROLE
+
+GRANT
+
+GRANT
+
+SET
+
+ id |   name    | country
+----+-----------+---------
+  1 | Mei Lin   | UK
+  2 | Sam Ortiz | Spain
+(2 rows)
+
+ERROR:  permission denied for table customers`}>
+
+```sql
+CREATE ROLE support NOLOGIN;
+GRANT SELECT (id, name, country) ON customers TO support;
+GRANT UPDATE (city) ON customers TO support;
+
+SET ROLE support;
+
+SELECT id, name, country
+FROM customers
+ORDER BY id
+LIMIT 2;
+
+SELECT * FROM customers;
+```
+
+</CodeExample>
+
+`SELECT *` fails because it asks for every column, including `email`. (Column privileges are perfect for this, but they make `SELECT *` fail for that role. A **view** with only the allowed columns is often friendlier.)
+
+### The sequence gotcha
+
+Inserting into a table with a `serial` or identity-like default also calls `nextval()` on the table's **sequence**, and that needs its own privilege:
+
+<CodeExample output={`CREATE ROLE
+
+GRANT
+
+SET
+
+ERROR:  permission denied for sequence orders_id_seq`}>
+
+```sql
+CREATE ROLE checkout NOLOGIN;
+GRANT INSERT ON orders TO checkout;
+
+SET ROLE checkout;
+INSERT INTO orders (customer_id, ordered_at, status)
+VALUES (1, '2025-07-01 12:00', 'paid');
+```
+
+</CodeExample>
+
+The fix is `GRANT USAGE ON SEQUENCE orders_id_seq TO checkout;`, or `GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO …`. (Columns declared `GENERATED … AS IDENTITY` don't need this: their sequence is used on the table's behalf.)
+
+### Checking privileges
+
+`has_table_privilege()`, `has_column_privilege()` and friends answer "could this role do this?" without switching roles, and they include privileges inherited from groups:
+
+<CodeExample output={`CREATE ROLE
+
+GRANT
+
+ whole_table | name_column | email_column
+-------------+-------------+--------------
+ f           | t           | f
+(1 row)`}>
+
+```sql
+CREATE ROLE support NOLOGIN;
+GRANT SELECT (id, name, country) ON customers TO support;
+
+SELECT
+  has_table_privilege('support', 'customers', 'SELECT')
+    AS whole_table,
+  has_column_privilege('support', 'customers', 'name', 'SELECT')
+    AS name_column,
+  has_column_privilege('support', 'customers', 'email', 'SELECT')
+    AS email_column;
+```
+
+</CodeExample>
+
+In `psql`, `\dp customers` shows a table's privileges, and `\du` lists roles. The `information_schema.role_table_grants` and `column_privileges` views give you the same information as queries.
+
+<Callout type="warning" title="Things PUBLIC gets by default">
+
+`PUBLIC` is a pseudo-role meaning "every role". By default it may **connect** to databases, create **temporary tables**, and **execute every function**. Since PostgreSQL 15 it can no longer create tables in the `public` schema. Harden a production database with `REVOKE ALL ON DATABASE shop FROM PUBLIC;` (then grant `CONNECT` to your roles), and revoke `EXECUTE` on any function that shouldn't be callable by everyone.
+
+</Callout>
+
+## Default privileges: grants for tables that don't exist yet
+
+`GRANT SELECT ON ALL TABLES IN SCHEMA public TO readers` covers the tables that exist **today**. Next month a migration adds `refunds`, and the dashboards start failing with "permission denied". It's a classic post-deploy incident. **Default privileges** fix it: they're grants applied automatically to objects **a given role** creates in the future:
+
+<TryIt language="sql" code={`CREATE ROLE app_owner NOLOGIN;
+CREATE ROLE readers NOLOGIN;
+CREATE SCHEMA shop AUTHORIZATION app_owner;
+GRANT USAGE ON SCHEMA shop TO readers;
+
+-- Future tables created BY app_owner IN shop: readable by readers
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA shop
+  GRANT SELECT ON TABLES TO readers;
+
+-- A later migration, run as the owner
+SET ROLE app_owner;
+CREATE TABLE shop.refunds (id integer, amount numeric(8, 2));
+INSERT INTO shop.refunds VALUES (1, 6.50);
+RESET ROLE;
+
+SET ROLE readers;
+SELECT * FROM shop.refunds;`} />
+
+The `FOR ROLE` part is what trips people up: default privileges belong to the role that **creates** the objects. If a different role runs a migration, its tables get no grants. That's one more reason to make a single owner role create everything.
+
+## A least-privilege layout
+
+Most production databases end up with a layout like this one:
+
+```text
+app_owner   NOLOGIN   owns the schema and every table
+migrator    LOGIN     member of app_owner; used only by the deploy pipeline
+app_rw      NOLOGIN   SELECT, INSERT, UPDATE, DELETE on the tables;
+                      USAGE on the sequences; no DDL, no TRUNCATE
+shop_app    LOGIN     member of app_rw; the web app's connection
+readonly    NOLOGIN   SELECT only (or only on reporting views)
+analyst_*   LOGIN     members of readonly, one per person
+```
+
+- The application **can't change the schema**, so an injection bug can't `DROP TABLE`.
+- Each person gets their own login (in a group), so logs show *who* did something and leavers are removed with one `DROP ROLE`.
+- Built-in **predefined roles** cover common needs: `pg_read_all_data`, `pg_write_all_data`, `pg_monitor` (monitoring dashboards), `pg_signal_backend` (cancel queries).
+
+<Callout type="tip" title="SECURITY DEFINER: a controlled door">
+
+Sometimes a role needs one narrow power, like "cancel your own order" but not "update any order". Write a function that does exactly that and declare it `SECURITY DEFINER`: it runs with its **owner's** privileges. Always add `SET search_path = pg_catalog, public` to such functions (otherwise a caller could put their own `=` operator or function earlier in the path), and `REVOKE EXECUTE … FROM PUBLIC` before granting it to the roles that need it.
+
+</Callout>
+
+<Quiz
+  question="A role can SELECT from orders and has INSERT on orders, yet its INSERT fails with permission denied for sequence orders_id_seq. Why?"
+  options={["It needs UPDATE on orders", "The id default calls nextval(), which needs USAGE on the sequence", "Only superusers can insert", "It needs the REFERENCES privilege"]}
+  answer={1}
+  explanation="A serial column's default is nextval('orders_id_seq'), and using a sequence is a separate privilege: GRANT USAGE ON SEQUENCE orders_id_seq TO the role."
+/>
+
+<Quiz
+  question="You ran GRANT SELECT ON ALL TABLES IN SCHEMA public TO readers last month. A table created yesterday by a migration isn't readable. What prevents this from happening again?"
+  options={["Run the GRANT again after every migration by hand", "ALTER DEFAULT PRIVILEGES FOR ROLE <the migration role> ... GRANT SELECT ON TABLES TO readers", "Make readers a superuser", "GRANT ALL ON SCHEMA public TO readers"]}
+  answer={1}
+  explanation="GRANT ... ON ALL TABLES only affects existing tables. Default privileges apply to tables the named role creates in the future."
+/>
+
+<Exercise
+  language="sql"
+  title="Roles for the shop"
+  starter={`-- 1. shop_readonly (NOLOGIN): read products, orders and
+--    order_items; on customers only id, name and country.
+
+-- 2. shop_writer (NOLOGIN): a member of shop_readonly; may
+--    INSERT orders and order_items, use the orders id
+--    sequence, and UPDATE only the status of orders.
+
+-- 3. checkout_app (LOGIN): a member of shop_writer.
+
+-- Review the table grants:
+SELECT grantee, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee LIKE 'shop%'
+ORDER BY grantee, table_name, privilege_type;
+`}
+  tests={[
+    { name: "The three roles exist; only checkout_app can log in", check: "(await query(\"SELECT string_agg(rolname || ':' || rolcanlogin, ',' ORDER BY rolname) AS s FROM pg_roles WHERE rolname IN ('checkout_app', 'shop_readonly', 'shop_writer')\"))[0].s === 'checkout_app:true,shop_readonly:false,shop_writer:false'" },
+    { name: "shop_readonly reads products, orders, order_items, but can't write or read employees", check: "(await query(\"SELECT has_table_privilege('shop_readonly', 'products', 'SELECT') AND has_table_privilege('shop_readonly', 'orders', 'SELECT') AND has_table_privilege('shop_readonly', 'order_items', 'SELECT') AND NOT has_table_privilege('shop_readonly', 'employees', 'SELECT') AND NOT has_table_privilege('shop_readonly', 'orders', 'INSERT') AND NOT has_table_privilege('shop_readonly', 'products', 'UPDATE') AS ok\"))[0].ok === true" },
+    { name: "Customers: id, name, country readable, email and the whole table not", check: "(await query(\"SELECT has_column_privilege('shop_readonly', 'customers', 'id', 'SELECT') AND has_column_privilege('shop_readonly', 'customers', 'name', 'SELECT') AND has_column_privilege('shop_readonly', 'customers', 'country', 'SELECT') AND NOT has_column_privilege('shop_readonly', 'customers', 'email', 'SELECT') AND NOT has_table_privilege('shop_readonly', 'customers', 'SELECT') AS ok\"))[0].ok === true" },
+    { name: "checkout_app inherits through shop_writer and shop_readonly", check: "(await query(\"SELECT pg_has_role('checkout_app', 'shop_writer', 'MEMBER') AND pg_has_role('shop_writer', 'shop_readonly', 'MEMBER') AND has_table_privilege('checkout_app', 'products', 'SELECT') AND has_table_privilege('checkout_app', 'order_items', 'INSERT') AND has_sequence_privilege('checkout_app', 'orders_id_seq', 'USAGE') AS ok\"))[0].ok === true" },
+    { name: "Orders: status can be updated, other columns can't, nothing can be deleted", check: "(await query(\"SELECT has_column_privilege('checkout_app', 'orders', 'status', 'UPDATE') AND NOT has_column_privilege('checkout_app', 'orders', 'customer_id', 'UPDATE') AND NOT has_table_privilege('checkout_app', 'orders', 'DELETE') AND NOT has_table_privilege('shop_readonly', 'orders', 'UPDATE') AS ok\"))[0].ok === true" },
+    { name: "As checkout_app: placing an order works, reading emails doesn't", check: "await (async () => { await query('SET ROLE checkout_app'); const placed = await query(\"INSERT INTO orders (customer_id, ordered_at, status) VALUES (1, '2025-07-01', 'paid') RETURNING id\").then(r => r[0].id > 40, () => false); const hidden = await query('SELECT email FROM customers').then(() => false, () => true); return placed && hidden; })()" },
+  ]}
+>
+
+Set up least-privilege roles for the shop:
+
+1. **`shop_readonly`** (`NOLOGIN`): may read `products`, `orders` and `order_items`, and only the `id`, `name` and `country` columns of `customers`.
+2. **`shop_writer`** (`NOLOGIN`): a member of `shop_readonly`. It may also `INSERT` into `orders` and `order_items`, use the sequence `orders_id_seq`, and `UPDATE` only the `status` column of `orders`.
+3. **`checkout_app`** (`LOGIN`): the checkout service's login, a member of `shop_writer`.
+
+Keep the review query at the end.
+
+<Hint>
+
+Use `GRANT SELECT (id, name, country) ON customers TO shop_readonly;` for the columns, `GRANT UPDATE (status) ON orders TO shop_writer;` for the status, and `GRANT shop_readonly TO shop_writer;` (or `CREATE ROLE shop_writer NOLOGIN IN ROLE shop_readonly;`) for membership.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE ROLE shop_readonly NOLOGIN;
+GRANT SELECT ON products, orders, order_items TO shop_readonly;
+GRANT SELECT (id, name, country) ON customers TO shop_readonly;
+
+CREATE ROLE shop_writer NOLOGIN IN ROLE shop_readonly;
+GRANT INSERT ON orders, order_items TO shop_writer;
+GRANT USAGE ON SEQUENCE orders_id_seq TO shop_writer;
+GRANT UPDATE (status) ON orders TO shop_writer;
+
+CREATE ROLE checkout_app LOGIN IN ROLE shop_writer;
+
+SELECT grantee, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee LIKE 'shop%'
+ORDER BY grantee, table_name, privilege_type;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **role** is a user (`LOGIN`) or a group (`NOLOGIN`); roles join groups and **inherit** their privileges.
+- Owners can do anything; everyone else gets only what you **`GRANT`** (and lose what you **`REVOKE`**): table, column, sequence, schema and function privileges.
+- Test with **`SET ROLE`** / `RESET ROLE`, or ask `has_table_privilege()` and friends.
+- **Default privileges** (`ALTER DEFAULT PRIVILEGES FOR ROLE … GRANT …`) cover tables that migrations create later.
+- **Least privilege**: the app never connects as a superuser or as the owner; one owner role for DDL, a read-write role for the app, read-only roles for people. Watch what `PUBLIC` gets by default.

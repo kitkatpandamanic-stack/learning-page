@@ -1,0 +1,424 @@
+---
+title: Choosing the Right Database
+description: OLTP vs OLAP, column stores, document and key-value stores, caches and search engines, and how far PostgreSQL alone can take you.
+duration: 22
+xp: 30
+---
+
+Sooner or later someone in a planning meeting says it: "Postgres won't scale, we should move to MongoDB." Or "search needs Elasticsearch." Or "let's put Redis in front of everything." Sometimes they're right. Often the real problem was a missing index, and the team ends up running **two** databases, keeping them in sync, and debugging why they disagree. 🧭
+
+A senior engineer's job here isn't to know every database. It's to know what kind of **workload** you have, what PostgreSQL already does well, and the specific signs that you've truly outgrown it. That's this lesson.
+
+## Two kinds of workload: OLTP and OLAP
+
+Almost every database workload leans towards one of two shapes:
+
+| | **OLTP** (online transaction processing) | **OLAP** (online analytical processing) |
+| --- | --- | --- |
+| Typical question | "Show order 4242", "add this item to the cart" | "Revenue by country and month for 3 years" |
+| Rows per query | A few, found by key | Millions, scanned and aggregated |
+| Writes | Many small, concurrent transactions | Bulk loads, mostly appends |
+| What matters | Low latency, correctness, concurrency | Throughput over huge scans |
+| Users | The app, thousands of requests per second | Analysts, dashboards, a few big queries |
+
+PostgreSQL is built for OLTP, and you can see the difference in the plans:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 50000
+
+ANALYZE
+
+              QUERY PLAN
+--------------------------------------
+ Index Scan using sales_pkey on sales
+   Index Cond: (id = 4242)
+(2 rows)
+
+       QUERY PLAN
+-------------------------
+ HashAggregate
+   Group Key: country
+   ->  Seq Scan on sales
+(3 rows)`}>
+
+```sql
+CREATE TABLE sales (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sold_at timestamp NOT NULL,
+  customer_id integer NOT NULL,
+  product_id integer NOT NULL,
+  quantity integer NOT NULL,
+  amount numeric(10, 2) NOT NULL,
+  country text NOT NULL,
+  channel text NOT NULL,
+  note text
+);
+
+INSERT INTO sales (sold_at, customer_id, product_id, quantity,
+  amount, country, channel, note)
+SELECT
+  timestamp '2025-01-01' + g * interval '1 minute',
+  g % 5000 + 1, g % 15 + 1, g % 3 + 1, g % 100 + 0.99,
+  (ARRAY['UK', 'Spain', 'Japan', 'India'])[g % 4 + 1],
+  (ARRAY['web', 'app', 'shop'])[g % 3 + 1],
+  'order note number ' || g
+FROM generate_series(1, 50000) AS g;
+
+ANALYZE sales;
+
+-- OLTP: one row by key, a few page reads
+EXPLAIN (COSTS OFF)
+SELECT * FROM sales WHERE id = 4242;
+
+-- OLAP: every row is read to build four totals
+EXPLAIN (COSTS OFF)
+SELECT country, sum(amount)
+FROM sales
+GROUP BY country;
+```
+
+</CodeExample>
+
+The first query touches a handful of pages, no matter how big the table gets. The second must read **every row**, and it gets slower in direct proportion to the table's size. With 50,000 rows nobody notices; with 2 billion it takes minutes.
+
+## Why analytics loves column stores
+
+PostgreSQL is a **row store**: each row's values are stored together, in 8 kB pages. That's perfect for "fetch order 4242 with all its columns". But to sum one column, it has to read every page, which means every column of every row:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 50000
+
+ whole_table | amount_column
+-------------+---------------
+ 4944 kB     | 341 kB
+(1 row)`}>
+
+```sql
+CREATE TABLE sales (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sold_at timestamp NOT NULL,
+  customer_id integer NOT NULL,
+  product_id integer NOT NULL,
+  quantity integer NOT NULL,
+  amount numeric(10, 2) NOT NULL,
+  country text NOT NULL,
+  channel text NOT NULL,
+  note text
+);
+
+INSERT INTO sales (sold_at, customer_id, product_id, quantity,
+  amount, country, channel, note)
+SELECT
+  timestamp '2025-01-01' + g * interval '1 minute',
+  g % 5000 + 1, g % 15 + 1, g % 3 + 1, g % 100 + 0.99,
+  (ARRAY['UK', 'Spain', 'Japan', 'India'])[g % 4 + 1],
+  (ARRAY['web', 'app', 'shop'])[g % 3 + 1],
+  'order note number ' || g
+FROM generate_series(1, 50000) AS g;
+
+-- what sum(amount) must read vs the data it actually needs
+SELECT
+  pg_size_pretty(pg_relation_size('sales')) AS whole_table,
+  pg_size_pretty(sum(pg_column_size(amount))) AS amount_column
+FROM sales;
+```
+
+</CodeExample>
+
+To add up about 340 kB of amounts, PostgreSQL reads almost 5 MB of pages, roughly 15 times more data than the query needs. A **column store** keeps each column in its own file instead, so that query reads only the `amount` column. Values in one column look alike, so they also **compress** extremely well (often 5 to 10 times), and the engine processes them in batches using modern CPU features (**vectorised execution**). For big aggregations that's commonly 10 to 100 times faster.
+
+Popular column stores: **ClickHouse** (self-hosted or cloud), **DuckDB** (embedded, like SQLite for analytics: great on a laptop or inside a data pipeline), and the cloud warehouses **BigQuery**, **Snowflake** and **Redshift**. The price: inserting or updating single rows is slow or awkward, transactions are limited, and it's one more system to run. The usual architecture keeps PostgreSQL as the **source of truth** for the app, and copies data into the warehouse with a scheduled **ETL/ELT** job or continuously with **change data capture (CDC)** from logical replication, which you met in [Backups, Replication & Connection Pooling](/learn/sql/backups-and-replication).
+
+### Stretch PostgreSQL first
+
+Before adding a warehouse, these often buy years:
+
+- **Summary (rollup) tables** or [materialized views](/learn/sql/views-and-materialized-views): compute daily totals once, then dashboards read 365 rows instead of 50 million.
+- A **read replica** for reports, so heavy queries don't slow down the app.
+- **Partitioning** by time, so reports on recent data only read recent partitions.
+- **BRIN indexes** for big, append-only tables where a column grows with the physical order (timestamps of inserted events). A BRIN index stores only the minimum and maximum for each block range of the table, so it's tiny:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 100000
+
+CREATE INDEX
+
+CREATE INDEX
+
+    index    |  size
+-------------+---------
+ sales_brin  | 24 kB
+ sales_btree | 2208 kB
+(2 rows)`}>
+
+```sql
+CREATE TABLE sales (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  sold_at timestamp NOT NULL,
+  amount numeric(10, 2) NOT NULL
+);
+
+INSERT INTO sales (sold_at, amount)
+SELECT timestamp '2025-01-01' + g * interval '1 minute', g % 100
+FROM generate_series(1, 100000) AS g;
+
+CREATE INDEX sales_btree ON sales (sold_at);
+CREATE INDEX sales_brin ON sales USING brin (sold_at);
+
+SELECT
+  relname AS index,
+  pg_size_pretty(pg_relation_size(oid)) AS size
+FROM pg_class
+WHERE relname IN ('sales_btree', 'sales_brin')
+ORDER BY relname;
+```
+
+</CodeExample>
+
+A hundred times smaller than the B-tree, and good enough for "events in this week" over billions of rows. It's useless if the column's values are scattered randomly through the table, because then every block range covers everything. Extensions push further still: TimescaleDB for time series, Citus for distributed and columnar tables, pg_duckdb to run DuckDB's engine inside PostgreSQL. (Extensions can't be installed in this browser database, but they're one `CREATE EXTENSION` away on a real server.)
+
+## Documents, key-value and wide-column stores
+
+The "NoSQL" databases each trade away some of SQL's guarantees for something specific:
+
+- **Document stores** (MongoDB, Couchbase) store JSON-like documents with flexible fields and make sharding across machines built in. PostgreSQL's **JSONB** with GIN indexes covers the "flexible attributes" need for most apps, **and** keeps joins, constraints and transactions for everything else. A good split: stable, important fields as real columns; the long tail of optional attributes in a JSONB column.
+- **Key-value stores** (Redis/Valkey, DynamoDB) answer "get the value for this key" extremely fast and at enormous scale. DynamoDB and **wide-column stores** like Cassandra scale writes across many machines almost without limit, but you design tables around the exact queries you'll run, with no joins and no ad-hoc questions later.
+- **Graph databases** (Neo4j) shine when the main questions are deep traversals: "friends of friends of friends who like X". Trees and shallow graphs are fine with recursive CTEs in PostgreSQL.
+
+### Caches
+
+**Redis** (or Valkey, Memcached) in front of the database keeps hot data in memory. The common pattern is **cache-aside**:
+
+```text
+read:   value = cache.get(key)
+        if missing: value = db.query(...); cache.set(key, value, ttl=60s)
+write:  db.update(...); cache.delete(key)
+```
+
+A cache can cut database load dramatically, but it adds the classic hard problem: **invalidation**. Every write path must remember to delete the right keys, or users see stale prices and old permissions. When a popular key expires, thousands of requests can miss at once and hit the database together (a **cache stampede**). So cache **after** you've fixed slow queries, start with data that tolerates being a little stale, and always set a TTL.
+
+## Search engines
+
+Search boxes are where teams most often add a second database too early, because PostgreSQL has **full-text search** built in. `to_tsvector` turns text into normalised word stems (**lexemes**), and `websearch_to_tsquery` turns what a user typed into a query:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+                 document
+-------------------------------------------
+ 'beginn':2 'first':5 'marathon':6 'run':3
+(1 row)
+
+ id |               title
+----+------------------------------------
+  3 | A beginner runs her first marathon
+(1 row)
+
+ id |               title
+----+------------------------------------
+  1 | Running PostgreSQL in production
+  2 | Why our runners love bamboo
+  3 | A beginner runs her first marathon
+(3 rows)`}>
+
+```sql
+CREATE TABLE posts (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL
+);
+
+INSERT INTO posts (title) VALUES
+  ('Running PostgreSQL in production'),
+  ('Why our runners love bamboo'),
+  ('A beginner runs her first marathon'),
+  ('Cooking rice the panda way');
+
+-- small words like "a" and "her" are dropped, "runs" becomes "run"
+SELECT to_tsvector('english', 'A beginner runs her first marathon')
+  AS document;
+
+-- words, not substrings: "running" also finds "runs"; - excludes
+SELECT id, title
+FROM posts
+WHERE to_tsvector('english', title)
+  @@ websearch_to_tsquery('english', 'running -postgresql')
+ORDER BY id;
+
+-- compare: ILIKE matches any substring
+SELECT id, title
+FROM posts
+WHERE title ILIKE '%run%'
+ORDER BY id;
+```
+
+</CodeExample>
+
+`ILIKE` found "runners" (a different word) and can't use a normal index for `'%…%'`. Full-text search matched the **word** "run" in any form, understood the minus sign, and with a **GIN index** on the `tsvector` it stays fast on millions of documents. `ts_rank` sorts results by relevance, and you'll use it in the exercise.
+
+A dedicated search engine (**Elasticsearch**/**OpenSearch**, **Meilisearch**, **Typesense**) earns its place when you need typo tolerance, "did you mean", facets with counts, synonyms and fine relevance tuning across many languages, or search over very large amounts of text. The cost is a second copy of your data that's always slightly behind, plus a sync pipeline that can break. (PostgreSQL's `pg_trgm` extension adds fuzzy, typo-tolerant matching too.)
+
+## Queues, streams and vectors
+
+- **Job queues**: a table with `SELECT … FOR UPDATE SKIP LOCKED`, which you met in [Locks, Job Queues and Deadlocks](/learn/sql/row-locks-and-job-queues), handles thousands of jobs per second, and the job commits in the **same transaction** as the data it changes. Reach for RabbitMQ or SQS when many services must exchange messages.
+- **Event streams**: **Kafka** (or Redpanda, Kinesis) keeps an ordered log of events that many consumers read independently and can **replay**. It's a different tool from a queue, built for very high throughput.
+- **Vectors** for AI features (semantic search, recommendations): the **pgvector** extension stores embeddings and indexes them for nearest-neighbour search, and keeps them next to the data they describe. Dedicated vector databases make sense at very large scale.
+
+## When PostgreSQL is enough
+
+Very often. A single modern server with fast NVMe disks and plenty of memory handles terabytes of data and tens of thousands of transactions per second. Notion shards its Postgres data across hundreds of logical shards, and Instagram famously scaled on sharded PostgreSQL. Most products never get near those numbers. When load grows, climb this ladder **one step at a time**, measuring as you go:
+
+1. **Fix queries and indexes** (`EXPLAIN`, the slow query log, `pg_stat_statements`). This is usually the 10x win.
+2. **Scale up**: more CPU, memory and faster disks. Boring and effective.
+3. **Connection pooling** and sensible timeouts.
+4. **Read replicas** for read-heavy traffic and reports.
+5. **Partitioning** and archiving old data.
+6. **Caching** hot, read-mostly data.
+7. **Split by function**: separate databases for separate services or domains.
+8. **Sharding**: spreading one dataset over many servers, by tenant or user (Citus, or in the application). Powerful, and a large permanent cost: cross-shard queries, transactions and migrations all get harder.
+
+<Callout type="tip" title="Questions to ask before adding a database">
+
+- What exact **access pattern** fails today, and have we measured it?
+- What **consistency** does it need: may it be seconds behind, or must it be exact?
+- Who will **back it up, monitor it, secure it, upgrade it** and keep it in sync, and at 3 a.m.?
+- Can PostgreSQL do it with an index, a feature or an extension we already trust?
+
+Every new database is a new thing to operate. Add one when the answer to the last question is a measured "no".
+
+</Callout>
+
+<Quiz
+  question="An app on PostgreSQL needs a new dashboard: revenue by country, month and channel over 4 years of sales (800 million rows). Queries take 3 minutes. What is the most sensible first step?"
+  options={[
+    "Move the whole app to MongoDB",
+    "Add a summary table (or materialized view) of daily totals per country and channel, refreshed regularly",
+    "Put Redis in front of the database",
+    "Add a B-tree index on every column of the sales table",
+  ]}
+  answer={1}
+  explanation="The dashboard needs aggregates, not raw rows. Pre-aggregating daily totals turns 800 million rows into a few hundred thousand, and the dashboard becomes fast. If analytics keep growing, a column store fed by CDC is the next step. A document store or a cache doesn't make scanning 800 million rows cheaper, and extra indexes slow down writes without helping full-table aggregates."
+/>
+
+<Quiz
+  question="Which search requirement is a good reason to add a dedicated search engine instead of PostgreSQL full-text search?"
+  options={[
+    "Users type 'refunds' and should find articles that say 'refund'",
+    "Results must be sorted by relevance",
+    "Typo-tolerant search with facet counts and synonyms across 12 languages over 200 million documents",
+    "Searching the titles of 5,000 help articles",
+  ]}
+  answer={2}
+  explanation="Stemming (refunds → refund), relevance ranking with ts_rank and thousands or even millions of documents are all handled by PostgreSQL full-text search with a GIN index. Heavy typo tolerance, facets, synonyms and multilingual tuning at very large scale are where dedicated search engines earn their extra operational cost."
+/>
+
+<Exercise
+  language="sql"
+  title="Search the help centre without a search engine"
+  starter={`CREATE TABLE help_articles (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  body text NOT NULL
+);
+
+INSERT INTO help_articles (title, body) VALUES
+  ('Refund policy',
+   'You can ask for a refund within 30 days of delivery.'),
+  ('Tracking your parcel',
+   'Every shipped order gets a tracking link by email.'),
+  ('Damaged items',
+   'Send us a photo and we will refund or replace the item.'),
+  ('Changing your address',
+   'Update the address before the order is shipped.'),
+  ('Gift cards',
+   'Gift cards cannot be refunded or exchanged for cash.'),
+  ('Paying by card',
+   'We accept all major cards. Cards are charged at shipping.');
+
+-- 1. Add the generated column search (title weight A, body B)
+
+-- 2. Add a GIN index on it
+
+-- 3. Search for what the user typed: refunds
+SELECT id, title
+FROM help_articles
+WHERE title ILIKE '%refunds%'
+ORDER BY id;
+`}
+  tests={[
+    { name: "search is a stored generated tsvector column", check: "(await query(\"SELECT format_type(atttypid, atttypmod) AS type, attgenerated FROM pg_attribute WHERE attrelid = 'help_articles'::regclass AND attname = 'search'\")).some(r => r.type === 'tsvector' && r.attgenerated === 's')" },
+    { name: "Titles weigh more than bodies", check: "(await query(\"SELECT search::text AS s FROM help_articles WHERE id = 1\"))[0].s.includes(\"'polici':2A\")" },
+    { name: "A GIN index covers search", check: "(await query(\"SELECT indexdef FROM pg_indexes WHERE tablename = 'help_articles'\")).some(r => /USING gin \\(search\\)/.test(r.indexdef))" },
+    { name: "Columns are id, title, rank", check: "columns.join() === 'id,title,rank'" },
+    { name: "Finds refund, refunded and refunds, best match first", check: "rows.map(r => r.id).join() === '1,3,5' && rows[0].rank === 0.669 && rows[1].rank === 0.243" },
+    { name: "New articles are found too", check: "(await rerun(\"INSERT INTO help_articles (title, body) VALUES ('Refunds for subscriptions', 'Cancel any time.')\")).map(r => r.id).join() === '1,7,3,5'" },
+  ]}
+>
+
+The support team wants a search box for the help centre, and someone has already suggested running Elasticsearch for six articles. Show them PostgreSQL can do it: 🔎
+
+1. Add a column **`search`** of type `tsvector` that is **`GENERATED ALWAYS AS (…) STORED`**, built with the `'english'` configuration from the **title with weight `'A'`** joined (`||`) with the **body with weight `'B'`**, so title matches rank higher.
+2. Add a **GIN** index on `search`.
+3. Replace the last query: find the articles matching what the user typed, **`refunds`**, using `websearch_to_tsquery('english', 'refunds')`. Show **`id`**, **`title`** and **`rank`**, which is `ts_rank(search, query)` rounded to **3** decimals, best first, ties by `id`.
+
+<Hint>
+
+The column: `ALTER TABLE help_articles ADD COLUMN search tsvector GENERATED ALWAYS AS (setweight(to_tsvector('english', title), 'A') || setweight(to_tsvector('english', body), 'B')) STORED;`. The index: `CREATE INDEX … ON help_articles USING gin (search);`. In the query, put the tsquery in the `FROM` list (`FROM help_articles, websearch_to_tsquery('english', 'refunds') AS q`) so you can use `q` in both `WHERE search @@ q` and `ts_rank(search, q)`. `ts_rank` returns a `real`: cast it with `::numeric` before `round(…, 3)`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE help_articles (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  body text NOT NULL
+);
+
+INSERT INTO help_articles (title, body) VALUES
+  ('Refund policy',
+   'You can ask for a refund within 30 days of delivery.'),
+  ('Tracking your parcel',
+   'Every shipped order gets a tracking link by email.'),
+  ('Damaged items',
+   'Send us a photo and we will refund or replace the item.'),
+  ('Changing your address',
+   'Update the address before the order is shipped.'),
+  ('Gift cards',
+   'Gift cards cannot be refunded or exchanged for cash.'),
+  ('Paying by card',
+   'We accept all major cards. Cards are charged at shipping.');
+
+ALTER TABLE help_articles ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', title), 'A')
+      || setweight(to_tsvector('english', body), 'B')
+  ) STORED;
+
+CREATE INDEX help_articles_search_idx
+  ON help_articles USING gin (search);
+
+SELECT id, title, round(ts_rank(search, q)::numeric, 3) AS rank
+FROM help_articles,
+  websearch_to_tsquery('english', 'refunds') AS q
+WHERE search @@ q
+ORDER BY rank DESC, id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **OLTP** (many small transactions by key) and **OLAP** (big scans and aggregates) need different engines; PostgreSQL is an excellent OLTP database.
+- **Row stores** read whole rows; **column stores** (ClickHouse, DuckDB, BigQuery, Snowflake) read only the needed columns, compressed. Feed them from PostgreSQL with ETL or CDC.
+- Stretch PostgreSQL first: **rollup tables / materialized views**, read replicas, partitioning, **BRIN** indexes, extensions.
+- **JSONB** covers most document needs; key-value and wide-column stores trade queries and joins for scale; graph databases suit deep traversals.
+- **Caches** cut load but bring invalidation and stampedes: fix queries first, always use a TTL.
+- **Full-text search** (`tsvector`, `websearch_to_tsquery`, `ts_rank`, GIN) handles most search boxes; dedicated engines win on typo tolerance, facets and huge multilingual corpora.
+- Climb the scaling ladder one measured step at a time: queries and indexes, bigger server, pooling, replicas, partitioning, caching, splitting, and **sharding** last.

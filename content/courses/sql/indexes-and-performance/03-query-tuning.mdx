@@ -1,0 +1,438 @@
+---
+title: Tuning Slow Queries
+description: Write index-friendly (sargable) conditions, stop selecting everything, paginate with keysets instead of OFFSET, kill N+1 queries and keep the planner's statistics fresh.
+duration: 25
+xp: 25
+---
+
+You can read plans and you know your indexes. Yet in real projects, most slow queries aren't missing an index: they're written in a way that **stops** the index from being used, or they ask for far more work than the page needs. The good news is that these problems repeat, and once you know the patterns you'll spot them in code review in seconds. 🔧
+
+This lesson is a tour of the five tuning fixes you'll use most often in your career.
+
+## Sargable conditions: leave the column alone
+
+A condition is **sargable** (from "Search ARGument ABLE") when the database can use an index to find the matching rows. The rule is simple: **keep the indexed column bare on one side of the comparison**, and put all the calculation on the other side.
+
+An index on `bought_on` is sorted by `bought_on`. It's not sorted by `extract(month FROM bought_on)`, so a condition on that expression can't use it, and PostgreSQL has to compute the expression for every row:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE INDEX
+
+ANALYZE
+
+                                                      QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on purchases
+         Filter: ((EXTRACT(year FROM bought_on) = '2024'::numeric) AND (EXTRACT(month FROM bought_on) = '3'::numeric))
+(3 rows)
+
+                                          QUERY PLAN
+----------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Index Scan using purchases_bought_on_idx on purchases
+         Index Cond: ((bought_on >= '2024-03-01'::date) AND (bought_on < '2024-04-01'::date))
+(3 rows)`}>
+
+```sql
+CREATE TABLE purchases AS
+SELECT g AS id,
+  g % 5000 + 1 AS customer_id,
+  date '2024-01-01' + g / 200 AS bought_on,
+  (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+CREATE INDEX purchases_bought_on_idx ON purchases (bought_on);
+ANALYZE purchases;
+
+-- Not sargable: a function wraps the column
+EXPLAIN (COSTS OFF)
+SELECT sum(amount) AS revenue
+FROM purchases
+WHERE extract(year FROM bought_on) = 2024
+  AND extract(month FROM bought_on) = 3;
+
+-- Sargable: the same rows, as a range on the bare column
+EXPLAIN (COSTS OFF)
+SELECT sum(amount) AS revenue
+FROM purchases
+WHERE bought_on >= '2024-03-01'
+  AND bought_on < '2024-04-01';
+```
+
+</CodeExample>
+
+Both queries return the same rows, but only the second can use the index. Notice the **half-open range**: `>=` the first day, `<` the first day of the **next** month. It's correct for `date`, `timestamp` and `timestamptz` alike, while `BETWEEN '2024-03-01' AND '2024-03-31'` silently loses everything after midnight on 31 March when the column is a timestamp.
+
+Common non-sargable patterns and their rewrites:
+
+| Instead of | Write |
+| --- | --- |
+| `extract(year FROM d) = 2024` | `d >= '2024-01-01' AND d < '2025-01-01'` |
+| `created_at::date = '2024-03-01'` | `created_at >= '2024-03-01' AND created_at < '2024-03-02'` |
+| `amount * 1.2 > 120` | `amount > 120 / 1.2` |
+| `lower(email) = 'mei@x.io'` | the same, **plus** an index on `lower(email)` |
+| `coalesce(deleted, false) = false` | `deleted IS NOT TRUE`, or make the column `NOT NULL` |
+| `name LIKE '%son'` | a different tool (full-text search, `pg_trgm`) |
+
+### Watch out for type mismatches
+
+A sneakier way to wrap a column in a function is to compare it with a value of a **different type**. Here `id` is an integer, but `42.0` is a numeric, so PostgreSQL converts **every id** to numeric to compare them:
+
+<CodeExample output={`CREATE TABLE AS
+
+ALTER TABLE
+
+ANALYZE
+
+            QUERY PLAN
+----------------------------------
+ Seq Scan on purchases
+   Filter: ((id)::numeric = 42.0)
+(2 rows)
+
+                  QUERY PLAN
+----------------------------------------------
+ Index Scan using purchases_pkey on purchases
+   Index Cond: (id = 42)
+(2 rows)`}>
+
+```sql
+CREATE TABLE purchases AS
+SELECT g AS id, (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+ALTER TABLE purchases ADD PRIMARY KEY (id);
+ANALYZE purchases;
+
+EXPLAIN (COSTS OFF) SELECT * FROM purchases WHERE id = 42.0;
+EXPLAIN (COSTS OFF) SELECT * FROM purchases WHERE id = 42;
+```
+
+</CodeExample>
+
+The `(id)::numeric` in the Filter gives it away. In app code this happens when a driver sends a parameter with the wrong type, for example a JavaScript number that became a float, or an `id` column stored as `text` and searched with a number. When a plan shows a cast on **the column side**, fix the types.
+
+## Don't SELECT * in application code
+
+`SELECT *` is perfect for exploring data, and that's how this course has used it. In code that runs thousands of times a minute, list the columns you need:
+
+- **Less data to read and send.** A `products` table might have a 20 KB `description` and a big JSON `attributes` column. A product list page that needs name and price shouldn't drag those through the database, the network and your app's memory for every row.
+- **Index-only scans.** As you saw in [the last lesson](/learn/sql/choosing-indexes), a query that needs only indexed columns can skip the table entirely. `SELECT *` never can.
+- **Stable code.** When someone adds or reorders columns, `SELECT *` silently changes what your code receives. Explicit columns break loudly, or not at all.
+
+## Pagination: keyset beats OFFSET
+
+The classic way to show results page by page is `LIMIT … OFFSET …`. It's easy, and on page 1 it's fast. But `OFFSET 50000` doesn't jump to row 50,001: the database has to **produce and throw away** the first 50,000 rows every time. Page 2,500 of a feed is 2,500 times slower than page 1.
+
+**Keyset pagination** (also called the **seek method**) remembers where the last page **ended** and asks for the rows after it. With an index on the sort columns, every page costs the same:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE INDEX
+
+ANALYZE
+
+                                            QUERY PLAN
+--------------------------------------------------------------------------------------------------
+ Limit (actual rows=20.00 loops=1)
+   ->  Index Scan Backward using purchases_day_id_idx on purchases (actual rows=50020.00 loops=1)
+         Index Searches: 1
+(3 rows)
+
+                                          QUERY PLAN
+-----------------------------------------------------------------------------------------------
+ Limit (actual rows=20.00 loops=1)
+   ->  Index Scan Backward using purchases_day_id_idx on purchases (actual rows=20.00 loops=1)
+         Index Cond: (ROW(bought_on, id) < ROW('2024-09-07'::date, 50001))
+         Index Searches: 1
+(4 rows)`}>
+
+```sql
+CREATE TABLE purchases AS
+SELECT g AS id,
+  date '2024-01-01' + g / 200 AS bought_on,
+  (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+CREATE INDEX purchases_day_id_idx ON purchases (bought_on, id);
+ANALYZE purchases;
+
+-- Page 2,501 with OFFSET: reads 50,020 rows to show 20
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT id, bought_on, amount
+FROM purchases
+ORDER BY bought_on DESC, id DESC
+LIMIT 20 OFFSET 50000;
+
+-- The same page with a keyset: "after the last row I showed"
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT id, bought_on, amount
+FROM purchases
+WHERE (bought_on, id) < ('2024-09-07', 50001)
+ORDER BY bought_on DESC, id DESC
+LIMIT 20;
+```
+
+</CodeExample>
+
+Compare the `actual rows` of the Index Scan: **50,020** versus **20**. How keyset pagination works:
+
+1. The first page is a plain `ORDER BY bought_on DESC, id DESC LIMIT 20`.
+2. The app remembers the **last row's** sort values, here `('2024-09-07', 50001)`, usually in the "next page" link or an opaque cursor token.
+3. The next page asks for rows that come **after** it in the sort order. For a descending sort that's `<`, written as a **row comparison** `(bought_on, id) < (…, …)`, which compares column by column like a dictionary does, and which a B-tree on `(bought_on, id)` can serve directly.
+
+The **`id` tie-breaker** is essential: 200 purchases share each day, and without a unique last column you'd skip or repeat rows at page boundaries. Keyset pages are also **stable**: with OFFSET, a new row inserted at the top shifts everything down by one, so the user sees a row twice; a keyset page doesn't care.
+
+The trade-off: you can't jump straight to page 37, only to the next (or previous) page. That suits feeds, infinite scrolling and APIs perfectly. For an admin table that really needs page numbers, OFFSET is fine as long as the pages stay shallow.
+
+<Callout type="tip" title="Counting is expensive too">
+
+"Page 1 of 41,237" needs a `count(*)` over every matching row, which is often slower than the page itself. Many products show "Next" without a total, or an estimate. For a whole-table estimate, `SELECT reltuples FROM pg_class WHERE relname = 'purchases'` costs nothing.
+
+</Callout>
+
+<Quiz
+  question="A query has WHERE (created_at, id) < ('2025-06-01 12:00', 900) ORDER BY created_at DESC, id DESC LIMIT 20. Why is id in there?"
+  options={[
+    "It makes the query faster by itself, even without an index",
+    "Many rows can share the same created_at, so id makes the position unique and stops rows being skipped or repeated between pages",
+    "PostgreSQL requires at least two columns in a row comparison",
+    "It sorts the newest ids first, which is required by LIMIT",
+  ]}
+  answer={1}
+  explanation="The keyset is the last row's position in the sort order. If several rows share created_at, the timestamp alone can't say where the page ended. Adding a unique column as a tie-breaker makes the position exact."
+/>
+
+## N+1 queries: the app-side killer
+
+Some of the worst performance problems aren't in any single query: each query is fast, but there are **thousands** of them. The classic is the **N+1 problem**: one query to fetch a list, then one more query **per item**:
+
+```js
+// ❌ 1 query for the orders + 1 query per order
+const orders = await db.query(
+  "SELECT id, customer_id FROM orders ORDER BY id LIMIT 100",
+);
+for (const order of orders) {
+  order.customer = await db.query(
+    "SELECT name FROM customers WHERE id = $1",
+    [order.customer_id],
+  );
+}
+```
+
+That's 101 round trips. Even at a fast 1 ms each (the query itself takes microseconds; the time goes on the network and the driver), the page needs 100 ms before doing anything else, and with 1,000 rows a full second. In a profiler or the database log it looks like the same tiny query repeated over and over.
+
+ORMs make this easy to do by accident: accessing `order.customer` in a template quietly runs a query each time. They also have the cure, called **eager loading**: `include` in Prisma or Sequelize, `selectinload()` / `joinedload()` in SQLAlchemy, `select_related()` / `prefetch_related()` in Django.
+
+The fix in SQL is to ask for **everything at once**, with a join:
+
+<CodeExample output={` id |     name
+----+--------------
+  1 | Sofia Rossi
+  2 | Diego López
+  3 | Ravi Patel
+  4 | Chloe Martin
+(4 rows)`}>
+
+```sql
+SELECT o.id, c.name
+FROM orders AS o
+JOIN customers AS c ON c.id = o.customer_id
+ORDER BY o.id
+LIMIT 4;
+```
+
+</CodeExample>
+
+When the second query can't easily become a join (different service, cache, or code structure), **batch** it instead: collect the ids and fetch them all with one `= ANY(…)`. The app sends the ids as a single array parameter, `WHERE id = ANY($1)`:
+
+<CodeExample output={` id |     name
+----+--------------
+  3 | Ada Brooks
+  4 | Kenji Mori
+  8 | Sofia Rossi
+ 10 | Anna Ivanova
+(4 rows)`}>
+
+```sql
+-- Two queries in total, however many orders there are
+SELECT id, name
+FROM customers
+WHERE id = ANY (ARRAY[3, 8, 4, 10])
+ORDER BY id;
+```
+
+</CodeExample>
+
+Two queries instead of N+1, whatever N is. This is exactly what the ORMs' `prefetch_related` / `selectinload` do under the hood.
+
+## Statistics: keep the planner informed
+
+Every decision you've seen in this module was based on the planner's **estimates**, and estimates come from **statistics**. When statistics are missing or stale, the planner is guessing blind. Watch what happens to a fresh table, before and after `ANALYZE`:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 20000
+
+                                        QUERY PLAN
+-------------------------------------------------------------------------------------------
+ Seq Scan on app_logs  (cost=0.00..264.00 rows=54 width=68) (actual rows=18000.00 loops=1)
+   Filter: (level = 'info'::text)
+   Rows Removed by Filter: 2000
+(3 rows)
+
+ANALYZE
+
+                                          QUERY PLAN
+----------------------------------------------------------------------------------------------
+ Seq Scan on app_logs  (cost=0.00..378.00 rows=18000 width=20) (actual rows=18000.00 loops=1)
+   Filter: (level = 'info'::text)
+   Rows Removed by Filter: 2000
+(3 rows)
+
+ n_distinct |   most_common_vals   | most_common_freqs
+------------+----------------------+-------------------
+          3 | {info,warning,error} | {0.9,0.09,0.01}
+(1 row)`}>
+
+```sql
+CREATE TABLE app_logs (
+  id integer PRIMARY KEY,
+  level text NOT NULL,
+  message text NOT NULL
+);
+
+INSERT INTO app_logs
+SELECT g,
+  CASE WHEN g % 100 = 0 THEN 'error'
+       WHEN g % 10 = 0 THEN 'warning'
+       ELSE 'info' END,
+  'event ' || g
+FROM generate_series(1, 20000) AS g;
+
+-- No statistics yet: a blind guess
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM app_logs WHERE level = 'info';
+
+ANALYZE app_logs;
+
+-- With statistics: spot on
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM app_logs WHERE level = 'info';
+
+-- What ANALYZE learned about the column
+SELECT n_distinct, most_common_vals, most_common_freqs
+FROM pg_stats
+WHERE tablename = 'app_logs' AND attname = 'level';
+```
+
+</CodeExample>
+
+Before `ANALYZE`, the planner expected **54** rows and got **18,000**: off by a factor of 333. Here it doesn't matter (there's only one sensible plan), but feed that estimate into a join and the planner happily picks a Nested Loop that runs 18,000 times instead of once. After `ANALYZE`, the estimate is exact. The **`pg_stats`** view shows what it knows: 3 distinct values, and how common each one is (90% info, 9% warnings, 1% errors).
+
+How statistics stay fresh, and when they don't:
+
+- **Autovacuum** runs `ANALYZE` on a table in the background after enough of it has changed (by default about 10% of rows). That covers normal traffic.
+- **After a bulk load or big migration**, run `ANALYZE` yourself. Autovacuum may not have caught up yet when your next query arrives, and that query will be planned with old numbers. The same goes for a database you've just restored from a dump: run `ANALYZE` (or `vacuumdb --analyze-only`) before letting traffic in.
+- **Huge tables with skewed data** can need a bigger sample: `ALTER TABLE app_logs ALTER COLUMN level SET STATISTICS 1000;` (the default is 100).
+- **Correlated columns** (city and country, say) fool the planner, which assumes conditions are independent and multiplies their selectivities. `CREATE STATISTICS … (dependencies) ON city, country FROM …` teaches it the relationship.
+
+<Callout type="note" title="A tuning workflow">
+
+1. **Find** the queries that matter: the slowest by total time in `pg_stat_statements`, not the one that "feels" slow.
+2. **`EXPLAIN (ANALYZE, BUFFERS)`** it on production-sized data (a copy, or wrapped in `BEGIN` … `ROLLBACK`).
+3. Look for the usual suspects: estimates far from actual rows, Seq Scans returning few rows, huge "Rows Removed by Filter", Sorts that spill to disk, Nested Loops with large `loops`.
+4. Fix the **query** first (sargable conditions, fewer columns, keyset pages, batching), then the **indexes**, then the **statistics**. Hardware and settings come last.
+5. Measure again, and keep the before-and-after plans in the pull request.
+
+</Callout>
+
+<Quiz
+  question="Right after importing 5 million rows into an empty table, a simple report query picks a strange Nested Loop plan and runs for minutes. What should you try first?"
+  options={[
+    "Restart the database server",
+    "Run ANALYZE on the table so the planner has statistics about the new data",
+    "Drop all the indexes on the table",
+    "Rewrite the query with OFFSET",
+  ]}
+  answer={1}
+  explanation="Right after a bulk load the table may have no or stale statistics, so the planner badly misestimates row counts and can choose a plan that's terrible for millions of rows. ANALYZE takes seconds and often fixes it on the spot. Compare estimated and actual rows in EXPLAIN ANALYZE to confirm."
+/>
+
+<Exercise
+  language="sql"
+  title="Fix the monthly revenue report"
+  starter={`-- 60,000 invoices from January 2024 to May 2025
+CREATE TABLE invoices AS
+SELECT g AS id,
+  g % 3000 + 1 AS customer_id,
+  timestamp '2024-01-01' + g * interval '12 minutes 1 second'
+    AS issued_at,
+  (g * 7) % 300 + 9.99 AS total
+FROM generate_series(1, 60000) AS g;
+CREATE INDEX invoices_issued_at_idx ON invoices (issued_at);
+ANALYZE invoices;
+
+-- Revenue for March 2025: correct, but scans every invoice
+SELECT count(*) AS invoices, sum(total) AS revenue
+FROM invoices
+WHERE extract(year FROM issued_at) = 2025
+  AND extract(month FROM issued_at) = 3;
+`}
+  tests={[
+    { name: "Columns are invoices, revenue", check: "columns.join() === 'invoices,revenue'" },
+    { name: "Same answer as the slow version", check: "rows.length === 1 && rows[0].invoices === 3715 && rows[0].revenue === 593647.85" },
+    { name: "The plan has no Seq Scan", check: "!(await query('EXPLAIN (COSTS OFF) ' + lastQuery)).some(r => r['QUERY PLAN'].includes('Seq Scan'))" },
+    { name: "issued_at isn't wrapped in a function or cast", check: "!/extract|date_part|date_trunc|to_char|issued_at\\s*::/i.test(lastQuery)" },
+    { name: "Counts an invoice at 23:59 on 31 March", check: "(await query(lastQuery))[0].invoices + 1 === (await rerun(\"INSERT INTO invoices VALUES (60001, 1, '2025-03-31 23:59', 100)\"))[0].invoices" },
+    { name: "Leaves out an invoice at midnight on 1 April", check: "(await query(lastQuery))[0].invoices === (await rerun(\"INSERT INTO invoices VALUES (60002, 1, '2025-04-01 00:00', 100)\"))[0].invoices" },
+  ]}
+>
+
+The finance dashboard's "revenue for the month" query is correct, but it reads all 60,000 invoices because `issued_at` is wrapped in `extract()`, so the index on `issued_at` can't be used.
+
+Rewrite the last query so that it:
+
+- returns the **same** `invoices` and `revenue` for March 2025,
+- uses the index (no Seq Scan in its plan),
+- still counts an invoice issued at 23:59 on 31 March, and leaves out one issued at midnight on 1 April.
+
+Check your plan with `EXPLAIN (COSTS OFF)` in front of the query, then remove it again: the last statement must be the report itself.
+
+<Hint>
+
+Compare the bare column with a **half-open range**: `issued_at >= '2025-03-01'` and `issued_at < '2025-04-01'`. Avoid `BETWEEN '2025-03-01' AND '2025-03-31'`: for a timestamp, `'2025-03-31'` means midnight at the **start** of 31 March, so the whole last day would be lost.
+
+</Hint>
+
+<Solution>
+
+```sql
+-- 60,000 invoices from January 2024 to May 2025
+CREATE TABLE invoices AS
+SELECT g AS id,
+  g % 3000 + 1 AS customer_id,
+  timestamp '2024-01-01' + g * interval '12 minutes 1 second'
+    AS issued_at,
+  (g * 7) % 300 + 9.99 AS total
+FROM generate_series(1, 60000) AS g;
+CREATE INDEX invoices_issued_at_idx ON invoices (issued_at);
+ANALYZE invoices;
+
+-- Revenue for March 2025, as a range on the bare column
+SELECT count(*) AS invoices, sum(total) AS revenue
+FROM invoices
+WHERE issued_at >= '2025-03-01'
+  AND issued_at < '2025-04-01';
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **Sargable** conditions keep the indexed column bare: use half-open ranges (`>= start AND < next`) instead of `extract()` or casts, move arithmetic to the other side, and watch for type mismatches that cast the column.
+- List the columns you need instead of **`SELECT *`** in app code: less data, index-only scans, stable code.
+- **Keyset pagination** (`WHERE (sort_col, id) < (last values) ORDER BY … LIMIT n`) costs the same on every page; `OFFSET n` reads and discards n rows.
+- **N+1 queries** turn one page into hundreds of round trips: use a join, `= ANY($1)` batching or your ORM's eager loading.
+- The planner is only as good as its **statistics**: `ANALYZE` after bulk loads, read `pg_stats`, and compare estimated with actual rows in `EXPLAIN ANALYZE`.

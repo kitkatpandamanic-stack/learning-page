@@ -1,0 +1,445 @@
+---
+title: "Part 1: Tenants and the schema"
+description: Read the brief for a multi-tenant task tracker, compare tenancy models, and design a schema where no row can ever point into another tenant's data.
+duration: 25
+xp: 35
+---
+
+Welcome to the Level 3 capstone. You're the database lead at a start-up building **PandaTasks**, a project and task tracker sold to companies. Each customer company is a **tenant**: Acme Ltd signs up, invites its people, creates projects and tasks, and must never, ever see a single row that belongs to Globex. 🐼
+
+Over three parts you'll design, secure and prepare this database for launch, using everything from Level 3:
+
+1. **Tenants and the schema** (this part): the tenancy model, keys and constraints that make cross-tenant mistakes impossible.
+2. **Isolating tenants**: roles and row-level security, so a forgotten `WHERE` can't leak data.
+3. **Launch review**: indexes and partitioning for tenant data, a migration plan, and the final checklist.
+
+## The brief
+
+Here's what product and the founders have told you:
+
+- **Isolation is the top requirement.** One company seeing another company's tasks would end the business.
+- About **5,000 tenants** in the first year. Most are small teams; a few enterprise customers will have millions of tasks.
+- A **user** (one email address) can belong to **several tenants**, for example a freelancer who works for two clients, with a role in each: `owner`, `admin` or `member`.
+- Tenants are on a **plan**: `free`, `pro` or `enterprise`, with limits per plan.
+- Every change is recorded in an **activity log**, kept for a time that depends on the plan.
+- Tenants can ask for **all their data to be exported or deleted** (GDPR), and support staff sometimes need to look across tenants.
+
+## Three ways to host many tenants
+
+Before any `CREATE TABLE`, choose the **tenancy model**. There are three classic options:
+
+| | Database per tenant | Schema per tenant | Shared tables + `tenant_id` |
+| --- | --- | --- | --- |
+| Isolation | Strongest | Strong | Enforced by keys and RLS |
+| Migrations | Run 5,000 times | Run 5,000 times | Run once |
+| Connections | A pool per database | Shared, `search_path` per request | Shared |
+| Cross-tenant reports | Very hard | Hard | Plain SQL |
+| Cost per small tenant | High | Medium | Tiny |
+| Moving a big tenant out | Already separate | Easy | Needs a copy by `tenant_id` |
+| Works up to | Hundreds of tenants | Low thousands | Hundreds of thousands+ |
+
+Database- or schema-per-tenant looks safest, but with thousands of tenants every migration becomes a fleet operation that can fail half-way, catalogs grow huge, and connection pools multiply. Most SaaS products, from small start-ups to Salesforce-scale platforms, use **shared tables with a `tenant_id` column**, made safe by constraints and **row-level security**, and move only the very biggest customers onto their own servers if they must.
+
+That's PandaTasks' choice too. The rule that follows is simple and strict: **every table that holds tenant data has a `tenant_id` column**, even when it could be found through a join. It's what row-level security filters on, what every index starts with, and what you'd shard by one day.
+
+## Tenants, users and memberships
+
+`tenants` and `users` are the two "global" tables. A user isn't owned by one tenant, so the link between them is its own table, **`memberships`**, with the role. Plans and roles are a small fixed set, so they're `ENUM` types:
+
+<CodeExample output={`CREATE TYPE
+
+CREATE TYPE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE INDEX
+
+CREATE TABLE
+
+INSERT 0 3
+
+INSERT 0 5
+
+INSERT 0 7
+
+  tenant  |   member   |  role
+----------+------------+--------
+ Acme Ltd | Ada Brooks | member
+ Acme Ltd | Mei Lin    | owner
+ Acme Ltd | Sam Ortiz  | member
+ Globex   | Ada Brooks | owner
+ Globex   | Kenji Mori | member
+ Initech  | Mei Lin    | admin
+ Initech  | Ravi Patel | owner
+(7 rows)`}>
+
+```sql
+CREATE TYPE plan AS ENUM ('free', 'pro', 'enterprise');
+CREATE TYPE member_role AS ENUM ('owner', 'admin', 'member');
+
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL,
+  plan plan NOT NULL DEFAULT 'free'
+);
+
+CREATE TABLE users (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text NOT NULL,
+  name text NOT NULL
+);
+-- one account per email, whatever the capitals
+CREATE UNIQUE INDEX users_email_key ON users (lower(email));
+
+CREATE TABLE memberships (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  user_id bigint NOT NULL REFERENCES users ON DELETE CASCADE,
+  role member_role NOT NULL DEFAULT 'member',
+  PRIMARY KEY (tenant_id, user_id)
+);
+
+INSERT INTO tenants (slug, name, plan) VALUES
+  ('acme', 'Acme Ltd', 'pro'),
+  ('globex', 'Globex', 'free'),
+  ('initech', 'Initech', 'enterprise');
+
+INSERT INTO users (email, name) VALUES
+  ('mei@acme.test', 'Mei Lin'),
+  ('sam@acme.test', 'Sam Ortiz'),
+  ('ada@globex.test', 'Ada Brooks'),
+  ('kenji@globex.test', 'Kenji Mori'),
+  ('ravi@initech.test', 'Ravi Patel');
+
+INSERT INTO memberships (tenant_id, user_id, role) VALUES
+  (1, 1, 'owner'), (1, 2, 'member'), (1, 3, 'member'),
+  (2, 3, 'owner'), (2, 4, 'member'),
+  (3, 5, 'owner'), (3, 1, 'admin');
+
+SELECT t.name AS tenant, u.name AS member, m.role
+FROM memberships AS m
+JOIN tenants AS t ON t.id = m.tenant_id
+JOIN users AS u ON u.id = m.user_id
+ORDER BY t.name, u.name;
+```
+
+</CodeExample>
+
+Ada works for Acme and Globex, and Mei is in Acme and Initech, with different roles in each. A few deliberate choices:
+
+- **`memberships` has the primary key `(tenant_id, user_id)`**, with `tenant_id` first. Most lookups are "the members of this tenant", and other tables will point at this pair.
+- The email rule is a **unique index on `lower(email)`**, so `Mei@Acme.test` can't sign up twice.
+- `ON DELETE CASCADE` from `tenants` means deleting a tenant removes its memberships. Users stay, because they may belong elsewhere.
+- In the real product every table also has `created_at timestamptz NOT NULL DEFAULT now()`. We leave timestamps out of the examples to keep the output short.
+
+## Making cross-tenant references impossible
+
+Now projects and tasks. Here's the subtle bug that shared-table designs are famous for. With an ordinary foreign key on `project_id`, nothing stops a task of **Globex** from pointing at a project of **Acme**:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 2
+
+INSERT 0 1
+
+ task_tenant | project_tenant |       title
+-------------+----------------+-------------------
+           2 |              1 | Steal the roadmap
+(1 row)`}>
+
+```sql
+CREATE TABLE projects (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id bigint NOT NULL,
+  name text NOT NULL
+);
+
+-- the naive version: project_id alone
+CREATE TABLE tasks (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id bigint NOT NULL,
+  project_id bigint NOT NULL REFERENCES projects,
+  title text NOT NULL
+);
+
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Acme roadmap'), (2, 'Globex website');
+
+-- a bug in the app (or an attacker guessing ids) does this:
+INSERT INTO tasks (tenant_id, project_id, title)
+VALUES (2, 1, 'Steal the roadmap');
+
+SELECT
+  k.tenant_id AS task_tenant,
+  p.tenant_id AS project_tenant,
+  k.title
+FROM tasks AS k
+JOIN projects AS p ON p.id = k.project_id;
+```
+
+</CodeExample>
+
+The database accepted a Globex task inside Acme's project. Now any screen that lists "tasks of the Acme roadmap" shows Globex's task to Acme, and maybe the reverse. Application code is supposed to check this, on every endpoint, forever.
+
+The fix is to make the **tenant part of the key**. Give `projects` the primary key `(tenant_id, id)`, and let tasks reference that **pair**. A **composite foreign key** requires both columns to match the same row, so a task and its project must be in the same tenant:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 2
+
+INSERT 0 1
+
+ERROR:  insert or update on table "tasks" violates foreign key constraint "tasks_tenant_id_project_id_fkey"
+DETAIL:  Key (tenant_id, project_id)=(2, 1) is not present in table "projects".`}>
+
+```sql
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (tenant_id, name)
+);
+
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id) ON DELETE CASCADE
+);
+
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Acme roadmap'), (2, 'Globex website');
+
+-- same tenant: fine
+INSERT INTO tasks (tenant_id, project_id, title)
+VALUES (1, 1, 'Plan Q3');
+
+-- across tenants: rejected by the database itself
+INSERT INTO tasks (tenant_id, project_id, title)
+VALUES (2, 1, 'Steal the roadmap');
+```
+
+</CodeExample>
+
+The same pattern applies to every reference inside a tenant. An assignee isn't just "a user": it must be a **member of the same tenant**, so the task's foreign key points at `memberships (tenant_id, user_id)`. Per-tenant names get per-tenant uniqueness: `UNIQUE (tenant_id, name)` lets Acme and Globex both have a project called "Website", but not two in the same company.
+
+<Callout type="note" title="ON DELETE SET NULL for one column">
+
+What should happen to a task when its assignee leaves the company (their membership is deleted)? The task should stay, unassigned. But a plain `ON DELETE SET NULL` on the foreign key `(tenant_id, assignee_id)` would set **both** columns to `NULL`, and `tenant_id` is `NOT NULL`, so the delete would fail. Since PostgreSQL 15 you can name the columns to clear: `ON DELETE SET NULL (assignee_id)`. A composite foreign key with any `NULL` column isn't checked at all, so an unassigned task (`assignee_id IS NULL`) is fine.
+
+</Callout>
+
+## Choosing ids
+
+PandaTasks uses `bigint` identity columns: compact, fast, and easy to read in support tickets. Two things to keep in mind:
+
+- **Ids are global**, shared by all tenants, so they **leak information**. If a new Globex task gets id 1,000,042, Globex can watch the number grow and estimate how busy the whole platform is. Never rely on an id being hard to guess: authorisation (and RLS, in the next part) is what protects data.
+- If ids must be generated outside the database or must not reveal counts, use **UUIDs**. PostgreSQL 18 has a built-in **`uuidv7()`**, which puts a timestamp first. New ids are then almost always larger than older ones, so they're inserted at the end of the B-tree index, like a sequence, instead of at random places all over it, the main performance problem of random `gen_random_uuid()` (version 4) keys.
+
+```sql
+CREATE TABLE api_keys (
+  id uuid PRIMARY KEY DEFAULT uuidv7(),
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  label text NOT NULL
+);
+```
+
+Users often want short, human numbers per tenant too ("PT-42" in Acme's own sequence). That's a **display number**, stored in its own column with `UNIQUE (tenant_id, number)`, never the primary key.
+
+<Quiz
+  question="tasks has FOREIGN KEY (tenant_id, project_id) REFERENCES projects (tenant_id, id). What does this guarantee that FOREIGN KEY (project_id) REFERENCES projects (id) does not?"
+  options={[
+    "That project ids are unique across all tenants",
+    "That a task can only point to a project of the same tenant",
+    "That tasks are deleted when their tenant is deleted",
+    "That the query planner uses an index for the join",
+  ]}
+  answer={1}
+  explanation="A composite foreign key requires a projects row where both tenant_id and id match. A task of tenant 2 can no longer reference a project of tenant 1, because the row (2, 1) doesn't exist. The single-column key only checks that some project with that id exists, in any tenant."
+/>
+
+<Quiz
+  question="Why does PandaTasks keep a tenant_id column on tasks, even though it could be found by joining tasks to projects?"
+  options={[
+    "PostgreSQL requires it for foreign keys",
+    "To save disk space",
+    "So that RLS policies, indexes, partitioning and a future shard key can all use it directly on every tenant table",
+    "Because tenant_id must be the primary key of every table",
+  ]}
+  answer={2}
+  explanation="Denormalising tenant_id onto every tenant-owned table is deliberate. Policies can then compare tenant_id directly (no join in every check), indexes can start with it, and tools like Citus can co-locate all of a tenant's rows on one server by sharding on it."
+/>
+
+<Exercise
+  language="sql"
+  title="Design the tasks table"
+  starter={`CREATE TYPE member_role AS ENUM ('owner', 'admin', 'member');
+
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL
+);
+CREATE TABLE users (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+CREATE TABLE memberships (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  user_id bigint NOT NULL REFERENCES users ON DELETE CASCADE,
+  role member_role NOT NULL DEFAULT 'member',
+  PRIMARY KEY (tenant_id, user_id)
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (tenant_id, name)
+);
+
+INSERT INTO tenants (slug, name) VALUES
+  ('acme', 'Acme Ltd'), ('globex', 'Globex');
+INSERT INTO users (name) VALUES ('Mei'), ('Sam'), ('Ada');
+INSERT INTO memberships (tenant_id, user_id) VALUES
+  (1, 1), (1, 2), (2, 3);
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+
+-- Create the tasks table here
+
+
+INSERT INTO tasks (tenant_id, project_id, title, status, assignee_id)
+VALUES
+  (1, 1, 'Design the home page', 'done', 1),
+  (1, 1, 'Write the pricing page', 'doing', 2),
+  (1, 2, 'Set up push notifications', 'todo', NULL),
+  (2, 3, 'Pick a domain name', 'todo', 3);
+
+SELECT tenant_id, id, title, status, assignee_id
+FROM tasks
+ORDER BY tenant_id, id;
+`}
+  tests={[
+    { name: "The four tasks are inserted", check: "rows.length === 4 && columns.join() === 'tenant_id,id,title,status,assignee_id'" },
+    { name: "Primary key is (tenant_id, id)", check: "(await query(\"SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'tasks'::regclass AND contype = 'p'\")).some(r => r.def === 'PRIMARY KEY (tenant_id, id)')" },
+    { name: "A task can't point at another tenant's project", check: "await query(\"INSERT INTO tasks (tenant_id, project_id, title) VALUES (2, 1, 'x')\").then(() => false, e => /foreign key/.test(e.message))" },
+    { name: "Only members of the same tenant can be assigned", check: "await query(\"INSERT INTO tasks (tenant_id, project_id, title, assignee_id) VALUES (2, 3, 'x', 1)\").then(() => false, e => /foreign key/.test(e.message))" },
+    { name: "status allows only todo, doing and done (default todo)", check: "(await query(\"INSERT INTO tasks (tenant_id, project_id, title) VALUES (1, 2, 'Default status') RETURNING status\"))[0].status === 'todo' && await query(\"INSERT INTO tasks (tenant_id, project_id, title, status) VALUES (1, 1, 'x', 'blocked')\").then(() => false, e => /check constraint/.test(e.message))" },
+    { name: "When a member leaves, their tasks stay but are unassigned", check: "(await query(\"DELETE FROM memberships WHERE tenant_id = 1 AND user_id = 2\"), (await query(\"SELECT assignee_id FROM tasks WHERE title = 'Write the pricing page'\"))[0].assignee_id === null)" },
+    { name: "Deleting a project deletes its tasks", check: "(await query(\"DELETE FROM projects WHERE tenant_id = 1 AND id = 1\"), (await query(\"SELECT count(*) AS n FROM tasks WHERE project_id = 1\"))[0].n === 0)" },
+  ]}
+>
+
+Create PandaTasks' **`tasks`** table so the database itself enforces the tenant rules. Columns:
+
+- **`tenant_id`** `bigint NOT NULL`, **`id`** `bigint GENERATED ALWAYS AS IDENTITY`, **`project_id`** `bigint NOT NULL`, **`title`** `text NOT NULL`,
+- **`status`** `text NOT NULL`, default **`'todo'`**, allowing only `'todo'`, `'doing'` and `'done'`,
+- **`assignee_id`** `bigint`, which may be `NULL`.
+
+Rules:
+
+1. The primary key is **`(tenant_id, id)`**.
+2. A task's project must belong to the **same tenant**; deleting a project **deletes its tasks**.
+3. An assignee must be a **member of the same tenant**. When that membership is deleted, the task **stays** and only `assignee_id` becomes `NULL`.
+
+The inserts and the query at the bottom should then run. The checks try to break your rules with bad inserts and deletes. 🔒
+
+<Hint>
+
+Two composite foreign keys, as table constraints after the columns:
+
+`FOREIGN KEY (tenant_id, project_id) REFERENCES projects (tenant_id, id) ON DELETE CASCADE`
+
+`FOREIGN KEY (tenant_id, assignee_id) REFERENCES memberships (tenant_id, user_id) ON DELETE SET NULL (assignee_id)`
+
+The status rule is `CHECK (status IN ('todo', 'doing', 'done'))` on the column, next to `DEFAULT 'todo'`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TYPE member_role AS ENUM ('owner', 'admin', 'member');
+
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL
+);
+CREATE TABLE users (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+CREATE TABLE memberships (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  user_id bigint NOT NULL REFERENCES users ON DELETE CASCADE,
+  role member_role NOT NULL DEFAULT 'member',
+  PRIMARY KEY (tenant_id, user_id)
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (tenant_id, name)
+);
+
+INSERT INTO tenants (slug, name) VALUES
+  ('acme', 'Acme Ltd'), ('globex', 'Globex');
+INSERT INTO users (name) VALUES ('Mei'), ('Sam'), ('Ada');
+INSERT INTO memberships (tenant_id, user_id) VALUES
+  (1, 1), (1, 2), (2, 3);
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  status text NOT NULL DEFAULT 'todo'
+    CHECK (status IN ('todo', 'doing', 'done')),
+  assignee_id bigint,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, assignee_id)
+    REFERENCES memberships (tenant_id, user_id)
+    ON DELETE SET NULL (assignee_id)
+);
+
+INSERT INTO tasks (tenant_id, project_id, title, status, assignee_id)
+VALUES
+  (1, 1, 'Design the home page', 'done', 1),
+  (1, 1, 'Write the pricing page', 'doing', 2),
+  (1, 2, 'Set up push notifications', 'todo', NULL),
+  (2, 3, 'Pick a domain name', 'todo', 3);
+
+SELECT tenant_id, id, title, status, assignee_id
+FROM tasks
+ORDER BY tenant_id, id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- PandaTasks uses **shared tables with a `tenant_id`** on every tenant-owned table: one migration path, cheap small tenants, plain SQL for reports. Database- and schema-per-tenant isolate more but don't scale to thousands of tenants.
+- **Users are global**; **memberships `(tenant_id, user_id)`** carry each user's role per tenant.
+- Tenant-owned tables use **`PRIMARY KEY (tenant_id, id)`**, and references inside a tenant are **composite foreign keys** that include `tenant_id`, so cross-tenant links are impossible.
+- **`ON DELETE SET NULL (column)`** clears only the named column of a composite key.
+- Per-tenant rules use per-tenant uniqueness, like **`UNIQUE (tenant_id, name)`**.
+- Global ids leak counts and can be guessed; **`uuidv7()`** gives index-friendly UUIDs. Authorisation, not secret ids, protects data.

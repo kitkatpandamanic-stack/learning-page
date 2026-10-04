@@ -1,0 +1,411 @@
+---
+title: Запросы внутри запросов
+description: Используйте ответ одного запроса внутри другого — скалярные подзапросы, IN, EXISTS и коррелированные подзапросы — и обходите ловушку NOT IN.
+duration: 18
+xp: 25
+---
+
+Для некоторых вопросов сначала нужен другой ответ. «Какие товары стоят **дороже среднего**?» Чтобы ответить, нужно знать, чему равно среднее. Можно выполнить два запроса и перенести число вручную, но в SQL есть способ лучше: поместить один запрос **внутрь** другого.
+
+Запрос внутри другого запроса называется **подзапросом (subquery)**. Его пишут в скобках, и PostgreSQL вычисляет его сам как часть большого запроса. В этом уроке вы познакомитесь с четырьмя формами, которые встречаются постоянно: одно значение, список с `IN`, проверка «да или нет» с `EXISTS` и **коррелированные (correlated)** подзапросы, которые выполняются для каждой строки.
+
+## Подзапрос, который возвращает одно значение
+
+Начнём с внутреннего вопроса отдельно: какова средняя цена товара?
+
+<CodeExample output={` average
+---------
+   18.13
+(1 row)`}>
+
+```sql
+SELECT round(avg(price), 2) AS average
+FROM products;
+```
+
+</CodeExample>
+
+Теперь поставьте этот запрос в скобках ровно туда, где вы написали бы число:
+
+<CodeExample output={`          name          | price
+------------------------+-------
+ Rice Cooker            | 89.90
+ Tea Pot                | 32.00
+ Algorithms in Pictures | 29.00
+ Clean Python           | 24.99
+(4 rows)`}>
+
+```sql
+SELECT name, price
+FROM products
+WHERE price > (SELECT avg(price) FROM products)
+ORDER BY price DESC;
+```
+
+</CodeExample>
+
+PostgreSQL сначала выполняет внутренний запрос, получает одно число (18.13…) и затем использует его в `WHERE` как любое другое значение. Подзапрос, который возвращает **ровно одну строку с одним столбцом**, называется **скалярным подзапросом (scalar subquery)**. Его можно использовать везде, где допустимо одно значение.
+
+В том числе в списке `SELECT`. Здесь для каждого товара видно, насколько его цена отличается от средней:
+
+<CodeExample output={`          name          | price | vs_average
+------------------------+-------+------------
+ Rice Cooker            | 89.90 |      71.77
+ Tea Pot                | 32.00 |      13.87
+ Algorithms in Pictures | 29.00 |      10.87
+(3 rows)`}>
+
+```sql
+SELECT
+  name,
+  price,
+  round(price - (SELECT avg(price) FROM products), 2) AS vs_average
+FROM products
+ORDER BY price DESC
+LIMIT 3;
+```
+
+</CodeExample>
+
+<Callout type="warning" title="Одно значение — значит одно значение">
+
+Скалярный подзапрос должен вернуть не больше одной строки. Если строк больше, PostgreSQL не знает, какое значение взять, и останавливается с ошибкой:
+
+<CodeExample output={`ERROR:  more than one row returned by a subquery used as an expression`}>
+
+```sql
+SELECT name
+FROM products
+WHERE price > (SELECT price FROM products WHERE category = 'tea');
+```
+
+</CodeExample>
+
+Если внутренний запрос не вернул **ни одной** строки, значение равно `NULL`, а сравнение с `NULL` никогда не бывает истинным — внешний запрос просто молча ничего не вернёт.
+
+</Callout>
+
+## Список значений с IN
+
+Вы уже знаете `IN` с фиксированным списком: `WHERE country IN ('UK', 'Japan')`. Список может прийти и из подзапроса, который возвращает **один столбец с любым числом строк**.
+
+Какие покупатели сделали хотя бы один заказ? Их id хранятся в таблице `orders`:
+
+<CodeExample output={` id |    name
+----+------------
+  1 | Mei Lin
+  2 | Sam Ortiz
+  3 | Ada Brooks
+  4 | Kenji Mori
+  5 | Ravi Patel
+(5 rows)`}>
+
+```sql
+SELECT id, name
+FROM customers
+WHERE id IN (SELECT customer_id FROM orders)
+ORDER BY id
+LIMIT 5;
+```
+
+</CodeExample>
+
+Обратите внимание: покупатели с тремя заказами всё равно появляются один раз. `IN` спрашивает только «есть ли этот id где-нибудь в списке?», поэтому повторы в списке не важны. В этом преимущество перед соединением (JOIN), которое повторило бы покупателя для каждого заказа.
+
+`NOT IN` переворачивает вопрос. Кто **ни разу** не заказывал?
+
+<CodeExample output={` id |    name    | joined_on
+----+------------+------------
+ 18 | Grace Kim  | 2024-11-23
+ 19 | Tom Baker  | 2024-12-12
+ 20 | Nina Novak | 2025-01-05
+(3 rows)`}>
+
+```sql
+SELECT id, name, joined_on
+FROM customers
+WHERE id NOT IN (SELECT customer_id FROM orders)
+ORDER BY id;
+```
+
+</CodeExample>
+
+Сработало. Но в `NOT IN` скрыта неприятная ловушка.
+
+## Ловушка NOT IN: NULL в списке
+
+Найдём сотрудников, которые **никем не руководят**. id каждого руководителя встречается в чьём-то `manager_id`, так что кажется, что это должно работать:
+
+<CodeExample output={` name
+------
+(0 rows)`}>
+
+```sql
+SELECT name
+FROM employees
+WHERE id NOT IN (SELECT manager_id FROM employees);
+```
+
+</CodeExample>
+
+Ни одной строки? Но ведь многие сотрудники никем не руководят. Виновница — Grace Hopper, генеральный директор: у неё нет руководителя, поэтому её `manager_id` равен `NULL`, и этот `NULL` попадает в список.
+
+`x NOT IN (1, 2, NULL)` означает `x <> 1 AND x <> 2 AND x <> NULL`. Сравнение с `NULL` даёт **неизвестно (unknown)**, а не истину, поэтому всё условие не может быть истинным ни для одной строки. Один `NULL` в списке — и `NOT IN` ничего не возвращает.
+
+Быстрое исправление — не пускать `NULL` в список:
+
+<CodeExample output={`       name
+-------------------
+ Linus Park
+ Margaret Hamilton
+ Ken Thompson
+(3 rows)`}>
+
+```sql
+SELECT name
+FROM employees
+WHERE id NOT IN (
+  SELECT manager_id
+  FROM employees
+  WHERE manager_id IS NOT NULL
+)
+ORDER BY id
+LIMIT 3;
+```
+
+</CodeExample>
+
+Исправление получше — `NOT EXISTS`, с которым вы познакомитесь дальше: у него вообще нет ловушки с `NULL`.
+
+<Callout type="danger" title="Не доверяйте NOT IN на столбце, где бывает NULL">
+
+`NOT IN (подзапрос)` молча возвращает **ноль строк**, если подзапрос вернул хотя бы один `NULL`. Никакой ошибки — просто неверный ответ. Если столбец может содержать `NULL`, отфильтруйте `NULL` или используйте `NOT EXISTS`. У `IN` (без `NOT`) такой проблемы нет.
+
+</Callout>
+
+## Да или нет с EXISTS
+
+`EXISTS (подзапрос)` истинно, если подзапрос возвращает **хотя бы одну строку**, и ложно, если не возвращает ни одной. Ему неважно, что в этих строках, поэтому внутри обычно пишут `SELECT 1`.
+
+Самое интересное: подзапрос может ссылаться на **внешнюю** строку. Здесь для каждого покупателя `c` подзапрос ищет отменённый заказ этого покупателя:
+
+<CodeExample output={`     name
+--------------
+ Mei Lin
+ Sam Ortiz
+ Chloe Martin
+ Noah Smith
+ Zara Khan
+(5 rows)`}>
+
+```sql
+SELECT c.name
+FROM customers AS c
+WHERE EXISTS (
+  SELECT 1
+  FROM orders AS o
+  WHERE o.customer_id = c.id
+    AND o.status = 'cancelled'
+)
+ORDER BY c.id
+LIMIT 5;
+```
+
+</CodeExample>
+
+Читайте это как предложение: «покупатели, для которых существует их заказ, который был отменён». А `NOT EXISTS` отвечает на прежний вопрос о сотрудниках — несмотря на `NULL`:
+
+<CodeExample output={`      name      |    job_title
+----------------+-----------------
+ Aiko Suzuki    | Support Agent
+ Barbara Liskov | Architect
+ Carlos Ruiz    | Account Manager
+ Dieter Rams    | Designer
+ Elena Gomez    | Account Manager
+(5 rows)`}>
+
+```sql
+SELECT e.name, e.job_title
+FROM employees AS e
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM employees AS report
+  WHERE report.manager_id = e.id
+)
+ORDER BY e.name
+LIMIT 5;
+```
+
+</CodeExample>
+
+К тому же PostgreSQL прекращает поиск, как только находит первую подходящую строку, так что `EXISTS` — дешёвый способ спросить «есть ли хоть какой-нибудь…?».
+
+## Коррелированные подзапросы: свой ответ для каждой строки
+
+Подзапрос, который использует столбец внешнего запроса, как `c.id` выше, называется **коррелированным подзапросом (correlated subquery)**. Концептуально он выполняется заново для **каждой строки** внешнего запроса, подставляя значения этой строки.
+
+Это позволяет сравнивать каждую строку с **её собственной группой**. Какие сотрудники зарабатывают больше среднего в **своём** отделе?
+
+<CodeExample output={`      name      | department_id | salary
+----------------+---------------+--------
+ Alan Turing    |             1 | 130000
+ Barbara Liskov |             1 | 105000
+ Ada Lovelace   |             1 |  98000
+ Don Norman     |             2 |  95000
+ Mary Kay       |             3 |  90000
+ Hana Sato      |             4 |  70000
+ Marie Curie    |             5 | 112000
+(7 rows)`}>
+
+```sql
+SELECT e.name, e.department_id, e.salary
+FROM employees AS e
+WHERE e.salary > (
+  SELECT avg(colleague.salary)
+  FROM employees AS colleague
+  WHERE colleague.department_id = e.department_id
+)
+ORDER BY e.department_id, e.salary DESC;
+```
+
+</CodeExample>
+
+Для Alan Turing (отдел 1) внутренний запрос усредняет отдел 1, для Don Norman — отдел 2, и так далее. Читаемым запрос делают разные псевдонимы (aliases) для двух копий `employees` (`e` и `colleague`).
+
+Grace Hopper в результате нет, и это правильно: её `department_id` равен `NULL`, поэтому внутренний запрос не находит коллег, их среднее — `NULL`, а `salary > NULL` никогда не истинно.
+
+Коррелированные подзапросы работают и в списке `SELECT`. Вот число заказов каждого покупателя — с нулём для тех, кто ни разу не заказывал:
+
+<CodeExample output={`    name    | orders
+------------+--------
+ Mei Lin    |      2
+ Sam Ortiz  |      3
+ Grace Kim  |      0
+ Tom Baker  |      0
+ Nina Novak |      0
+(5 rows)`}>
+
+```sql
+SELECT
+  c.name,
+  (SELECT count(*)
+   FROM orders AS o
+   WHERE o.customer_id = c.id) AS orders
+FROM customers AS c
+WHERE c.id IN (1, 2, 18, 19, 20)
+ORDER BY c.id;
+```
+
+</CodeExample>
+
+<Callout type="tip" title="Подзапрос или соединение?">
+
+На многие вопросы можно ответить обоими способами: «покупатели с заказом» — это `IN`/`EXISTS` или `JOIN` с `DISTINCT`; число заказов выше — это ещё и `LEFT JOIN` с `GROUP BY`. Планировщик PostgreSQL часто превращает оба варианта в один и тот же план, так что выбирайте тот, который **читается** понятнее. Простое правило: используйте соединение, когда нужны столбцы **из** другой таблицы, и `EXISTS` / `IN`, когда по ней нужно только **отфильтровать**.
+
+</Callout>
+
+## Подзапросы во FROM
+
+Подзапрос может заменить и **таблицу**. Его результат становится временной таблицей, которую можно запрашивать, фильтровать и соединять. Это называется **производной таблицей (derived table)**, и у неё обязательно должен быть псевдоним.
+
+Какова средняя сумма заказа? Сначала посчитаем сумму каждого заказа, а потом усредним эти суммы:
+
+<CodeExample output={` orders | average_order
+--------+---------------
+     40 |         70.23
+(1 row)`}>
+
+```sql
+SELECT count(*) AS orders, round(avg(total), 2) AS average_order
+FROM (
+  SELECT order_id, sum(quantity * unit_price) AS total
+  FROM order_items
+  GROUP BY order_id
+) AS order_totals;
+```
+
+</CodeExample>
+
+Написать `avg(sum(...))` напрямую нельзя — агрегатные функции не вкладываются друг в друга, поэтому запрос в два шага здесь самый подходящий. Когда таких шагов становится несколько, скобки трудно читать; в следующем уроке вы увидите, как `WITH` даёт каждому шагу имя.
+
+<TryIt language="sql" code={`-- Измените внутренний запрос и посмотрите, как за ним следует внешний.
+SELECT name, category, price
+FROM products
+WHERE category IN (
+  SELECT category
+  FROM products
+  WHERE price > 20
+)
+ORDER BY category, price DESC;`} />
+
+<Quiz
+  question="Подзапрос SELECT manager_id FROM employees возвращает 1, 2, 3 и NULL. Сколько строк оставит WHERE id NOT IN (этот подзапрос)?"
+  options={["Все строки, кроме id 1, 2 и 3", "Только строку, где id равен NULL", "Ни одной", "Будет ошибка"]}
+  answer={2}
+  explanation="NOT IN сравнивает со всеми значениями списка, а id <> NULL даёт «неизвестно», а не истину. Поэтому условие никогда не выполняется и строк не будет — причём без всякой ошибки. Используйте NOT EXISTS или отфильтруйте NULL."
+/>
+
+<Quiz
+  question="Что делает подзапрос коррелированным?"
+  options={["Он возвращает больше одной строки", "Он ссылается на столбец внешнего запроса", "Он написан в части FROM", "Он использует EXISTS"]}
+  answer={1}
+  explanation="Коррелированный подзапрос использует значение из внешней строки (например, WHERE o.customer_id = c.id), поэтому его результат может быть разным для каждой внешней строки."
+/>
+
+<Exercise
+  language="sql"
+  title="Дороже среднего в своей категории"
+  starter={`-- Товары дороже средней цены СВОЕЙ категории.
+SELECT p.name, p.category, p.price
+FROM products AS p
+WHERE p.price > (
+  SELECT avg(price)
+  FROM products
+)
+ORDER BY p.category, p.price DESC;
+`}
+  tests={[
+    { name: "Показывает столбцы name, category, price", check: "columns.join() === 'name,category,price'" },
+    { name: "Находит 7 товаров дороже среднего по своей категории", check: "rows.length === 7" },
+    { name: "Включает дешёвое, но дорогое для снеков Panda Cookies", check: "rows.some(r => r.name === 'Panda Cookies')" },
+    { name: "Отсортировано по категории, затем по цене от большей", check: "rows.map(r => r.name).join() === 'Algorithms in Pictures,Clean Python,Rice Cooker,Panda Cookies,Matcha Powder,Plush Panda,Kite'" },
+    { name: "Следует за данными, когда появляется новый товар", check: "(await rerun(\"INSERT INTO products (name, category, price) VALUES ('Lucky Socks', 'clothes', 9), ('Silk Scarf', 'clothes', 30)\")).some(r => r.name === 'Silk Scarf')" },
+  ]}
+>
+
+Запрос в редакторе сравнивает каждый товар со средней ценой **всех** товаров. Измените его так, чтобы каждый товар сравнивался со средней ценой **своей категории**: пачка Panda Cookies за 3.75 в целом недорогая, но среди снеков она самая дорогая.
+
+Оставьте столбцы `name, category, price`, отсортированные по категории, а затем по цене — от самой высокой.
+
+<Hint>
+
+Дайте внутреннему `products` свой псевдоним, например `AS same_cat`, и добавьте `WHERE`, который связывает его с внешней строкой: `WHERE same_cat.category = p.category`. Это делает подзапрос коррелированным.
+
+</Hint>
+
+<Solution>
+
+```sql
+SELECT p.name, p.category, p.price
+FROM products AS p
+WHERE p.price > (
+  SELECT avg(same_cat.price)
+  FROM products AS same_cat
+  WHERE same_cat.category = p.category
+)
+ORDER BY p.category, p.price DESC;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Подзапрос** — это запрос в скобках внутри другого запроса.
+- **Скалярный подзапрос** возвращает одно значение и может стоять везде, где допустимо значение, например `WHERE price > (SELECT avg(price) FROM products)`. Больше одной строки — ошибка.
+- `IN (подзапрос)` проверяет по списку из одного столбца; повторы в списке не важны.
+- `NOT IN` не возвращает **ничего**, если в списке есть `NULL`. Предпочитайте `NOT EXISTS`.
+- `EXISTS (подзапрос)` истинно, когда подзапрос находит хотя бы одну строку.
+- **Коррелированный** подзапрос использует столбцы внешней строки, поэтому может сравнивать каждую строку с её собственной группой.
+- Подзапрос во `FROM` — это **производная таблица**, и ей нужен псевдоним.

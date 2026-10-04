@@ -1,0 +1,478 @@
+---
+title: Functions, Procedures and DO Blocks
+description: Write your own SQL and PL/pgSQL functions with variables, IF and loops, return whole tables, raise errors, run one-off DO blocks and batch work in procedures.
+duration: 25
+xp: 25
+---
+
+PostgreSQL ships with hundreds of functions: `round()`, `lower()`, `date_trunc()`, `coalesce()`. You can add your own. A function like `order_total(17)` or `customer_tier(5)` puts a business rule in one place, where every query, report and app can use it, whatever language the app is written in. 🧩
+
+In this lesson you'll write functions in plain **SQL** and in **PL/pgSQL**, PostgreSQL's built-in procedural language with variables, `IF` and loops. Then you'll run one-off scripts with **`DO`** and write **procedures** that can commit work in batches.
+
+## Your first SQL function
+
+A function has a name, typed **parameters**, a **return type** and a body. The simplest kind is a single SQL expression:
+
+<CodeExample output={`CREATE FUNCTION
+
+     name      | price | with_vat
+---------------+-------+----------
+ Jasmine Tea   |  6.50 |     7.80
+ Matcha Powder | 14.00 |    16.80
+ Earl Grey     |  5.25 |     6.30
+(3 rows)
+
+  vat  | reduced | by_name
+-------+---------+---------
+ 12.00 |   11.00 |   10.50
+(1 row)`}>
+
+```sql
+CREATE FUNCTION with_vat(price numeric, rate numeric DEFAULT 0.2)
+RETURNS numeric
+LANGUAGE sql
+IMMUTABLE
+RETURN round(price * (1 + rate), 2);
+
+SELECT name, price, with_vat(price) AS with_vat
+FROM products
+WHERE category = 'tea'
+ORDER BY id;
+
+SELECT with_vat(10) AS vat,
+  with_vat(10, 0.1) AS reduced,
+  with_vat(rate => 0.05, price => 10) AS by_name;
+```
+
+</CodeExample>
+
+Piece by piece:
+
+- **`with_vat(price numeric, rate numeric DEFAULT 0.2)`**: two parameters; `rate` has a **default**, so callers can leave it out. Callers can also pass arguments **by name** with `=>`, in any order.
+- **`RETURNS numeric`**: the type of the result.
+- **`LANGUAGE sql`**: the body is SQL.
+- **`IMMUTABLE`**: the result depends only on the arguments (more on this below).
+- **`RETURN …`**: the body. This short form (the SQL standard's) is checked when the function is created, and PostgreSQL records which tables and functions it uses.
+
+You'll often see the older form too, with the body as a string between **`$$` dollar quotes**. Dollar quotes are just another way to write a string, one where single quotes inside don't need escaping. Both forms work; this one is needed for PL/pgSQL:
+
+```sql
+CREATE OR REPLACE FUNCTION with_vat(
+  price numeric,
+  rate numeric DEFAULT 0.2
+)
+RETURNS numeric
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT round(price * (1 + rate), 2);
+$$;
+```
+
+**`CREATE OR REPLACE FUNCTION`** changes an existing function's body, as long as the parameter types and return type stay the same. `DROP FUNCTION with_vat(numeric, numeric)` removes it: you list the parameter types because PostgreSQL allows several functions with the same name and different parameters (**overloading**).
+
+## Functions that return tables
+
+A function can return many rows. Declare **`RETURNS TABLE (…)`** with the columns, and use the function in `FROM` like a table. These are sometimes called **table functions**, or parameterised views:
+
+<CodeExample output={`CREATE FUNCTION
+
+ order_id | ordered_at | total
+----------+------------+--------
+        5 | 2025-01-24 | 149.73
+       22 | 2025-04-04 | 124.10
+       39 | 2025-06-13 |  28.00
+(3 rows)`}>
+
+```sql
+CREATE FUNCTION customer_orders(p_customer_id integer)
+RETURNS TABLE (order_id integer, ordered_at date, total numeric)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT o.id, o.ordered_at::date, sum(oi.quantity * oi.unit_price)
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.customer_id = p_customer_id
+  GROUP BY o.id
+  ORDER BY o.id;
+$$;
+
+SELECT * FROM customer_orders(2);
+```
+
+</CodeExample>
+
+The `p_` prefix on parameters is a common convention: it stops a parameter called `customer_id` from being confused with the **column** `customer_id` inside the body.
+
+## Volatility: IMMUTABLE, STABLE, VOLATILE
+
+Every function has a **volatility** label that tells the planner how much it can trust the function:
+
+| Label | Promise | Examples |
+| --- | --- | --- |
+| **`IMMUTABLE`** | Same arguments, same result, forever. Doesn't read tables. | `with_vat()`, `lower()`, `abs()` |
+| **`STABLE`** | Same result within one statement; may read tables. | `customer_orders()`, `now()` |
+| **`VOLATILE`** (the default) | Can return something different on every call, or change data. | `random()`, `nextval()`, anything that writes |
+
+The label matters. Only `IMMUTABLE` functions can be used in **expression indexes** (like `lower(email)` in [the indexes lesson](/learn/sql/choosing-indexes)) and generated columns, and `IMMUTABLE`/`STABLE` let the planner evaluate a call once instead of per row. But **don't lie**: a function marked `IMMUTABLE` that reads a table can give wrong results, because PostgreSQL is allowed to cache its answer, even inside an index.
+
+## PL/pgSQL: variables, IF and loops
+
+When one SQL statement isn't enough, write the function in **PL/pgSQL**. Its body is a **block**: optional `DECLARE` for variables, then `BEGIN … END` with statements, `IF`, loops and `RETURN`:
+
+<CodeExample output={`CREATE FUNCTION
+
+    name     | badge
+-------------+--------
+ Mei Lin     | bronze
+ Sam Ortiz   | silver
+ Sofia Rossi | gold
+ Grace Kim   | none
+(4 rows)`}>
+
+```sql
+CREATE FUNCTION loyalty_badge(p_customer_id integer)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_orders integer;
+BEGIN
+  SELECT count(*) INTO v_orders
+  FROM orders
+  WHERE customer_id = p_customer_id
+    AND status <> 'cancelled';
+
+  IF v_orders >= 3 THEN
+    RETURN 'gold';
+  ELSIF v_orders = 2 THEN
+    RETURN 'silver';
+  ELSIF v_orders = 1 THEN
+    RETURN 'bronze';
+  END IF;
+  RETURN 'none';
+END;
+$$;
+
+SELECT name, loyalty_badge(id) AS badge
+FROM customers
+WHERE id IN (1, 2, 8, 18)
+ORDER BY id;
+```
+
+</CodeExample>
+
+The building blocks:
+
+- **`DECLARE v_orders integer;`** declares a variable (`v_` for variables is another common convention). Assign with `:=`, as in `v_total := v_total + 1;`.
+- **`SELECT … INTO v_orders`** runs a query and stores its result in the variable. If the query finds no row, the variable becomes `NULL`.
+- **`IF … THEN … ELSIF … ELSE … END IF;`** and `CASE` for decisions.
+- **`RETURN`** ends the function with a value.
+
+Loops come in several flavours. **`FOR row IN query LOOP`** runs once per row of a query, and **`RAISE NOTICE`** prints a message, which is handy for debugging:
+
+<CodeExample output={`NOTICE:  tea: 3 products, 52 in stock
+NOTICE:  snacks: 3 products, 265 in stock
+NOTICE:  books: 3 products, 10 in stock
+NOTICE:  toys: 3 products, 48 in stock
+NOTICE:  kitchen: 3 products, 210 in stock
+DO`}>
+
+```sql
+DO $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN
+    SELECT category, count(*) AS n, sum(stock) AS stock
+    FROM products
+    GROUP BY category
+    ORDER BY min(id)
+  LOOP
+    RAISE NOTICE '%: % products, % in stock', r.category, r.n, r.stock;
+  END LOOP;
+END;
+$$;
+```
+
+</CodeExample>
+
+Each `%` in the message is replaced by the next argument. There are also `WHILE condition LOOP`, `FOR i IN 1..10 LOOP` and a bare `LOOP … EXIT WHEN … END LOOP`. But think twice before looping over rows to change them one by one: a single `UPDATE … WHERE` is almost always much faster than a loop of thousands of small updates. Use PL/pgSQL for **control flow** and leave the set work to SQL.
+
+<Callout type="note" title="RETURN QUERY and RETURN NEXT">
+
+A PL/pgSQL function with `RETURNS TABLE (…)` or `RETURNS SETOF …` adds rows to its result with **`RETURN QUERY SELECT …;`** (a whole query's rows) or **`RETURN NEXT;`** (one row from the output variables), and finishes with a plain `RETURN;`.
+
+</Callout>
+
+## Raising and catching errors
+
+**`RAISE EXCEPTION`** stops the function with an error, and the whole statement (and transaction) that called it fails. Use it to refuse bad input with a clear message instead of returning something misleading:
+
+<CodeExample output={`CREATE FUNCTION
+
+ restock
+---------
+      52
+(1 row)
+
+ERROR:  quantity must be positive, got -5`}>
+
+```sql
+CREATE FUNCTION restock(p_product_id integer, p_quantity integer)
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_stock integer;
+BEGIN
+  IF p_quantity <= 0 THEN
+    RAISE EXCEPTION 'quantity must be positive, got %', p_quantity;
+  END IF;
+
+  UPDATE products
+  SET stock = stock + p_quantity
+  WHERE id = p_product_id
+  RETURNING stock INTO v_stock;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'product % not found', p_product_id;
+  END IF;
+  RETURN v_stock;
+END;
+$$;
+
+SELECT restock(1, 12);
+SELECT restock(1, -5);
+```
+
+</CodeExample>
+
+**`FOUND`** is a special variable that's true when the last statement affected or returned at least one row. To **catch** an error, add an `EXCEPTION` section to a block. Catch only the errors you expect and can handle, by name:
+
+```sql
+BEGIN
+  INSERT INTO members (email) VALUES (p_email);
+EXCEPTION
+  WHEN unique_violation THEN
+    RAISE NOTICE '% is already a member', p_email;
+END;
+```
+
+A block with an `EXCEPTION` section is undone as a unit when an error is caught (it uses a savepoint internally), which makes it a little slower; don't add one "just in case".
+
+<Quiz
+  question="Which volatility label should a function get if it reads the products table to look up a price?"
+  options={[
+    "IMMUTABLE, because the same product id always gives the same price",
+    "STABLE, because it reads a table: the result can change between statements but not within one",
+    "VOLATILE is required for any function with parameters",
+    "None, labels are only for documentation",
+  ]}
+  answer={1}
+  explanation="Prices can change, so the result isn't fixed forever, which rules out IMMUTABLE. Within a single statement the table doesn't change under you, so STABLE is the honest label. Marking it IMMUTABLE could let PostgreSQL reuse a stale price."
+/>
+
+## DO blocks: one-off scripts
+
+A **`DO` block** is an anonymous PL/pgSQL block that runs once and isn't saved. You saw one above. They're perfect for one-off admin scripts and migrations that need logic, for example dynamic SQL across several tables:
+
+<CodeExample output={`NOTICE:  customers: 20 rows
+NOTICE:  orders: 40 rows
+NOTICE:  products: 15 rows
+DO`}>
+
+```sql
+DO $$
+DECLARE
+  t text;
+  n bigint;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['customers', 'orders', 'products'] LOOP
+    EXECUTE format('SELECT count(*) FROM %I', t) INTO n;
+    RAISE NOTICE '%: % rows', t, n;
+  END LOOP;
+END;
+$$;
+```
+
+</CodeExample>
+
+**`EXECUTE`** runs SQL built as a string at run time, here because a table name can't be a variable in normal SQL. Always build such strings with **`format()`**: `%I` quotes an **identifier** (a table or column name) safely and `%L` a **literal** value. Gluing user input into SQL with `||` is how SQL injection happens, which the security module covers in depth.
+
+## Procedures: functions that can commit
+
+A **procedure** looks like a function, but it's run with **`CALL`**, returns no value, and has one superpower: it can **`COMMIT`** in the middle. That makes procedures the right tool for long batch jobs, where you want to save progress every few thousand rows instead of holding one enormous transaction open:
+
+<CodeExample output={`CREATE PROCEDURE
+
+NOTICE:  batch 1: 10 orders
+NOTICE:  batch 2: 6 orders
+NOTICE:  batch 3: 0 orders
+CALL
+
+  status   | orders
+-----------+--------
+ cancelled |      8
+ delivered |     32
+(2 rows)`}>
+
+```sql
+CREATE PROCEDURE deliver_old_orders(p_before date, p_batch integer)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_done integer;
+  v_batch integer := 0;
+BEGIN
+  LOOP
+    UPDATE orders
+    SET status = 'delivered'
+    WHERE id IN (
+      SELECT id FROM orders
+      WHERE status IN ('paid', 'shipped')
+        AND ordered_at < p_before
+      ORDER BY id
+      LIMIT p_batch
+    );
+    GET DIAGNOSTICS v_done = ROW_COUNT;
+    v_batch := v_batch + 1;
+    RAISE NOTICE 'batch %: % orders', v_batch, v_done;
+    COMMIT;  -- each batch is saved, and its locks released
+    EXIT WHEN v_done = 0;
+  END LOOP;
+END;
+$$;
+
+CALL deliver_old_orders('2025-07-01', 10);
+
+SELECT status, count(*) AS orders
+FROM orders
+GROUP BY status
+ORDER BY status;
+```
+
+</CodeExample>
+
+**`GET DIAGNOSTICS v_done = ROW_COUNT`** reads how many rows the last statement changed. Functions can't do this kind of batching: a function always runs inside the caller's single transaction, so everything it does is committed (or rolled back) together at the end.
+
+| | Function | Procedure | DO block |
+| --- | --- | --- | --- |
+| Run with | `SELECT f(…)`, in any query | `CALL p(…)` | runs immediately |
+| Returns | a value or rows | nothing (or `OUT` parameters) | nothing |
+| `COMMIT` inside | no | yes | yes, when not inside a transaction |
+| Saved in the database | yes | yes | no |
+
+<Callout type="warning" title="How much logic belongs in the database?">
+
+Functions are great for small, data-centric rules that every client must share (a price calculation, a tier, a consistency check) and for batch jobs that would otherwise drag millions of rows over the network. They're harder to test, debug, version and deploy than app code, so keep them in migrations under version control, keep them small, and don't move your whole app into PL/pgSQL. If a function needs to run with more privileges than its caller (`SECURITY DEFINER`), always pin its `search_path` with `SET search_path = …`, or a user can trick it into calling their own objects.
+
+</Callout>
+
+<Exercise
+  language="sql"
+  title="Order totals and customer tiers"
+  starter={`-- 1. order_total: the total of one order (0 if it has no items)
+CREATE FUNCTION order_total(p_order_id integer)
+RETURNS numeric
+LANGUAGE sql
+STABLE
+RETURN 0;
+
+-- 2. customer_tier: gold, silver, bronze or new (PL/pgSQL)
+
+
+-- 3. How many customers are in each tier?
+`}
+  tests={[
+    { name: "order_total adds up an order's items", check: "(await query('SELECT order_total(1) AS a, order_total(17) AS b'))[0].a === 102 && (await query('SELECT order_total(17) AS b'))[0].b === 200.17" },
+    { name: "order_total is 0 for an order with no items", check: "(await query('SELECT order_total(-1) AS t'))[0].t === 0" },
+    { name: "customer_tier is written in PL/pgSQL", check: "(await query(\"SELECT l.lanname FROM pg_proc AS p JOIN pg_language AS l ON l.oid = p.prolang WHERE p.proname = 'customer_tier'\"))[0]?.lanname === 'plpgsql'" },
+    { name: "Tiers are right for existing customers", check: "(await query('SELECT customer_tier(2) AS a, customer_tier(1) AS b, customer_tier(3) AS c, customer_tier(20) AS d'))[0] && Object.values((await query('SELECT customer_tier(2) AS a, customer_tier(1) AS b, customer_tier(3) AS c, customer_tier(20) AS d'))[0]).join() === 'gold,silver,bronze,new'" },
+    { name: "An unknown customer raises an error saying 'not found'", check: "await query('SELECT customer_tier(999)').then(() => false, e => /not found/.test(e.message))" },
+    { name: "Cancelled orders don't count, new orders do", check: "await (async () => { await query(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (19, '2025-07-01', 'cancelled') RETURNING id) INSERT INTO order_items SELECT id, 15, 5, 89.90 FROM o\"); await query(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (20, '2025-07-01', 'paid') RETURNING id) INSERT INTO order_items SELECT id, 13, 4, 32.00 FROM o\"); const r = (await query('SELECT customer_tier(19) AS a, customer_tier(20) AS b'))[0]; return r.a === 'new' && r.b === 'silver'; })()" },
+    { name: "The last query counts customers per tier, biggest first", check: "columns.join() === 'tier,customers' && rows.map(r => r.tier + ':' + r.customers).join() === 'silver:7,bronze:6,gold:4,new:3'" },
+  ]}
+>
+
+The shop wants loyalty tiers based on how much each customer has spent. Write two functions and use them:
+
+1. **`order_total(p_order_id integer)`** in SQL: the sum of `quantity * unit_price` for that order's items, or **`0`** when it has none.
+2. **`customer_tier(p_customer_id integer) RETURNS text`** in **PL/pgSQL**:
+   - if no customer has that id, `RAISE EXCEPTION` with a message containing `not found`;
+   - add up `order_total()` of the customer's orders that are **not cancelled**;
+   - return `'gold'` from 250, `'silver'` from 100, `'bronze'` above 0, and `'new'` for 0.
+3. Finish with a query that returns the columns `tier, customers`: how many customers are in each tier, the biggest group first (break ties by tier name).
+
+<Hint>
+
+- `order_total`: `RETURN (SELECT coalesce(sum(quantity * unit_price), 0) FROM order_items WHERE order_id = p_order_id);`
+- `customer_tier`: start with `IF NOT EXISTS (SELECT 1 FROM customers WHERE id = p_customer_id) THEN RAISE EXCEPTION 'customer % not found', p_customer_id; END IF;`. Then `SELECT coalesce(sum(order_total(id)), 0) INTO v_spent FROM orders WHERE …;` and an `IF … ELSIF …` chain from the highest tier down.
+- Step 3: `SELECT customer_tier(id) AS tier, count(*) AS customers FROM customers GROUP BY tier ORDER BY customers DESC, tier;`
+
+</Hint>
+
+<Solution>
+
+```sql
+-- 1. order_total: the total of one order (0 if it has no items)
+CREATE FUNCTION order_total(p_order_id integer)
+RETURNS numeric
+LANGUAGE sql
+STABLE
+RETURN (
+  SELECT coalesce(sum(quantity * unit_price), 0)
+  FROM order_items
+  WHERE order_id = p_order_id
+);
+
+-- 2. customer_tier: gold, silver, bronze or new (PL/pgSQL)
+CREATE FUNCTION customer_tier(p_customer_id integer)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_spent numeric;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM customers WHERE id = p_customer_id) THEN
+    RAISE EXCEPTION 'customer % not found', p_customer_id;
+  END IF;
+
+  SELECT coalesce(sum(order_total(id)), 0) INTO v_spent
+  FROM orders
+  WHERE customer_id = p_customer_id
+    AND status <> 'cancelled';
+
+  IF v_spent >= 250 THEN
+    RETURN 'gold';
+  ELSIF v_spent >= 100 THEN
+    RETURN 'silver';
+  ELSIF v_spent > 0 THEN
+    RETURN 'bronze';
+  END IF;
+  RETURN 'new';
+END;
+$$;
+
+-- 3. How many customers are in each tier?
+SELECT customer_tier(id) AS tier, count(*) AS customers
+FROM customers
+GROUP BY tier
+ORDER BY customers DESC, tier;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **`CREATE FUNCTION name(params) RETURNS type LANGUAGE sql`** packages logic; parameters can have **defaults** and be passed **by name** (`=>`). Use `RETURN …` or a `$$`-quoted body.
+- **`RETURNS TABLE (…)`** functions are used in `FROM` like parameterised views.
+- Label volatility honestly: **`IMMUTABLE`** (pure, indexable), **`STABLE`** (reads tables), **`VOLATILE`** (the default).
+- **PL/pgSQL** adds `DECLARE`d variables, `SELECT … INTO`, `IF`/`ELSIF`, `FOR … IN query LOOP`, `RAISE NOTICE`, `RAISE EXCEPTION`, `FOUND` and `EXCEPTION WHEN … THEN` blocks.
+- **`DO $$ … $$`** runs a one-off block; build dynamic SQL with **`EXECUTE format('… %I …', name)`**, never by gluing strings.
+- **Procedures** run with `CALL` and can **`COMMIT`** between batches; functions always run inside the caller's transaction.
