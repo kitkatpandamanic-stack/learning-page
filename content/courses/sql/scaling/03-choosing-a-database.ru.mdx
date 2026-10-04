@@ -1,0 +1,424 @@
+---
+title: Как выбрать подходящую базу данных
+description: OLTP и OLAP, колоночные хранилища, документные и key-value базы, кеши и поисковые движки — и как далеко можно зайти с одним PostgreSQL.
+duration: 22
+xp: 30
+---
+
+Рано или поздно на планировании кто-нибудь это скажет: «Postgres не масштабируется, надо переезжать на MongoDB». Или «для поиска нужен Elasticsearch». Или «давайте поставим Redis перед всем». Иногда они правы. Но часто настоящей проблемой был недостающий индекс, а команда в итоге поддерживает **две** базы данных, синхронизирует их и выясняет, почему они расходятся. 🧭
+
+Задача senior-инженера здесь — не знать все базы данных на свете. Нужно понимать, какая у вас **нагрузка (workload)**, что PostgreSQL уже умеет хорошо и по каким конкретным признакам видно, что вы действительно из него выросли. Об этом и урок.
+
+## Два вида нагрузки: OLTP и OLAP
+
+Почти любая нагрузка на базу данных тяготеет к одной из двух форм:
+
+| | **OLTP** (online transaction processing, обработка транзакций) | **OLAP** (online analytical processing, аналитическая обработка) |
+| --- | --- | --- |
+| Типичный вопрос | «Покажи заказ 4242», «добавь этот товар в корзину» | «Выручка по странам и месяцам за 3 года» |
+| Строк на запрос | Несколько, найденных по ключу | Миллионы, просмотренных и агрегированных |
+| Запись | Много мелких параллельных транзакций | Массовые загрузки, в основном добавление |
+| Что важно | Низкая задержка, корректность, конкурентность | Пропускная способность на огромных сканированиях |
+| Пользователи | Приложение, тысячи запросов в секунду | Аналитики, дашборды, несколько больших запросов |
+
+PostgreSQL создан для OLTP, и разницу видно в планах:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 50000
+
+ANALYZE
+
+              QUERY PLAN
+--------------------------------------
+ Index Scan using sales_pkey on sales
+   Index Cond: (id = 4242)
+(2 rows)
+
+       QUERY PLAN
+-------------------------
+ HashAggregate
+   Group Key: country
+   ->  Seq Scan on sales
+(3 rows)`}>
+
+```sql
+CREATE TABLE sales (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sold_at timestamp NOT NULL,
+  customer_id integer NOT NULL,
+  product_id integer NOT NULL,
+  quantity integer NOT NULL,
+  amount numeric(10, 2) NOT NULL,
+  country text NOT NULL,
+  channel text NOT NULL,
+  note text
+);
+
+INSERT INTO sales (sold_at, customer_id, product_id, quantity,
+  amount, country, channel, note)
+SELECT
+  timestamp '2025-01-01' + g * interval '1 minute',
+  g % 5000 + 1, g % 15 + 1, g % 3 + 1, g % 100 + 0.99,
+  (ARRAY['UK', 'Spain', 'Japan', 'India'])[g % 4 + 1],
+  (ARRAY['web', 'app', 'shop'])[g % 3 + 1],
+  'order note number ' || g
+FROM generate_series(1, 50000) AS g;
+
+ANALYZE sales;
+
+-- OLTP: одна строка по ключу, несколько прочитанных страниц
+EXPLAIN (COSTS OFF)
+SELECT * FROM sales WHERE id = 4242;
+
+-- OLAP: читается каждая строка, чтобы получить четыре суммы
+EXPLAIN (COSTS OFF)
+SELECT country, sum(amount)
+FROM sales
+GROUP BY country;
+```
+
+</CodeExample>
+
+Первый запрос затрагивает горстку страниц, какой бы большой ни стала таблица. Второй обязан прочитать **каждую строку** и замедляется прямо пропорционально размеру таблицы. При 50 000 строк никто не заметит; при 2 миллиардах это займёт минуты.
+
+## Почему аналитика любит колоночные хранилища
+
+PostgreSQL — **строковое хранилище (row store)**: значения каждой строки хранятся вместе, в страницах по 8 кБ. Это идеально для «достань заказ 4242 со всеми столбцами». Но чтобы просуммировать один столбец, ему приходится прочитать каждую страницу, а значит, каждый столбец каждой строки:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 50000
+
+ whole_table | amount_column
+-------------+---------------
+ 4944 kB     | 341 kB
+(1 row)`}>
+
+```sql
+CREATE TABLE sales (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sold_at timestamp NOT NULL,
+  customer_id integer NOT NULL,
+  product_id integer NOT NULL,
+  quantity integer NOT NULL,
+  amount numeric(10, 2) NOT NULL,
+  country text NOT NULL,
+  channel text NOT NULL,
+  note text
+);
+
+INSERT INTO sales (sold_at, customer_id, product_id, quantity,
+  amount, country, channel, note)
+SELECT
+  timestamp '2025-01-01' + g * interval '1 minute',
+  g % 5000 + 1, g % 15 + 1, g % 3 + 1, g % 100 + 0.99,
+  (ARRAY['UK', 'Spain', 'Japan', 'India'])[g % 4 + 1],
+  (ARRAY['web', 'app', 'shop'])[g % 3 + 1],
+  'order note number ' || g
+FROM generate_series(1, 50000) AS g;
+
+-- что должен прочитать sum(amount) и какие данные ему реально нужны
+SELECT
+  pg_size_pretty(pg_relation_size('sales')) AS whole_table,
+  pg_size_pretty(sum(pg_column_size(amount))) AS amount_column
+FROM sales;
+```
+
+</CodeExample>
+
+Чтобы сложить примерно 340 кБ сумм, PostgreSQL читает почти 5 МБ страниц — примерно в 15 раз больше данных, чем нужно запросу. **Колоночное хранилище (column store)** хранит каждый столбец в отдельном файле, поэтому такой запрос читает только столбец `amount`. Значения в одном столбце похожи друг на друга, поэтому они ещё и отлично **сжимаются** (часто в 5–10 раз), а движок обрабатывает их пачками, используя возможности современных CPU (**векторизованное выполнение, vectorised execution**). Для больших агрегаций это обычно в 10–100 раз быстрее.
+
+Популярные колоночные хранилища: **ClickHouse** (на своих серверах или в облаке), **DuckDB** (встраиваемый, как SQLite для аналитики: отлично работает на ноутбуке или внутри конвейера данных) и облачные хранилища **BigQuery**, **Snowflake** и **Redshift**. Цена: вставка или обновление отдельных строк медленные или неудобные, транзакции ограничены, и это ещё одна система, которую надо эксплуатировать. Обычная архитектура оставляет PostgreSQL **источником истины** для приложения и копирует данные в хранилище задачей **ETL/ELT** по расписанию или непрерывно через **захват изменений данных (change data capture, CDC)** на основе логической репликации, с которой вы познакомились в уроке [Бэкапы, репликация и пул соединений](/learn/sql/backups-and-replication).
+
+### Сначала выжмите максимум из PostgreSQL
+
+Прежде чем добавлять хранилище, вот что часто покупает годы:
+
+- **Сводные таблицы (rollup tables)** или [материализованные представления](/learn/sql/views-and-materialized-views): посчитайте дневные итоги один раз, и дашборды будут читать 365 строк вместо 50 миллионов.
+- **Реплика для чтения** под отчёты, чтобы тяжёлые запросы не замедляли приложение.
+- **Секционирование** по времени, чтобы отчёты по свежим данным читали только свежие секции.
+- **BRIN-индексы** для больших таблиц, в которые только добавляют данные и где столбец растёт вместе с физическим порядком строк (время вставленных событий). BRIN-индекс хранит только минимум и максимум для каждого диапазона блоков таблицы, поэтому он крошечный:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 100000
+
+CREATE INDEX
+
+CREATE INDEX
+
+    index    |  size
+-------------+---------
+ sales_brin  | 24 kB
+ sales_btree | 2208 kB
+(2 rows)`}>
+
+```sql
+CREATE TABLE sales (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  sold_at timestamp NOT NULL,
+  amount numeric(10, 2) NOT NULL
+);
+
+INSERT INTO sales (sold_at, amount)
+SELECT timestamp '2025-01-01' + g * interval '1 minute', g % 100
+FROM generate_series(1, 100000) AS g;
+
+CREATE INDEX sales_btree ON sales (sold_at);
+CREATE INDEX sales_brin ON sales USING brin (sold_at);
+
+SELECT
+  relname AS index,
+  pg_size_pretty(pg_relation_size(oid)) AS size
+FROM pg_class
+WHERE relname IN ('sales_btree', 'sales_brin')
+ORDER BY relname;
+```
+
+</CodeExample>
+
+В сто раз меньше B-дерева и вполне достаточно для «событий за эту неделю» среди миллиардов строк. Но он бесполезен, если значения столбца разбросаны по таблице случайно: тогда каждый диапазон блоков покрывает всё. Расширения идут ещё дальше: TimescaleDB для временных рядов, Citus для распределённых и колоночных таблиц, pg_duckdb для запуска движка DuckDB внутри PostgreSQL. (В эту браузерную базу данных расширения установить нельзя, но на настоящем сервере они в одном `CREATE EXTENSION` от вас.)
+
+## Документные, key-value и wide-column хранилища
+
+Каждая из «NoSQL»-баз жертвует частью гарантий SQL ради чего-то конкретного:
+
+- **Документные хранилища (document stores)** (MongoDB, Couchbase) хранят JSON-подобные документы с гибкими полями, и шардирование по машинам в них встроено. **JSONB** в PostgreSQL с GIN-индексами закрывает потребность в «гибких атрибутах» для большинства приложений **и** сохраняет соединения, ограничения и транзакции для всего остального. Хорошее разделение: стабильные важные поля — настоящими столбцами; длинный хвост необязательных атрибутов — в столбце JSONB.
+- **Хранилища ключ-значение (key-value stores)** (Redis/Valkey, DynamoDB) отвечают на «дай значение по этому ключу» очень быстро и в огромных масштабах. DynamoDB и **wide-column-хранилища** вроде Cassandra масштабируют запись на множество машин почти без ограничений, но таблицы вы проектируете под точные запросы, которые будете выполнять, — без соединений и без произвольных вопросов потом.
+- **Графовые базы данных (graph databases)** (Neo4j) блистают, когда главные вопросы — глубокие обходы: «друзья друзей друзей, которым нравится X». Деревья и неглубокие графы прекрасно обрабатываются рекурсивными CTE в PostgreSQL.
+
+### Кеши
+
+**Redis** (или Valkey, Memcached) перед базой данных держит горячие данные в памяти. Распространённый паттерн — **cache-aside (кеш сбоку)**:
+
+```text
+чтение: value = cache.get(key)
+        если нет: value = db.query(...); cache.set(key, value, ttl=60s)
+запись: db.update(...); cache.delete(key)
+```
+
+Кеш может резко снизить нагрузку на базу, но добавляет классическую сложную проблему — **инвалидацию**. Каждый путь записи должен не забыть удалить нужные ключи, иначе пользователи увидят устаревшие цены и старые права доступа. Когда популярный ключ истекает, тысячи запросов могут одновременно промахнуться и вместе ударить по базе (**cache stampede, лавина промахов кеша**). Поэтому добавляйте кеш **после** того, как исправили медленные запросы, начинайте с данных, которым не страшно немного устареть, и всегда задавайте TTL.
+
+## Поисковые движки
+
+Строка поиска — то место, где команды чаще всего слишком рано добавляют вторую базу данных, ведь в PostgreSQL встроен **полнотекстовый поиск (full-text search)**. `to_tsvector` превращает текст в нормализованные основы слов (**лексемы, lexemes**), а `websearch_to_tsquery` превращает то, что ввёл пользователь, в запрос:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+                 document
+-------------------------------------------
+ 'beginn':2 'first':5 'marathon':6 'run':3
+(1 row)
+
+ id |               title
+----+------------------------------------
+  3 | A beginner runs her first marathon
+(1 row)
+
+ id |               title
+----+------------------------------------
+  1 | Running PostgreSQL in production
+  2 | Why our runners love bamboo
+  3 | A beginner runs her first marathon
+(3 rows)`}>
+
+```sql
+CREATE TABLE posts (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL
+);
+
+INSERT INTO posts (title) VALUES
+  ('Running PostgreSQL in production'),
+  ('Why our runners love bamboo'),
+  ('A beginner runs her first marathon'),
+  ('Cooking rice the panda way');
+
+-- короткие слова вроде "a" и "her" отбрасываются, "runs" становится "run"
+SELECT to_tsvector('english', 'A beginner runs her first marathon')
+  AS document;
+
+-- слова, а не подстроки: "running" находит и "runs"; минус исключает
+SELECT id, title
+FROM posts
+WHERE to_tsvector('english', title)
+  @@ websearch_to_tsquery('english', 'running -postgresql')
+ORDER BY id;
+
+-- сравните: ILIKE совпадает с любой подстрокой
+SELECT id, title
+FROM posts
+WHERE title ILIKE '%run%'
+ORDER BY id;
+```
+
+</CodeExample>
+
+`ILIKE` нашёл «runners» (другое слово) и не может использовать обычный индекс для `'%…%'`. Полнотекстовый поиск нашёл **слово** «run» в любой форме, понял знак минуса, а с **GIN-индексом** на `tsvector` остаётся быстрым на миллионах документов. `ts_rank` сортирует результаты по релевантности — он пригодится вам в упражнении.
+
+Отдельный поисковый движок (**Elasticsearch**/**OpenSearch**, **Meilisearch**, **Typesense**) оправдывает себя, когда нужны устойчивость к опечаткам, «возможно, вы имели в виду», фасеты со счётчиками, синонимы и тонкая настройка релевантности для многих языков или поиск по очень большим объёмам текста. Цена — вторая копия данных, которая всегда немного отстаёт, плюс конвейер синхронизации, который может сломаться. (Расширение PostgreSQL `pg_trgm` тоже добавляет нечёткий поиск, устойчивый к опечаткам.)
+
+## Очереди, потоки и векторы
+
+- **Очереди задач**: таблица с `SELECT … FOR UPDATE SKIP LOCKED`, которую вы видели в уроке [Блокировки, очереди задач и взаимоблокировки](/learn/sql/row-locks-and-job-queues), справляется с тысячами задач в секунду, а задача коммитится в **той же транзакции**, что и данные, которые она меняет. RabbitMQ или SQS нужны, когда сообщениями должны обмениваться многие сервисы.
+- **Потоки событий**: **Kafka** (или Redpanda, Kinesis) хранит упорядоченный журнал событий, который многие потребители читают независимо и могут **перечитать заново**. Это другой инструмент, не очередь, — он создан для очень высокой пропускной способности.
+- **Векторы** для AI-функций (семантический поиск, рекомендации): расширение **pgvector** хранит эмбеддинги, индексирует их для поиска ближайших соседей и держит их рядом с данными, которые они описывают. Отдельные векторные базы данных имеют смысл в очень больших масштабах.
+
+## Когда PostgreSQL достаточно
+
+Очень часто. Один современный сервер с быстрыми NVMe-дисками и большим объёмом памяти справляется с терабайтами данных и десятками тысяч транзакций в секунду. Notion шардирует свои данные Postgres на сотни логических шардов, а Instagram, как известно, масштабировался на шардированном PostgreSQL. Большинство продуктов никогда даже не приближаются к таким цифрам. Когда нагрузка растёт, поднимайтесь по этой лестнице **по одной ступеньке**, измеряя на каждом шаге:
+
+1. **Исправьте запросы и индексы** (`EXPLAIN`, журнал медленных запросов, `pg_stat_statements`). Обычно это и есть выигрыш в 10 раз.
+2. **Масштабируйтесь вертикально**: больше CPU, памяти и более быстрые диски. Скучно и эффективно.
+3. **Пул соединений** и разумные тайм-ауты.
+4. **Реплики для чтения** под трафик с преобладанием чтения и отчёты.
+5. **Секционирование** и архивирование старых данных.
+6. **Кеширование** горячих данных, которые в основном читают.
+7. **Разделение по функциям**: отдельные базы данных для отдельных сервисов или доменов.
+8. **Шардирование (sharding)**: распределение одного набора данных по многим серверам, по арендатору или пользователю (Citus или на уровне приложения). Мощно — и это большая постоянная цена: запросы между шардами, транзакции и миграции становятся сложнее.
+
+<Callout type="tip" title="Вопросы, которые стоит задать перед добавлением базы данных">
+
+- Какой именно **паттерн доступа** не справляется сегодня, и измерили ли мы это?
+- Какая **согласованность** ему нужна: можно отставать на секунды или данные должны быть точными?
+- Кто будет **бэкапить, мониторить, защищать, обновлять** её и поддерживать синхронизацию — в том числе в 3 часа ночи?
+- Может ли PostgreSQL справиться с этим с помощью индекса, встроенной возможности или расширения, которым мы уже доверяем?
+
+Каждая новая база данных — это новая вещь, которую нужно эксплуатировать. Добавляйте её, когда ответ на последний вопрос — измеренное «нет».
+
+</Callout>
+
+<Quiz
+  question="Приложению на PostgreSQL нужен новый дашборд: выручка по странам, месяцам и каналам за 4 года продаж (800 миллионов строк). Запросы выполняются 3 минуты. Какой первый шаг самый разумный?"
+  options={[
+    "Перенести всё приложение на MongoDB",
+    "Добавить сводную таблицу (или материализованное представление) дневных итогов по стране и каналу, регулярно обновляемую",
+    "Поставить Redis перед базой данных",
+    "Добавить B-tree индекс на каждый столбец таблицы sales",
+  ]}
+  answer={1}
+  explanation="Дашборду нужны агрегаты, а не сырые строки. Предварительная агрегация дневных итогов превращает 800 миллионов строк в несколько сотен тысяч, и дашборд становится быстрым. Если аналитика продолжит расти, следующий шаг — колоночное хранилище, наполняемое через CDC. Документное хранилище или кеш не удешевят сканирование 800 миллионов строк, а лишние индексы замедлят запись и не помогут агрегатам по всей таблице."
+/>
+
+<Quiz
+  question="Какое требование к поиску — хорошая причина добавить отдельный поисковый движок вместо полнотекстового поиска PostgreSQL?"
+  options={[
+    "Пользователи вводят 'refunds' и должны находить статьи со словом 'refund'",
+    "Результаты должны быть отсортированы по релевантности",
+    "Поиск, устойчивый к опечаткам, с фасетами со счётчиками и синонимами на 12 языках по 200 миллионам документов",
+    "Поиск по заголовкам 5000 статей справки",
+  ]}
+  answer={2}
+  explanation="Стемминг (refunds → refund), ранжирование по релевантности через ts_rank и тысячи или даже миллионы документов — всё это умеет полнотекстовый поиск PostgreSQL с GIN-индексом. Сильная устойчивость к опечаткам, фасеты, синонимы и многоязычная настройка в очень больших масштабах — вот где отдельные поисковые движки оправдывают дополнительные расходы на эксплуатацию."
+/>
+
+<Exercise
+  language="sql"
+  title="Поиск по справочному центру без поискового движка"
+  starter={`CREATE TABLE help_articles (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  body text NOT NULL
+);
+
+INSERT INTO help_articles (title, body) VALUES
+  ('Refund policy',
+   'You can ask for a refund within 30 days of delivery.'),
+  ('Tracking your parcel',
+   'Every shipped order gets a tracking link by email.'),
+  ('Damaged items',
+   'Send us a photo and we will refund or replace the item.'),
+  ('Changing your address',
+   'Update the address before the order is shipped.'),
+  ('Gift cards',
+   'Gift cards cannot be refunded or exchanged for cash.'),
+  ('Paying by card',
+   'We accept all major cards. Cards are charged at shipping.');
+
+-- 1. Добавьте генерируемый столбец search (title с весом A, body — B)
+
+-- 2. Добавьте на него GIN-индекс
+
+-- 3. Найдите то, что ввёл пользователь: refunds
+SELECT id, title
+FROM help_articles
+WHERE title ILIKE '%refunds%'
+ORDER BY id;
+`}
+  tests={[
+    { name: "search — хранимый генерируемый столбец tsvector", check: "(await query(\"SELECT format_type(atttypid, atttypmod) AS type, attgenerated FROM pg_attribute WHERE attrelid = 'help_articles'::regclass AND attname = 'search'\")).some(r => r.type === 'tsvector' && r.attgenerated === 's')" },
+    { name: "Заголовки весят больше, чем текст", check: "(await query(\"SELECT search::text AS s FROM help_articles WHERE id = 1\"))[0].s.includes(\"'polici':2A\")" },
+    { name: "search покрыт GIN-индексом", check: "(await query(\"SELECT indexdef FROM pg_indexes WHERE tablename = 'help_articles'\")).some(r => /USING gin \\(search\\)/.test(r.indexdef))" },
+    { name: "Столбцы — id, title, rank", check: "columns.join() === 'id,title,rank'" },
+    { name: "Находит refund, refunded и refunds, лучшее совпадение первым", check: "rows.map(r => r.id).join() === '1,3,5' && rows[0].rank === 0.669 && rows[1].rank === 0.243" },
+    { name: "Новые статьи тоже находятся", check: "(await rerun(\"INSERT INTO help_articles (title, body) VALUES ('Refunds for subscriptions', 'Cancel any time.')\")).map(r => r.id).join() === '1,7,3,5'" },
+  ]}
+>
+
+Команда поддержки хочет строку поиска для справочного центра, и кто-то уже предложил поднять Elasticsearch ради шести статей. Покажите, что PostgreSQL справится сам: 🔎
+
+1. Добавьте столбец **`search`** типа `tsvector`, который **`GENERATED ALWAYS AS (…) STORED`**, построенный с конфигурацией `'english'` из **заголовка (title) с весом `'A'`**, соединённого (`||`) с **текстом (body) с весом `'B'`**, чтобы совпадения в заголовке ранжировались выше.
+2. Добавьте **GIN**-индекс на `search`.
+3. Замените последний запрос: найдите статьи, подходящие под то, что ввёл пользователь, — **`refunds`**, с помощью `websearch_to_tsquery('english', 'refunds')`. Покажите **`id`**, **`title`** и **`rank`** — это `ts_rank(search, query)`, округлённый до **3** знаков после запятой; лучшие первыми, при равенстве — по `id`.
+
+<Hint>
+
+Столбец: `ALTER TABLE help_articles ADD COLUMN search tsvector GENERATED ALWAYS AS (setweight(to_tsvector('english', title), 'A') || setweight(to_tsvector('english', body), 'B')) STORED;`. Индекс: `CREATE INDEX … ON help_articles USING gin (search);`. В запросе поместите tsquery в список `FROM` (`FROM help_articles, websearch_to_tsquery('english', 'refunds') AS q`), чтобы использовать `q` и в `WHERE search @@ q`, и в `ts_rank(search, q)`. `ts_rank` возвращает `real`: приведите его через `::numeric` перед `round(…, 3)`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE help_articles (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  body text NOT NULL
+);
+
+INSERT INTO help_articles (title, body) VALUES
+  ('Refund policy',
+   'You can ask for a refund within 30 days of delivery.'),
+  ('Tracking your parcel',
+   'Every shipped order gets a tracking link by email.'),
+  ('Damaged items',
+   'Send us a photo and we will refund or replace the item.'),
+  ('Changing your address',
+   'Update the address before the order is shipped.'),
+  ('Gift cards',
+   'Gift cards cannot be refunded or exchanged for cash.'),
+  ('Paying by card',
+   'We accept all major cards. Cards are charged at shipping.');
+
+ALTER TABLE help_articles ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', title), 'A')
+      || setweight(to_tsvector('english', body), 'B')
+  ) STORED;
+
+CREATE INDEX help_articles_search_idx
+  ON help_articles USING gin (search);
+
+SELECT id, title, round(ts_rank(search, q)::numeric, 3) AS rank
+FROM help_articles,
+  websearch_to_tsquery('english', 'refunds') AS q
+WHERE search @@ q
+ORDER BY rank DESC, id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **OLTP** (много мелких транзакций по ключу) и **OLAP** (большие сканирования и агрегаты) требуют разных движков; PostgreSQL — отличная OLTP-база данных.
+- **Строковые хранилища** читают строки целиком; **колоночные** (ClickHouse, DuckDB, BigQuery, Snowflake) читают только нужные столбцы, да ещё и сжатые. Наполняйте их из PostgreSQL через ETL или CDC.
+- Сначала выжмите максимум из PostgreSQL: **сводные таблицы / материализованные представления**, реплики для чтения, секционирование, **BRIN**-индексы, расширения.
+- **JSONB** закрывает большинство потребностей в документах; key-value и wide-column хранилища меняют запросы и соединения на масштаб; графовые базы подходят для глубоких обходов.
+- **Кеши** снижают нагрузку, но приносят инвалидацию и лавины промахов: сначала исправьте запросы и всегда задавайте TTL.
+- **Полнотекстовый поиск** (`tsvector`, `websearch_to_tsquery`, `ts_rank`, GIN) справляется с большинством строк поиска; отдельные движки выигрывают на устойчивости к опечаткам, фасетах и огромных многоязычных корпусах.
+- Поднимайтесь по лестнице масштабирования по одной измеренной ступеньке: запросы и индексы, сервер помощнее, пул соединений, реплики, секционирование, кеширование, разделение и **шардирование** — в последнюю очередь.

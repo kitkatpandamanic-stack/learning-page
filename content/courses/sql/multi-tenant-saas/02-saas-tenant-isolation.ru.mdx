@@ -1,0 +1,560 @@
+---
+title: "Часть 2: Изоляция арендаторов"
+description: Дайте приложению собственную роль, сообщайте PostgreSQL, от имени какого арендатора действует запрос, и обеспечьте изоляцию на каждой таблице с помощью RLS, чтобы забытый WHERE не приводил к утечке.
+duration: 25
+xp: 35
+---
+
+В Части 1 вы сделали так, что строка не может **ссылаться** на другого арендатора. Но ничто не мешает приложению **читать** строки другого арендатора. За годы в PandaTasks появятся сотни запросов от десятка разработчиков, и в каждом нужно не забыть `WHERE tenant_id = …`. Утечки данных в мультиарендных продуктах очень часто сводятся ровно к одному забытому условию: эндпоинт вроде `GET /tasks/:id`, который проверяет, что пользователь вошёл в систему, но не проверяет, что задача принадлежит его компании. 🕳️
+
+В этой части вы заставите PostgreSQL самостоятельно охранять границу арендатора с помощью **защиты на уровне строк (row-level security, RLS)** из урока [Защита на уровне строк](/learn/sql/row-level-security), чтобы забытый фильтр возвращал пустоту, а не чужие данные. Проверки в приложении остаются, а RLS — это **вторая линия обороны** под ними.
+
+## План
+
+Три роли, три задачи:
+
+| Роль | Кто использует | Что может |
+| --- | --- | --- |
+| Владелец (роль миграций) | Миграции, которые запускает конвейер деплоя | Создавать и изменять таблицы; владеет ими |
+| `app_user` | Приложение, через пулер | Читать и писать строки — **только текущего арендатора** |
+| `support_admin` | Внутренний инструмент поддержки с аудитом | Читать по всем арендаторам (`BYPASSRLS`) |
+
+И одно правило для каждого запроса, который обрабатывает приложение:
+
+```ts
+// в приложении: каждый запрос выполняется в одной транзакции
+// и сообщает PostgreSQL, от имени какого арендатора действует
+await db.transaction(async (tx) => {
+  await tx.query("SELECT set_config('app.tenant_id', $1, true)", [
+    String(session.tenantId), // из проверенного входа, никогда не из URL
+  ]);
+  return handler(tx);
+});
+```
+
+`set_config(…, true)` действует **в пределах транзакции**, как `SET LOCAL`: значение исчезает при `COMMIT`, поэтому это безопасно с PgBouncer в режиме транзакций, как вы видели в уроке [Бэкапы, репликация и пул соединений](/learn/sql/backups-and-replication). Сессионный `SET` остался бы на соединении из пула и мог бы достаться запросу **следующего арендатора** — ровно тот баг, который мы пытаемся предотвратить.
+
+## Шаг 1: кто текущий арендатор?
+
+Политикам (policies) нужен ответ на один вопрос: от имени какого арендатора действует эта транзакция? Небольшая функция читает настройку. Важная деталь — что происходит, когда настройки **нет**:
+
+<CodeExample output={`CREATE FUNCTION
+
+ not_set
+---------
+    NULL
+(1 row)
+
+BEGIN
+
+ set_config
+------------
+ 1
+(1 row)
+
+ in_transaction
+----------------
+              1
+(1 row)
+
+COMMIT
+
+ after_commit
+--------------
+         NULL
+(1 row)`}>
+
+```sql
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+
+SELECT current_tenant_id() AS not_set;
+
+BEGIN;
+SELECT set_config('app.tenant_id', '1', true);
+SELECT current_tenant_id() AS in_transaction;
+COMMIT;
+
+SELECT current_tenant_id() AS after_commit;
+```
+
+</CodeExample>
+
+- `current_setting('app.tenant_id', true)`: второй аргумент, `missing_ok`, возвращает `NULL` вместо ошибки, если настройку ни разу не задавали.
+- После окончания настройки в пределах транзакции значение становится **пустой строкой**, а не `NULL`; `nullif(…, '')` тоже превращает его в `NULL`.
+- Политика `tenant_id = current_tenant_id()` с `NULL` никогда не бывает истинной, поэтому запрос, забывший указать арендатора, **не видит ни одной строки** и не может ничего записать. Схема **отказывает в закрытую сторону (fails closed)**.
+- `STABLE` сообщает планировщику, что результат не меняется в течение запроса, поэтому функция вычисляется один раз на запрос, а не на каждую строку, и её можно использовать даже в поиске по индексу.
+
+## Шаг 2: роль приложения и политики
+
+Теперь полная настройка: роль для приложения только с нужными ей привилегиями, затем RLS на каждой таблице арендатора. Каждый пример в этой части начинается со схемы из Части 1, сокращённой до трёх таблиц:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 2
+
+INSERT 0 3
+
+INSERT 0 5
+
+CREATE ROLE
+
+GRANT
+
+GRANT
+
+CREATE FUNCTION
+
+ALTER TABLE
+
+ALTER TABLE
+
+CREATE POLICY
+
+ALTER TABLE
+
+ALTER TABLE
+
+CREATE POLICY
+
+SET
+
+ set_config
+------------
+ 1
+(1 row)
+
+ id |         title
+----+------------------------
+  1 | Design the home page
+  2 | Write the pricing page
+  3 | Fix the login crash
+(3 rows)
+
+ set_config
+------------
+ 2
+(1 row)
+
+ id |        title
+----+----------------------
+  4 | Pick a domain name
+  5 | Draft the about page
+(2 rows)
+
+ set_config
+------------
+
+(1 row)
+
+ count
+-------
+     0
+(1 row)
+
+ set_config
+------------
+ 2
+(1 row)
+
+ERROR:  new row violates row-level security policy for table "tasks"`}>
+
+```sql
+-- схема из Части 1, сокращённая
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id)
+);
+INSERT INTO tenants (slug) VALUES ('acme'), ('globex');
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+INSERT INTO tasks (tenant_id, project_id, title) VALUES
+  (1, 1, 'Design the home page'),
+  (1, 1, 'Write the pricing page'),
+  (1, 2, 'Fix the login crash'),
+  (2, 3, 'Pick a domain name'),
+  (2, 3, 'Draft the about page');
+
+-- роль приложения: не суперпользователь, не владелец, без BYPASSRLS
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT ON tenants TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON projects, tasks TO app_user;
+
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON projects
+  USING (tenant_id = current_tenant_id())
+  WITH CHECK (tenant_id = current_tenant_id());
+
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON tasks
+  USING (tenant_id = current_tenant_id())
+  WITH CHECK (tenant_id = current_tenant_id());
+
+-- теперь действуем как приложение: ниже нигде нет WHERE tenant_id
+SET ROLE app_user;
+
+SELECT set_config('app.tenant_id', '1', false);
+SELECT id, title FROM tasks ORDER BY id;
+
+SELECT set_config('app.tenant_id', '2', false);
+SELECT id, title FROM tasks ORDER BY id;
+
+-- запрос, который забыл указать арендатора
+SELECT set_config('app.tenant_id', '', false);
+SELECT count(*) FROM tasks;
+
+-- Globex (арендатор 2) пытается записать в проект Acme
+SELECT set_config('app.tenant_id', '2', false);
+INSERT INTO tasks (tenant_id, project_id, title)
+VALUES (1, 1, 'Sneaky task');
+```
+
+</CodeExample>
+
+(Чтобы демо было коротким, арендатор задаётся на всю сессию через `false`. Настоящее приложение использует `true` внутри каждой транзакции, как выше.)
+
+Каждый запрос выполнялся **без** `WHERE tenant_id = …`, и каждый арендатор видел только свои задачи. Две части политики выполняют разную работу:
+
+- **`USING (…)`** фильтрует строки, которые инструкция может **видеть**: `SELECT`, а также строки, которые могут затронуть `UPDATE` или `DELETE`. Строки, не прошедшие проверку, молча невидимы, будто их нет.
+- **`WITH CHECK (…)`** проверяется на **записываемых** строках: новых строках из `INSERT` и новой версии строки после `UPDATE`. Строки, не прошедшие проверку, вызывают ошибку. Без этого арендатор мог бы выполнить `UPDATE tasks SET tenant_id = 2` и перекинуть свои строки другому арендатору.
+
+Политика без предложения `FOR` применяется ко всем командам (`FOR ALL`). Можно также написать отдельные политики `FOR SELECT`, `FOR INSERT` и так далее — например, чтобы участники могли читать, а удалять — только администраторы.
+
+### FORCE и кто обходит RLS
+
+Три вида ролей политики **не** затрагивают:
+
+- **суперпользователи** — всегда;
+- роли с атрибутом **`BYPASSRLS`** (так `support_admin` читает по всем арендаторам);
+- **владелец таблицы** — если у таблицы нет **`FORCE ROW LEVEL SECURITY`**.
+
+Третий пункт кусает реальные команды: приложение подключается той же ролью, что запускала миграции, значит, владеет таблицами, и RLS тихо ничего не делает. `FORCE` закрывает эту дыру, но лучшее решение — то, что выше: отдельная непривилегированная `app_user`. А поскольку суперпользователи полностью обходят RLS, **приложение никогда не должно подключаться как суперпользователь**.
+
+<Callout type="warning" title="Представления могут обходить RLS">
+
+Представление (view) обычно выполняется с привилегиями своего **владельца**. Если владелец — роль миграций (суперпользователь или владелец таблицы), RLS **внутри** представления пропускается, и `SELECT count(*) FROM task_titles` через представление посчитает задачи всех арендаторов. Начиная с PostgreSQL 15 создавайте представления для приложения с **`WITH (security_invoker = true)`**, чтобы они проверяли RLS от имени роли, которая к ним обращается. То же относится к функциям `SECURITY DEFINER`: они выполняются от имени владельца, поэтому используйте их только намеренно и фильтруйте внутри по `current_tenant_id()`.
+
+</Callout>
+
+## Шаг 3: защитите каждую таблицу — и сохраните это
+
+В PandaTasks появятся таблицы для комментариев, вложений, меток, счетов… и однажды кто-то добавит таблицу и забудет её политику. Это предотвращают две привычки. Во-первых, генерируйте политики одинаково для каждой таблицы со столбцом `tenant_id`, безопасно экранируя имена через `format('%I')`:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE FUNCTION
+
+NOTICE:  protected comments
+NOTICE:  protected projects
+NOTICE:  protected tasks
+DO
+
+ tablename |    policyname    |               qual
+-----------+------------------+-----------------------------------
+ comments  | tenant_isolation | (tenant_id = current_tenant_id())
+ projects  | tenant_isolation | (tenant_id = current_tenant_id())
+ tasks     | tenant_isolation | (tenant_id = current_tenant_id())
+(3 rows)
+
+CREATE TABLE
+
+ unprotected
+-------------
+ attachments
+(1 row)`}>
+
+```sql
+CREATE TABLE projects (tenant_id bigint NOT NULL, name text);
+CREATE TABLE tasks (tenant_id bigint NOT NULL, title text);
+CREATE TABLE comments (tenant_id bigint NOT NULL, body text);
+
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+
+DO $$
+DECLARE
+  t text;
+BEGIN
+  FOR t IN
+    SELECT table_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND column_name = 'tenant_id'
+    ORDER BY table_name
+  LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+    EXECUTE format(
+      'CREATE POLICY tenant_isolation ON %I
+         USING (tenant_id = current_tenant_id())
+         WITH CHECK (tenant_id = current_tenant_id())', t);
+    RAISE NOTICE 'protected %', t;
+  END LOOP;
+END
+$$;
+
+SELECT tablename, policyname, qual
+FROM pg_policies
+ORDER BY tablename;
+
+-- через несколько месяцев новая миграция забывает про RLS
+CREATE TABLE attachments (tenant_id bigint NOT NULL, url text);
+
+-- сторожевой запрос: таблицы арендаторов без RLS
+SELECT c.relname AS unprotected
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relkind IN ('r', 'p')
+  AND NOT c.relrowsecurity
+  AND EXISTS (
+    SELECT 1
+    FROM pg_attribute AS a
+    WHERE a.attrelid = c.oid
+      AND a.attname = 'tenant_id'
+      AND NOT a.attisdropped
+  )
+ORDER BY c.relname;
+```
+
+</CodeExample>
+
+Во-вторых, запускайте этот **сторожевой запрос в CI** после миграций: если он возвращает хоть одну строку, сборка падает. `pg_class.relrowsecurity` и `relforcerowsecurity` показывают, включена ли RLS и принудительна ли она, а `relkind` `'r'` и `'p'` — это обычные и секционированные таблицы.
+
+Ещё лучше — написать **тест изоляции**: создайте двух арендаторов с данными, затем выполните настоящие запросы приложения как `app_user` для арендатора A и проверьте, что не вернулось ни одной строки арендатора B. Такой тест ловит баги, которые сторожевой запрос поймать не может, например опечатку в политике.
+
+## Глобальные таблицы и границы RLS
+
+Не у каждой таблицы есть `tenant_id`. `users` — глобальная таблица, но участник Acme должен видеть только пользователей Acme. Политика может использовать подзапрос (subquery):
+
+```sql
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY same_tenant_users ON users FOR SELECT
+  USING (EXISTS (
+    SELECT 1
+    FROM memberships AS m
+    WHERE m.user_id = users.id
+      AND m.tenant_id = current_tenant_id()
+  ));
+```
+
+`memberships` тоже защищена своей политикой, поэтому подзапрос видит только участников текущего арендатора. Делайте подзапросы в политиках простыми и индексированными: они выполняются для каждой проверяемой строки.
+
+Несколько граничных случаев, о которых стоит знать:
+
+- **Проверки ограничений видят все строки.** Внешние ключи и ограничения уникальности проверяются без RLS — поэтому составные ключи из Части 1 по-прежнему работают. Это также означает, что глобальный `UNIQUE (slug)` сообщает арендатору, что «globex» уже занят. Для slug это нормально; для всего чувствительного делайте уникальность в пределах арендатора.
+- **Фоновым задачам** (письма, выгрузки, ночные отчёты) тоже нужен арендатор. Запускайте их для каждого арендатора с настройкой или отдельной, намеренно привилегированной ролью — но никогда не используйте втихую роль владельца.
+- **Производительность**: политика добавляется к каждому запросу, поэтому каждый индекс на таблице арендатора должен **начинаться с `tenant_id`**. Планы вы проверите в Части 3.
+
+<Quiz
+  question="PandaTasks включает RLS на tasks с политикой USING (tenant_id = current_tenant_id()), но приложение всё равно видит задачи всех арендаторов. Приложение подключается ролью, которая запускала миграции и владеет таблицами. Какое исправление наиболее вероятно?"
+  options={[
+    "Добавить в политику WITH CHECK",
+    "Выполнить ANALYZE для таблицы tasks",
+    "Подключать приложение отдельной ролью — не владельцем и без BYPASSRLS (и включить FORCE ROW LEVEL SECURITY на таблицах)",
+    "Сделать current_tenant_id() VOLATILE",
+  ]}
+  answer={2}
+  explanation="Владельцы таблиц обходят RLS, если у таблицы нет FORCE ROW LEVEL SECURITY, а суперпользователи обходят её всегда. Надёжное решение — непривилегированная роль приложения плюс FORCE как страховка. WITH CHECK влияет только на запись, а ANALYZE и изменчивость функции не меняют, к кому применяется RLS."
+/>
+
+<Quiz
+  question="Обработчик запроса забыл вызвать set_config('app.tenant_id', ...). Что вернёт SELECT * FROM tasks для app_user с функцией current_tenant_id() и политиками PandaTasks?"
+  options={[
+    "Все задачи всех арендаторов",
+    "Ошибку: unrecognized configuration parameter",
+    "Ни одной строки, потому что tenant_id = NULL никогда не истинно",
+    "Задачи арендатора из предыдущего запроса",
+  ]}
+  answer={2}
+  explanation="current_setting('app.tenant_id', true) возвращает NULL (или пустую строку после окончания локальной настройки), nullif превращает '' в NULL, а tenant_id = NULL никогда не истинно. Схема отказывает в закрытую сторону. Значение предыдущего арендатора тоже не может утечь, потому что приложение задаёт его с is_local = true, и оно заканчивается вместе с каждой транзакцией."
+/>
+
+<Exercise
+  language="sql"
+  title="Заприте каждого арендатора в его собственных строках"
+  starter={`CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id)
+);
+INSERT INTO tenants (slug) VALUES ('acme'), ('globex');
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+INSERT INTO tasks (tenant_id, project_id, title) VALUES
+  (1, 1, 'Design the home page'),
+  (1, 1, 'Write the pricing page'),
+  (1, 2, 'Fix the login crash'),
+  (2, 3, 'Pick a domain name'),
+  (2, 3, 'Draft the about page');
+
+-- 1. Роль app_user и её привилегии
+
+-- 2. current_tenant_id()
+
+-- 3. RLS (включённая и принудительная) с политикой на projects и tasks
+
+-- 4. Сторожевой запрос: таблицы арендаторов без RLS, как table_name
+SELECT 'todo' AS table_name;
+`}
+  tests={[
+    { name: "app_user не суперпользователь и не может обходить RLS", check: "(await query(\"SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'app_user'\")).some(r => r.rolsuper === false && r.rolbypassrls === false)" },
+    { name: "RLS включена и принудительна на projects и tasks", check: "(await query(\"SELECT relname FROM pg_class WHERE relname IN ('projects', 'tasks') AND relrowsecurity AND relforcerowsecurity ORDER BY relname\")).map(r => r.relname).join() === 'projects,tasks'" },
+    { name: "Сторожевой запрос не находит незащищённых таблиц (столбец table_name)", check: "columns.join() === 'table_name' && rows.length === 0" },
+    { name: "Сторожевой запрос ловит новую таблицу без RLS", check: "(await rerun(\"CREATE TABLE invoices (tenant_id bigint NOT NULL, total numeric)\")).map(r => r.table_name).join() === 'invoices'" },
+    { name: "Acme видит только свои задачи и проекты", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '1', false)\"), await query('SET ROLE app_user'), (await query('SELECT title FROM tasks ORDER BY id')).map(r => r.title).join() === 'Design the home page,Write the pricing page,Fix the login crash' && (await query('SELECT count(*) AS n FROM projects'))[0].n === 2)" },
+    { name: "Globex видит только свои задачи", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '2', false)\"), await query('SET ROLE app_user'), (await query('SELECT title FROM tasks ORDER BY id')).map(r => r.title).join() === 'Pick a domain name,Draft the about page')" },
+    { name: "Арендатор не задан: никаких строк", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '', false)\"), await query('SET ROLE app_user'), (await query('SELECT count(*) AS n FROM tasks'))[0].n === 0 && (await query('SELECT count(*) AS n FROM projects'))[0].n === 0)" },
+    { name: "Запись в другого арендатора отклоняется", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '2', false)\"), await query('SET ROLE app_user'), await query(\"INSERT INTO tasks (tenant_id, project_id, title) VALUES (1, 1, 'Sneaky')\").then(() => false, e => /row-level security/.test(e.message)))" },
+    { name: "Приложение по-прежнему может добавлять задачи своему арендатору", check: "(await query('RESET ROLE'), await query(\"SELECT set_config('app.tenant_id', '2', false)\"), await query('SET ROLE app_user'), (await query(\"INSERT INTO tasks (tenant_id, project_id, title) VALUES (2, 3, 'Launch!') RETURNING title\")).length === 1)" },
+  ]}
+>
+
+Защитите таблицы PandaTasks так, чтобы изоляцию обеспечивала база данных. Оставьте подготовку вверху, а затем: 🛡️
+
+1. Создайте роль **`app_user`** (здесь достаточно `NOLOGIN`) и выдайте ей `SELECT` на `tenants` и `SELECT, INSERT, UPDATE, DELETE` на `projects` и `tasks`.
+2. Создайте **`current_tenant_id()`**, возвращающую настройку `app.tenant_id` как `bigint` или `NULL`, если её нет или она пустая.
+3. **Включите и сделайте принудительной** защиту на уровне строк для `projects` и `tasks`, у каждой — политика, при которой строки видны и доступны для записи, только когда `tenant_id = current_tenant_id()`.
+4. Замените последний запрос **сторожевым запросом** из этого урока: таблицы в `public`, у которых есть столбец `tenant_id`, но RLS **не включена**, в виде одного столбца **`table_name`**, отсортированные. Когда всё защищено, он не возвращает строк.
+
+Затем проверки действуют как приложение: переключаются на `app_user`, задают разных арендаторов и пытаются читать и писать через границу.
+
+<Hint>
+
+`CREATE ROLE app_user NOLOGIN;` и две инструкции `GRANT`. Функция — та же, что в Шаге 1. Для каждой таблицы: `ALTER TABLE … ENABLE ROW LEVEL SECURITY;`, `ALTER TABLE … FORCE ROW LEVEL SECURITY;` и `CREATE POLICY tenant_isolation ON … USING (tenant_id = current_tenant_id()) WITH CHECK (tenant_id = current_tenant_id());`. Для сторожевого запроса скопируйте запрос из Шага 3 и переименуйте его столбец в `AS table_name`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id)
+);
+INSERT INTO tenants (slug) VALUES ('acme'), ('globex');
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+INSERT INTO tasks (tenant_id, project_id, title) VALUES
+  (1, 1, 'Design the home page'),
+  (1, 1, 'Write the pricing page'),
+  (1, 2, 'Fix the login crash'),
+  (2, 3, 'Pick a domain name'),
+  (2, 3, 'Draft the about page');
+
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT ON tenants TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON projects, tasks TO app_user;
+
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON projects
+  USING (tenant_id = current_tenant_id())
+  WITH CHECK (tenant_id = current_tenant_id());
+
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON tasks
+  USING (tenant_id = current_tenant_id())
+  WITH CHECK (tenant_id = current_tenant_id());
+
+SELECT c.relname AS table_name
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relkind IN ('r', 'p')
+  AND NOT c.relrowsecurity
+  AND EXISTS (
+    SELECT 1
+    FROM pg_attribute AS a
+    WHERE a.attrelid = c.oid
+      AND a.attname = 'tenant_id'
+      AND NOT a.attisdropped
+  )
+ORDER BY c.relname;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- RLS — это **вторая линия обороны**: проверки в приложении остаются, а забытый `WHERE tenant_id` возвращает пустоту вместо утечки.
+- Приложение подключается **непривилегированной ролью** (не суперпользователь, не владелец, без `BYPASSRLS`); инструменты поддержки используют отдельную роль `BYPASSRLS` с аудитом.
+- Каждый запрос задаёт арендатора **внутри своей транзакции** через `set_config('app.tenant_id', …, true)`: это безопасно с пулом в режиме транзакций.
+- **`current_tenant_id()`** возвращает `NULL`, когда настройки нет или она пустая, поэтому политики **отказывают в закрытую сторону**.
+- **`USING`** фильтрует то, что видит инструкция; **`WITH CHECK`** отклоняет строки, записываемые за пределы арендатора. **`FORCE ROW LEVEL SECURITY`** применяет политики и к владельцу.
+- Представлениям нужен **`security_invoker = true`**; функции `SECURITY DEFINER` и фоновые задачи требуют аккуратности.
+- Генерируйте политики для **каждой** таблицы с `tenant_id` и запускайте в CI **сторожевой запрос** и тесты изоляции.

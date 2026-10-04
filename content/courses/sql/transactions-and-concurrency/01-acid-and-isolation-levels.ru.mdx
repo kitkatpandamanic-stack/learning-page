@@ -1,0 +1,457 @@
+---
+title: ACID, транзакции и уровни изоляции
+description: Что на самом деле гарантирует ACID, как ведут себя транзакции при сбоях, какие аномалии вызывают одновременные пользователи и как с ними справляется каждый уровень изоляции в PostgreSQL.
+duration: 25
+xp: 30
+---
+
+Магазин продаёт билеты на концерт. Код простой: прочитать, сколько билетов осталось, и если есть хотя бы один — продать его и записать обратно `left - 1`. Все тесты он прошёл. В день старта продаж 2 000 человек нажали «Купить» в одну и ту же секунду, и магазин продал **2 140 билетов на 2 000 мест**. Ничего не упало, ни одна ошибка не попала в лог, и каждый запрос сделал ровно то, что было написано в коде. 🎫
+
+Такие баги существуют, только когда **много транзакций выполняются одновременно**, — а это обычное состояние любой настоящей базы данных. Этот модуль посвящён тому, как их понять: транзакции и уровни изоляции (этот урок), блокировки (следующий) и механизм под капотом — MVCC (урок после него).
+
+## ACID, буква за буквой
+
+С транзакциями (transactions) вы познакомились в модуле об изменении данных: `BEGIN`, несколько инструкций, затем `COMMIT` или `ROLLBACK`. Обещания, которые даёт транзакция, называются **ACID**:
+
+| Буква | Обещание | Как PostgreSQL его выполняет |
+| --- | --- | --- |
+| **Atomicity** (атомарность) | Либо происходят все изменения транзакции, либо ни одно | Незафиксированные версии строк просто никогда не показываются (MVCC) |
+| **Consistency** (согласованность) | Транзакция переводит данные из одного корректного состояния в другое | Ограничения: `CHECK`, `FOREIGN KEY`, `UNIQUE`, `NOT NULL`… |
+| **Isolation** (изоляция) | Одновременные транзакции не видят недоделанную работу друг друга | Снимки (MVCC) и блокировки |
+| **Durability** (долговечность) | Как только `COMMIT` вернул управление, изменение переживёт сбой | Журнал предзаписи (write-ahead log, WAL), сбрасываемый на диск при фиксации |
+
+Две из них заслуживают более пристального взгляда. **Согласованность** сильна ровно настолько, насколько сильны ваши ограничения: PostgreSQL не может знать, что баланс не должен уходить в минус, пока об этом не скажет `CHECK`. А у **изоляции** есть регулятор: она бывает разных уровней, и уровень по умолчанию — **не** полная изоляция. Именно отсюда взялся баг с билетами.
+
+## Атомарность в действии
+
+Вот банк с правилом, записанным как ограничение: баланс не может быть меньше нуля. Перевод — это два обновления, и второе нарушает правило. В PL/pgSQL блок с предложением `EXCEPTION` выполняется как **подтранзакция (subtransaction)**, поэтому мы можем перехватить ошибку и посмотреть, что уцелело:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+NOTICE:  transfer cancelled: new row for relation "accounts" violates check constraint "accounts_balance_check"
+DO
+
+ id | owner | balance
+----+-------+---------
+  1 | Mei   |  100.00
+  2 | Sam   |   50.00
+(2 rows)`}>
+
+```sql
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  owner text NOT NULL,
+  balance numeric(10, 2) NOT NULL CHECK (balance >= 0)
+);
+INSERT INTO accounts VALUES (1, 'Mei', 100), (2, 'Sam', 50);
+
+DO $$
+BEGIN
+  UPDATE accounts SET balance = balance + 500 WHERE id = 2;
+  UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+EXCEPTION WHEN check_violation THEN
+  RAISE NOTICE 'transfer cancelled: %', SQLERRM;
+END $$;
+
+SELECT * FROM accounts ORDER BY id;
+```
+
+</CodeExample>
+
+Первый `UPDATE` **выполнился успешно**: на мгновение баланс Sam действительно был 550. Но когда второй упал, откатился весь блок, включая успешное зачисление. Никто, даже эта же сессия, никогда не увидит 550 у Sam. Это и есть атомарность: никаких недоделанных переводов, никаких денег из ниоткуда.
+
+## Транзакции подробнее
+
+Несколько фактов, на которых люди обжигаются в продакшене:
+
+- **Каждая инструкция — это транзакция.** Без `BEGIN` PostgreSQL оборачивает каждую инструкцию в собственную транзакцию (**автофиксация, autocommit**). Один `UPDATE` миллиона строк сам по себе выполняется по принципу «всё или ничего».
+- **Драйверы ведут себя по-разному.** psql и большинство драйверов для Node.js работают в режиме автофиксации. psycopg в Python открывает транзакцию за вас на первой инструкции и ждёт `conn.commit()`: забудете его — и ваши изменения исчезнут при закрытии соединения.
+
+### Ошибка отравляет транзакцию
+
+После любой ошибки внутри `BEGIN … COMMIT` PostgreSQL отказывается выполнять что-либо ещё, пока транзакция не завершится:
+
+```text
+BEGIN;
+UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+ERROR:  new row for relation "accounts" violates check constraint ...
+SELECT * FROM accounts;
+ERROR:  current transaction is aborted, commands ignored until end of
+        transaction block
+COMMIT;
+ROLLBACK
+```
+
+Посмотрите на последнюю строку: на `COMMIT` неудавшейся транзакции PostgreSQL отвечает `ROLLBACK`. Приложения, которые не проверяют этот ответ, считают, что сохранили данные, хотя это не так. Чтобы восстановиться после ожидаемой ошибки **внутри** транзакции, сначала поставьте `SAVEPOINT`, а после ошибки выполните `ROLLBACK TO SAVEPOINT` — именно это сделал для нас блок `EXCEPTION` в PL/pgSQL выше.
+
+### Внутри транзакции время стоит на месте
+
+`now()` — это время **начала** транзакции, сколько бы она ни длилась. `clock_timestamp()` — реальное время:
+
+<CodeExample output={`BEGIN
+
+DO
+
+ now_is_start | clock_moved_on
+--------------+----------------
+ t            | t
+(1 row)
+
+COMMIT`}>
+
+```sql
+BEGIN;
+
+DO $$ BEGIN PERFORM pg_sleep(0.05); END $$;
+
+SELECT now() = transaction_timestamp() AS now_is_start,
+  clock_timestamp() > now() AS clock_moved_on;
+
+COMMIT;
+```
+
+</CodeExample>
+
+Обычно это именно то, что нужно (все строки, вставленные одной транзакцией, получают одинаковый `created_at`), но это удивляет каждого, кто измеряет длительность с помощью `now()` внутри долгой транзакции.
+
+## Что ломается, когда транзакции пересекаются
+
+Когда две транзакции одновременно трогают одни и те же данные, у возможных сюрпризов есть имена. Эти временные диаграммы показывают две сессии, **A** и **B**, рядом; время течёт сверху вниз. (У этой базы данных в браузере одно соединение, поэтому читайте их как схемы; любую из них можно воспроизвести у себя на компьютере в двух окнах `psql`.)
+
+**Неповторяющееся чтение (non-repeatable read)**: один и тот же запрос даёт разные ответы внутри одной транзакции.
+
+```text
+A: BEGIN;
+A: SELECT balance FROM accounts WHERE id = 1;    -- 100
+                                    B: UPDATE accounts SET balance = 40
+                                         WHERE id = 1;     -- автофиксация
+A: SELECT balance FROM accounts WHERE id = 1;    -- 40 (read committed)
+A: COMMIT;
+```
+
+**Фантомное чтение (phantom read)**: в уже прочитанном диапазоне появляются новые строки. Отчёт насчитывает 40 заказов, затем суммирует итоги «всех» заказов — и в сумму попадают деньги 41-го заказа.
+
+**Потерянное обновление (lost update)**: баг с билетами. Обе сессии читают одно и то же значение, обе вычисляют из него новое, и вторая запись молча заменяет первую:
+
+```text
+A: BEGIN;                           B: BEGIN;
+A: SELECT left FROM events
+     WHERE id = 7;         -- 1
+                                    B: SELECT left FROM events
+                                         WHERE id = 7;     -- 1
+A: UPDATE events SET left = 0
+     WHERE id = 7;
+A: COMMIT;              -- продано!
+                                    B: UPDATE events SET left = 0
+                                         WHERE id = 7;
+                                    B: COMMIT;         -- снова продано!
+```
+
+Продано два билета, `left` изменился с 1 на 0, и в таблице всё выглядит нормально.
+
+**Асимметрия записи (write skew)**: две транзакции читают **одни и те же** строки, затем каждая записывает **разную** строку, и вместе они нарушают правило, которое ни одна не нарушила по отдельности. Хрестоматийный пример: в больнице хотя бы один врач должен быть на дежурстве. Alice и Bob оба дежурят и оба плохо себя чувствуют:
+
+```text
+A (Alice): BEGIN;                   B (Bob): BEGIN;
+A: SELECT count(*) FROM doctors
+     WHERE on_call;        -- 2
+                                    B: SELECT count(*) FROM doctors
+                                         WHERE on_call;    -- 2
+A: UPDATE doctors SET on_call = false
+     WHERE name = 'Alice';
+                                    B: UPDATE doctors
+                                         SET on_call = false
+                                         WHERE name = 'Bob';
+A: COMMIT;                          B: COMMIT;
+-- никто не дежурит
+```
+
+**Грязное чтение (dirty read)** — когда видны **незафиксированные** изменения другой транзакции — пятая классическая аномалия, но о ней можно забыть: PostgreSQL не допускает её ни на одном уровне.
+
+## Уровни изоляции в PostgreSQL
+
+Стандарт SQL определяет четыре уровня изоляции (isolation levels) по тому, какие аномалии они запрещают. PostgreSQL реализует три из них (`READ UNCOMMITTED` он трактует как `READ COMMITTED`):
+
+| Уровень | Снимок | Неповторяющееся чтение | Фантом | Потерянное обновление | Асимметрия записи |
+| --- | --- | --- | --- | --- | --- |
+| **Read committed** (по умолчанию) | новый на каждую **инструкцию** | возможно | возможен | возможно (чтение-изменение-запись) | возможна |
+| **Repeatable read** | один на **транзакцию** | исключено | исключён | **ошибка** 40001 | возможна |
+| **Serializable** | один на транзакцию + отслеживание конфликтов | исключено | исключён | **ошибка** 40001 | **ошибка** 40001 |
+
+- **Read committed** даёт каждой **инструкции** свежий снимок всех зафиксированных данных. Это быстро и подходит для большей части работы — если только вы не читаете значение одной инструкцией, а записываете вычисленное из него значение другой.
+- **Repeatable read** делает один снимок при **первом запросе** транзакции и использует его до конца: идеально для отчётов, которые выполняют несколько запросов и должны сходиться друг с другом. Если транзакция пытается обновить строку, которую кто-то изменил после снимка, она падает с ошибкой `could not serialize access due to concurrent update`.
+- **Serializable** гарантирует, что результат будет таким же, как если бы транзакции выполнялись **одна за другой** в каком-то порядке. PostgreSQL отслеживает, какие транзакции что читали (Serializable Snapshot Isolation), и прерывает одну из транзакций в любом опасном сценарии, включая асимметрию записи.
+
+Уровень выбирается для каждой транзакции, и задать его нужно до первого запроса:
+
+<CodeExample output={` default_transaction_isolation
+-------------------------------
+ read committed
+(1 row)
+
+BEGIN
+
+ transaction_isolation
+-----------------------
+ repeatable read
+(1 row)
+
+ orders
+--------
+     40
+(1 row)
+
+COMMIT
+
+BEGIN
+
+ orders
+--------
+     40
+(1 row)
+
+ERROR:  SET TRANSACTION ISOLATION LEVEL must be called before any query`}>
+
+```sql
+SHOW default_transaction_isolation;
+
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SHOW transaction_isolation;
+SELECT count(*) AS orders FROM orders;
+COMMIT;
+
+BEGIN;
+SELECT count(*) AS orders FROM orders;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+```
+
+</CodeExample>
+
+Последняя инструкция падает намеренно: как только транзакция выполнила запрос, правила её снимка зафиксированы. Пишите `BEGIN ISOLATION LEVEL …` (или `SET TRANSACTION` сразу после `BEGIN`). Для отчётов добавляйте **`READ ONLY`**: тогда PostgreSQL отклонит любую запись, а на уровне serializable сможет пропустить часть служебного учёта.
+
+<Callout type="warning" title="Чем выше изоляция, тем обязательнее повторы">
+
+Repeatable read и serializable не устраняют конфликты: они превращают тихую порчу данных в **ошибки** с SQLSTATE `40001` (`serialization_failure`). Ваше приложение должно перехватывать этот код и **выполнять всю транзакцию заново** с самого начала, включая чтения. Код, который выставляет `SERIALIZABLE` без цикла повторов, просто превращает неверные данные в неудавшиеся запросы. Взаимоблокировки (`40P01`, следующий урок) заслуживают того же обращения.
+
+</Callout>
+
+Цикл повторов в коде приложения выглядит так (Python с psycopg):
+
+```python
+from psycopg import errors
+
+def run_in_transaction(conn, work, attempts=5):
+    for attempt in range(attempts):
+        try:
+            with conn.transaction():       # BEGIN ... COMMIT
+                return work(conn)
+        except (errors.SerializationFailure,
+                errors.DeadlockDetected):
+            if attempt == attempts - 1:
+                raise                      # сдаёмся и сообщаем об ошибке
+            # иначе: идём на новый круг и выполняем всё заново
+```
+
+## Исправляем потерянное обновление
+
+Вернёмся к билетам. Есть четыре стандартных исправления, от самого простого к самому тяжёлому:
+
+1. **Пусть арифметику делает база данных, а проверка будет в той же инструкции.** `UPDATE events SET left = left - 1 WHERE id = 7 AND left > 0` читает и пишет **одной** инструкцией. В режиме read committed, если другая транзакция тем временем обновила строку, PostgreSQL дождётся её, а затем **заново проверит `WHERE` на новой версии**. Второй покупатель получит `UPDATE 0`: билеты распроданы.
+2. **Заблокируйте строку, пока думаете**: `SELECT … FOR UPDATE` заставляет другую сессию ждать, пока вы не зафиксируете транзакцию. Это тема следующего урока.
+3. **Оптимистичная блокировка (optimistic locking)**: храните столбец `version` и обновляйте, только если он не изменился с момента чтения. Пока пользователь редактирует, никакие блокировки не держатся; конфликт проявляется как `UPDATE 0`.
+4. **Repeatable read или serializable с повторами**: база данных обнаруживает конфликт, а вы выполняете транзакцию заново.
+
+Вот исправления 1 и 3 в действии. Каждый `UPDATE` сообщает, сколько строк он изменил, и **это число и есть ответ**:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 1
+
+UPDATE 1
+
+UPDATE 0
+
+UPDATE 1
+
+UPDATE 0
+
+ id |       name       | seats_left | version
+----+------------------+------------+---------
+  7 | Panda Jazz Night |          0 |       2
+(1 row)`}>
+
+```sql
+CREATE TABLE gigs (
+  id integer PRIMARY KEY,
+  name text NOT NULL,
+  seats_left integer NOT NULL CHECK (seats_left >= 0),
+  version integer NOT NULL DEFAULT 1
+);
+INSERT INTO gigs (id, name, seats_left) VALUES (7, 'Panda Jazz', 1);
+
+-- Исправление 1: два покупателя, одно место
+UPDATE gigs SET seats_left = seats_left - 1
+WHERE id = 7 AND seats_left > 0;
+UPDATE gigs SET seats_left = seats_left - 1
+WHERE id = 7 AND seats_left > 0;
+
+-- Исправление 3: оба редактора загрузили версию 1
+UPDATE gigs SET name = 'Panda Jazz Night', version = version + 1
+WHERE id = 7 AND version = 1;
+UPDATE gigs SET name = 'Jazz with Pandas', version = version + 1
+WHERE id = 7 AND version = 1;
+
+SELECT * FROM gigs;
+```
+
+</CodeExample>
+
+И второй покупатель, и второй редактор получают **0 строк**, а приложение превращает это в «Билеты распроданы» или «Кто-то уже изменил эту страницу, обновите её». Обратите внимание, чего здесь нет: предварительного `SELECT`. Проверка и запись — одна атомарная инструкция.
+
+<Quiz
+  question="В режиме READ COMMITTED две сессии одновременно выполняют UPDATE gigs SET seats_left = seats_left - 1 WHERE id = 7 AND seats_left > 0 при seats_left = 1. Что произойдёт?"
+  options={["Обе выполнятся, и seats_left станет -1", "Обе выполнятся, и seats_left станет 0, то есть одно место продано дважды", "Вторая дождётся фиксации первой, заново проверит WHERE на новой строке и обновит 0 строк", "Вторая упадёт с ошибкой сериализации"]}
+  answer={2}
+  explanation="Обновляемая строка заблокирована до конца своей транзакции, поэтому второй UPDATE ждёт. В READ COMMITTED он затем заново вычисляет WHERE на только что зафиксированной версии (seats_left = 0), она уже не подходит, и он сообщает UPDATE 0. Чтение-изменение-запись в одной инструкции безопасно; разнесённое на SELECT и UPDATE — нет."
+/>
+
+<Quiz
+  question="Какую аномалию REPEATABLE READ в PostgreSQL всё ещё допускает?"
+  options={["Грязное чтение", "Неповторяющееся чтение", "Фантомное чтение", "Асимметрию записи"]}
+  answer={3}
+  explanation="Repeatable read в PostgreSQL использует один снимок на всю транзакцию, что исключает неповторяющееся и фантомное чтение (а грязного чтения он не допускает никогда). Асимметрию записи, когда две транзакции читают одни и те же строки и обновляют разные, ловит только SERIALIZABLE."
+/>
+
+<Exercise
+  language="sql"
+  title="Перевод, который не теряет деньги"
+  starter={`CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  owner text NOT NULL,
+  balance numeric(10, 2) NOT NULL CHECK (balance >= 0)
+);
+INSERT INTO accounts VALUES (1, 'Mei', 100), (2, 'Sam', 50);
+
+CREATE TABLE transfers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  from_id integer NOT NULL,
+  to_id integer NOT NULL,
+  amount numeric(10, 2) NOT NULL
+);
+
+-- Исправьте эту функцию: см. задание
+CREATE FUNCTION transfer(from_id integer, to_id integer,
+  amount numeric)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  current_balance numeric;
+BEGIN
+  SELECT balance INTO current_balance
+  FROM accounts WHERE id = from_id;
+
+  UPDATE accounts SET balance = current_balance - amount
+  WHERE id = from_id;
+  UPDATE accounts SET balance = balance + amount
+  WHERE id = to_id;
+
+  INSERT INTO transfers (from_id, to_id, amount)
+  VALUES (from_id, to_id, amount);
+END;
+$$;
+
+SELECT transfer(1, 2, 30);
+SELECT * FROM accounts ORDER BY id;`}
+  tests={[
+    { name: "После transfer(1, 2, 30) у Mei 70, а у Sam 80", check: "rows.map(r => r.owner + ' ' + r.balance).join() === 'Mei 70,Sam 80'" },
+    { name: "Каждый перевод записывается в transfers", check: "(await query(\"SELECT transfer(2, 1, 5)\"), (await query(\"SELECT from_id, to_id, amount FROM transfers ORDER BY id\")).map(r => r.from_id + '>' + r.to_id + ' ' + r.amount).join() === '1>2 30,2>1 5')" },
+    { name: "Недостаточно денег: ошибка 'insufficient funds'", check: "await query(\"SELECT transfer(1, 2, 500)\").then(() => false, e => /insufficient funds/.test(e.message))" },
+    { name: "Неизвестный получатель: ошибка 'unknown account' вместо потери денег", check: "await query(\"SELECT transfer(1, 99, 10)\").then(() => false, e => /unknown account/.test(e.message))" },
+    { name: "Неизвестный отправитель: ошибка 'unknown account'", check: "await query(\"SELECT transfer(42, 1, 10)\").then(() => false, e => /unknown account/.test(e.message))" },
+    { name: "Отрицательные суммы отклоняются (иначе деньги пошли бы в обратную сторону)", check: "await query(\"SELECT transfer(2, 1, -20)\").then(() => false, () => true)" },
+    { name: "Списание проверяет и вычитает в одном UPDATE (без SELECT … INTO)", check: "!/SELECT[^;]*\\bINTO\\b/i.test((await query(\"SELECT prosrc FROM pg_proc WHERE proname = 'transfer'\"))[0].prosrc)" },
+  ]}
+>
+
+В банковской функции `transfer` три бага: в ней поджидает **потерянное обновление** (она читает баланс, а затем записывает значение, вычисленное «в голове» приложения), она позволяет деньгам **исчезнуть**, если счёта получателя не существует (`UPDATE`, не нашедший ни одной строки, — это не ошибка!), и при нехватке денег она падает с невнятным сообщением об ограничении. Перепишите `transfer(from_id, to_id, amount)` так, чтобы:
+
+1. `amount`, равный нулю или меньше, вызывал исключение,
+2. списание было **одним** защищённым `UPDATE`, который вычитает и проверяет в одной инструкции (`… SET balance = balance - amount WHERE id = from_id AND balance >= amount`), без предварительного `SELECT … INTO`,
+3. если списание не изменило ни одной строки, функция вызывала исключение `insufficient funds` (или `unknown account`, если отправителя не существует),
+4. если зачисление не изменило ни одной строки, функция вызывала исключение `unknown account`, что заодно отменяет и списание,
+5. успешные переводы записывались в `transfers`.
+
+Оставьте две последние строки, которые выполняют перевод и показывают балансы.
+
+<Hint>
+
+В PL/pgSQL **`FOUND`** истинно после `UPDATE`, изменившего хотя бы одну строку. `RAISE EXCEPTION 'insufficient funds';` прерывает функцию, и поскольку функция выполняется внутри транзакции инструкции, всё, что она уже сделала, откатывается. Чтобы после неудачного списания отличить «нет денег» от «нет счёта», используйте `IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = from_id) THEN … END IF;`. Имена параметров здесь совпадают с именами столбцов, поэтому уточняйте столбцы: `WHERE accounts.id = transfer.from_id` — или переименуйте параметры.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  owner text NOT NULL,
+  balance numeric(10, 2) NOT NULL CHECK (balance >= 0)
+);
+INSERT INTO accounts VALUES (1, 'Mei', 100), (2, 'Sam', 50);
+
+CREATE TABLE transfers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  from_id integer NOT NULL,
+  to_id integer NOT NULL,
+  amount numeric(10, 2) NOT NULL
+);
+
+CREATE FUNCTION transfer(p_from integer, p_to integer,
+  p_amount numeric)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF p_amount IS NULL OR p_amount <= 0 THEN
+    RAISE EXCEPTION 'amount must be positive';
+  END IF;
+
+  UPDATE accounts SET balance = balance - p_amount
+  WHERE id = p_from AND balance >= p_amount;
+  IF NOT FOUND THEN
+    IF NOT EXISTS (SELECT 1 FROM accounts WHERE id = p_from) THEN
+      RAISE EXCEPTION 'unknown account %', p_from;
+    END IF;
+    RAISE EXCEPTION 'insufficient funds in account %', p_from;
+  END IF;
+
+  UPDATE accounts SET balance = balance + p_amount
+  WHERE id = p_to;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'unknown account %', p_to;
+  END IF;
+
+  INSERT INTO transfers (from_id, to_id, amount)
+  VALUES (p_from, p_to, p_amount);
+END;
+$$;
+
+SELECT transfer(1, 2, 30);
+SELECT * FROM accounts ORDER BY id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **ACID**: атомарность (всё или ничего), согласованность (сильна ровно настолько, насколько сильны ваши ограничения), изоляция (бывает разных уровней), долговечность (WAL).
+- Каждая инструкция — отдельная транзакция, если вы не написали `BEGIN`; ошибка прерывает всю транзакцию до `ROLLBACK`, а `SAVEPOINT` (или блок `EXCEPTION` в PL/pgSQL) позволяет восстановиться на полпути.
+- `now()` — время начала транзакции; `clock_timestamp()` — реальное время.
+- Аномалии конкурентного доступа: неповторяющееся чтение, фантомы, **потерянные обновления** и **асимметрия записи**. Грязного чтения PostgreSQL не показывает никогда.
+- **Read committed** (по умолчанию) делает снимок на каждую инструкцию; **repeatable read** — один на транзакцию; **serializable** вдобавок обнаруживает опасные сценарии. Более строгие уровни сообщают о конфликтах ошибками `40001`, поэтому приложение должно **повторять** транзакцию.
+- Самое дешёвое исправление потерянного обновления — одна атомарная инструкция: `UPDATE … SET x = x - 1 WHERE … AND x > 0` с последующей проверкой числа строк. Оптимистичная блокировка со столбцом `version` делает то же самое для долгих правок.

@@ -1,0 +1,445 @@
+---
+title: "Часть 1: Арендаторы и схема"
+description: Изучите задание для мультиарендного трекера задач, сравните модели арендности и спроектируйте схему, в которой ни одна строка не сможет указать на данные другого арендатора.
+duration: 25
+xp: 35
+---
+
+Добро пожаловать в итоговый проект Уровня 3. Вы — ведущий специалист по базам данных в стартапе, который делает **PandaTasks** — трекер проектов и задач для компаний. Каждая компания-клиент — это **арендатор (tenant)**: Acme Ltd регистрируется, приглашает своих людей, создаёт проекты и задачи — и никогда, ни при каких условиях не должна увидеть ни одной строки, принадлежащей Globex. 🐼
+
+За три части вы спроектируете эту базу данных, защитите её и подготовите к запуску, используя всё, что изучили на Уровне 3:
+
+1. **Арендаторы и схема** (эта часть): модель арендности, ключи и ограничения, которые делают ошибки между арендаторами невозможными.
+2. **Изоляция арендаторов**: роли и защита на уровне строк, чтобы забытый `WHERE` не мог привести к утечке данных.
+3. **Проверка перед запуском**: индексы и секционирование для данных арендаторов, план миграции и финальный чек-лист.
+
+## Задание
+
+Вот что сказали вам продакт и основатели:
+
+- **Изоляция — главное требование.** Если одна компания увидит задачи другой, бизнесу конец.
+- Около **5000 арендаторов** в первый год. Большинство — небольшие команды; у нескольких корпоративных клиентов будут миллионы задач.
+- **Пользователь** (один адрес email) может состоять в **нескольких арендаторах** — например, фрилансер, работающий на двух клиентов, — и в каждом у него своя роль: `owner`, `admin` или `member`.
+- У арендаторов есть **тариф (plan)**: `free`, `pro` или `enterprise`, с ограничениями на каждом тарифе.
+- Каждое изменение записывается в **журнал активности**, который хранится в течение срока, зависящего от тарифа.
+- Арендаторы могут попросить **выгрузить или удалить все свои данные** (GDPR), а сотрудникам поддержки иногда нужно смотреть сразу по всем арендаторам.
+
+## Три способа разместить много арендаторов
+
+Прежде чем писать какой-либо `CREATE TABLE`, выберите **модель арендности (tenancy model)**. Классических вариантов три:
+
+| | База данных на арендатора | Схема на арендатора | Общие таблицы + `tenant_id` |
+| --- | --- | --- | --- |
+| Изоляция | Самая сильная | Сильная | Обеспечивается ключами и RLS |
+| Миграции | Запускаются 5000 раз | Запускаются 5000 раз | Запускаются один раз |
+| Соединения | Пул на каждую базу | Общие, `search_path` на запрос | Общие |
+| Отчёты по всем арендаторам | Очень сложно | Сложно | Обычный SQL |
+| Стоимость маленького арендатора | Высокая | Средняя | Крошечная |
+| Вынести крупного арендатора | Уже отдельно | Легко | Нужно копирование по `tenant_id` |
+| Работает до | Сотен арендаторов | Нескольких тысяч | Сотен тысяч и больше |
+
+База или схема на арендатора выглядит безопаснее всего, но при тысячах арендаторов каждая миграция превращается в операцию над целым парком, которая может упасть на полпути, системные каталоги разрастаются, а пулы соединений множатся. Большинство SaaS-продуктов — от маленьких стартапов до платформ масштаба Salesforce — используют **общие таблицы со столбцом `tenant_id`**, защищённые ограничениями и **защитой на уровне строк (row-level security)**, и лишь при необходимости переносят самых крупных клиентов на собственные серверы.
+
+PandaTasks выбирает то же самое. Отсюда простое и строгое правило: **в каждой таблице с данными арендатора есть столбец `tenant_id`**, даже если его можно было бы найти через соединение. Именно по нему фильтрует защита на уровне строк, с него начинается каждый индекс, и по нему вы однажды будете шардировать.
+
+## Арендаторы, пользователи и членства
+
+`tenants` и `users` — две «глобальные» таблицы. Пользователь не принадлежит одному арендатору, поэтому связь между ними — отдельная таблица **`memberships`** (членства) с ролью. Тарифы и роли — это небольшой фиксированный набор, поэтому они объявлены типами `ENUM`:
+
+<CodeExample output={`CREATE TYPE
+
+CREATE TYPE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE INDEX
+
+CREATE TABLE
+
+INSERT 0 3
+
+INSERT 0 5
+
+INSERT 0 7
+
+  tenant  |   member   |  role
+----------+------------+--------
+ Acme Ltd | Ada Brooks | member
+ Acme Ltd | Mei Lin    | owner
+ Acme Ltd | Sam Ortiz  | member
+ Globex   | Ada Brooks | owner
+ Globex   | Kenji Mori | member
+ Initech  | Mei Lin    | admin
+ Initech  | Ravi Patel | owner
+(7 rows)`}>
+
+```sql
+CREATE TYPE plan AS ENUM ('free', 'pro', 'enterprise');
+CREATE TYPE member_role AS ENUM ('owner', 'admin', 'member');
+
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL,
+  plan plan NOT NULL DEFAULT 'free'
+);
+
+CREATE TABLE users (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text NOT NULL,
+  name text NOT NULL
+);
+-- один аккаунт на email, независимо от регистра букв
+CREATE UNIQUE INDEX users_email_key ON users (lower(email));
+
+CREATE TABLE memberships (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  user_id bigint NOT NULL REFERENCES users ON DELETE CASCADE,
+  role member_role NOT NULL DEFAULT 'member',
+  PRIMARY KEY (tenant_id, user_id)
+);
+
+INSERT INTO tenants (slug, name, plan) VALUES
+  ('acme', 'Acme Ltd', 'pro'),
+  ('globex', 'Globex', 'free'),
+  ('initech', 'Initech', 'enterprise');
+
+INSERT INTO users (email, name) VALUES
+  ('mei@acme.test', 'Mei Lin'),
+  ('sam@acme.test', 'Sam Ortiz'),
+  ('ada@globex.test', 'Ada Brooks'),
+  ('kenji@globex.test', 'Kenji Mori'),
+  ('ravi@initech.test', 'Ravi Patel');
+
+INSERT INTO memberships (tenant_id, user_id, role) VALUES
+  (1, 1, 'owner'), (1, 2, 'member'), (1, 3, 'member'),
+  (2, 3, 'owner'), (2, 4, 'member'),
+  (3, 5, 'owner'), (3, 1, 'admin');
+
+SELECT t.name AS tenant, u.name AS member, m.role
+FROM memberships AS m
+JOIN tenants AS t ON t.id = m.tenant_id
+JOIN users AS u ON u.id = m.user_id
+ORDER BY t.name, u.name;
+```
+
+</CodeExample>
+
+Ada работает на Acme и Globex, а Mei состоит в Acme и Initech, причём в каждом с разной ролью. Несколько осознанных решений:
+
+- **У `memberships` первичный ключ `(tenant_id, user_id)`**, и `tenant_id` стоит первым. Большинство поисков — это «участники этого арендатора», а другие таблицы будут ссылаться на эту пару.
+- Правило для email — это **уникальный индекс на `lower(email)`**, поэтому `Mei@Acme.test` не сможет зарегистрироваться дважды.
+- `ON DELETE CASCADE` от `tenants` означает, что удаление арендатора удаляет его членства. Пользователи остаются, потому что могут состоять где-то ещё.
+- В настоящем продукте в каждой таблице есть ещё и `created_at timestamptz NOT NULL DEFAULT now()`. Мы опускаем метки времени в примерах, чтобы вывод был короче.
+
+## Делаем ссылки между арендаторами невозможными
+
+Теперь проекты и задачи. Вот коварный баг, которым славятся схемы с общими таблицами. С обычным внешним ключом (foreign key) на `project_id` ничто не мешает задаче **Globex** указать на проект **Acme**:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 2
+
+INSERT 0 1
+
+ task_tenant | project_tenant |       title
+-------------+----------------+-------------------
+           2 |              1 | Steal the roadmap
+(1 row)`}>
+
+```sql
+CREATE TABLE projects (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id bigint NOT NULL,
+  name text NOT NULL
+);
+
+-- наивная версия: только project_id
+CREATE TABLE tasks (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id bigint NOT NULL,
+  project_id bigint NOT NULL REFERENCES projects,
+  title text NOT NULL
+);
+
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Acme roadmap'), (2, 'Globex website');
+
+-- баг в приложении (или злоумышленник, подбирающий id) делает вот что:
+INSERT INTO tasks (tenant_id, project_id, title)
+VALUES (2, 1, 'Steal the roadmap');
+
+SELECT
+  k.tenant_id AS task_tenant,
+  p.tenant_id AS project_tenant,
+  k.title
+FROM tasks AS k
+JOIN projects AS p ON p.id = k.project_id;
+```
+
+</CodeExample>
+
+База данных приняла задачу Globex внутри проекта Acme. Теперь любой экран со списком «задач дорожной карты Acme» покажет Acme задачу Globex — а может, и наоборот. Предполагается, что код приложения проверяет это на каждом эндпоинте, всегда.
+
+Решение — сделать **арендатора частью ключа**. Дайте `projects` первичный ключ `(tenant_id, id)`, и пусть задачи ссылаются на эту **пару**. **Составной внешний ключ (composite foreign key)** требует, чтобы оба столбца совпадали с одной и той же строкой, поэтому задача и её проект обязаны принадлежать одному арендатору:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 2
+
+INSERT 0 1
+
+ERROR:  insert or update on table "tasks" violates foreign key constraint "tasks_tenant_id_project_id_fkey"
+DETAIL:  Key (tenant_id, project_id)=(2, 1) is not present in table "projects".`}>
+
+```sql
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (tenant_id, name)
+);
+
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id) ON DELETE CASCADE
+);
+
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Acme roadmap'), (2, 'Globex website');
+
+-- тот же арендатор: всё в порядке
+INSERT INTO tasks (tenant_id, project_id, title)
+VALUES (1, 1, 'Plan Q3');
+
+-- между арендаторами: отклоняется самой базой данных
+INSERT INTO tasks (tenant_id, project_id, title)
+VALUES (2, 1, 'Steal the roadmap');
+```
+
+</CodeExample>
+
+Тот же паттерн применяется к каждой ссылке внутри арендатора. Исполнитель — это не просто «пользователь»: он должен быть **участником того же арендатора**, поэтому внешний ключ задачи указывает на `memberships (tenant_id, user_id)`. Для имён в пределах арендатора — уникальность в пределах арендатора: `UNIQUE (tenant_id, name)` позволяет и Acme, и Globex иметь проект «Website», но не два таких в одной компании.
+
+<Callout type="note" title="ON DELETE SET NULL для одного столбца">
+
+Что должно произойти с задачей, когда её исполнитель уходит из компании (его членство удаляется)? Задача должна остаться, просто без исполнителя. Но обычный `ON DELETE SET NULL` на внешнем ключе `(tenant_id, assignee_id)` установил бы в `NULL` **оба** столбца, а `tenant_id` объявлен `NOT NULL`, так что удаление упало бы с ошибкой. Начиная с PostgreSQL 15 можно перечислить столбцы, которые нужно очистить: `ON DELETE SET NULL (assignee_id)`. Составной внешний ключ, в котором хотя бы один столбец `NULL`, вообще не проверяется, поэтому задача без исполнителя (`assignee_id IS NULL`) — это нормально.
+
+</Callout>
+
+## Выбор id
+
+PandaTasks использует столбцы идентичности `bigint`: компактные, быстрые и удобные для чтения в тикетах поддержки. Помните о двух вещах:
+
+- **Id глобальные**, общие для всех арендаторов, поэтому они **выдают информацию**. Если новая задача Globex получает id 1 000 042, Globex может следить за ростом числа и оценивать, насколько загружена вся платформа. Никогда не полагайтесь на то, что id трудно угадать: данные защищает авторизация (и RLS — в следующей части).
+- Если id нужно генерировать вне базы данных или они не должны выдавать количество, используйте **UUID**. В PostgreSQL 18 есть встроенная функция **`uuidv7()`**, которая ставит метку времени в начало. Тогда новые id почти всегда больше старых и вставляются в конец B-tree индекса, как у последовательности, а не в случайные места по всему индексу, — это главная проблема производительности у случайных ключей `gen_random_uuid()` (версии 4).
+
+```sql
+CREATE TABLE api_keys (
+  id uuid PRIMARY KEY DEFAULT uuidv7(),
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  label text NOT NULL
+);
+```
+
+Пользователям часто нужны ещё и короткие, понятные номера в пределах арендатора («PT-42» в собственной нумерации Acme). Это **отображаемый номер**, который хранится в отдельном столбце с `UNIQUE (tenant_id, number)`, и он никогда не бывает первичным ключом.
+
+<Quiz
+  question="В tasks есть FOREIGN KEY (tenant_id, project_id) REFERENCES projects (tenant_id, id). Что это гарантирует такого, чего не гарантирует FOREIGN KEY (project_id) REFERENCES projects (id)?"
+  options={[
+    "Что id проектов уникальны среди всех арендаторов",
+    "Что задача может указывать только на проект того же арендатора",
+    "Что задачи удаляются, когда удаляется их арендатор",
+    "Что планировщик использует индекс для соединения",
+  ]}
+  answer={1}
+  explanation="Составной внешний ключ требует строку в projects, где совпадают и tenant_id, и id. Задача арендатора 2 больше не может сослаться на проект арендатора 1, потому что строки (2, 1) не существует. Ключ из одного столбца проверяет лишь то, что какой-то проект с таким id существует — у любого арендатора."
+/>
+
+<Quiz
+  question="Зачем PandaTasks хранит столбец tenant_id в tasks, хотя его можно найти, соединив tasks с projects?"
+  options={[
+    "PostgreSQL требует его для внешних ключей",
+    "Чтобы сэкономить место на диске",
+    "Чтобы политики RLS, индексы, секционирование и будущий ключ шардирования могли использовать его напрямую в каждой таблице арендатора",
+    "Потому что tenant_id должен быть первичным ключом каждой таблицы",
+  ]}
+  answer={2}
+  explanation="Денормализация tenant_id в каждую таблицу, принадлежащую арендатору, — сознательное решение. Политики могут сравнивать tenant_id напрямую (без соединения в каждой проверке), индексы могут с него начинаться, а инструменты вроде Citus могут размещать все строки арендатора на одном сервере, шардируя по нему."
+/>
+
+<Exercise
+  language="sql"
+  title="Спроектируйте таблицу tasks"
+  starter={`CREATE TYPE member_role AS ENUM ('owner', 'admin', 'member');
+
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL
+);
+CREATE TABLE users (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+CREATE TABLE memberships (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  user_id bigint NOT NULL REFERENCES users ON DELETE CASCADE,
+  role member_role NOT NULL DEFAULT 'member',
+  PRIMARY KEY (tenant_id, user_id)
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (tenant_id, name)
+);
+
+INSERT INTO tenants (slug, name) VALUES
+  ('acme', 'Acme Ltd'), ('globex', 'Globex');
+INSERT INTO users (name) VALUES ('Mei'), ('Sam'), ('Ada');
+INSERT INTO memberships (tenant_id, user_id) VALUES
+  (1, 1), (1, 2), (2, 3);
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+
+-- Создайте таблицу tasks здесь
+
+
+INSERT INTO tasks (tenant_id, project_id, title, status, assignee_id)
+VALUES
+  (1, 1, 'Design the home page', 'done', 1),
+  (1, 1, 'Write the pricing page', 'doing', 2),
+  (1, 2, 'Set up push notifications', 'todo', NULL),
+  (2, 3, 'Pick a domain name', 'todo', 3);
+
+SELECT tenant_id, id, title, status, assignee_id
+FROM tasks
+ORDER BY tenant_id, id;
+`}
+  tests={[
+    { name: "Все четыре задачи вставлены", check: "rows.length === 4 && columns.join() === 'tenant_id,id,title,status,assignee_id'" },
+    { name: "Первичный ключ — (tenant_id, id)", check: "(await query(\"SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'tasks'::regclass AND contype = 'p'\")).some(r => r.def === 'PRIMARY KEY (tenant_id, id)')" },
+    { name: "Задача не может указывать на проект другого арендатора", check: "await query(\"INSERT INTO tasks (tenant_id, project_id, title) VALUES (2, 1, 'x')\").then(() => false, e => /foreign key/.test(e.message))" },
+    { name: "Назначить можно только участника того же арендатора", check: "await query(\"INSERT INTO tasks (tenant_id, project_id, title, assignee_id) VALUES (2, 3, 'x', 1)\").then(() => false, e => /foreign key/.test(e.message))" },
+    { name: "status допускает только todo, doing и done (по умолчанию todo)", check: "(await query(\"INSERT INTO tasks (tenant_id, project_id, title) VALUES (1, 2, 'Default status') RETURNING status\"))[0].status === 'todo' && await query(\"INSERT INTO tasks (tenant_id, project_id, title, status) VALUES (1, 1, 'x', 'blocked')\").then(() => false, e => /check constraint/.test(e.message))" },
+    { name: "Когда участник уходит, его задачи остаются, но без исполнителя", check: "(await query(\"DELETE FROM memberships WHERE tenant_id = 1 AND user_id = 2\"), (await query(\"SELECT assignee_id FROM tasks WHERE title = 'Write the pricing page'\"))[0].assignee_id === null)" },
+    { name: "Удаление проекта удаляет его задачи", check: "(await query(\"DELETE FROM projects WHERE tenant_id = 1 AND id = 1\"), (await query(\"SELECT count(*) AS n FROM tasks WHERE project_id = 1\"))[0].n === 0)" },
+  ]}
+>
+
+Создайте таблицу **`tasks`** для PandaTasks так, чтобы правила арендаторов обеспечивала сама база данных. Столбцы:
+
+- **`tenant_id`** `bigint NOT NULL`, **`id`** `bigint GENERATED ALWAYS AS IDENTITY`, **`project_id`** `bigint NOT NULL`, **`title`** `text NOT NULL`,
+- **`status`** `text NOT NULL`, по умолчанию **`'todo'`**, допускающий только `'todo'`, `'doing'` и `'done'`,
+- **`assignee_id`** `bigint`, который может быть `NULL`.
+
+Правила:
+
+1. Первичный ключ — **`(tenant_id, id)`**.
+2. Проект задачи должен принадлежать **тому же арендатору**; удаление проекта **удаляет его задачи**.
+3. Исполнитель должен быть **участником того же арендатора**. Когда это членство удаляется, задача **остаётся**, и только `assignee_id` становится `NULL`.
+
+После этого вставки и запрос внизу должны выполниться. Проверки попытаются нарушить ваши правила некорректными вставками и удалениями. 🔒
+
+<Hint>
+
+Два составных внешних ключа — ограничениями таблицы после столбцов:
+
+`FOREIGN KEY (tenant_id, project_id) REFERENCES projects (tenant_id, id) ON DELETE CASCADE`
+
+`FOREIGN KEY (tenant_id, assignee_id) REFERENCES memberships (tenant_id, user_id) ON DELETE SET NULL (assignee_id)`
+
+Правило для статуса — `CHECK (status IN ('todo', 'doing', 'done'))` на столбце, рядом с `DEFAULT 'todo'`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TYPE member_role AS ENUM ('owner', 'admin', 'member');
+
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL
+);
+CREATE TABLE users (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+CREATE TABLE memberships (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  user_id bigint NOT NULL REFERENCES users ON DELETE CASCADE,
+  role member_role NOT NULL DEFAULT 'member',
+  PRIMARY KEY (tenant_id, user_id)
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants ON DELETE CASCADE,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (tenant_id, name)
+);
+
+INSERT INTO tenants (slug, name) VALUES
+  ('acme', 'Acme Ltd'), ('globex', 'Globex');
+INSERT INTO users (name) VALUES ('Mei'), ('Sam'), ('Ada');
+INSERT INTO memberships (tenant_id, user_id) VALUES
+  (1, 1), (1, 2), (2, 3);
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (2, 'Website');
+
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  status text NOT NULL DEFAULT 'todo'
+    CHECK (status IN ('todo', 'doing', 'done')),
+  assignee_id bigint,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, assignee_id)
+    REFERENCES memberships (tenant_id, user_id)
+    ON DELETE SET NULL (assignee_id)
+);
+
+INSERT INTO tasks (tenant_id, project_id, title, status, assignee_id)
+VALUES
+  (1, 1, 'Design the home page', 'done', 1),
+  (1, 1, 'Write the pricing page', 'doing', 2),
+  (1, 2, 'Set up push notifications', 'todo', NULL),
+  (2, 3, 'Pick a domain name', 'todo', 3);
+
+SELECT tenant_id, id, title, status, assignee_id
+FROM tasks
+ORDER BY tenant_id, id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- PandaTasks использует **общие таблицы с `tenant_id`** в каждой таблице, принадлежащей арендатору: один путь миграций, дешёвые маленькие арендаторы, обычный SQL для отчётов. База или схема на арендатора изолируют сильнее, но не масштабируются на тысячи арендаторов.
+- **Пользователи глобальные**; **членства `(tenant_id, user_id)`** хранят роль каждого пользователя у каждого арендатора.
+- Таблицы арендаторов используют **`PRIMARY KEY (tenant_id, id)`**, а ссылки внутри арендатора — это **составные внешние ключи**, включающие `tenant_id`, поэтому связи между арендаторами невозможны.
+- **`ON DELETE SET NULL (column)`** очищает только указанный столбец составного ключа.
+- Правила в пределах арендатора используют уникальность в пределах арендатора, например **`UNIQUE (tenant_id, name)`**.
+- Глобальные id выдают количество и могут быть угаданы; **`uuidv7()`** даёт UUID, удобные для индекса. Данные защищает авторизация, а не секретность id.

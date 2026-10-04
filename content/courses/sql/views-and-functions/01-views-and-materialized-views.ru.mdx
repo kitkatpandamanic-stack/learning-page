@@ -1,0 +1,415 @@
+---
+title: Представления и материализованные представления
+description: Сохраняйте запросы как представления, которые ведут себя как таблицы, держите их в согласии с данными и кэшируйте дорогие результаты в материализованных представлениях.
+duration: 20
+xp: 25
+---
+
+Вы уже умеете писать длинные хитрые запросы: соединения, группировки, оконные функции. А потом один и тот же 12-строчный запрос «суммы заказов» появляется на панели мониторинга, в задаче выставления счетов, на админской странице и в трёх отчётах. Кто-то исправляет ошибку в одной копии (отменённые заказы не должны учитываться!), а остальные пять молча продолжают ошибаться. 😬
+
+**Представление (view)** даёт запросу имя: вы пишете его один раз и везде используете как таблицу. **Материализованное представление (materialized view)** идёт дальше и сохраняет результат, так что дорогой запрос выполняется один раз, а не при каждой загрузке страницы. Этот модуль о том, как упаковывать логику внутрь базы данных: сначала представления, затем функции и триггеры.
+
+## Создание представления
+
+`CREATE VIEW name AS` и затем любой `SELECT` — так запрос сохраняется под именем:
+
+<CodeExample output={`CREATE VIEW
+
+ order_id | customer_id |  status   | total
+----------+-------------+-----------+--------
+        2 |          15 | shipped   | 200.17
+       17 |           1 | shipped   | 200.17
+       32 |           4 | shipped   | 200.17
+        5 |           2 | delivered | 149.73
+(4 rows)`}>
+
+```sql
+CREATE VIEW order_totals AS
+SELECT o.id AS order_id,
+  o.customer_id,
+  o.ordered_at,
+  o.status,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+GROUP BY o.id;
+
+SELECT order_id, customer_id, status, total
+FROM order_totals
+ORDER BY total DESC, order_id
+LIMIT 4;
+```
+
+</CodeExample>
+
+Снаружи `order_totals` выглядит в точности как таблица: из него можно выбирать столбцы, фильтровать через `WHERE`, сортировать, группировать и соединять с другими таблицами. Тем, кто им пользуется, не нужно знать, что внутри — соединение и `GROUP BY`.
+
+Представления отлично подходят для:
+
+- **Повторного использования**: одно определение «суммы заказа» или «активного покупателя» для всей команды.
+- **Простоты**: аналитики обращаются к `order_totals`, а не выводят его заново.
+- **Стабильного интерфейса**: можно перестроить таблицы под ним, сохранив столбцы представления прежними, и отчёты не сломаются.
+- **Безопасности**: представление может показывать часть столбцов (без email, без зарплат) и часть строк, а пользователям можно разрешить читать представление, но не таблицу. Этим вы займётесь в модуле о безопасности.
+
+## Представление хранит запрос, а не данные
+
+Обычное представление **не содержит строк**. Каждый раз, когда вы к нему обращаетесь, PostgreSQL выполняет сохранённый запрос на текущих данных, поэтому представление всегда актуально:
+
+<CodeExample output={`CREATE VIEW
+
+ order_id | total
+----------+--------
+        1 | 102.00
+(1 row)
+
+INSERT 0 1
+
+ order_id | total
+----------+--------
+        1 | 191.90
+(1 row)`}>
+
+```sql
+CREATE VIEW order_totals AS
+SELECT o.id AS order_id, sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+GROUP BY o.id;
+
+SELECT * FROM order_totals WHERE order_id = 1;
+
+-- Добавляем в заказ 1 рисоварку
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (1, 15, 1, 89.90);
+
+SELECT * FROM order_totals WHERE order_id = 1;
+```
+
+</CodeExample>
+
+Поскольку представление — это просто сохранённый запрос, хранить его ничего не стоит, и оно никогда не устаревает. Но и **быстрее** запроса внутри него оно не работает. Когда вы обращаетесь к представлению, планировщик **подставляет (inlines)** его определение в ваш запрос и планирует всё вместе, поэтому `WHERE order_id = 1` по-прежнему может использовать индекс первичного ключа `orders`. Представление, за которым прячется медленный запрос, — всё тот же медленный запрос.
+
+Определение представления можно узнать с помощью `pg_get_viewdef('order_totals')` или в системном представлении `information_schema.views` (в psql его показывает `\d+ order_totals`).
+
+### Представления поверх представлений
+
+Представления могут использовать другие представления. Представление `customer_stats` может строиться на `order_totals`, и каждый слой остаётся коротким и читаемым:
+
+<CodeExample output={`CREATE VIEW
+
+CREATE VIEW
+
+    name     | orders | spent
+-------------+--------+--------
+ Ravi Patel  |      3 | 282.23
+ Sam Ortiz   |      2 | 273.83
+ Sofia Rossi |      3 | 260.13
+(3 rows)`}>
+
+```sql
+CREATE VIEW order_totals AS
+SELECT o.id AS order_id, o.customer_id, o.status,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+GROUP BY o.id;
+
+CREATE VIEW customer_stats AS
+SELECT c.id, c.name,
+  count(*) AS orders,
+  sum(t.total) AS spent
+FROM customers AS c
+JOIN order_totals AS t ON t.customer_id = c.id
+WHERE t.status <> 'cancelled'
+GROUP BY c.id;
+
+SELECT name, orders, spent
+FROM customer_stats
+ORDER BY spent DESC, name
+LIMIT 3;
+```
+
+</CodeExample>
+
+Только не складывайте их слишком глубоко. Пять слоёв представлений поверх представлений мешают понять, что на самом деле делает запрос, и позволяют незаметно соединить одни и те же таблицы несколько раз.
+
+## Изменение и удаление представлений
+
+**`CREATE OR REPLACE VIEW`** обновляет запрос представления с одним ограничением: новая версия должна сохранить существующие столбцы с теми же именами и типами и в том же порядке. Можно только **добавлять** столбцы в конец. Для всего остального нужны `DROP VIEW` и `CREATE VIEW`.
+
+PostgreSQL также отслеживает **зависимости (dependencies)**: он не даст сломать представление, удалив то, что оно использует:
+
+<CodeExample output={`CREATE VIEW
+
+ERROR:  cannot drop column status of table orders because other objects depend on it
+DETAIL:  view order_summary depends on column status of table orders
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.`}>
+
+```sql
+CREATE VIEW order_summary AS
+SELECT id, customer_id, status
+FROM orders;
+
+ALTER TABLE orders DROP COLUMN status;
+```
+
+</CodeExample>
+
+PostgreSQL отказывается удалять столбец `status`, потому что от него зависит представление `order_summary`, и подсказывает вариант с `CASCADE`. Это полезная особенность: иначе представление упало бы в 3 часа ночи, когда запускается ночной отчёт. `CASCADE` удалил бы представление вместе со столбцом, а это редко то, что нужно. Вместо этого сначала удалите или измените представление, затем столбец, а потом создайте представление заново — лучше всего в одной миграции внутри транзакции.
+
+<Callout type="warning" title="SELECT * в представлении замораживается">
+
+`CREATE VIEW v AS SELECT * FROM products` раскрывает `*` **один раз** — при создании представления. Столбцы, добавленные в `products` позже, в представлении не появятся. В представлениях перечисляйте столбцы явно, чтобы то, что возвращает представление, было записано и его можно было проверить на ревью.
+
+</Callout>
+
+## Обновляемые представления и WITH CHECK OPTION
+
+**Простое представление** — то, что выбирает из одной таблицы без `GROUP BY`, `DISTINCT`, агрегатов, `UNION` и `LIMIT`, — автоматически **обновляемое (updatable)**: `INSERT`, `UPDATE` и `DELETE` над представлением изменяют исходную таблицу.
+
+Попробуем на маленькой таблице `teas`. Возникает вопрос: что, если вставить через представление строку, которую само представление не показало бы? По умолчанию PostgreSQL это разрешает, и строка «исчезает» в таблице. **`WITH CHECK OPTION`** это запрещает:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+CREATE VIEW
+
+UPDATE 1
+
+UPDATE 0
+
+INSERT 0 1
+
+ in_view
+---------
+       0
+(1 row)
+
+CREATE VIEW
+
+ERROR:  new row violates check option for view "in_stock"
+DETAIL:  Failing row contains (4, Sencha, 8.50, 0).`}>
+
+```sql
+CREATE TABLE teas (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  price numeric(6, 2) NOT NULL,
+  stock integer NOT NULL
+);
+INSERT INTO teas (name, price, stock) VALUES
+  ('Jasmine', 6.50, 40), ('Earl Grey', 5.25, 0);
+
+CREATE VIEW in_stock AS
+SELECT id, name, price, stock
+FROM teas
+WHERE stock > 0;
+
+-- Обновления доходят до таблицы...
+UPDATE in_stock SET price = 6.75 WHERE name = 'Jasmine';
+-- ...но только для строк, которые видит представление
+UPDATE in_stock SET price = 6.00 WHERE name = 'Earl Grey';
+
+-- Строка, которую представление не видит: вставлена, но невидима
+INSERT INTO in_stock (name, price, stock) VALUES ('Oolong', 9, 0);
+SELECT count(*) AS in_view FROM in_stock WHERE name = 'Oolong';
+
+-- С check option такие строки отклоняются
+CREATE OR REPLACE VIEW in_stock AS
+SELECT id, name, price, stock
+FROM teas
+WHERE stock > 0
+WITH CHECK OPTION;
+
+INSERT INTO in_stock (name, price, stock) VALUES ('Sencha', 8.50, 0);
+```
+
+</CodeExample>
+
+Последняя вставка отклонена: новая строка нарушает check option представления `in_stock`, и PostgreSQL показывает строку, которая не прошла проверку.
+
+Представления с агрегатами или соединениями автоматически не обновляются. Если через такое представление действительно нужно писать, изменение может перевести триггер `INSTEAD OF` (с триггерами вы познакомитесь [через урок](/learn/sql/triggers)), но обычно проще писать прямо в таблицы.
+
+<Quiz
+  question="Вы создали обычное представление top_customers, а затем вставили новые заказы в таблицу orders. Что покажет SELECT * FROM top_customers?"
+  options={[
+    "Данные в том виде, в каком они были при создании представления",
+    "Текущие данные вместе с новыми заказами, потому что запрос представления выполняется каждый раз",
+    "Ничего, пока вы не выполните REFRESH VIEW top_customers",
+    "Ошибку, потому что таблица изменилась после создания представления",
+  ]}
+  answer={1}
+  explanation="Обычное представление хранит только свой запрос. Каждый SELECT из представления выполняет этот запрос над таблицами в их текущем состоянии, поэтому оно всегда отражает самые свежие данные. Хранят результаты и требуют обновления только материализованные представления."
+/>
+
+## Материализованные представления: сохраняем результат
+
+Иногда запрос за представлением действительно дорогой: панель, которая агрегирует миллионы заказов по месяцам и пересчитывается для каждого посетителя. **Материализованное представление** выполняет запрос **один раз** и хранит результат как таблицу. Читать его так же быстро, как маленькую таблицу, но данные — это **снимок (snapshot)**: он меняется, только когда вы его **обновляете (refresh)**.
+
+<CodeExample output={`CREATE MATERIALIZED VIEW
+
+   month    | orders | revenue
+------------+--------+---------
+ 2025-01-01 |      5 |  518.30
+ 2025-02-01 |      6 |  331.69
+ 2025-03-01 |      6 |  525.80
+ 2025-04-01 |      6 |  331.69
+ 2025-05-01 |      5 |  467.80
+ 2025-06-01 |      4 |  270.54
+(6 rows)
+
+INSERT 0 1
+
+ revenue
+---------
+  270.54
+(1 row)
+
+REFRESH
+
+ revenue
+---------
+ 1169.54
+(1 row)`}>
+
+```sql
+CREATE MATERIALIZED VIEW monthly_revenue AS
+SELECT date_trunc('month', o.ordered_at)::date AS month,
+  count(DISTINCT o.id) AS orders,
+  sum(oi.quantity * oi.unit_price) AS revenue
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY 1;
+
+SELECT * FROM monthly_revenue ORDER BY month;
+
+-- Большая новая продажа в июне: 10 рисоварок
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (40, 15, 10, 89.90);
+
+-- Всё ещё старое число: снимок не изменился
+SELECT revenue FROM monthly_revenue WHERE month = '2025-06-01';
+
+REFRESH MATERIALIZED VIEW monthly_revenue;
+
+SELECT revenue FROM monthly_revenue WHERE month = '2025-06-01';
+```
+
+</CodeExample>
+
+**`REFRESH MATERIALIZED VIEW`** заново выполняет запрос и заменяет сохранённые строки. Кто и когда это запускает? Обычно задача по расписанию: каждые несколько минут, каждую ночь или сразу после импорта данных, из которых строится представление (это умеет расширение `pg_cron` или планировщик задач вашего приложения).
+
+Что нужно знать об обновлении:
+
+- Обычный `REFRESH` **блокирует** материализованное представление: все, кто его читает, ждут окончания обновления.
+- **`REFRESH MATERIALIZED VIEW CONCURRENTLY`** позволяет продолжать чтение во время обновления: он вычисляет новый результат и применяет только различия. Для этого нужен **уникальный индекс** на материализованном представлении, чтобы PostgreSQL мог сопоставить старые и новые строки:
+
+```sql
+CREATE UNIQUE INDEX monthly_revenue_month_idx
+  ON monthly_revenue (month);
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_revenue;
+```
+
+- На материализованное представление можно добавить и **другие индексы**, как на любую таблицу, — это делает его отличной основой для быстрых панелей и поиска.
+
+<Callout type="tip" title="Представление, материализованное представление или таблица?">
+
+- **Представление**: всегда свежее, места не занимает, работает с той же скоростью, что и его запрос. Используйте, чтобы дать имя логике и поделиться ею.
+- **Материализованное представление**: быстро читается, устаревает до обновления, обновляется целиком. Используйте для дорогих отчётов, где «по состоянию на 5 минут назад» вполне годится.
+- **Сводная таблица, которую обновляет ваш код или триггер**: и свежая, и быстрая, но логику обновления пишете и поддерживаете вы. Используйте, когда нужно и то и другое, и смиритесь со сложностью.
+
+</Callout>
+
+<Quiz
+  question="REFRESH MATERIALIZED VIEW CONCURRENTLY sales_summary падает с ошибкой, требующей уникальный индекс. Зачем он нужен PostgreSQL?"
+  options={[
+    "Уникальные индексы ускоряют чтение любого материализованного представления",
+    "Параллельное обновление сравнивает новый результат со старыми строками и должно сопоставить их один к одному, а для этого нужен уникальный ключ",
+    "У материализованных представлений не может быть индексов других видов",
+    "Не нужен: ошибка означает, что в запросе представления есть повторяющиеся строки",
+  ]}
+  answer={1}
+  explanation="Параллельное обновление оставляет старые строки доступными для чтения, пока вычисляет новый результат, а затем вставляет, обновляет и удаляет только изменившиеся строки. Чтобы понять, какой старой строке соответствует какая новая, ему нужен уникальный индекс на материализованном представлении."
+/>
+
+<Exercise
+  language="sql"
+  title="Представления продаж для магазина"
+  starter={`-- 1. Представление: по строке на каждый товар, продан он или нет
+CREATE VIEW product_sales AS
+SELECT p.id AS product_id,
+  p.name,
+  p.category
+FROM products AS p;
+
+-- 2. Материализованное представление: итоги по категориям
+--    на основе product_sales
+
+
+-- 3. Покажите категории, сначала с самой большой выручкой
+`}
+  tests={[
+    { name: "product_sales — представление с правильными столбцами", check: "(await query(\"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) AS cols FROM information_schema.columns WHERE table_name = 'product_sales'\"))[0].cols === 'product_id,name,category,units_sold,revenue' && (await query(\"SELECT count(*) AS n FROM information_schema.views WHERE table_name = 'product_sales'\"))[0].n === 1" },
+    { name: "В product_sales есть каждый товар с количеством и выручкой", check: "await (async () => { const r = await query('SELECT * FROM product_sales ORDER BY product_id'); return r.length === 15 && r[1].units_sold === 17 && r[1].revenue === 238 && r[14].units_sold === 9 && r[14].revenue === 809.1; })()" },
+    { name: "category_sales — материализованное представление", check: "(await query(\"SELECT count(*) AS n FROM pg_matviews WHERE matviewname = 'category_sales'\"))[0].n === 1" },
+    { name: "Последний запрос показывает category, units_sold, revenue", check: "columns.join() === 'category,units_sold,revenue' && rows.length === 5" },
+    { name: "Категории отсортированы по выручке, начиная с самой большой", check: "rows.map(r => r.category).join() === 'kitchen,books,toys,tea,snacks' && rows[0].revenue === 1160.1" },
+    { name: "Непроданные товары показывают 0, а не NULL, и представление остаётся живым", check: "await (async () => { await query(\"INSERT INTO products (name, category, price, stock) VALUES ('Oolong', 'tea', 9, 5)\"); const r = await query(\"SELECT units_sold, revenue FROM product_sales WHERE name = 'Oolong'\"); return r.length === 1 && r[0].units_sold === 0 && r[0].revenue === 0; })()" },
+  ]}
+>
+
+Менеджерам магазина нужны две вещи: живое представление продаж **по товарам** и быстрая сводка **по категориям** для их панели, которая обновляется по ночам.
+
+1. Допишите представление **`product_sales`** со столбцами `product_id, name, category, units_sold, revenue` — по одной строке на **каждый** товар. `units_sold` — общее количество в `order_items`, а `revenue` — сумма `quantity * unit_price`. У товаров, которые ни разу не продавались, в обоих столбцах должен быть `0`, а не `NULL`.
+2. Создайте **материализованное представление** `category_sales` (столбцы `category, units_sold, revenue`), выбирая из `product_sales` и группируя по категории.
+3. Завершите запросом `SELECT * FROM category_sales`, отсортированным по `revenue` от большей к меньшей.
+
+<Hint>
+
+Чтобы появились и непроданные товары, присоедините `order_items` через **`LEFT JOIN`** и сгруппируйте `GROUP BY p.id`. У товара без позиций суммы будут `NULL`, поэтому оберните их: `coalesce(sum(oi.quantity), 0) AS units_sold`. Шаг 2 начинается с `CREATE MATERIALIZED VIEW category_sales AS SELECT category, sum(units_sold) AS units_sold, …`.
+
+</Hint>
+
+<Solution>
+
+```sql
+-- 1. Представление: по строке на каждый товар, продан он или нет
+CREATE VIEW product_sales AS
+SELECT p.id AS product_id,
+  p.name,
+  p.category,
+  coalesce(sum(oi.quantity), 0) AS units_sold,
+  coalesce(sum(oi.quantity * oi.unit_price), 0) AS revenue
+FROM products AS p
+LEFT JOIN order_items AS oi ON oi.product_id = p.id
+GROUP BY p.id;
+
+-- 2. Материализованное представление: итоги по категориям
+--    на основе product_sales
+CREATE MATERIALIZED VIEW category_sales AS
+SELECT category,
+  sum(units_sold) AS units_sold,
+  sum(revenue) AS revenue
+FROM product_sales
+GROUP BY category;
+
+-- 3. Покажите категории, сначала с самой большой выручкой
+SELECT *
+FROM category_sales
+ORDER BY revenue DESC;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Представление** (`CREATE VIEW name AS SELECT …`) — это сохранённый запрос, которым пользуются как таблицей: одно общее определение, более простые запросы, стабильный интерфейс и способ скрыть столбцы и строки.
+- Представления **не хранят данных**: они всегда актуальны и работают не быстрее своего запроса (планировщик подставляет их определение).
+- `CREATE OR REPLACE VIEW` может только **добавлять** столбцы в конец; зависимости не дают удалить столбцы, которые использует представление. Перечисляйте столбцы вместо `SELECT *`.
+- Простые представления над одной таблицей — **обновляемые**; `WITH CHECK OPTION` отклоняет строки, которые представление не смогло бы показать.
+- **Материализованное представление** хранит свой результат: читается быстро, но остаётся снимком до **`REFRESH MATERIALIZED VIEW`**. `CONCURRENTLY` оставляет его доступным для чтения во время обновления и требует уникального индекса.

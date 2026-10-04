@@ -1,0 +1,439 @@
+---
+title: "Часть 3: рейтинги, скользящие средние и итоговый дашборд"
+description: Ранжируйте товары внутри категорий, найдите самых важных покупателей, сгладьте недельную выручку скользящим средним и упакуйте дашборд в представления.
+duration: 25
+xp: 30
+---
+
+Дашборд уже может рассказать команде, сколько покупателей активно, как быстро растёт выручка, возвращаются ли покупатели и где отваливаются посетители. Не хватает ещё двух видов плиток: **рейтингов (leaderboards)** («что продаётся лучше всего?») и **линий тренда**, которые не скачут каждую неделю. Затем мы упакуем все запросы в **представления (views)**, чтобы инструмент дашборда выполнял только `SELECT * FROM something`. 🏁
+
+## Рейтинги: три способа ранжировать
+
+«Хиты продаж по категориям» требуют ранжирования **внутри** каждой категории: оконной функции с `PARTITION BY category`. Три функции ранжирования отличаются только тем, как они обращаются с **равными значениями (ties)**. Вот они рядом — ранжируют товары по числу проданных штук:
+
+<CodeExample output={` category |        product         | units | row_number | rank | dense_rank
+----------+------------------------+-------+------------+------+------------
+ books    | Algorithms in Pictures |    17 |          1 |    1 |          1
+ books    | Clean Python           |     9 |          2 |    2 |          2
+ books    | The Bamboo Code        |     9 |          3 |    2 |          2
+ kitchen  | Bamboo Chopsticks      |    15 |          1 |    1 |          1
+ kitchen  | Rice Cooker            |     9 |          2 |    2 |          2
+ kitchen  | Tea Pot                |     9 |          3 |    2 |          2
+(6 rows)`}>
+
+```sql
+WITH product_sales AS (
+  SELECT p.category, p.name AS product,
+    sum(oi.quantity) AS units
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  JOIN products AS p ON p.id = oi.product_id
+  WHERE o.status <> 'cancelled'
+  GROUP BY p.id
+)
+SELECT category, product, units,
+  row_number() OVER (PARTITION BY category
+    ORDER BY units DESC, product) AS row_number,
+  rank() OVER w AS rank,
+  dense_rank() OVER w AS dense_rank
+FROM product_sales
+WHERE category IN ('books', 'kitchen')
+WINDOW w AS (PARTITION BY category ORDER BY units DESC)
+ORDER BY category, units DESC, product;
+```
+
+</CodeExample>
+
+Clean Python и The Bamboo Code продались по 9 экземпляров:
+
+- **`row_number()`** всегда нумерует строки 1, 2, 3 — есть равенство или нет. Здесь у него свой критерий для разрешения равенства (`ORDER BY units DESC, product`), поэтому Clean Python получает 2, а The Bamboo Code — 3. Без такого критерия то, какой из двух получит 2, произвольно и может меняться от запуска к запуску, а «топ-2», построенный на этом, молча выбросит один из двух равных товаров.
+- **`rank()`** даёт обоим 2, а следующий товар получил бы 4: он **пропускает** номера, как турнирная таблица.
+- **`dense_rank()`** даёт обоим 2, а следующий товар получил бы 3: без пропусков.
+
+Для плитки «топ-N» обычно подходит `rank()` или `dense_rank()`: при равенстве за второе место нужно показать оба товара. Используйте `row_number()`, когда нужно ровно N строк, и тогда добавьте критерий для равенства (`ORDER BY units DESC, product`), чтобы результат был хотя бы стабильным.
+
+## Топ-2 в каждой категории и их доля
+
+Оконную функцию нельзя использовать в `WHERE`, потому что `WHERE` выполняется **до** вычисления окон. Поэтому классический запрос «топ-N в каждой группе» ранжирует в CTE, а фильтрует снаружи. Заодно `sum(…) OVER (PARTITION BY category)` даёт итог по категории в каждой строке, и выручка превращается в **долю категории**:
+
+<CodeExample output={` category |        product         | revenue | category_rank | share_pct
+----------+------------------------+---------+---------------+-----------
+ books    | Algorithms in Pictures |  493.00 |             1 |        59
+ books    | Clean Python           |  224.91 |             2 |        27
+ kitchen  | Rice Cooker            |  809.10 |             1 |        70
+ kitchen  | Tea Pot                |  288.00 |             2 |        25
+ snacks   | Panda Cookies          |   60.00 |             1 |        69
+ snacks   | Bamboo Crisps          |   26.91 |             2 |        31
+ tea      | Earl Grey              |   42.00 |             1 |        52
+ tea      | Jasmine Tea            |   39.00 |             2 |        48
+ toys     | Wooden Puzzle          |  182.40 |             1 |        63
+ toys     | Kite                   |  105.00 |             2 |        37
+(10 rows)`}>
+
+```sql
+WITH product_sales AS (
+  SELECT p.category, p.name AS product,
+    sum(oi.quantity * oi.unit_price) AS revenue
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  JOIN products AS p ON p.id = oi.product_id
+  WHERE o.status <> 'cancelled'
+  GROUP BY p.id
+),
+ranked AS (
+  SELECT category, product, revenue,
+    dense_rank() OVER (PARTITION BY category
+      ORDER BY revenue DESC) AS category_rank,
+    round(100 * revenue
+      / sum(revenue) OVER (PARTITION BY category)) AS share_pct
+  FROM product_sales
+)
+SELECT *
+FROM ranked
+WHERE category_rank <= 2
+ORDER BY category, category_rank, product;
+```
+
+</CodeExample>
+
+Одна только Rice Cooker даёт 70% выручки категории kitchen. Этот риск заслуживает отдельной плитки: если у её поставщика возникнут проблемы, обрушится вся категория.
+
+## Какие покупатели важнее всего?
+
+Ещё одна любимая плитка: «наши лучшие покупатели приносят X% выручки». **Нарастающий итог (running total)** выручки, отсортированный от самого крупного покупателя вниз и поделённый на общий итог `sum(…) OVER ()`, даёт накопленную долю:
+
+<CodeExample output={`    name     | revenue | cumulative_pct | quartile
+-------------+---------+----------------+----------
+ Ravi Patel  |  282.23 |           11.5 |        1
+ Sam Ortiz   |  273.83 |           22.7 |        1
+ Sofia Rossi |  260.13 |           33.4 |        1
+ Diego López |  258.17 |           43.9 |        1
+ Kenji Mori  |  207.67 |           52.4 |        1
+ Mei Lin     |  200.17 |           60.6 |        2
+(6 rows)`}>
+
+```sql
+WITH customer_revenue AS (
+  SELECT c.name, sum(oi.quantity * oi.unit_price) AS revenue
+  FROM customers AS c
+  JOIN orders AS o ON o.customer_id = c.id
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY c.id
+)
+SELECT name, revenue,
+  round(100 * sum(revenue) OVER (ORDER BY revenue DESC, name)
+    / sum(revenue) OVER (), 1) AS cumulative_pct,
+  ntile(4) OVER (ORDER BY revenue DESC, name) AS quartile
+FROM customer_revenue
+ORDER BY revenue DESC, name
+LIMIT 6;
+```
+
+</CodeExample>
+
+5 лучших из 17 покупателей приносят больше половины выручки. В бизнесе это называют принципом **Парето (Pareto)** («80/20»), и он решает, куда направить усилия: эти пятеро заслуживают личного письма с благодарностью. **`ntile(4)`** делит покупателей на четыре почти равные группы (квартили) — удобно для сегментов вроде «лучшие 25% покупателей».
+
+Обратите внимание на критерий `name` для равенства в **обоих** оконных `ORDER BY`. Без него двух покупателей с одинаковой выручкой можно было бы просуммировать в любом порядке, и нарастающий итог отличался бы от запуска к запуску.
+
+## Линии тренда: скользящее среднее за 4 недели
+
+Недельная выручка скачет: один крупный заказ Rice Cooker делает неделю потрясающей. **Скользящее среднее (moving average)** сглаживает линию, усредняя каждую неделю с тремя предыдущими. Для него нужны две уже знакомые вещи: **календарь без пропусков** (пропущенная неделя испортила бы «три предыдущие недели») и **рамка окна (window frame)**:
+
+<CodeExample output={`    week    | revenue | avg_4_weeks
+------------+---------+-------------
+ 2025-04-07 |   52.20 |       98.11
+ 2025-04-14 |  114.74 |      124.69
+ 2025-04-21 |   22.80 |       92.96
+ 2025-04-28 |   17.85 |       51.90
+ 2025-05-05 |  109.50 |       66.22
+ 2025-05-12 |  200.17 |       87.58
+ 2025-05-19 |    8.40 |       83.98
+ 2025-05-26 |  207.73 |      131.45
+ 2025-06-02 |  124.10 |      135.10
+ 2025-06-09 |   52.20 |       98.11
+ 2025-06-16 |   36.24 |      105.07
+(11 rows)`}>
+
+```sql
+WITH paid_orders AS (
+  SELECT o.id, o.ordered_at,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+),
+weeks AS (
+  SELECT generate_series(date '2025-01-06', date '2025-06-16',
+    interval '1 week')::date AS week
+),
+weekly AS (
+  SELECT w.week, coalesce(sum(p.total), 0) AS revenue
+  FROM weeks AS w
+  LEFT JOIN paid_orders AS p
+    ON p.ordered_at >= w.week AND p.ordered_at < w.week + 7
+  GROUP BY w.week
+),
+smoothed AS (
+  SELECT week, revenue,
+    CASE WHEN count(*) OVER last_4 = 4
+      THEN round(avg(revenue) OVER last_4, 2)
+    END AS avg_4_weeks
+  FROM weekly
+  WINDOW last_4 AS (ORDER BY week
+    ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
+)
+SELECT *
+FROM smoothed
+WHERE week >= '2025-04-07'
+ORDER BY week;
+```
+
+</CodeExample>
+
+- **`ROWS BETWEEN 3 PRECEDING AND CURRENT ROW`** — это рамка: текущая неделя и три строки перед ней. `ROWS` считает строки, поэтому в календаре должна быть ровно одна строка на неделю, без пропусков.
+- У первых трёх недель года нет трёх предыдущих недель, поэтому их среднее строилось бы по меньшему числу недель. `CASE` с **`count(*) OVER last_4 = 4`** показывает NULL вместо обманчивого частичного среднего.
+- **Фильтр по дате стоит во внешнем запросе**, после того как окно сделало свою работу. Если поставить `WHERE week >= '2025-04-07'` внутрь `weekly`, первое апрельское среднее стало бы NULL, потому что нужных ему мартовских недель уже не было бы.
+
+Недельная выручка колеблется от 8.40 до 207.73, а среднее держится примерно между 50 и 135, так что тренд читать гораздо легче.
+
+## Упаковываем дашборд в представления
+
+Инструмент дашборда (Metabase, Grafana, Superset, Looker…) не должен хранить запросы на 40 строк: там их никто не ревьюит, а одна и та же логика «оплаченного заказа» копировалась бы в каждую плитку. Вместо этого каждый строительный блок становится **представлением (view)** в базе данных, а плитки обращаются к представлениям:
+
+<CodeExample output={`CREATE VIEW
+
+CREATE VIEW
+
+   month    | orders | active_customers | revenue
+------------+--------+------------------+---------
+ 2025-04-01 |      6 |                6 |  331.69
+ 2025-05-01 |      5 |                5 |  467.80
+ 2025-06-01 |      4 |                4 |  270.54
+(3 rows)`}>
+
+```sql
+CREATE VIEW paid_orders AS
+SELECT o.id, o.customer_id, o.ordered_at,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY o.id;
+
+CREATE VIEW monthly_kpis AS
+SELECT date_trunc('month', ordered_at)::date AS month,
+  count(*) AS orders,
+  count(DISTINCT customer_id) AS active_customers,
+  sum(total) AS revenue
+FROM paid_orders
+GROUP BY 1;
+
+SELECT *
+FROM monthly_kpis
+WHERE month >= '2025-04-01'
+ORDER BY month;
+```
+
+</CodeExample>
+
+Представления можно строить друг на друге: `monthly_kpis` построено на `paid_orders`, и определение оплаченного заказа теперь живёт **ровно в одном месте**. Когда финансовый отдел решит, что заказы `paid` не считаются, пока их не отправили, вы меняете одно представление, и все плитки следуют за ним.
+
+Представление выполняет свой запрос **каждый раз**, когда его читают. Это идеально для маленьких быстрых запросов. Для тяжёлых (скажем, когортной таблицы по миллионам заказов) используйте **материализованное представление (materialized view)**: оно хранит результат как таблица, а вы обновляете его по расписанию. Цена — оно может быть **устаревшим**:
+
+<CodeExample output={`CREATE MATERIALIZED VIEW
+
+INSERT 0 1
+
+INSERT 0 1
+
+   month    | revenue
+------------+---------
+ 2025-06-01 |  270.54
+(1 row)
+
+REFRESH
+
+   month    | revenue
+------------+---------
+ 2025-06-01 |  360.44
+(1 row)`}>
+
+```sql
+CREATE MATERIALIZED VIEW monthly_revenue AS
+SELECT date_trunc('month', o.ordered_at)::date AS month,
+  sum(oi.quantity * oi.unit_price) AS revenue
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY 1;
+
+-- Приходит новый заказ...
+INSERT INTO orders (customer_id, ordered_at, status)
+VALUES (3, '2025-06-20 12:00', 'paid');
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+SELECT max(id), 15, 1, 89.90 FROM orders;
+
+SELECT * FROM monthly_revenue WHERE month = '2025-06-01';
+
+REFRESH MATERIALIZED VIEW monthly_revenue;
+
+SELECT * FROM monthly_revenue WHERE month = '2025-06-01';
+```
+
+</CodeExample>
+
+Первый `SELECT` всё ещё показывает старую выручку за июнь; новая Rice Cooker появляется только после `REFRESH`. Дашборды на материализованных представлениях прямо пишут об этом на экране: «Данные на 06:00 сегодня».
+
+<Callout type="tip" title="Как сделать дашборд быстрым в продакшене">
+
+- **Проиндексируйте столбец времени**: почти каждая плитка фильтрует по диапазонам `ordered_at`, поэтому индекс по `orders (ordered_at)` превращает полное сканирование в сканирование диапазона. Пишите фильтры так, чтобы индекс мог их использовать (sargable): `ordered_at >= …`, но никогда `date_trunc(…, ordered_at) = …`.
+- **Обновляйте, не блокируя читателей**: обычный `REFRESH MATERIALIZED VIEW` не пускает читателей, пока работает. `REFRESH MATERIALIZED VIEW CONCURRENTLY` не блокирует, но ему нужен **уникальный индекс** на материализованном представлении (здесь — по `month`).
+- **Агрегируйте заранее**: при миллионах событий в день команды держат таблицу `daily_stats`, которую ночная задача заполняет одной строкой на день, и дашборд читает только её.
+- **Используйте реплику**: тяжёлые аналитические запросы выполняются на реплике для чтения (read replica), чтобы они не замедляли оформление заказов покупателями на основном сервере.
+
+</Callout>
+
+## Итоговый набор запросов дашборда
+
+Вот весь дашборд, плитка за плиткой, с техникой, которая стоит за каждой:
+
+| Плитка | Запрос | Чем построено |
+| --- | --- | --- |
+| Выручка, заказы, активные покупатели за этот месяц (относительно прошлого) | `monthly_kpis` + `lag()` | `date_trunc`, `count(DISTINCT)`, `nullif` |
+| График активных покупателей по дням | календарь + LEFT JOIN | `generate_series`, условия в `ON` |
+| Активные за последние 30 дней | соединение по диапазону | `count(DISTINCT)` на каждый день календаря |
+| Треугольник удержания по когортам | сетка + сводная таблица | `age()`, `max(…) FILTER`, NULL для будущего |
+| Воронка конверсии (по устройствам) | шаги в `VALUES` + LEFT JOIN | `first_value`, `lag`, `PARTITION BY` |
+| Хиты продаж по категориям | ранжирование в CTE, фильтр снаружи | `dense_rank`, `sum() OVER (PARTITION BY)` |
+| Лучшие покупатели | нарастающая доля | `sum() OVER (ORDER BY)`, `ntile` |
+| Тренд недельной выручки | календарь + скользящее среднее | `ROWS BETWEEN 3 PRECEDING AND CURRENT ROW` |
+
+Каждую строку этой таблицы вы теперь написали сами. 🐼
+
+<Quiz
+  question="Почему запрос «топ-N в каждой группе» ранжирует строки в CTE, а фильтрует через WHERE во внешнем запросе?"
+  options={["Потому что CTE быстрее подзапросов", "Потому что оконные функции вычисляются после WHERE, поэтому их нельзя использовать в WHERE того же запроса", "Потому что dense_rank() работает только внутри CTE", "Потому что ORDER BY должен идти перед WHERE"]}
+  answer={1}
+  explanation="PostgreSQL сначала вычисляет FROM, WHERE, GROUP BY и HAVING, затем оконные функции, затем ORDER BY и LIMIT. Чтобы отфильтровать по результату оконной функции, нужен ещё один уровень запроса вокруг: CTE или подзапрос."
+/>
+
+<Quiz
+  question="Плитка дашборда читает из материализованного представления, которое обновляется каждую ночь в 06:00. Заказ оформлен в 10:00. Когда плитка его покажет?"
+  options={["Сразу, как обычное представление", "После следующего обновления, в 06:00 следующего дня", "Никогда, материализованные представления не меняются", "Как только кто-то выполнит SELECT из представления"]}
+  answer={1}
+  explanation="Материализованное представление хранит результат запроса на момент создания или обновления. Чтение возвращает этот сохранённый результат, поэтому новые строки появляются только после следующего REFRESH MATERIALIZED VIEW."
+/>
+
+<Exercise
+  language="sql"
+  title="Финальное задание: представления дашборда"
+  starter={`-- 1. Оплаченные заказы с суммами (готово)
+CREATE VIEW paid_orders AS
+SELECT o.id, o.customer_id, o.ordered_at,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY o.id;
+
+-- 2. product_leaderboard:
+--    category, product, revenue, category_rank
+
+
+-- 3. weekly_revenue:
+--    week, revenue, avg_4_weeks
+
+
+-- 4. Плитка хитов продаж: топ-2 в каждой категории
+SELECT 'todo' AS category;`}
+  tests={[
+    { name: "У product_leaderboard столбцы category, product, revenue, category_rank", check: "(await query(\"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) AS c FROM information_schema.columns WHERE table_name = 'product_leaderboard'\"))[0].c === 'category,product,revenue,category_rank'" },
+    { name: "Лидеры каждой категории верны", check: "(await query(\"SELECT product, revenue FROM product_leaderboard WHERE category_rank = 1 ORDER BY category\")).map(r => r.product + ' ' + r.revenue).join() === 'Algorithms in Pictures 493,Rice Cooker 809.1,Panda Cookies 60,Earl Grey 42,Wooden Puzzle 182.4'" },
+    { name: "Плитка показывает топ-2 в каждой категории, отсортированные по категории, рангу и товару", check: "columns.join() === 'category,product,revenue,category_rank' && rows.length === 10 && rows.map(r => r.category_rank).join() === '1,2,1,2,1,2,1,2,1,2' && rows[1].product === 'Clean Python'" },
+    { name: "В weekly_revenue 24 недели без пропусков со средним за 4 недели (NULL для первых трёх)", check: "(rs => rs.length === 24 && rs.map(r => r.week + ' ' + r.revenue + ' ' + r.avg_4_weeks).filter((r, i) => i < 4 || i === 23).join() === '2025-01-06 302.17 null,2025-01-13 8.4 null,2025-01-20 149.73 null,2025-01-27 182.1 160.6,2025-06-16 36.24 105.07')(await query(\"SELECT week, revenue, avg_4_weeks FROM weekly_revenue ORDER BY week\"))" },
+    { name: "Неделя без оплаченных заказов показывает выручку 0", check: "(await query(\"UPDATE orders SET status = 'cancelled' WHERE id = 3\"), await query(\"SELECT revenue, avg_4_weeks FROM weekly_revenue WHERE week = '2025-01-27'\")).map(r => r.revenue + ' ' + r.avg_4_weeks).join() === '182.1 158.5'" },
+    { name: "Равные значения делят ранг, без пропуска после них (dense_rank)", check: "(await rerun(\"INSERT INTO orders (customer_id, ordered_at, status) VALUES (3, '2025-06-18 12:00', 'paid'); INSERT INTO order_items SELECT max(id), 12, 1, 77.40 FROM orders\")).filter(r => r.category === 'toys').map(r => r.product + ' ' + r.category_rank).join() === 'Kite 1,Wooden Puzzle 1'" },
+    { name: "Представления живые: новые заказы появляются в weekly_revenue", check: "(await query(\"INSERT INTO orders (customer_id, ordered_at, status) VALUES (3, '2025-06-18 12:00', 'paid')\"), await query(\"INSERT INTO order_items SELECT max(id), 12, 1, 77.40 FROM orders\"), (await query(\"SELECT revenue FROM weekly_revenue WHERE week = '2025-06-16'\"))[0].revenue === 113.64)" },
+  ]}
+>
+
+Пора выпускать дашборд. 🚀 В заготовке уже есть представление `paid_orders`. Добавьте поверх него ещё два представления, а затем запрос для плитки хитов продаж:
+
+1. **`product_leaderboard`** со столбцами `category`, `product` (название товара), `revenue` (по оплаченным заказам) и `category_rank`: `dense_rank()` выручки товара внутри его категории, начиная с наибольшей. В нём есть только товары, которые хоть что-то продали.
+2. **`weekly_revenue`** со столбцами `week` (дата, понедельник каждой недели с `2025-01-06` по `2025-06-16`), `revenue` (`0` для недели без оплаченных заказов) и `avg_4_weeks`: средняя выручка этой недели и трёх предыдущих, округлённая до 2 знаков, или NULL, если 4 недель ещё не набралось.
+3. Наконец, **плитку хитов продаж**: выберите всё из `product_leaderboard`, где `category_rank` не больше 2, с сортировкой по категории, рангу и товару.
+
+Проверки потом меняют данные и снова читают ваши представления, поэтому это должны быть именно представления, а не таблицы.
+
+<Hint>
+
+`product_leaderboard`: соедините `paid_orders` с `order_items` и `products`, сгруппируйте по `p.id` в CTE, затем добавьте `dense_rank() OVER (PARTITION BY category ORDER BY revenue DESC)`. `weekly_revenue`: скопируйте запрос со скользящим средним из этого урока — календарь `weeks` с `generate_series(date '2025-01-06', date '2025-06-16', interval '1 week')::date`, LEFT JOIN по полуоткрытому диапазону недели с `coalesce(sum(p.total), 0)`, затем `CASE WHEN count(*) OVER last_4 = 4 THEN round(avg(revenue) OVER last_4, 2) END` с рамкой `ROWS BETWEEN 3 PRECEDING AND CURRENT ROW`. Представление может начинаться с `WITH`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE VIEW paid_orders AS
+SELECT o.id, o.customer_id, o.ordered_at,
+  sum(oi.quantity * oi.unit_price) AS total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled'
+GROUP BY o.id;
+
+CREATE VIEW product_leaderboard AS
+WITH product_sales AS (
+  SELECT p.category, p.name AS product,
+    sum(oi.quantity * oi.unit_price) AS revenue
+  FROM paid_orders AS po
+  JOIN order_items AS oi ON oi.order_id = po.id
+  JOIN products AS p ON p.id = oi.product_id
+  GROUP BY p.id
+)
+SELECT category, product, revenue,
+  dense_rank() OVER (PARTITION BY category
+    ORDER BY revenue DESC) AS category_rank
+FROM product_sales;
+
+CREATE VIEW weekly_revenue AS
+WITH weeks AS (
+  SELECT generate_series(date '2025-01-06', date '2025-06-16',
+    interval '1 week')::date AS week
+),
+weekly AS (
+  SELECT w.week, coalesce(sum(p.total), 0) AS revenue
+  FROM weeks AS w
+  LEFT JOIN paid_orders AS p
+    ON p.ordered_at >= w.week AND p.ordered_at < w.week + 7
+  GROUP BY w.week
+)
+SELECT week, revenue,
+  CASE WHEN count(*) OVER last_4 = 4
+    THEN round(avg(revenue) OVER last_4, 2)
+  END AS avg_4_weeks
+FROM weekly
+WINDOW last_4 AS (ORDER BY week
+  ROWS BETWEEN 3 PRECEDING AND CURRENT ROW);
+
+SELECT *
+FROM product_leaderboard
+WHERE category_rank <= 2
+ORDER BY category, category_rank, product;
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+За три части вы написали все запросы, стоящие за настоящим продуктовым дашбордом:
+
+- **Часть 1**: **определения** метрик, **активные покупатели** по месяцам и дням на календаре без пропусков, **рост** относительно предыдущего периода с `lag()` и сопоставимые сравнения для незаконченных месяцев.
+- **Часть 2**: **когорты** и **треугольник удержания**, который отличает «ещё нет» от «никогда», и **воронка конверсии** — общая и по устройствам.
+- **Часть 3**: **рейтинги** с `rank`/`dense_rank`, нарастающая доля по **Парето**, **скользящее среднее** с рамкой окна, и всё это упаковано в **представления** и **материализованные представления**.
+
+🎉 **Поздравляем, вы завершили Уровень 2!** Вы умеете ранжировать, сравнивать и сглаживать данные оконными функциями, разворачивать таблицы с `FILTER`, обходить иерархии рекурсивными CTE, работать с JSON, читать планы запросов, выбирать индексы и создавать представления, функции и триггеры. Это инструментарий профессионального аналитика данных и крепкого backend-разработчика. Уровень 3 ведёт туда, где живут senior-инженеры: что происходит, когда **много** пользователей меняют одни и те же данные в один и тот же момент. Начнём с транзакций и конкурентного доступа.

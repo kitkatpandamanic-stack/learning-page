@@ -1,0 +1,353 @@
+---
+title: SQL-инъекции
+description: Узнайте, как возникает SQL-инъекция, когда код вклеивает ввод в SQL, безопасно проэксплуатируйте её в песочнице и исправьте с помощью параметров, format() с %I и %L и белых списков.
+duration: 22
+xp: 30
+---
+
+**SQL-инъекция (SQL injection)** уже больше двадцати лет входит во все топ-10 угроз веб-безопасности и до сих пор становится причиной крупных утечек данных. Причина всегда одна и та же: программа собирает SQL, **вклеивая пользовательский ввод в текст SQL**, и ввод, содержащий синтаксис SQL, **выполняется** как SQL. В этом уроке вы проэксплуатируете такую уязвимость (безопасно, в своей песочнице), а затем изучите способы защиты — они простые, и применять их нужно каждый раз без исключений. 💉
+
+## Как это происходит в коде приложения
+
+Вот эндпоинт поиска, написанный неправильно, на Python и на JavaScript:
+
+```python
+# Python (psycopg): ТАК НЕЛЬЗЯ
+city = request.args["city"]
+cur.execute(f"SELECT id, name FROM customers WHERE city = '{city}'")
+```
+
+```js
+// JavaScript (node-postgres): ТАК НЕЛЬЗЯ
+const city = req.query.city;
+await pool.query(`SELECT id, name FROM customers WHERE city = '${city}'`);
+```
+
+При `city = London` база данных получает ровно то, чего ожидал разработчик. Но `city` контролирует пользователь, и ничто не мешает ему вставить туда кавычку:
+
+```text
+ввод:    x' OR '1'='1
+запрос:  SELECT id, name FROM customers WHERE city = 'x' OR '1'='1'
+                                                     └──── SQL атакующего ───┘
+```
+
+Кавычка **досрочно закрывает строку**, и остаток ввода становится частью запроса. `'1'='1'` всегда истинно, поэтому `WHERE` подходит под каждую строку.
+
+## Смотрим, как это происходит
+
+Та же ошибка может жить и внутри базы данных — в функции на PL/pgSQL, которая собирает строку запроса и выполняет её через `EXECUTE`. Это позволяет попробовать настоящие атаки прямо здесь:
+
+<CodeExample output={`CREATE FUNCTION
+
+ id |    name    |  city
+----+------------+--------
+  1 | Mei Lin    | London
+  3 | Ada Brooks | London
+(2 rows)
+
+ leaked
+--------
+     20
+(1 row)`}>
+
+```sql
+-- ТАК НЕЛЬЗЯ: ввод склеивается с текстом SQL
+CREATE FUNCTION find_customers(search_city text)
+RETURNS TABLE (id integer, name text, city text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT id, name, city FROM customers WHERE city = '''
+    || search_city || ''' ORDER BY id';
+END $$;
+
+SELECT * FROM find_customers('London');
+
+SELECT count(*) AS leaked
+FROM find_customers($$x' OR '1'='1$$);
+```
+
+</CodeExample>
+
+(`$$…$$` — это **строки в долларовых кавычках (dollar quoting)**: строковый литерал, в котором `'` не нужно экранировать. Так строки атак просто легче читать.)
+
+Лишние клиенты в ответе — это только начало. С помощью **`UNION`** злоумышленник может заставить запрос вернуть строки из **любой таблицы**, которую может читать подключение, — лишь бы совпадали количество и типы столбцов. А `--` закомментирует остаток исходного запроса:
+
+<CodeExample output={`CREATE FUNCTION
+
+ id |      name      |  city
+----+----------------+--------
+  7 | Barbara Liskov | 105000
+ 18 | Marie Curie    | 112000
+  2 | Alan Turing    | 130000
+  1 | Grace Hopper   | 150000
+(4 rows)`}>
+
+```sql
+CREATE FUNCTION find_customers(search_city text)
+RETURNS TABLE (id integer, name text, city text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT id, name, city FROM customers WHERE city = '''
+    || search_city || ''' ORDER BY id';
+END $$;
+
+SELECT * FROM find_customers(
+  $$x' UNION SELECT id, name, salary::text FROM employees
+     WHERE salary > 100000 ORDER BY 3 --$$
+);
+```
+
+</CodeExample>
+
+Поле «найти клиентов по городу» только что слило зарплаты руководителей. Настоящие атакующие идут дальше:
+
+- **Составные запросы (stacked queries)**: `x'; DROP TABLE orders; --` срабатывает с драйверами, которые отправляют несколько инструкций в одной строке.
+- **Слепая инъекция (blind injection)**: когда ничего не выводится, задают вопросы с ответом «да/нет» (`… AND (SELECT salary FROM employees WHERE id = 1) > 100000 --`) и смотрят, меняется ли страница, или засекают время с помощью `pg_sleep(5)`.
+- **Инъекция через ошибки (error-based)**: вызывают ошибки, в сообщениях которых оказываются данные, например `CAST((SELECT email FROM customers LIMIT 1) AS integer)`.
+
+Экранирование кавычек вручную («заменить `'` на `''`») — не решение: об этом легко один раз забыть, и это не помогает с числами, идентификаторами и шаблонами `LIKE`.
+
+## Решение: параметры
+
+**Параметризованный запрос (parameterised query)** отправляет текст SQL и значения **отдельно**. Сначала разбирается SQL с заполнителями вроде `$1`; значения приходят потом, и с ними всегда обращаются только как с **данными**. Что бы ни ввёл пользователь, структуру запроса это изменить не может. Тот же механизм можно увидеть в чистом SQL с помощью `PREPARE` и `EXECUTE`:
+
+<CodeExample output={`PREPARE
+
+ id |    name
+----+------------
+  1 | Mei Lin
+  3 | Ada Brooks
+(2 rows)
+
+ id | name
+----+------
+(0 rows)`}>
+
+```sql
+PREPARE customers_in(text) AS
+  SELECT id, name
+  FROM customers
+  WHERE city = $1
+  ORDER BY id;
+
+EXECUTE customers_in('London');
+
+EXECUTE customers_in($$x' OR '1'='1$$);
+```
+
+</CodeExample>
+
+Строка атаки теперь просто странное название города, под которое никто не подходит. В PL/pgSQL динамический SQL получает параметры через **`EXECUTE … USING`**:
+
+<CodeExample output={`CREATE FUNCTION
+
+ leaked
+--------
+      0
+(1 row)`}>
+
+```sql
+CREATE FUNCTION find_customers(search_city text)
+RETURNS TABLE (id integer, name text, city text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT id, name, city FROM customers
+     WHERE city = $1 ORDER BY id'
+    USING search_city;
+END $$;
+
+SELECT count(*) AS leaked
+FROM find_customers($$x' OR '1'='1$$);
+```
+
+</CodeExample>
+
+(Если запросу вообще не нужно быть динамическим, не используйте `EXECUTE`: обычный SQL внутри функции параметризуется автоматически.) В коде приложения параметры поддерживает любой драйвер. Используйте их для **каждого** значения, даже для тех, которые вы «точно знаете», что безопасны:
+
+```python
+# Python (psycopg 3): драйвер отправляет city отдельно
+cur.execute(
+    "SELECT id, name FROM customers WHERE city = %s",
+    (city,),
+)
+# %s здесь — заполнитель, а НЕ форматирование через % в Python:
+# никогда не пишите "... = %s" % city
+```
+
+```js
+// JavaScript (node-postgres)
+const { rows } = await pool.query(
+  "SELECT id, name FROM customers WHERE city = $1",
+  [city],
+);
+```
+
+ORM и построители запросов параметризуют за вас — пока вы не воспользуетесь их «сырыми» лазейками. Знайте, какие из них безопасны в вашем стеке:
+
+```js
+// Prisma
+await prisma.$queryRaw`SELECT * FROM customers WHERE city = ${city}`;
+//   безопасно: тегированный шаблон превращает ${city} в параметр
+await prisma.$queryRawUnsafe(`SELECT … WHERE city = '${city}'`);
+//   небезопасно: обычная строка, склеенная из кусков
+```
+
+```python
+# SQLAlchemy
+session.execute(text("SELECT * FROM customers WHERE city = :city"),
+                {"city": city})            # безопасно
+session.execute(text(f"SELECT * FROM customers WHERE city = '{city}'"))
+                                           # небезопасно
+```
+
+## Динамические идентификаторы: format() и белые списки
+
+Параметры могут заменять только **значения**. Имена таблиц и столбцов, `ASC`/`DESC` и ключевые слова параметрами быть не могут, а приложениям они часто нужны («сортировать по столбцу, на который нажал пользователь»). Для них используйте функции экранирования PostgreSQL, а ещё лучше — **белый список (allow-list)**.
+
+**`format()`** безопасно собирает текст SQL: `%I` экранирует **идентификатор (identifier)** (добавляет двойные кавычки, когда нужно, и экранирует их), `%L` экранирует **литерал (literal)** (добавляет одинарные кавычки и экранирует их). `quote_ident()` и `quote_literal()` делают то же самое для одного значения:
+
+<CodeExample output={`                       safe_sql
+------------------------------------------------------
+ SELECT name FROM "Customers" WHERE city = 'O''Brien'
+(1 row)
+
+        attack_becomes_a_name
+-------------------------------------
+ ORDER BY "price; DROP TABLE orders"
+(1 row)`}>
+
+```sql
+SELECT format(
+  'SELECT %I FROM %I WHERE city = %L',
+  'name', 'Customers', $$O'Brien$$
+) AS safe_sql;
+
+SELECT format('ORDER BY %I', $$price; DROP TABLE orders$$)
+  AS attack_becomes_a_name;
+```
+
+</CodeExample>
+
+Атака превращается в одно длинное безобидное (и несуществующее) имя столбца. И всё же для идентификаторов лучше использовать **белый список**: сверяйте ввод с несколькими ожидаемыми значениями и отклоняйте всё остальное. Так проще рассуждать о коде, а пользователи получают понятную ошибку вместо «column does not exist»:
+
+```js
+const SORTABLE = { name: "name", price: "price", newest: "created_at" };
+const column = SORTABLE[req.query.sort] ?? "name";       // белый список
+const direction = req.query.dir === "desc" ? "DESC" : "ASC";
+await pool.query(
+  `SELECT * FROM products WHERE category = $1
+   ORDER BY ${column} ${direction}`,                      // только наши строки
+  [req.query.category],                                   // параметр
+);
+```
+
+<Callout type="warning" title="Для LIKE нужен ещё один шаг">
+
+`WHERE name ILIKE $1` с параметром `'%' + input + '%'` защищён от инъекции, но пользователь всё равно может ввести `%` и `_` — это **подстановочные символы (wildcards)**. Поиск по `%%%%%%%%` может превратиться в очень медленный запрос. Экранируйте их, прежде чем добавлять свои: в SQL — `replace(replace(replace(input, '\', '\\'), '%', '\%'), '_', '\_')`.
+
+</Callout>
+
+## Эшелонированная защита
+
+Параметры останавливают инъекции. А эти меры ограничивают ущерб, если ошибка всё-таки проскочит:
+
+- **Минимальные привилегии** (из [урока о ролях](/learn/sql/roles-and-privileges)): роль приложения без прав на DDL не сможет выполнить `DROP TABLE`, а роль без доступа к `employees` не сольёт зарплаты через `UNION`.
+- **Защита на уровне строк** (следующий урок): даже запрос, потерявший свой `WHERE`, увидит только строки текущего пользователя.
+- **Обобщённые сообщения об ошибках** для пользователей. Подробные ошибки PostgreSQL помогают атакующим; записывайте их в лог на сервере.
+- **Инъекция второго порядка (second-order injection)**: данные, которые были безопасно сохранены, всё равно могут стать опасными, когда их **позже** вклеят в SQL, — например, сохранённый «фильтр отчёта» или имя таблицы в строке настроек. Считайте значения из собственной базы тоже недоверенным вводом.
+- **Линтеры**: Bandit и Semgrep (Python), плагины ESLint (JavaScript) и ревью кода должны помечать любую сборку строк вокруг `execute`/`query`.
+
+<Callout type="note" title="Межсетевые экраны для веб-приложений">
+
+WAF, который блокирует запросы с `' OR 1=1`, ловит скрипт-кидди, но не настойчивых атакующих: один и тот же SQL можно записать бесконечным числом способов. Это ремень безопасности, а не исправление. Исправьте запрос.
+
+</Callout>
+
+<Quiz
+  question="Какой из вариантов защищён от SQL-инъекции?"
+  options={["Экранировать ввод через email.replace(\"'\", \"''\") и вклеить его", "pool.query('SELECT * FROM users WHERE email = $1', [email])", "cur.execute(f\"SELECT * FROM users WHERE email = '{email}'\")", "prisma.$queryRawUnsafe с почтой, вклеенной в строку"]}
+  answer={1}
+  explanation="Только параметризованный запрос отправляет значение отдельно от текста SQL. Ручное экранирование ненадёжно, а два других варианта вклеивают ввод прямо в запрос."
+/>
+
+<Quiz
+  question="Пользователи могут выбирать, по какому столбцу сортировать. Как имя столбца должно попадать в запрос?"
+  options={["Как параметр, например ORDER BY $1", "Вклеиваться как есть, ведь имена столбцов не могут содержать SQL", "Проверяться по белому списку известных столбцов (или экранироваться через format('%I'))", "Экранироваться заменой ' на ''"]}
+  answer={2}
+  explanation="Параметры могут быть только значениями: ORDER BY $1 сортирует по константе и ничего не меняет. Идентификаторы нужно проверять по белому списку или экранировать через %I / quote_ident."
+/>
+
+<Exercise
+  language="sql"
+  title="Исправьте поиск товаров"
+  starter={`-- ТАК НЕЛЬЗЯ: в этот поиск можно внедрить SQL через оба аргумента.
+CREATE FUNCTION search_products(cat text, sort_by text)
+RETURNS TABLE (name text, category text, price numeric)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT name, category, price FROM products'
+    || ' WHERE category = ''' || cat || ''''
+    || ' ORDER BY ' || sort_by || ', name';
+END $$;
+
+SELECT * FROM search_products('tea', 'price');
+`}
+  tests={[
+    { name: "search_products('tea', 'price') возвращает чаи, сначала самые дешёвые", check: "columns.join() === 'name,category,price' && rows.map(r => r.name).join() === 'Earl Grey,Jasmine Tea,Matcha Powder'" },
+    { name: "Сортировка по name и по stock работает", check: "(await query(\"SELECT string_agg(name, ',') AS s FROM search_products('toys', 'name')\"))[0].s === 'Kite,Plush Panda,Wooden Puzzle' && (await query(\"SELECT string_agg(name, ',') AS s FROM search_products('books', 'stock')\"))[0].s === 'Clean Python,Algorithms in Pictures,The Bamboo Code'" },
+    { name: "Инъекция через cat ничего не возвращает", check: "(await query(\"SELECT count(*) AS n FROM search_products($$x' OR '1'='1$$, 'price')\"))[0].n === 0" },
+    { name: "Категория с кавычкой работает", check: "(await query(\"INSERT INTO products (name, category, price) VALUES ('Yo-yo', 'kids'' toys', 3)\"), (await query(\"SELECT count(*) AS n FROM search_products('kids'' toys', 'name')\"))[0].n === 1)" },
+    { name: "Инъекция через sort_by отклоняется", check: "await query(\"SELECT * FROM search_products('tea', '(SELECT CASE WHEN (SELECT salary FROM employees WHERE id = 1) > 100000 THEN price ELSE stock END)')\").then(() => false, () => true)" },
+    { name: "Для sort_by разрешены только name, price и stock", check: "await query(\"SELECT * FROM search_products('tea', 'id')\").then(() => false, () => true)" },
+  ]}
+>
+
+Функция поиска в магазине вклеивает оба аргумента в свой SQL. Перепишите её (то же имя, те же аргументы и те же столбцы результата) так, чтобы:
+
+1. `cat` передавался как **параметр** через `EXECUTE … USING`.
+2. `sort_by` был одним из значений **`name`**, **`price`** или **`stock`**: на всё остальное выбрасывается исключение (`RAISE EXCEPTION 'cannot sort by %', sort_by;`).
+3. Разрешённый столбец попадал в SQL через **`format()`** и `%I`. Оставьте `name` вторым ключом сортировки.
+
+<Hint>
+
+Начните тело функции с белого списка: `IF sort_by NOT IN ('name', 'price', 'stock') THEN RAISE EXCEPTION …; END IF;`. Затем `RETURN QUERY EXECUTE format('SELECT name, category, price FROM products WHERE category = $1 ORDER BY %I, name', sort_by) USING cat;`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE FUNCTION search_products(cat text, sort_by text)
+RETURNS TABLE (name text, category text, price numeric)
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF sort_by NOT IN ('name', 'price', 'stock') THEN
+    RAISE EXCEPTION 'cannot sort by %', sort_by;
+  END IF;
+
+  RETURN QUERY EXECUTE format(
+    'SELECT name, category, price FROM products
+     WHERE category = $1
+     ORDER BY %I, name',
+    sort_by
+  ) USING cat;
+END $$;
+
+SELECT * FROM search_products('tea', 'price');
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- SQL-инъекция возникает, когда ввод **вклеивается в текст SQL**; кавычка во вводе закрывает строку, и остаток выполняется как SQL (`OR '1'='1'`, `UNION SELECT …`, составные запросы, слепые атаки и атаки через ошибки).
+- Решение — **параметры** для каждого значения: `$1` в node-postgres, `%s` в psycopg, `EXECUTE … USING` в PL/pgSQL, `PREPARE`/`EXECUTE` в чистом SQL. Остерегайтесь «raw/unsafe»-методов ORM.
+- Идентификаторы не могут быть параметрами: используйте **белый список** или `format()` с **`%I`** (идентификаторы) и **`%L`** (литералы), либо `quote_ident()` / `quote_literal()`.
+- Экранируйте `%` и `_` во вводе для `LIKE`.
+- Ограничивайте ущерб минимальными привилегиями, защитой на уровне строк, обобщёнными сообщениями об ошибках и линтерами, а сохранённые данные тоже считайте недоверенными.

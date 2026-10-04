@@ -1,0 +1,526 @@
+---
+title: Миграции без простоя
+description: Безопасно меняйте схему нагруженной базы данных — с тайм-аутами блокировок, изменениями без перезаписи таблиц, ограничениями NOT VALID, подходом expand/contract и заполнением порциями.
+duration: 25
+xp: 30
+---
+
+**Миграция (migration)** — это версионированный скрипт, который меняет схему: добавляет столбец, ограничение, индекс. На вашем ноутбуке любая миграция выполняется за миллисекунды. В продакшене тот же `ALTER TABLE` может положить весь сайт, потому что в таблице 200 миллионов строк и её используют тысячи запросов в секунду. Этот урок о том, как менять базу данных **во время работы**, без простоя (downtime). 🚧
+
+## Каждый ALTER TABLE берёт блокировку
+
+Реальный инцидент вкратце: команда добавила в таблицу `orders` столбец, допускающий NULL. Само изменение занимает миллисекунду. И всё же сайт лежал четыре минуты. Вот почему. Большинству форм `ALTER TABLE` нужна блокировка (lock) **`ACCESS EXCLUSIVE`** — самая сильная из существующих: пока она удерживается, никто другой не может даже читать таблицу. Блокировки, которые держит ваша собственная транзакция, видны в `pg_locks`:
+
+<CodeExample output={`BEGIN
+
+ALTER TABLE
+
+        mode
+---------------------
+ AccessExclusiveLock
+(1 row)
+
+ROLLBACK
+
+BEGIN
+
+CREATE INDEX
+
+   mode
+-----------
+ ShareLock
+(1 row)
+
+ROLLBACK`}>
+
+```sql
+BEGIN;
+ALTER TABLE orders ADD COLUMN note text;
+
+SELECT mode
+FROM pg_locks
+WHERE relation = 'orders'::regclass
+  AND pid = pg_backend_pid();
+ROLLBACK;
+
+BEGIN;
+CREATE INDEX orders_status ON orders (status);
+
+SELECT mode
+FROM pg_locks
+WHERE relation = 'orders'::regclass
+  AND pid = pg_backend_pid();
+ROLLBACK;
+```
+
+</CodeExample>
+
+Обычный `CREATE INDEX` берёт блокировку `SHARE`: чтение продолжается, но каждый `INSERT`, `UPDATE` и `DELETE` ждёт, пока индекс не будет построен. А теперь сам инцидент по минутам:
+
+```text
+10:00:00  Стартует отчёт: SELECT … FROM orders  (идёт 4 минуты,
+          держит слабую блокировку ACCESS SHARE)
+10:00:05  Миграция: ALTER TABLE orders ADD COLUMN note text;
+          нужна ACCESS EXCLUSIVE, приходится ждать отчёт
+10:00:06  Оформление заказа: SELECT … FROM orders WHERE id = …
+          тоже ждёт: он в очереди ПОЗАДИ ждущего ALTER
+10:00:06+ все запросы к orders встают в очередь; соединения
+          заканчиваются; сайт лежит
+10:04:00  Отчёт завершается; ALTER выполняется за 1 мс; очередь рассасывается
+```
+
+Сам `ALTER` не делал ничего медленного. Он **ждал**, а всё остальное ждало за ним. Решение — быстро сдаваться вместо ожидания: задайте для миграций **`lock_timeout`** и повторите попытку позже, если он сработает:
+
+```sql
+SET lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN note text;
+-- ERROR:  canceling statement due to lock timeout
+-- → ничего не изменилось, никто не был заблокирован дольше 2 с; повторите
+```
+
+Задайте для миграций и `statement_timeout`, а перед началом проверьте `pg_stat_activity` на долгие запросы.
+
+## Быстрые изменения и перезапись таблицы
+
+Держать сильную блокировку миллисекунду — нормально. Держать её, пока PostgreSQL **перезаписывает всю таблицу** (копирует каждую строку в новый файл), — это авария. Одни изменения затрагивают только системный каталог, другие перезаписывают таблицу. Отличить их можно по номеру файла таблицы, `pg_relation_filenode()`: он меняется, когда таблица перезаписывается:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE TABLE
+
+INSERT 0 1
+
+CREATE FUNCTION
+
+ALTER TABLE
+
+ALTER TABLE
+
+ after_add_columns
+-------------------
+ f
+(1 row)
+
+ALTER TABLE
+
+ after_volatile_default
+------------------------
+ t
+(1 row)
+
+ALTER TABLE
+
+ after_type_change
+-------------------
+ t
+(1 row)`}>
+
+```sql
+CREATE TABLE events AS
+SELECT g AS id, 'click' AS kind
+FROM generate_series(1, 100000) AS g;
+
+CREATE TABLE file_seen (node oid);
+INSERT INTO file_seen SELECT pg_relation_filenode('events');
+
+-- true, если events перезаписали с момента прошлого вызова
+CREATE FUNCTION rewritten() RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+  changed boolean;
+BEGIN
+  SELECT node <> pg_relation_filenode('events')
+  INTO changed FROM file_seen;
+  UPDATE file_seen SET node = pg_relation_filenode('events');
+  RETURN changed;
+END $$;
+
+ALTER TABLE events ADD COLUMN source text;
+ALTER TABLE events ADD COLUMN seen boolean NOT NULL DEFAULT false;
+SELECT rewritten() AS after_add_columns;
+
+ALTER TABLE events ADD COLUMN token uuid DEFAULT gen_random_uuid();
+SELECT rewritten() AS after_volatile_default;
+
+ALTER TABLE events ALTER COLUMN id TYPE bigint;
+SELECT rewritten() AS after_type_change;
+```
+
+</CodeExample>
+
+Добавить столбец, допускающий NULL, или столбец с **постоянным** значением по умолчанию можно мгновенно: PostgreSQL один раз сохраняет значение по умолчанию в каталоге и подставляет его при чтении старых строк. **Изменчивое (volatile)** значение по умолчанию (`gen_random_uuid()`, `clock_timestamp()`) нужно вычислить для каждой строки, поэтому таблица перезаписывается. Смена типа столбца обычно тоже вызывает перезапись. Шпаргалка:
+
+| Изменение | Цена |
+| --- | --- |
+| `ADD COLUMN` (допускает NULL или с постоянным `DEFAULT`) | Мгновенно |
+| `ADD COLUMN … DEFAULT gen_random_uuid()` | Перезапись |
+| `ALTER COLUMN … TYPE` (например, `integer` → `bigint`) | Перезапись (и перестроение индексов) |
+| `varchar(50)` → `varchar(100)` или `text` | Мгновенно |
+| `DROP COLUMN` | Мгновенно (место освобождается позже) |
+| `ADD CONSTRAINT … CHECK` / `FOREIGN KEY` | Просмотр всей таблицы под блокировкой |
+| `SET NOT NULL` | Просмотр всей таблицы под блокировкой (если это не доказывает действующая проверка) |
+| `CREATE INDEX` | Блокирует запись, пока строится |
+| `RENAME COLUMN` / `RENAME TO` | Мгновенно, но ломает каждый запрос со старым именем |
+
+## Ограничения в два шага: NOT VALID, затем VALIDATE
+
+Добавление `CHECK` или внешнего ключа просматривает все существующие строки, **удерживая блокировку**. Разбейте это на два шага:
+
+1. `ADD CONSTRAINT … NOT VALID`: с этого момента ограничение действует для новых и изменённых строк, но старые строки не проверяются. Короткая блокировка, без просмотра таблицы.
+2. `VALIDATE CONSTRAINT`: просматривает старые строки под более слабой блокировкой **`SHARE UPDATE EXCLUSIVE`**, так что чтение и запись продолжаются.
+
+<CodeExample output={`ALTER TABLE
+
+BEGIN
+
+ALTER TABLE
+
+           mode
+--------------------------
+ ShareUpdateExclusiveLock
+(1 row)
+
+COMMIT
+
+        conname        | convalidated
+-----------------------+--------------
+ customers_email_lower | t
+(1 row)`}>
+
+```sql
+ALTER TABLE customers
+  ADD CONSTRAINT customers_email_lower
+  CHECK (email = lower(email)) NOT VALID;
+
+BEGIN;
+ALTER TABLE customers VALIDATE CONSTRAINT customers_email_lower;
+
+SELECT mode
+FROM pg_locks
+WHERE relation = 'customers'::regclass
+  AND pid = pg_backend_pid();
+COMMIT;
+
+SELECT conname, convalidated
+FROM pg_constraint
+WHERE conname = 'customers_email_lower';
+```
+
+</CodeExample>
+
+То же самое работает для внешних ключей (`ADD FOREIGN KEY … NOT VALID`) и — впервые в PostgreSQL 18 — для `NOT NULL`:
+
+<CodeExample output={`ALTER TABLE
+
+UPDATE 2
+
+ALTER TABLE
+
+ attnotnull
+------------
+ t
+(1 row)`}>
+
+```sql
+ALTER TABLE customers
+  ADD CONSTRAINT customers_city_not_null NOT NULL city NOT VALID;
+
+UPDATE customers SET city = 'Unknown' WHERE city IS NULL;
+
+ALTER TABLE customers VALIDATE CONSTRAINT customers_city_not_null;
+
+SELECT attnotnull
+FROM pg_attribute
+WHERE attrelid = 'customers'::regclass AND attname = 'city';
+```
+
+</CodeExample>
+
+В более старых версиях рецепт такой: добавить `CHECK (city IS NOT NULL) NOT VALID`, проверить его через VALIDATE, затем выполнить `SET NOT NULL` (PostgreSQL увидит действующую проверку и пропустит просмотр таблицы), а потом удалить `CHECK`.
+
+### Индексы: CONCURRENTLY
+
+**`CREATE INDEX CONCURRENTLY`** строит индекс, не блокируя запись. Это дольше (два прохода по таблице), и у этого способа свои правила:
+
+<CodeExample output={`CREATE INDEX
+
+BEGIN
+
+ERROR:  CREATE INDEX CONCURRENTLY cannot run inside a transaction block`}>
+
+```sql
+CREATE INDEX CONCURRENTLY orders_status ON orders (status);
+
+BEGIN;
+CREATE INDEX CONCURRENTLY orders_customer ON orders (customer_id);
+```
+
+</CodeExample>
+
+- Его **нельзя выполнять внутри транзакции**, поэтому многим инструментам миграций для него нужен флаг «без транзакции».
+- Если построение падает (взаимоблокировка, дубликат в уникальном индексе), остаётся **невалидный** индекс, который всё равно замедляет запись. Найдите его с помощью `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;`, удалите и попробуйте снова.
+- Для нового уникального ограничения сначала постройте `CREATE UNIQUE INDEX CONCURRENTLY`, а затем выполните `ADD CONSTRAINT … UNIQUE USING INDEX` — блокировка понадобится лишь на мгновение.
+- Существуют также `DROP INDEX CONCURRENTLY` и `REINDEX CONCURRENTLY`.
+
+## Expand and contract: расширить и сжать
+
+Некоторые изменения никакой опцией не сделать безопасными: **переименование** столбца, смена его типа, разделение таблицы. Пока вы выкатываете новую версию, старый код приложения продолжает работать, а при поэтапном развёртывании (rolling deploy) старый и новый код работают **одновременно**. Любое изменение, которое ломает старый код, — это авария. Ответ — подход **expand and contract** («расширить и сжать», его ещё называют parallel change): никогда не меняйте ничего на месте; добавьте новое рядом со старым, переключитесь, а затем удалите старое.
+
+Вот классический и болезненный случай: `orders.id` имеет тип `integer` и закончится на 2 147 483 647. Прямая смена типа перезапишет таблицу под исключительной блокировкой. Вместо этого:
+
+```text
+EXPAND — расширение (старый код продолжает работать)
+  1. ALTER TABLE orders ADD COLUMN id_new bigint;            мгновенно
+  2. Триггер копирует id → id_new при каждом INSERT/UPDATE   двойная запись
+  3. Заполнить id_new для старых строк порциями              часы, онлайн
+  4. CREATE UNIQUE INDEX CONCURRENTLY … ON orders (id_new);  онлайн
+MIGRATE — переключение
+  5. В одной короткой транзакции (с lock_timeout): удалить триггер,
+     поменять имена (id → id_old, id_new → id), сделать новый индекс
+     первичным ключом (ADD CONSTRAINT … PRIMARY KEY USING INDEX)
+     и перенести последовательность и внешние ключи
+CONTRACT — сжатие (после того как новый код полностью выкачен)
+  6. ALTER TABLE orders DROP COLUMN id_old;
+```
+
+Каждый шаг небольшой, его можно приостановить, и после него работают и старый, и новый код. Сжимайте, только когда старый столбец больше никто не читает. Переименование столбца устроено так же: добавить новый столбец, писать в оба, заполнить, выкатить код, который читает новый столбец, затем удалить старый. В упражнении вы напишете шаг expand для переименования.
+
+## Заполнение порциями
+
+Шаг 3 выше — заполнение нового столбца для 200 миллионов существующих строк (backfill) — **нельзя** делать одним большим `UPDATE`:
+
+- Это одна транзакция: она блокирует каждую затронутую строку до своего конца, поэтому обычные обновления этих строк ждут.
+- Каждая обновлённая строка становится новой версией строки (MVCC), так что таблица может вырасти вдвое, а очистка (vacuum) ничего не сможет убрать, пока транзакция не закончится.
+- Реплики отстают, проигрывая одно гигантское изменение, а если оно упадёт через час, откатится всё целиком.
+
+Вместо этого обновляйте по несколько тысяч строк за раз и **фиксируйте каждую порцию**. Это умеет процедура (procedure): в отличие от функции, в ней можно делать `COMMIT`. Если идти по первичному ключу диапазонами, каждая порция остаётся поиском по индексу:
+
+<CodeExample output={`CREATE TABLE AS
+
+ALTER TABLE
+
+ALTER TABLE
+
+CREATE PROCEDURE
+
+NOTICE:  ids 1 to 5000
+NOTICE:  ids 5001 to 10000
+NOTICE:  ids 10001 to 15000
+NOTICE:  ids 15001 to 20000
+CALL
+
+ kind_code | events
+-----------+--------
+ CLICK     |  20000
+(1 row)`}>
+
+```sql
+CREATE TABLE events AS
+SELECT g AS id, 'click' AS kind
+FROM generate_series(1, 20000) AS g;
+ALTER TABLE events ADD PRIMARY KEY (id);
+ALTER TABLE events ADD COLUMN kind_code text;
+
+CREATE PROCEDURE backfill_kind_code(batch_size integer)
+LANGUAGE plpgsql AS $$
+DECLARE
+  next_id integer := 1;
+  last_id integer := (SELECT max(id) FROM events);
+BEGIN
+  WHILE next_id <= last_id LOOP
+    UPDATE events
+    SET kind_code = upper(kind)
+    WHERE id >= next_id AND id < next_id + batch_size
+      AND kind_code IS NULL;
+    RAISE NOTICE 'ids % to %', next_id, next_id + batch_size - 1;
+    COMMIT;
+    next_id := next_id + batch_size;
+  END LOOP;
+END $$;
+
+CALL backfill_kind_code(5000);
+
+SELECT kind_code, count(*) AS events
+FROM events
+GROUP BY kind_code;
+```
+
+</CodeExample>
+
+В продакшене между порциями ещё делают паузу (`PERFORM pg_sleep(0.1);`) и следят за отставанием реплик. Поскольку `UPDATE` пропускает строки, у которых значение уже есть, заполнение можно остановить и перезапустить в любой момент. Это свойство — безопасность повторного запуска — называется **идемпотентностью (idempotent)**, и им должен обладать каждый шаг миграции.
+
+## DDL в PostgreSQL транзакционен
+
+В отличие от MySQL или Oracle, PostgreSQL умеет откатывать изменения схемы. Миграция, обёрнутая в `BEGIN … COMMIT`, применяется либо целиком, либо никак:
+
+<CodeExample output={`BEGIN
+
+DROP TABLE
+
+ tables_named_movies
+---------------------
+                   0
+(1 row)
+
+ROLLBACK
+
+ movies
+--------
+     12
+(1 row)`}>
+
+```sql
+BEGIN;
+DROP TABLE movies;
+SELECT count(*) AS tables_named_movies
+FROM pg_tables
+WHERE tablename = 'movies';
+ROLLBACK;
+
+SELECT count(*) AS movies FROM movies;
+```
+
+</CodeExample>
+
+Но держите такие транзакции **короткими**: каждая блокировка, взятая любой инструкцией, удерживается до конца транзакции. Миграция, которая добавляет столбец, а затем в той же транзакции 10 минут заполняет его, держит `ACCESS EXCLUSIVE` все 10 минут.
+
+<Callout type="tip" title="Чек-лист для миграций">
+
+- Миграции хранятся в системе контроля версий и запускаются инструментом (Flyway, Liquibase, Alembic, Prisma Migrate, golang-migrate, sqitch…), а не вручную.
+- Задайте `lock_timeout` (несколько секунд) и `statement_timeout` и повторяйте попытку при тайм-ауте.
+- Предпочитайте мгновенные изменения; избегайте перезаписи таблиц; используйте `NOT VALID` + `VALIDATE` и `CONCURRENTLY`.
+- Каждый шаг обратно совместим с кодом, который работает прямо сейчас. Переименования и смены типа делаются через expand and contract.
+- Заполнение идёт порциями, отдельно от миграции схемы, и оно идемпотентно.
+- Репетируйте на копии с данными продакшен-объёма. Линтеры вроде **squawk** помечают небезопасные инструкции ещё на ревью.
+
+</Callout>
+
+```bash
+# Типичные команды в конвейере развёртывания
+npx prisma migrate deploy
+alembic upgrade head
+flyway migrate
+```
+
+<Quiz
+  question="ALTER TABLE, которому нужна всего миллисекунда работы, вызвал простой на несколько минут. Какая причина наиболее вероятна?"
+  options={["Таблица была перезаписана", "Он ждал своей блокировки за долгим запросом, а все остальные запросы встали в очередь за ним", "DDL в PostgreSQL не транзакционен", "У нового столбца было постоянное значение по умолчанию"]}
+  answer={1}
+  explanation="Ожидающий запрос на ACCESS EXCLUSIVE блокирует все последующие запросы к таблице, даже простые SELECT. lock_timeout заставляет миграцию быстро сдаться, а не выстраивать очередь."
+/>
+
+<Quiz
+  question="Нужно переименовать users.username в users.handle в нагруженном приложении с поэтапным развёртыванием. Какой первый шаг безопасен?"
+  options={["ALTER TABLE users RENAME COLUMN username TO handle", "Добавить handle, синхронизировать оба столбца триггером и заполнить порциями", "Удалить username и создать его заново под именем handle", "Создать представление с именем handle"]}
+  answer={1}
+  explanation="Переименование разом ломает все работающие копии старого кода. Сначала расширьте (новый столбец, двойная запись, заполнение), переключите код, а затем сожмите, удалив старый столбец."
+/>
+
+<Exercise
+  language="sql"
+  title="Expand: переименовать столбец без простоя"
+  starter={`CREATE TABLE members (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+INSERT INTO members (name)
+SELECT 'Member ' || g FROM generate_series(1, 20000) AS g;
+
+-- Шаг expand для переименования name -> full_name:
+-- 1. Добавьте столбец full_name типа text, допускающий NULL.
+-- 2. Триггер BEFORE INSERT OR UPDATE синхронизирует name и full_name:
+--    старый код пишет только name, новый — только full_name.
+-- 3. Процедура заполняет full_name порциями по 5000,
+--    делая COMMIT и RAISE NOTICE после каждой порции.
+-- 4. В конце посчитайте строки, у которых всё ещё нет full_name.
+SELECT count(*) AS missing FROM members;
+`}
+  tests={[
+    { name: "В members есть full_name и по-прежнему есть name", check: "(await query(\"SELECT string_agg(column_name, ',' ORDER BY column_name) AS s FROM information_schema.columns WHERE table_name = 'members' AND column_name IN ('name', 'full_name')\"))[0].s === 'full_name,name'" },
+    { name: "Все строки заполнены, и последний запрос показывает missing = 0", check: "columns.join() === 'missing' && rows[0].missing === 0 && (await query(\"SELECT count(*) AS n FROM members WHERE full_name IS DISTINCT FROM name\"))[0].n === 0" },
+    { name: "Заполнение шло порциями (по NOTICE на каждую)", check: "__output.filter(l => l.startsWith('NOTICE:')).length >= 4" },
+    { name: "Старый код, вставляющий только name, заполняет и full_name", check: "(await query(\"INSERT INTO members (name) VALUES ('Old App') RETURNING full_name\"))[0].full_name === 'Old App'" },
+    { name: "Новый код, вставляющий только full_name, заполняет и name", check: "(await query(\"INSERT INTO members (full_name) VALUES ('New App') RETURNING name\"))[0].name === 'New App'" },
+    { name: "Обновления через любой из столбцов остаются синхронными", check: "(await query(\"UPDATE members SET name = 'Renamed' WHERE id = 1 RETURNING full_name\"))[0].full_name === 'Renamed' && (await query(\"UPDATE members SET full_name = 'Moved' WHERE id = 2 RETURNING name\"))[0].name === 'Moved'" },
+  ]}
+>
+
+Команда хочет переименовать `members.name` в `full_name` в работающей системе. Напишите шаг **expand**:
+
+1. Добавьте столбец `full_name` типа `text`, допускающий NULL (`name` оставьте: старый код всё ещё им пользуется).
+2. Напишите триггер `BEFORE INSERT OR UPDATE`, который синхронизирует два столбца. Старый код пишет только в `name`, новый — только в `full_name`, и оба должны видеть одно и то же значение.
+3. Напишите процедуру, которая заполняет `full_name` для существующих строк порциями по 5000, с `COMMIT` и `RAISE NOTICE` после каждой порции, и вызовите её через `CALL`.
+4. Закончите запросом `SELECT count(*) AS missing FROM members WHERE full_name IS NULL;`.
+
+<Hint>
+
+В функции триггера обработайте вставки через `coalesce`: `NEW.full_name := coalesce(NEW.full_name, NEW.name);` и то же самое в обратную сторону (триггер `BEFORE` срабатывает до проверки `NOT NULL`). Для обновлений копируйте тот столбец, который изменился: `IF NEW.name IS DISTINCT FROM OLD.name THEN NEW.full_name := NEW.name; ELSIF … END IF;`. Для заполнения возьмите процедуру `backfill_kind_code` из урока.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE members (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+INSERT INTO members (name)
+SELECT 'Member ' || g FROM generate_series(1, 20000) AS g;
+
+ALTER TABLE members ADD COLUMN full_name text;
+
+CREATE FUNCTION members_sync_name() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.full_name := coalesce(NEW.full_name, NEW.name);
+    NEW.name := coalesce(NEW.name, NEW.full_name);
+  ELSIF NEW.name IS DISTINCT FROM OLD.name THEN
+    NEW.full_name := NEW.name;
+  ELSIF NEW.full_name IS DISTINCT FROM OLD.full_name THEN
+    NEW.name := NEW.full_name;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER members_sync_name
+BEFORE INSERT OR UPDATE ON members
+FOR EACH ROW EXECUTE FUNCTION members_sync_name();
+
+CREATE PROCEDURE backfill_full_name(batch_size integer)
+LANGUAGE plpgsql AS $$
+DECLARE
+  next_id integer := 1;
+  last_id integer := (SELECT max(id) FROM members);
+BEGIN
+  WHILE next_id <= last_id LOOP
+    UPDATE members
+    SET full_name = name
+    WHERE id >= next_id AND id < next_id + batch_size
+      AND full_name IS NULL;
+    RAISE NOTICE 'ids % to %', next_id, next_id + batch_size - 1;
+    COMMIT;
+    next_id := next_id + batch_size;
+  END LOOP;
+END $$;
+
+CALL backfill_full_name(5000);
+
+SELECT count(*) AS missing
+FROM members
+WHERE full_name IS NULL;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Большинство `ALTER TABLE` берут блокировку **`ACCESS EXCLUSIVE`**. Миграция, которая её **ждёт**, блокирует всех за собой: всегда задавайте **`lock_timeout`** и повторяйте попытку.
+- Предпочитайте **мгновенные** изменения (столбцы, допускающие NULL, постоянные значения по умолчанию); избегайте **перезаписи** (изменчивые значения по умолчанию, смена типа) на больших таблицах.
+- Добавляйте ограничения с **`NOT VALID`**, затем **`VALIDATE`** (более слабая блокировка). PostgreSQL 18 поддерживает это и для `NOT NULL`. Стройте индексы **`CONCURRENTLY`**.
+- Переименования и смены типа делаются через **expand and contract**: добавить, писать в оба, заполнить, переключить код, затем удалить.
+- **Заполняйте порциями** с фиксацией каждой порции, идемпотентно и отдельно от изменения схемы.
+- DDL в PostgreSQL **транзакционен**, но блокировки держатся до конца транзакции, поэтому делайте её короткой.

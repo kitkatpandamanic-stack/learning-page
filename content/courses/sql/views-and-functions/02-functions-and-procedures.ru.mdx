@@ -1,0 +1,478 @@
+---
+title: Функции, процедуры и блоки DO
+description: Пишите собственные функции на SQL и PL/pgSQL с переменными, IF и циклами, возвращайте целые таблицы, выбрасывайте ошибки, запускайте разовые блоки DO и обрабатывайте данные пакетами в процедурах.
+duration: 25
+xp: 25
+---
+
+В PostgreSQL сотни встроенных функций: `round()`, `lower()`, `date_trunc()`, `coalesce()`. Можно добавить и свои. Функция вроде `order_total(17)` или `customer_tier(5)` хранит бизнес-правило в одном месте, где им может воспользоваться любой запрос, отчёт и приложение, на каком бы языке оно ни было написано. 🧩
+
+В этом уроке вы будете писать функции (functions) на чистом **SQL** и на **PL/pgSQL** — встроенном процедурном языке PostgreSQL с переменными, `IF` и циклами. Затем вы будете запускать разовые скрипты с помощью **`DO`** и писать **процедуры (procedures)**, которые умеют фиксировать работу пакетами.
+
+## Ваша первая функция на SQL
+
+У функции есть имя, **параметры (parameters)** с типами, **тип возвращаемого значения (return type)** и тело. Самый простой вариант — одно SQL-выражение:
+
+<CodeExample output={`CREATE FUNCTION
+
+     name      | price | with_vat
+---------------+-------+----------
+ Jasmine Tea   |  6.50 |     7.80
+ Matcha Powder | 14.00 |    16.80
+ Earl Grey     |  5.25 |     6.30
+(3 rows)
+
+  vat  | reduced | by_name
+-------+---------+---------
+ 12.00 |   11.00 |   10.50
+(1 row)`}>
+
+```sql
+CREATE FUNCTION with_vat(price numeric, rate numeric DEFAULT 0.2)
+RETURNS numeric
+LANGUAGE sql
+IMMUTABLE
+RETURN round(price * (1 + rate), 2);
+
+SELECT name, price, with_vat(price) AS with_vat
+FROM products
+WHERE category = 'tea'
+ORDER BY id;
+
+SELECT with_vat(10) AS vat,
+  with_vat(10, 0.1) AS reduced,
+  with_vat(rate => 0.05, price => 10) AS by_name;
+```
+
+</CodeExample>
+
+Разберём по частям:
+
+- **`with_vat(price numeric, rate numeric DEFAULT 0.2)`**: два параметра; у `rate` есть **значение по умолчанию (default)**, поэтому при вызове его можно не указывать. Аргументы (arguments) можно передавать и **по имени** через `=>`, в любом порядке.
+- **`RETURNS numeric`**: тип результата.
+- **`LANGUAGE sql`**: тело написано на SQL.
+- **`IMMUTABLE`**: результат зависит только от аргументов (подробнее об этом ниже).
+- **`RETURN …`**: тело. Эта короткая форма (из стандарта SQL) проверяется при создании функции, и PostgreSQL запоминает, какие таблицы и функции она использует.
+
+Часто встречается и более старая форма, где тело записано строкой в **долларовых кавычках `$$` (dollar quotes)**. Долларовые кавычки — просто ещё один способ записать строку, в которой одинарные кавычки внутри не нужно экранировать. Работают обе формы; для PL/pgSQL нужна вот эта:
+
+```sql
+CREATE OR REPLACE FUNCTION with_vat(
+  price numeric,
+  rate numeric DEFAULT 0.2
+)
+RETURNS numeric
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT round(price * (1 + rate), 2);
+$$;
+```
+
+**`CREATE OR REPLACE FUNCTION`** меняет тело существующей функции, если типы параметров и возвращаемого значения остаются прежними. `DROP FUNCTION with_vat(numeric, numeric)` удаляет её: типы параметров нужно перечислить, потому что PostgreSQL допускает несколько функций с одним именем и разными параметрами (**перегрузка**, overloading).
+
+## Функции, которые возвращают таблицы
+
+Функция может возвращать много строк. Объявите **`RETURNS TABLE (…)`** со столбцами и используйте функцию во `FROM` как таблицу. Такие функции иногда называют **табличными функциями (table functions)** или параметризованными представлениями:
+
+<CodeExample output={`CREATE FUNCTION
+
+ order_id | ordered_at | total
+----------+------------+--------
+        5 | 2025-01-24 | 149.73
+       22 | 2025-04-04 | 124.10
+       39 | 2025-06-13 |  28.00
+(3 rows)`}>
+
+```sql
+CREATE FUNCTION customer_orders(p_customer_id integer)
+RETURNS TABLE (order_id integer, ordered_at date, total numeric)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT o.id, o.ordered_at::date, sum(oi.quantity * oi.unit_price)
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.customer_id = p_customer_id
+  GROUP BY o.id
+  ORDER BY o.id;
+$$;
+
+SELECT * FROM customer_orders(2);
+```
+
+</CodeExample>
+
+Префикс `p_` у параметров — распространённое соглашение: так параметр `customer_id` не спутать со **столбцом** `customer_id` внутри тела.
+
+## Изменчивость: IMMUTABLE, STABLE, VOLATILE
+
+У каждой функции есть метка **изменчивости (volatility)**, которая говорит планировщику, насколько он может доверять функции:
+
+| Метка | Обещание | Примеры |
+| --- | --- | --- |
+| **`IMMUTABLE`** | Те же аргументы — тот же результат, всегда. Не читает таблицы. | `with_vat()`, `lower()`, `abs()` |
+| **`STABLE`** | Тот же результат в пределах одной инструкции; может читать таблицы. | `customer_orders()`, `now()` |
+| **`VOLATILE`** (по умолчанию) | Может возвращать разное при каждом вызове или изменять данные. | `random()`, `nextval()`, всё, что пишет |
+
+Метка важна. Только `IMMUTABLE`-функции можно использовать в **функциональных индексах** (как `lower(email)` в [уроке об индексах](/learn/sql/choosing-indexes)) и генерируемых столбцах, а `IMMUTABLE`/`STABLE` позволяют планировщику вычислить вызов один раз, а не для каждой строки. Но **не обманывайте**: функция с меткой `IMMUTABLE`, которая читает таблицу, может давать неверные результаты, потому что PostgreSQL вправе закэшировать её ответ — даже внутри индекса.
+
+## PL/pgSQL: переменные, IF и циклы
+
+Когда одной SQL-инструкции мало, пишите функцию на **PL/pgSQL**. Её тело — это **блок**: необязательный `DECLARE` для переменных, затем `BEGIN … END` с инструкциями, `IF`, циклами и `RETURN`:
+
+<CodeExample output={`CREATE FUNCTION
+
+    name     | badge
+-------------+--------
+ Mei Lin     | bronze
+ Sam Ortiz   | silver
+ Sofia Rossi | gold
+ Grace Kim   | none
+(4 rows)`}>
+
+```sql
+CREATE FUNCTION loyalty_badge(p_customer_id integer)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_orders integer;
+BEGIN
+  SELECT count(*) INTO v_orders
+  FROM orders
+  WHERE customer_id = p_customer_id
+    AND status <> 'cancelled';
+
+  IF v_orders >= 3 THEN
+    RETURN 'gold';
+  ELSIF v_orders = 2 THEN
+    RETURN 'silver';
+  ELSIF v_orders = 1 THEN
+    RETURN 'bronze';
+  END IF;
+  RETURN 'none';
+END;
+$$;
+
+SELECT name, loyalty_badge(id) AS badge
+FROM customers
+WHERE id IN (1, 2, 8, 18)
+ORDER BY id;
+```
+
+</CodeExample>
+
+Строительные блоки:
+
+- **`DECLARE v_orders integer;`** объявляет переменную (variable) (`v_` для переменных — ещё одно распространённое соглашение). Присваивание — через `:=`, например `v_total := v_total + 1;`.
+- **`SELECT … INTO v_orders`** выполняет запрос и сохраняет его результат в переменную. Если запрос не нашёл ни одной строки, переменная становится `NULL`.
+- **`IF … THEN … ELSIF … ELSE … END IF;`** и `CASE` — для принятия решений.
+- **`RETURN`** завершает функцию и возвращает значение.
+
+Циклы (loops) бывают нескольких видов. **`FOR row IN query LOOP`** выполняется по разу для каждой строки запроса, а **`RAISE NOTICE`** выводит сообщение — это удобно для отладки:
+
+<CodeExample output={`NOTICE:  tea: 3 products, 52 in stock
+NOTICE:  snacks: 3 products, 265 in stock
+NOTICE:  books: 3 products, 10 in stock
+NOTICE:  toys: 3 products, 48 in stock
+NOTICE:  kitchen: 3 products, 210 in stock
+DO`}>
+
+```sql
+DO $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN
+    SELECT category, count(*) AS n, sum(stock) AS stock
+    FROM products
+    GROUP BY category
+    ORDER BY min(id)
+  LOOP
+    RAISE NOTICE '%: % products, % in stock', r.category, r.n, r.stock;
+  END LOOP;
+END;
+$$;
+```
+
+</CodeExample>
+
+Каждый `%` в сообщении заменяется следующим аргументом. Есть также `WHILE condition LOOP`, `FOR i IN 1..10 LOOP` и простой `LOOP … EXIT WHEN … END LOOP`. Но подумайте дважды, прежде чем перебирать строки в цикле, чтобы изменить их по одной: один `UPDATE … WHERE` почти всегда намного быстрее, чем цикл из тысяч мелких обновлений. Используйте PL/pgSQL для **управления ходом выполнения (control flow)**, а работу с множествами строк оставьте SQL.
+
+<Callout type="note" title="RETURN QUERY и RETURN NEXT">
+
+Функция на PL/pgSQL с `RETURNS TABLE (…)` или `RETURNS SETOF …` добавляет строки в результат с помощью **`RETURN QUERY SELECT …;`** (все строки запроса) или **`RETURN NEXT;`** (одна строка из выходных переменных) и завершается простым `RETURN;`.
+
+</Callout>
+
+## Выбрасываем и перехватываем ошибки
+
+**`RAISE EXCEPTION`** останавливает функцию с ошибкой, и вся инструкция (и транзакция), которая её вызвала, завершается неудачей. Используйте это, чтобы отклонять плохие входные данные с понятным сообщением, а не возвращать что-то вводящее в заблуждение:
+
+<CodeExample output={`CREATE FUNCTION
+
+ restock
+---------
+      52
+(1 row)
+
+ERROR:  quantity must be positive, got -5`}>
+
+```sql
+CREATE FUNCTION restock(p_product_id integer, p_quantity integer)
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_stock integer;
+BEGIN
+  IF p_quantity <= 0 THEN
+    RAISE EXCEPTION 'quantity must be positive, got %', p_quantity;
+  END IF;
+
+  UPDATE products
+  SET stock = stock + p_quantity
+  WHERE id = p_product_id
+  RETURNING stock INTO v_stock;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'product % not found', p_product_id;
+  END IF;
+  RETURN v_stock;
+END;
+$$;
+
+SELECT restock(1, 12);
+SELECT restock(1, -5);
+```
+
+</CodeExample>
+
+**`FOUND`** — специальная переменная, которая истинна, если последняя инструкция затронула или вернула хотя бы одну строку. Чтобы **перехватить** ошибку, добавьте в блок раздел `EXCEPTION`. Перехватывайте только те ошибки, которые ожидаете и можете обработать, — по имени:
+
+```sql
+BEGIN
+  INSERT INTO members (email) VALUES (p_email);
+EXCEPTION
+  WHEN unique_violation THEN
+    RAISE NOTICE '% is already a member', p_email;
+END;
+```
+
+Блок с разделом `EXCEPTION` при перехвате ошибки откатывается целиком (внутри он использует точку сохранения, savepoint), поэтому работает чуть медленнее; не добавляйте его «на всякий случай».
+
+<Quiz
+  question="Какую метку изменчивости должна получить функция, которая читает таблицу products, чтобы узнать цену?"
+  options={[
+    "IMMUTABLE, потому что один и тот же id товара всегда даёт одну и ту же цену",
+    "STABLE, потому что она читает таблицу: результат может меняться между инструкциями, но не внутри одной",
+    "VOLATILE обязательна для любой функции с параметрами",
+    "Никакую, метки нужны только для документации",
+  ]}
+  answer={1}
+  explanation="Цены могут меняться, так что результат не зафиксирован навсегда — это исключает IMMUTABLE. В пределах одной инструкции таблица у вас под ногами не меняется, поэтому честная метка — STABLE. С меткой IMMUTABLE PostgreSQL мог бы повторно использовать устаревшую цену."
+/>
+
+## Блоки DO: разовые скрипты
+
+**Блок `DO`** — анонимный блок PL/pgSQL, который выполняется один раз и не сохраняется. Один вы уже видели выше. Они идеальны для разовых админских скриптов и миграций, которым нужна логика, — например, для динамического SQL по нескольким таблицам:
+
+<CodeExample output={`NOTICE:  customers: 20 rows
+NOTICE:  orders: 40 rows
+NOTICE:  products: 15 rows
+DO`}>
+
+```sql
+DO $$
+DECLARE
+  t text;
+  n bigint;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['customers', 'orders', 'products'] LOOP
+    EXECUTE format('SELECT count(*) FROM %I', t) INTO n;
+    RAISE NOTICE '%: % rows', t, n;
+  END LOOP;
+END;
+$$;
+```
+
+</CodeExample>
+
+**`EXECUTE`** выполняет SQL, собранный в виде строки во время выполнения, — здесь это нужно потому, что в обычном SQL имя таблицы не может быть переменной. Всегда собирайте такие строки с помощью **`format()`**: `%I` безопасно заключает в кавычки **идентификатор (identifier)** (имя таблицы или столбца), а `%L` — **литерал (literal)**, то есть значение. Склеивание пользовательского ввода с SQL через `||` — это и есть путь к SQL-инъекции (SQL injection); подробно её разбирает модуль о безопасности.
+
+## Процедуры: функции, которые умеют фиксировать
+
+**Процедура** похожа на функцию, но запускается через **`CALL`**, не возвращает значения и обладает одной суперспособностью: она может выполнить **`COMMIT`** посреди работы. Поэтому процедуры — правильный инструмент для длинных пакетных задач, где нужно сохранять прогресс каждые несколько тысяч строк, а не держать открытой одну огромную транзакцию:
+
+<CodeExample output={`CREATE PROCEDURE
+
+NOTICE:  batch 1: 10 orders
+NOTICE:  batch 2: 6 orders
+NOTICE:  batch 3: 0 orders
+CALL
+
+  status   | orders
+-----------+--------
+ cancelled |      8
+ delivered |     32
+(2 rows)`}>
+
+```sql
+CREATE PROCEDURE deliver_old_orders(p_before date, p_batch integer)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_done integer;
+  v_batch integer := 0;
+BEGIN
+  LOOP
+    UPDATE orders
+    SET status = 'delivered'
+    WHERE id IN (
+      SELECT id FROM orders
+      WHERE status IN ('paid', 'shipped')
+        AND ordered_at < p_before
+      ORDER BY id
+      LIMIT p_batch
+    );
+    GET DIAGNOSTICS v_done = ROW_COUNT;
+    v_batch := v_batch + 1;
+    RAISE NOTICE 'batch %: % orders', v_batch, v_done;
+    COMMIT;  -- каждый пакет сохраняется, а его блокировки снимаются
+    EXIT WHEN v_done = 0;
+  END LOOP;
+END;
+$$;
+
+CALL deliver_old_orders('2025-07-01', 10);
+
+SELECT status, count(*) AS orders
+FROM orders
+GROUP BY status
+ORDER BY status;
+```
+
+</CodeExample>
+
+**`GET DIAGNOSTICS v_done = ROW_COUNT`** узнаёт, сколько строк изменила последняя инструкция. Функции так пакетно работать не могут: функция всегда выполняется внутри единственной транзакции вызывающего, поэтому всё, что она делает, фиксируется (или откатывается) разом в конце.
+
+| | Функция | Процедура | Блок DO |
+| --- | --- | --- | --- |
+| Как запустить | `SELECT f(…)`, в любом запросе | `CALL p(…)` | выполняется сразу |
+| Возвращает | значение или строки | ничего (или параметры `OUT`) | ничего |
+| `COMMIT` внутри | нет | да | да, если не внутри транзакции |
+| Сохраняется в базе | да | да | нет |
+
+<Callout type="warning" title="Сколько логики стоит держать в базе данных?">
+
+Функции отлично подходят для небольших правил, завязанных на данные, которые должны разделять все клиенты (расчёт цены, уровень лояльности, проверка согласованности), и для пакетных задач, которые иначе гоняли бы миллионы строк по сети. Тестировать, отлаживать, версионировать и развёртывать их сложнее, чем код приложения, поэтому храните их в миграциях под контролем версий, делайте маленькими и не переносите всё приложение в PL/pgSQL. Если функция должна выполняться с бо́льшими правами, чем у вызывающего (`SECURITY DEFINER`), всегда фиксируйте её `search_path` через `SET search_path = …`, иначе пользователь сможет обманом заставить её вызвать его собственные объекты.
+
+</Callout>
+
+<Exercise
+  language="sql"
+  title="Суммы заказов и уровни покупателей"
+  starter={`-- 1. order_total: сумма одного заказа (0, если в нём нет позиций)
+CREATE FUNCTION order_total(p_order_id integer)
+RETURNS numeric
+LANGUAGE sql
+STABLE
+RETURN 0;
+
+-- 2. customer_tier: gold, silver, bronze или new (PL/pgSQL)
+
+
+-- 3. Сколько покупателей на каждом уровне?
+`}
+  tests={[
+    { name: "order_total складывает позиции заказа", check: "(await query('SELECT order_total(1) AS a, order_total(17) AS b'))[0].a === 102 && (await query('SELECT order_total(17) AS b'))[0].b === 200.17" },
+    { name: "order_total равна 0 для заказа без позиций", check: "(await query('SELECT order_total(-1) AS t'))[0].t === 0" },
+    { name: "customer_tier написана на PL/pgSQL", check: "(await query(\"SELECT l.lanname FROM pg_proc AS p JOIN pg_language AS l ON l.oid = p.prolang WHERE p.proname = 'customer_tier'\"))[0]?.lanname === 'plpgsql'" },
+    { name: "Уровни существующих покупателей правильные", check: "(await query('SELECT customer_tier(2) AS a, customer_tier(1) AS b, customer_tier(3) AS c, customer_tier(20) AS d'))[0] && Object.values((await query('SELECT customer_tier(2) AS a, customer_tier(1) AS b, customer_tier(3) AS c, customer_tier(20) AS d'))[0]).join() === 'gold,silver,bronze,new'" },
+    { name: "Для неизвестного покупателя выбрасывается ошибка со словами 'not found'", check: "await query('SELECT customer_tier(999)').then(() => false, e => /not found/.test(e.message))" },
+    { name: "Отменённые заказы не учитываются, новые — учитываются", check: "await (async () => { await query(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (19, '2025-07-01', 'cancelled') RETURNING id) INSERT INTO order_items SELECT id, 15, 5, 89.90 FROM o\"); await query(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (20, '2025-07-01', 'paid') RETURNING id) INSERT INTO order_items SELECT id, 13, 4, 32.00 FROM o\"); const r = (await query('SELECT customer_tier(19) AS a, customer_tier(20) AS b'))[0]; return r.a === 'new' && r.b === 'silver'; })()" },
+    { name: "Последний запрос считает покупателей по уровням, начиная с самой большой группы", check: "columns.join() === 'tier,customers' && rows.map(r => r.tier + ':' + r.customers).join() === 'silver:7,bronze:6,gold:4,new:3'" },
+  ]}
+>
+
+Магазин хочет ввести уровни лояльности в зависимости от того, сколько потратил каждый покупатель. Напишите две функции и воспользуйтесь ими:
+
+1. **`order_total(p_order_id integer)`** на SQL: сумма `quantity * unit_price` по позициям этого заказа или **`0`**, если позиций нет.
+2. **`customer_tier(p_customer_id integer) RETURNS text`** на **PL/pgSQL**:
+   - если покупателя с таким id нет, выполните `RAISE EXCEPTION` с сообщением, содержащим `not found`;
+   - сложите `order_total()` всех **не отменённых** заказов покупателя;
+   - верните `'gold'` от 250, `'silver'` от 100, `'bronze'` больше 0 и `'new'` для 0.
+3. Завершите запросом, который возвращает столбцы `tier, customers`: сколько покупателей на каждом уровне, начиная с самой большой группы (при равенстве — по названию уровня).
+
+<Hint>
+
+- `order_total`: `RETURN (SELECT coalesce(sum(quantity * unit_price), 0) FROM order_items WHERE order_id = p_order_id);`
+- `customer_tier`: начните с `IF NOT EXISTS (SELECT 1 FROM customers WHERE id = p_customer_id) THEN RAISE EXCEPTION 'customer % not found', p_customer_id; END IF;`. Затем `SELECT coalesce(sum(order_total(id)), 0) INTO v_spent FROM orders WHERE …;` и цепочка `IF … ELSIF …` от высшего уровня вниз.
+- Шаг 3: `SELECT customer_tier(id) AS tier, count(*) AS customers FROM customers GROUP BY tier ORDER BY customers DESC, tier;`
+
+</Hint>
+
+<Solution>
+
+```sql
+-- 1. order_total: сумма одного заказа (0, если в нём нет позиций)
+CREATE FUNCTION order_total(p_order_id integer)
+RETURNS numeric
+LANGUAGE sql
+STABLE
+RETURN (
+  SELECT coalesce(sum(quantity * unit_price), 0)
+  FROM order_items
+  WHERE order_id = p_order_id
+);
+
+-- 2. customer_tier: gold, silver, bronze или new (PL/pgSQL)
+CREATE FUNCTION customer_tier(p_customer_id integer)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_spent numeric;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM customers WHERE id = p_customer_id) THEN
+    RAISE EXCEPTION 'customer % not found', p_customer_id;
+  END IF;
+
+  SELECT coalesce(sum(order_total(id)), 0) INTO v_spent
+  FROM orders
+  WHERE customer_id = p_customer_id
+    AND status <> 'cancelled';
+
+  IF v_spent >= 250 THEN
+    RETURN 'gold';
+  ELSIF v_spent >= 100 THEN
+    RETURN 'silver';
+  ELSIF v_spent > 0 THEN
+    RETURN 'bronze';
+  END IF;
+  RETURN 'new';
+END;
+$$;
+
+-- 3. Сколько покупателей на каждом уровне?
+SELECT customer_tier(id) AS tier, count(*) AS customers
+FROM customers
+GROUP BY tier
+ORDER BY customers DESC, tier;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **`CREATE FUNCTION name(params) RETURNS type LANGUAGE sql`** упаковывает логику; у параметров могут быть **значения по умолчанию**, а передавать их можно **по имени** (`=>`). Используйте `RETURN …` или тело в кавычках `$$`.
+- Функции с **`RETURNS TABLE (…)`** используются во `FROM` как параметризованные представления.
+- Указывайте изменчивость честно: **`IMMUTABLE`** (чистая функция, годится для индексов), **`STABLE`** (читает таблицы), **`VOLATILE`** (по умолчанию).
+- **PL/pgSQL** добавляет переменные в `DECLARE`, `SELECT … INTO`, `IF`/`ELSIF`, `FOR … IN query LOOP`, `RAISE NOTICE`, `RAISE EXCEPTION`, `FOUND` и блоки `EXCEPTION WHEN … THEN`.
+- **`DO $$ … $$`** выполняет разовый блок; динамический SQL собирайте через **`EXECUTE format('… %I …', name)`**, а не склеиванием строк.
+- **Процедуры** запускаются через `CALL` и могут выполнять **`COMMIT`** между пакетами; функции всегда выполняются внутри транзакции вызывающего.

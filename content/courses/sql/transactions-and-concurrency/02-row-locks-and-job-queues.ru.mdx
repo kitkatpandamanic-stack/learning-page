@@ -1,0 +1,526 @@
+---
+title: Блокировки, очереди задач и взаимоблокировки
+description: Как PostgreSQL блокирует строки и таблицы, SELECT FOR UPDATE и очереди задач на SKIP LOCKED, откуда берутся взаимоблокировки и как их избежать, и рекомендательные блокировки для вашего приложения.
+duration: 25
+xp: 30
+---
+
+Во вторник днём команда запустила миграцию из одной строки: `ALTER TABLE orders ADD COLUMN gift_note text`. На тестовой базе она заняла 3 миллисекунды. В продакшене сайт **лежал четыре минуты**. Сам `ALTER` выполнился мгновенно; проблемой был медленный аналитический запрос, который уже какое-то время читал `orders`. `ALTER` пришлось его **ждать**, а каждый обычный запрос, пришедший после `ALTER`, вставал в очередь **за ним**. Тысячи оформлений заказа скопились в ожидании блокировки. 🔒
+
+Блокировки (locks) — это способ, которым PostgreSQL не даёт одновременным транзакциям портить работу друг друга. Чаще всего вы их вообще не замечаете. Этот урок — о тех случаях, когда замечаете: блокировки строк и `SELECT … FOR UPDATE`, очереди задач на `SKIP LOCKED`, взаимоблокировки, блокировки таблиц во время миграций и рекомендательные блокировки.
+
+<Callout type="note" title="Здесь одно соединение, в реальной жизни — два">
+
+Блокировки важны только между **разными** сессиями, а у этой базы данных в браузере сессия всего одна. Поэтому запускаемые примеры показывают синтаксис и то, что PostgreSQL записывает о блокировках, а сами конфликты нарисованы как временные диаграммы: сессия **A** слева, **B** справа. Откройте у себя на компьютере два окна `psql`, чтобы воспроизвести любой из них.
+
+</Callout>
+
+## Блокировки строк: пишущие ждут пишущих
+
+Каждый `UPDATE` и `DELETE` **блокирует изменяемые строки** до конца своей транзакции. Благодаря MVCC (следующий урок) эта блокировка никогда не мешает **читающим**: обычный `SELECT` просто видит последнюю зафиксированную версию. Она мешает только другим **пишущим** в те же строки:
+
+```text
+A: BEGIN;
+A: UPDATE products SET stock = stock - 1
+     WHERE id = 1;          -- блокирует строку 1
+                                B: SELECT stock FROM products
+                                     WHERE id = 1;  -- 40, без ожидания
+                                B: UPDATE products SET stock = 0
+                                     WHERE id = 1;  -- ждёт...
+A: COMMIT;                      B: -- ...продолжает: UPDATE 1
+```
+
+Запомните правило: в PostgreSQL **читающие никогда не ждут пишущих, а пишущие никогда не ждут читающих**. В очередь встают только две транзакции, пишущие в одну и ту же строку, и только до тех пор, пока первая не завершится. Поэтому чем длиннее ваши транзакции, тем дольше ждут все остальные.
+
+## SELECT … FOR UPDATE: заблокируйте, пока решаете
+
+Иногда нужно прочитать строку, подумать и только потом записать. В прошлом уроке вы видели, что ломается, если кто-то другой запишет в промежутке. **`SELECT … FOR UPDATE`** читает строки **и блокирует их**, как будто вы их уже обновили, поэтому чужой `FOR UPDATE` или `UPDATE` этих строк будет ждать, пока вы не зафиксируете транзакцию:
+
+<CodeExample output={`BEGIN
+
+ id |     name      | stock
+----+---------------+-------
+  2 | Matcha Powder |    12
+(1 row)
+
+UPDATE 1
+
+    locked     |       mode
+---------------+------------------
+ products      | RowExclusiveLock
+ products      | RowShareLock
+ products_pkey | RowExclusiveLock
+ products_pkey | RowShareLock
+(4 rows)
+
+COMMIT`}>
+
+```sql
+BEGIN;
+
+SELECT id, name, stock
+FROM products
+WHERE id = 2
+FOR UPDATE;
+
+-- ...приложение проверяет остаток, связывается со складом...
+UPDATE products SET stock = stock - 1 WHERE id = 2;
+
+SELECT relation::regclass AS locked, mode
+FROM pg_locks
+WHERE locktype = 'relation' AND pid = pg_backend_pid()
+  AND relation IN ('products'::regclass,
+    'products_pkey'::regclass)
+ORDER BY relation::regclass::text, mode;
+
+COMMIT;
+```
+
+</CodeExample>
+
+Представление **`pg_locks`** перечисляет блокировки, которые держит каждая сессия. Обратите внимание на блокировки уровня таблицы: `RowShareLock` от `FOR UPDATE` и `RowExclusiveLock` от `UPDATE` — на самой таблице и на индексе её первичного ключа. Эти «строковые» режимы на таблице не конфликтуют друг с другом, поэтому тысячи сессий могут одновременно блокировать **разные** строки `products`. Самих блокировок строк в `pg_locks` нет вовсе: PostgreSQL записывает их **прямо в строку** (в её скрытый столбец `xmax`, как вы увидите в следующем уроке), поэтому блокировка миллиона строк не требует миллиона записей в памяти.
+
+У `FOR UPDATE` есть три более лёгких родственника — на случай, когда нужно меньше:
+
+| Предложение | Не даёт другим сессиям… | Типичное применение |
+| --- | --- | --- |
+| `FOR UPDATE` | обновлять, удалять или блокировать строку | прочитать, затем записать строку |
+| `FOR NO KEY UPDATE` | то же самое, но пропускает проверки внешних ключей | его берёт обычный `UPDATE` |
+| `FOR SHARE` | обновлять или удалять строку (разделять её могут и другие) | «эта строка не должна меняться, пока я не зафиксирую транзакцию» |
+| `FOR KEY SHARE` | удалять строку или менять её ключ | его автоматически берут проверки внешних ключей |
+
+### Без ожидания: NOWAIT и lock_timeout
+
+По умолчанию заблокированная инструкция ждёт **вечно**. Есть два способа сказать «не надо»:
+
+- **`FOR UPDATE NOWAIT`** сразу падает с ошибкой `could not obtain lock on row`, если строка заблокирована. Подходит для сценария «это место сейчас бронирует кто-то другой, выберите другое».
+- **`SET lock_timeout = '2s'`** заставляет любую инструкцию сессии сдаваться через 2 секунды: `canceling statement due to lock timeout`. Обязательно перед миграциями, как вы увидите ниже.
+
+## Очереди задач на SKIP LOCKED
+
+Многие приложения хранят **таблицу-очередь** фоновой работы: письма для отправки, картинки для масштабирования, отчёты для сборки. Задачи из неё забирают несколько процессов-**обработчиков (workers)**. В наивной версии два обработчика хватают **одну и ту же** задачу:
+
+```text
+A: SELECT id FROM jobs WHERE status = 'queued'
+     ORDER BY id LIMIT 1;    -- 1
+                                B: SELECT id FROM jobs WHERE ...
+                                     ORDER BY id LIMIT 1;  -- 1
+A: UPDATE jobs SET status = 'running' WHERE id = 1;
+                                B: UPDATE jobs
+                                     SET status = 'running'
+                                     WHERE id = 1;
+-- оба обработчика отправляют одно и то же письмо
+```
+
+Один только `FOR UPDATE` устраняет дубликаты, но тогда обработчик B **ждёт** задачу обработчика A вместо того, чтобы взять следующую: обработчики работают по одному. **`FOR UPDATE SKIP LOCKED`** — то самое исправление, которое превратило PostgreSQL в достойную очередь: он просто **пропускает** строки, заблокированные другой транзакцией, так что каждый обработчик получает свою задачу без ожидания:
+
+```text
+A: ... LIMIT 1 FOR UPDATE SKIP LOCKED;  -- задача 1 (блокирует её)
+                                B: ... LIMIT 1
+                                     FOR UPDATE SKIP LOCKED;
+                                     -- 1 заблокирована: пропуск → задача 2
+```
+
+Весь шаг «забрать задачу» обычно — одна инструкция: подзапрос находит и блокирует следующую задачу, а `UPDATE` помечает её как взятую и возвращает обработчику:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+ id |    kind    | attempts
+----+------------+----------
+  1 | send_email |        1
+(1 row)
+
+ id |     kind     | attempts
+----+--------------+----------
+  2 | resize_image |        1
+(1 row)
+
+ id |     kind     | status  | attempts
+----+--------------+---------+----------
+  1 | send_email   | running |        1
+  2 | resize_image | running |        1
+  3 | send_email   | queued  |        0
+(3 rows)`}>
+
+```sql
+CREATE TABLE jobs (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  kind text NOT NULL,
+  status text NOT NULL DEFAULT 'queued',
+  attempts integer NOT NULL DEFAULT 0
+);
+INSERT INTO jobs (kind)
+VALUES ('send_email'), ('resize_image'), ('send_email');
+
+UPDATE jobs
+SET status = 'running', attempts = attempts + 1
+WHERE id = (
+  SELECT id
+  FROM jobs
+  WHERE status = 'queued'
+  ORDER BY id
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, kind, attempts;
+
+UPDATE jobs
+SET status = 'running', attempts = attempts + 1
+WHERE id = (
+  SELECT id
+  FROM jobs
+  WHERE status = 'queued'
+  ORDER BY id
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, kind, attempts;
+
+SELECT * FROM jobs ORDER BY id;
+```
+
+</CodeExample>
+
+Второй захват получил задачу 2, потому что задача 1 уже не была `queued`. Если много обработчиков выполняют это одновременно, каждый получает свою задачу.
+
+Два варианта того, что происходит дальше:
+
+- **Держать блокировку во время работы**: забрать задачу внутри `BEGIN`, выполнить работу, пометить задачу как `done`, `COMMIT`. Если обработчик упадёт, его транзакция откатится, и задача автоматически снова станет `queued`. Просто, но транзакция остаётся открытой всё время, пока выполняется задача, а для задач длиной в минуты это плохо (почему — объясняет следующий урок).
+- **Забрать, зафиксировать, потом работать**: захват сразу фиксируется с «арендой» `locked_until = now() + interval '5 minutes'`, а задачу с истёкшей арендой можно забрать снова. Транзакции короткие, но случай «обработчик умер» придётся обрабатывать самостоятельно.
+
+<Callout type="tip" title="Индекс для очереди">
+
+Запрос захвата выполняется постоянно, а завершённые задачи копятся. **Частичный индекс (partial index)** только по ожидающим задачам сохраняет его быстрым, как бы ни росла таблица: `CREATE INDEX ON jobs (priority DESC, id) WHERE status = 'queued';`. И регулярно удаляйте или архивируйте завершённые задачи.
+
+</Callout>
+
+## Взаимоблокировки
+
+**Взаимоблокировка (deadlock)** — это две транзакции, каждая из которых ждёт блокировку, удерживаемую другой. Ни одна из них никогда не сможет продолжить:
+
+```text
+A: BEGIN;                       B: BEGIN;
+A: UPDATE accounts
+     SET balance = balance - 10
+     WHERE id = 1;  -- блокирует 1
+                                B: UPDATE accounts
+                                     SET balance = balance - 5
+                                     WHERE id = 2;  -- блокирует 2
+A: UPDATE accounts
+     SET balance = balance + 10
+     WHERE id = 2;  -- ждёт B
+                                B: UPDATE accounts
+                                     SET balance = balance + 5
+                                     WHERE id = 1;  -- ждёт A
+-- через deadlock_timeout (1 с) PostgreSQL выбирает жертву:
+                                B: ERROR:  deadlock detected
+                                   DETAIL: Process 812 waits for
+                                   ShareLock on transaction 5531;
+                                   blocked by process 790. ...
+A: -- продолжает: UPDATE 1
+```
+
+PostgreSQL ищет циклы после ожидания `deadlock_timeout` (по умолчанию 1 секунда) и прерывает **одну** из транзакций с SQLSTATE `40P01`. Другая продолжает работу. Взаимоблокировки никогда не висят вечно, но каждая стоит секунды ожидания плюс неудавшейся транзакции.
+
+Лекарство почти всегда одно: **блокируйте в постоянном порядке**. Если каждый перевод сначала блокирует счёт с меньшим id, A и B не смогут держать каждый «чужую» строку. Один из способов — заранее заблокировать обе строки, отсортировав их:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+BEGIN
+
+ id | balance
+----+---------
+  1 |  100.00
+  2 |   50.00
+(2 rows)
+
+UPDATE 1
+
+UPDATE 1
+
+COMMIT`}>
+
+```sql
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  balance numeric(10, 2) NOT NULL
+);
+INSERT INTO accounts VALUES (1, 100), (2, 50);
+
+-- Перевод со счёта 2 на счёт 1: блокируем обе строки, начиная с меньшего id
+BEGIN;
+SELECT id, balance
+FROM accounts
+WHERE id IN (2, 1)
+ORDER BY id
+FOR UPDATE;
+UPDATE accounts SET balance = balance - 5 WHERE id = 2;
+UPDATE accounts SET balance = balance + 5 WHERE id = 1;
+COMMIT;
+```
+
+</CodeExample>
+
+Другие привычки: держите транзакции **короткими**, обращайтесь к строкам в одном и том же порядке во всём коде (для пакетных обновлений — `ORDER BY id` в подзапросе, который выбирает строки) и обращайтесь с `40P01` так же, как с ошибкой сериализации: **повторяйте** транзакцию.
+
+## Блокировки таблиц и история с миграцией
+
+Каждая инструкция также берёт блокировку на **таблицы**, к которым обращается. Самые распространённые, от самой слабой к самой сильной:
+
+| Режим блокировки | Кто берёт | Конфликтует с |
+| --- | --- | --- |
+| `ACCESS SHARE` | `SELECT` | только `ACCESS EXCLUSIVE` |
+| `ROW SHARE` | `SELECT … FOR UPDATE / SHARE` | `EXCLUSIVE`, `ACCESS EXCLUSIVE` |
+| `ROW EXCLUSIVE` | `INSERT`, `UPDATE`, `DELETE` | `SHARE` и более сильными |
+| `SHARE` | `CREATE INDEX` (без `CONCURRENTLY`) | записью (`ROW EXCLUSIVE`) |
+| `ACCESS EXCLUSIVE` | большинство `ALTER TABLE`, `DROP`, `TRUNCATE`, `VACUUM FULL` | **всем**, даже с `SELECT` |
+
+Можно посмотреть, как миграция берёт самую сильную:
+
+<CodeExample output={`BEGIN
+
+ALTER TABLE
+
+ locked_table |        mode
+--------------+---------------------
+ products     | AccessExclusiveLock
+(1 row)
+
+ROLLBACK`}>
+
+```sql
+BEGIN;
+ALTER TABLE products ADD COLUMN weight_g integer;
+
+SELECT relation::regclass AS locked_table, mode
+FROM pg_locks
+WHERE locktype = 'relation'
+  AND relation = 'products'::regclass;
+ROLLBACK;
+```
+
+</CodeExample>
+
+Теперь история с аварией становится понятной. Запросы блокировок ждут в **очереди**, по порядку:
+
+```text
+A (отчёт):   SELECT ... FROM orders ...      -- ACCESS SHARE, идёт 4 мин
+B (миграция): ALTER TABLE orders ADD ...     -- хочет ACCESS EXCLUSIVE:
+                                             -- ждёт A
+C, D, E... : SELECT * FROM orders WHERE ...  -- ACCESS SHARE совместим
+                                             -- с A, но встаёт в очередь
+                                             -- за B!
+```
+
+Исправление дешёвое: запускайте миграции с **коротким `lock_timeout`** и повторяйте их:
+
+```sql
+SET lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN gift_note text;
+-- ERROR: canceling statement due to lock timeout → попробуйте позже
+```
+
+Если миграция падает через 2 секунды, трафик блокируется не дольше чем на 2 секунды. Также используйте неблокирующие варианты там, где они есть, например `CREATE INDEX CONCURRENTLY` (безопасные миграции подробно разбираются в модуле о моделировании данных).
+
+## Рекомендательные блокировки: блокировки для ваших собственных идей
+
+Иногда то, что нужно защитить, — вовсе не строка. «Ночной расчёт счетов может запускать только один сервер». «Пересобирать кеш этого покупателя может только один запрос за раз». **Рекомендательные блокировки (advisory locks)** — это блокировки на **число**, которые PostgreSQL держит для вас; что означает это число, решает ваше приложение:
+
+<CodeExample output={` got_lock
+----------
+ t
+(1 row)
+
+ released
+----------
+ t
+(1 row)
+
+BEGIN
+
+ got_lock
+----------
+ t
+(1 row)
+
+ locktype |     mode      | granted
+----------+---------------+---------
+ advisory | ExclusiveLock | t
+(1 row)
+
+COMMIT
+
+ advisory_locks_left
+---------------------
+                   0
+(1 row)`}>
+
+```sql
+-- Уровень сессии: держится до разблокировки или конца сессии
+SELECT pg_try_advisory_lock(42) AS got_lock;
+SELECT pg_advisory_unlock(42) AS released;
+
+-- Уровень транзакции: снимается автоматически при COMMIT/ROLLBACK
+BEGIN;
+SELECT pg_try_advisory_xact_lock(hashtext('nightly-billing'))
+  AS got_lock;
+SELECT locktype, mode, granted
+FROM pg_locks
+WHERE locktype = 'advisory';
+COMMIT;
+
+SELECT count(*) AS advisory_locks_left
+FROM pg_locks
+WHERE locktype = 'advisory';
+```
+
+</CodeExample>
+
+- **`pg_try_advisory_lock(n)`** возвращает `true`, если получил блокировку, и сразу `false`, если её держит другая сессия. Задачу cron, которая начинается с `IF NOT pg_try_advisory_lock(…) THEN exit`, можно спокойно запускать на каждом сервере: работу выполнит только один.
+- **`pg_advisory_lock(n)`** (без «try») ждёт, пока блокировка освободится.
+- Версии с **`_xact`** снимаются автоматически в конце транзакции, так что забыть разблокировать невозможно. Предпочитайте их.
+- **`hashtext('name')`** превращает читаемое имя в число — распространённое соглашение.
+
+<Callout type="warning" title="Рекомендательные блокировки сессии и пулеры соединений">
+
+Рекомендательная блокировка уровня сессии принадлежит **соединению с базой данных**, а не вашему запросу. За пулером вроде PgBouncer в режиме транзакций ваша следующая инструкция может выполниться в другом соединении, и вы «разблокируете» в соединении, которое блокировку никогда не держало, а настоящее останется заблокированным навсегда. С пулерами используйте только версии с `_xact`.
+
+</Callout>
+
+## Кто кого блокирует?
+
+Когда приложение в продакшене зависает, эти запросы (на настоящем сервере: чтобы что-то показать, им нужны другие сессии) находят виновника:
+
+```sql
+-- Ожидающие сессии и те, кто их блокирует
+SELECT pid, pg_blocking_pids(pid) AS blocked_by,
+  wait_event_type, state, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+
+-- Транзакции, открытые дольше 5 минут
+SELECT pid, now() - xact_start AS open_for, state,
+  left(query, 60) AS query
+FROM pg_stat_activity
+WHERE xact_start < now() - interval '5 minutes'
+ORDER BY xact_start;
+
+-- Крайняя мера: завершить блокирующую сессию
+SELECT pg_terminate_backend(12345);
+```
+
+Очень часто блокирующая сессия находится в состоянии **`idle in transaction`**: приложение выполнило `BEGIN`, что-то сделало, а потом ушло вызывать HTTP API или упало, не закрыв транзакцию. Всё это время оно держит свои блокировки. Параметр `idle_in_transaction_session_timeout` заставляет PostgreSQL завершать такие сессии автоматически.
+
+<Quiz
+  question="Два обработчика одновременно выполняют один и тот же запрос захвата с FOR UPDATE SKIP LOCKED, а в очереди задачи 1 и 2. Что произойдёт?"
+  options={["Оба получат задачу 1", "Один получит задачу 1, другой дождётся фиксации первого и тоже получит задачу 1", "Один получит задачу 1, другой пропустит её и получит задачу 2", "Второй обработчик получит ошибку"]}
+  answer={2}
+  explanation="SKIP LOCKED заставляет второго обработчика игнорировать строки, заблокированные другой транзакцией, поэтому он переходит к следующей задаче в очереди, а не ждёт. Обычный FOR UPDATE заставил бы его ждать; без блокировок вообще оба взяли бы задачу 1."
+/>
+
+<Quiz
+  question="Миграция выполняет ALTER TABLE orders ADD COLUMN note text, пока долгий отчёт читает orders. Почему обычные SELECT по orders начинают зависать?"
+  options={["ALTER TABLE сначала переписывает всю таблицу", "ALTER ждёт блокировку ACCESS EXCLUSIVE, и новые запросы встают в очередь за ним, хотя с отчётом они совместимы", "В PostgreSQL SELECT всегда ждёт пишущих", "Отчёт держит исключительную блокировку на orders"]}
+  answer={1}
+  explanation="Блокировки выдаются по порядку. ALTER нужна ACCESS EXCLUSIVE, которая конфликтует с ACCESS SHARE отчёта, поэтому он ждёт. Каждый следующий SELECT конфликтует с ожидающим ALTER и встаёт в очередь за ним. Короткий lock_timeout у миграции ограничивает ущерб."
+/>
+
+<Exercise
+  language="sql"
+  title="Заберите следующую задачу"
+  starter={`CREATE TABLE jobs (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  kind text NOT NULL,
+  priority integer NOT NULL DEFAULT 0,
+  status text NOT NULL DEFAULT 'queued',
+  run_at timestamptz NOT NULL,
+  attempts integer NOT NULL DEFAULT 0
+);
+INSERT INTO jobs (kind, priority, status, run_at) VALUES
+  ('send_email',    0, 'queued', '2025-06-01 09:00'),
+  ('build_report',  5, 'queued', '2025-06-01 09:05'),
+  ('send_email',    5, 'queued', '2025-06-01 09:10'),
+  ('cleanup',       9, 'done',   '2025-06-01 07:00'),
+  ('yearly_backup', 9, 'queued', '2999-01-01 00:00'),
+  ('resize_image',  0, 'queued', '2025-06-01 08:00');
+
+-- Заберите следующую задачу: одна инструкция, см. задание
+SELECT id, kind, attempts
+FROM jobs
+WHERE status = 'queued'
+ORDER BY id
+LIMIT 1;`}
+  tests={[
+    { name: "Возвращает столбцы id, kind, attempts", check: "columns.join() === 'id,kind,attempts'" },
+    { name: "Забирает самую срочную задачу, срок которой наступил: build_report (приоритет 5, самая старая), attempts 1", check: "rows.length === 1 && rows[0].id === 2 && rows[0].kind === 'build_report' && rows[0].attempts === 1" },
+    { name: "Помечает забранную задачу как running", check: "(await query(\"SELECT status FROM jobs WHERE id = 2\"))[0].status === 'running'" },
+    { name: "Блокирует строку с FOR UPDATE SKIP LOCKED", check: "/FOR\\s+UPDATE\\s+SKIP\\s+LOCKED/i.test(lastQuery)" },
+    { name: "Новая срочная задача забирается следующей", check: "(await rerun(\"INSERT INTO jobs (kind, priority, run_at) VALUES ('refund', 10, '2025-06-01 10:00')\")).map(r => r.kind).join() === 'refund'" },
+    { name: "Далее по priority и run_at; завершённые и будущие задачи никогда не забираются", check: "[(await rerun()), (await rerun()), (await rerun()), (await rerun())].map(rs => rs.map(r => r.id).join() || 'none').join() === '3,6,1,none'" },
+  ]}
+>
+
+Соберите шаг **захвата** для очереди задач магазина. Каждый запуск вашей инструкции должен брать **одну** задачу и отдавать её обработчику. Замените последний запрос заготовки одной инструкцией `UPDATE … RETURNING`, которая:
+
+1. выбирает следующую задачу со статусом `queued`, срок которой **наступил** (`run_at <= now()`): сначала с наибольшим `priority`, затем с самым ранним `run_at`, затем с наименьшим `id`,
+2. блокирует её с помощью **`FOR UPDATE SKIP LOCKED`**, чтобы параллельные обработчики никогда не брали одну и ту же задачу и никогда не ждали друг друга,
+3. выставляет её `status` в `'running'` и прибавляет 1 к `attempts`,
+4. возвращает `id`, `kind` и `attempts`.
+
+Проверки запускают вашу инструкцию снова и снова, как это делал бы обработчик: каждый раз она должна забирать новую задачу и ничего не возвращать, когда задач с наступившим сроком не осталось (задача `cleanup` уже выполнена, а срок резервного копирования наступит только в 2999 году).
+
+<Hint>
+
+Используйте форму из урока: `UPDATE jobs SET … WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY priority DESC, run_at, id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, kind, attempts;`. Если подзапрос не находит строк, он возвращает NULL, `id = NULL` ничему не соответствует, и `UPDATE` не возвращает строк — это ровно «задач для вас нет».
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE jobs (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  kind text NOT NULL,
+  priority integer NOT NULL DEFAULT 0,
+  status text NOT NULL DEFAULT 'queued',
+  run_at timestamptz NOT NULL,
+  attempts integer NOT NULL DEFAULT 0
+);
+INSERT INTO jobs (kind, priority, status, run_at) VALUES
+  ('send_email',    0, 'queued', '2025-06-01 09:00'),
+  ('build_report',  5, 'queued', '2025-06-01 09:05'),
+  ('send_email',    5, 'queued', '2025-06-01 09:10'),
+  ('cleanup',       9, 'done',   '2025-06-01 07:00'),
+  ('yearly_backup', 9, 'queued', '2999-01-01 00:00'),
+  ('resize_image',  0, 'queued', '2025-06-01 08:00');
+
+UPDATE jobs
+SET status = 'running', attempts = attempts + 1
+WHERE id = (
+  SELECT id
+  FROM jobs
+  WHERE status = 'queued' AND run_at <= now()
+  ORDER BY priority DESC, run_at, id
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, kind, attempts;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- `UPDATE` и `DELETE` блокируют изменяемые строки до конца транзакции. Пишущие ждут пишущих в **те же строки**; читающие и пишущие никогда не блокируют друг друга.
+- **`SELECT … FOR UPDATE`** блокирует строки, которые вы собираетесь изменить; `NOWAIT` и `lock_timeout` не дают ждать вечно. Блокировки строк живут в самих строках, режимы уровня таблицы — в `pg_locks`.
+- **`FOR UPDATE SKIP LOCKED`** превращает таблицу в безопасную параллельную очередь задач: один `UPDATE … WHERE id = (SELECT … LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING …`.
+- **Взаимоблокировки** обнаруживаются через `deadlock_timeout`, и одна транзакция падает с `40P01`. Блокируйте в постоянном порядке, держите транзакции короткими и повторяйте.
+- `ALTER TABLE` и похожие инструкции берут `ACCESS EXCLUSIVE`, а ожидающие запросы блокировок задерживают всё, что стоит за ними: запускайте миграции с коротким **`lock_timeout`**.
+- **Рекомендательные блокировки** блокируют число, смысл которого задаёт приложение; предпочитайте версии с `_xact`, особенно за пулером соединений.
+- В продакшене `pg_stat_activity` с `pg_blocking_pids()` показывает, кто кого блокирует, а сессии в состоянии `idle in transaction` — обычные подозреваемые.

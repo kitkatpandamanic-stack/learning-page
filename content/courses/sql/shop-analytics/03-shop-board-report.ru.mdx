@@ -1,0 +1,364 @@
+---
+title: "Аналитика магазина: сигналы о запасах и отчёт для совета"
+description: "Итоговый проект Уровня 1, часть 3: настройте сигналы о запасах, сохраните список дозаказа в своей таблице и соберите главные цифры магазина в один запрос-отчёт."
+duration: 18
+xp: 30
+---
+
+В списке основателя осталось два вопроса, и второй из них — большой финал:
+
+> 3. … и что скоро закончится?
+> 4. Можно ли уместить главные цифры на одной странице?
+
+В этой последней части вы настроите **сигналы о запасах** (stock alerts), превратите их в **список дозаказа**, который хранится в таблице вашей собственной конструкции, а затем соберёте **отчёт для совета директоров**: один запрос, который отвечает на главные вопросы совета в одной аккуратной таблице. Здесь сходится всё, что было на Уровне 1. 🐼📊
+
+## Сигналы о запасах
+
+Складу нужны сигналы двух видов: товары, которых **нет в наличии** (запас 0), и товары, которые **заканчиваются** (осталось меньше 10). Каждый сигнал — простой запрос; **`UNION ALL`** складывает их в один список, а текстовая метка говорит, что это за сигнал:
+
+<CodeExample output={`    alert     |          name          | stock
+--------------+------------------------+-------
+ out of stock | Clean Python           |     0
+ out of stock | Earl Grey              |     0
+ low stock    | Algorithms in Pictures |     3
+ low stock    | Rice Cooker            |     4
+ low stock    | Tea Pot                |     6
+ low stock    | The Bamboo Code        |     7
+ low stock    | Wooden Puzzle          |     9
+(7 rows)`}>
+
+```sql
+SELECT 'out of stock' AS alert, name, stock
+FROM products
+WHERE stock = 0
+UNION ALL
+SELECT 'low stock', name, stock
+FROM products
+WHERE stock BETWEEN 1 AND 9
+ORDER BY alert DESC, stock, name;
+```
+
+</CodeExample>
+
+Имена столбцов берутся из первого `SELECT`, а последний `ORDER BY` сортирует объединённый результат: по алфавиту `'out of stock'` идёт после `'low stock'`, поэтому `DESC` ставит срочные сигналы первыми. У каждой части свой `WHERE`, так что товар не может попасть в оба списка.
+
+## Хватит ли запаса?
+
+Фиксированный порог вроде «меньше 10» стрижёт все товары под одну гребёнку, но 9 штук Wooden Puzzle — это много для товара, который продаётся раз в год, и ничто для лидера продаж. Правило поумнее сравнивает запас с **недавними продажами**. Правило магазина: держать запас на **шесть месяцев** при темпе продаж последних трёх (с апреля по июнь). Всё, что ниже, дозаказывается:
+
+<CodeExample output={`          name          | stock | sold_apr_jun | reorder
+------------------------+-------+--------------+---------
+ Earl Grey              |     0 |            5 |      10
+ Algorithms in Pictures |     3 |            6 |       9
+ Wooden Puzzle          |     9 |            9 |       9
+ Clean Python           |     0 |            4 |       8
+ The Bamboo Code        |     7 |            6 |       5
+ Rice Cooker            |     4 |            4 |       4
+(6 rows)`}>
+
+```sql
+WITH recent_sales AS (
+  SELECT oi.product_id, sum(oi.quantity) AS sold
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  WHERE o.status <> 'cancelled'
+    AND o.ordered_at >= '2025-04-01'
+  GROUP BY oi.product_id
+)
+SELECT p.name, p.stock, r.sold AS sold_apr_jun,
+  2 * r.sold - p.stock AS reorder
+FROM products AS p
+JOIN recent_sales AS r ON r.product_id = p.id
+WHERE p.stock < 2 * r.sold
+ORDER BY reorder DESC, p.name;
+```
+
+</CodeExample>
+
+Шесть товаров нужно пополнить. Earl Grey и Clean Python уже распроданы, а Algorithms in Pictures скоро закончится: осталось 3, а за последние три месяца продано 6. Товары, которые недавно не продавались, не появляются, потому что внутреннее соединение с `recent_sales` их отбрасывает, — здесь это ровно то, что нужно: нет смысла дозаказывать то, что не продаётся.
+
+## Сохраняем список дозаказа
+
+Закупщица хочет отмечать позиции по мере того, как оформляет заказы у поставщиков, поэтому список должен жить в **таблице**, а не только на экране. Пора применить то, что вы узнали о [проектировании таблиц](/learn/sql/creating-tables): ключ-идентификатор, внешний ключ на `products`, `CHECK` для количества и значение по умолчанию для даты. Затем **`INSERT ... SELECT`** заполняет таблицу прямо из запроса, а `RETURNING` показывает, что сохранилось:
+
+<CodeExample output={`CREATE TABLE
+
+ product_id | quantity
+------------+----------
+          3 |       10
+          7 |        5
+          8 |        9
+          9 |        8
+         11 |        9
+         15 |        4
+(6 rows)`}>
+
+```sql
+CREATE TABLE restock_requests (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL CHECK (quantity > 0),
+  requested_on date NOT NULL DEFAULT '2025-07-01',
+  done boolean NOT NULL DEFAULT false,
+  UNIQUE (product_id, requested_on)
+);
+
+INSERT INTO restock_requests (product_id, quantity)
+SELECT p.id, 2 * r.sold - p.stock
+FROM products AS p
+JOIN (
+  SELECT oi.product_id, sum(oi.quantity) AS sold
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  WHERE o.status <> 'cancelled'
+    AND o.ordered_at >= '2025-04-01'
+  GROUP BY oi.product_id
+) AS r ON r.product_id = p.id
+WHERE p.stock < 2 * r.sold
+RETURNING product_id, quantity;
+```
+
+</CodeExample>
+
+Правило `UNIQUE (product_id, requested_on)` означает, что если запустить скрипт дважды в один день, один и тот же товар не будет запрошен дважды: вторая вставка завершится ошибкой, а не удвоит заказ.
+
+Когда приходит поставка, два изменения должны произойти **вместе**: запас увеличивается, а запросы помечаются выполненными. Это работа для **транзакции** (transaction) и для [`UPDATE ... FROM`](/learn/sql/update-and-delete), который обновляет строки с помощью другой таблицы:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+BEGIN
+
+     name     | stock
+--------------+-------
+ Earl Grey    |    10
+ Clean Python |     8
+(2 rows)
+
+UPDATE 2
+
+COMMIT`}>
+
+```sql
+CREATE TABLE restock_requests (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL CHECK (quantity > 0),
+  requested_on date NOT NULL DEFAULT '2025-07-01',
+  done boolean NOT NULL DEFAULT false
+);
+
+INSERT INTO restock_requests (product_id, quantity)
+VALUES (3, 10), (9, 8);
+
+BEGIN;
+
+UPDATE products AS p
+SET stock = p.stock + r.quantity
+FROM restock_requests AS r
+WHERE r.product_id = p.id
+  AND NOT r.done
+RETURNING p.name, p.stock;
+
+UPDATE restock_requests SET done = true WHERE NOT done;
+
+COMMIT;
+```
+
+</CodeExample>
+
+Если между `BEGIN` и `COMMIT` что-то пойдёт не так, ни одно из изменений не сохранится, поэтому запас никогда не увеличится дважды и не будет помечен выполненным без реальной поставки.
+
+<Quiz
+  question="Почему запрос на дозаказ соединяется с recent_sales через JOIN, а не через LEFT JOIN?"
+  options={[
+    "LEFT JOIN был бы медленнее",
+    "Товары без недавних продаж не нужно дозаказывать, а внутреннее соединение их отбрасывает",
+    "UNION ALL требует внутреннего соединения",
+    "LEFT JOIN нельзя использовать внутри CTE",
+  ]}
+  answer={1}
+  explanation="Внутреннее соединение оставляет только товары, которые есть в recent_sales, поэтому товары, не продававшиеся с апреля по июнь, выпадают. С LEFT JOIN они вернулись бы со значением sold, равным NULL, и пришлось бы обрабатывать их с помощью coalesce()."
+/>
+
+## Отчёт для совета директоров
+
+Членам совета не нужны пять таблиц; им нужна **одна страница главных цифр**. В SQL такую страницу удобно строить как одну строку на метрику, с названием `metric` и значением `value`:
+
+```text
+     metric      |  value
+-----------------+---------
+ revenue         | 2445.82
+ orders          |      32
+ ...
+```
+
+Каждая метрика — свой маленький запрос, возвращающий одну строку; `UNION ALL` складывает их вместе. Чтобы всё работало, нужно несколько вещей:
+
+- **Общие CTE**: определите `order_totals` (и всё, что нужно нескольким метрикам) один раз вверху, чтобы все цифры использовали **одни и те же определения**.
+- **Одинаковые типы столбцов**: каждая часть `UNION` должна давать совместимые типы. Количества (`bigint`) и деньги (`numeric`) отлично сочетаются: PostgreSQL приводит их все к `numeric`.
+- **Фиксированный порядок**: у `UNION` нет естественного порядка, поэтому дайте каждой строке номер позиции в CTE и отсортируйте по нему в конце, не показывая его.
+
+Вот каркас с первыми двумя метриками:
+
+<CodeExample output={` metric  |  value
+---------+---------
+ revenue | 2445.82
+ orders  |      32
+(2 rows)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+),
+valid_orders AS (
+  SELECT * FROM order_totals WHERE status <> 'cancelled'
+),
+report AS (
+  SELECT 1 AS pos, 'revenue' AS metric, sum(total) AS value
+  FROM valid_orders
+  UNION ALL
+  SELECT 2, 'orders', count(*)
+  FROM valid_orders
+)
+SELECT metric, value
+FROM report
+ORDER BY pos;
+```
+
+</CodeExample>
+
+Шаг `valid_orders` — это определение настоящего заказа в магазине, записанное **один раз**. Если совет позже решит, что заказы `'paid'` не должны учитываться, пока их не отправят, вы меняете одну строку, и все метрики следуют за ней.
+
+<Callout type="tip" title="Одно определение — много отчётов">
+
+В настоящей команде `order_totals` и `valid_orders` стали бы **представлениями** (views, сохранёнными запросами — они будут на Уровне 2), чтобы отчёт для совета, выгрузка для финансового отдела и дашборд не могли разойтись. А пока держите общие шаги в начале скрипта и копируйте их в точности.
+
+</Callout>
+
+<Exercise
+  language="sql"
+  title="Отчёт для совета директоров"
+  starter={`WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+),
+valid_orders AS (
+  SELECT * FROM order_totals WHERE status <> 'cancelled'
+),
+report AS (
+  SELECT 1 AS pos, 'revenue' AS metric, sum(total) AS value
+  FROM valid_orders
+  UNION ALL
+  SELECT 2, 'orders', count(*)
+  FROM valid_orders
+)
+SELECT metric, value
+FROM report
+ORDER BY pos;
+`}
+  tests={[
+    { name: "Столбцы: metric, value", check: "columns.join() === 'metric,value'" },
+    { name: "Семь метрик в порядке, нужном совету", check: "rows.map(r => r.metric).join() === 'revenue,orders,average order,customers,repeat customers,products never sold,products out of stock'" },
+    { name: "Выручка, число заказов и средний чек верны", check: "rows.slice(0, 3).map(r => r.value).join() === '2445.82,32,76.43'" },
+    { name: "Цифры по покупателям верны", check: "rows.slice(3, 5).map(r => r.value).join() === '17,12'" },
+    { name: "Цифры по товарам верны", check: "rows.slice(5).map(r => r.value).join() === '3,2'" },
+    { name: "Все цифры учитывают новые заказы", check: "(await rerun(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (18, '2025-07-01 12:00', 'delivered') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, 10, 2, 18.00 FROM o; WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (1, '2025-07-02 12:00', 'paid') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, 4, 1, 2.99 FROM o\")).map(r => r.value).join() === '2484.81,34,73.08,18,13,2,2'" },
+    { name: "Изменения запасов тоже отражаются", check: "(await rerun(\"UPDATE products SET stock = 0 WHERE name = 'Kite'\"))[6].value === 3" },
+  ]}
+>
+
+Доделайте отчёт для совета. Он должен возвращать столбцы `metric` и `value` ровно с этими семью строками в таком порядке:
+
+1. `revenue`: общая выручка неотменённых заказов,
+2. `orders`: количество этих заказов,
+3. `average order`: их средняя сумма, округлённая до 2 знаков после запятой,
+4. `customers`: сколько разных покупателей оформили хотя бы один из них,
+5. `repeat customers`: сколько покупателей оформили **два или больше** из них,
+6. `products never sold`: товары, которые не встречаются ни в одном неотменённом заказе,
+7. `products out of stock`: товары с запасом 0.
+
+Первые две готовы. Каждое число должно браться из данных, чтобы отчёт оставался верным, когда приходят новые заказы.
+
+<Hint>
+
+Метрики 3 и 4 тоже читают `valid_orders`: `round(avg(total), 2)` и `count(DISTINCT customer_id)`. Для 5 добавьте CTE вроде `customer_orders AS (SELECT customer_id, count(*) AS n FROM valid_orders GROUP BY customer_id)` и посчитайте его строки `WHERE n >= 2`. Для 6 посчитайте товары, для которых `WHERE NOT EXISTS` позиции в неотменённом заказе (как в части 2), а для 7 — товары `WHERE stock = 0`. Дайте каждой части её номер `pos` (с 3 по 7) и название метрики.
+
+</Hint>
+
+<Solution>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+),
+valid_orders AS (
+  SELECT * FROM order_totals WHERE status <> 'cancelled'
+),
+customer_orders AS (
+  SELECT customer_id, count(*) AS n
+  FROM valid_orders
+  GROUP BY customer_id
+),
+report AS (
+  SELECT 1 AS pos, 'revenue' AS metric, sum(total) AS value
+  FROM valid_orders
+  UNION ALL
+  SELECT 2, 'orders', count(*)
+  FROM valid_orders
+  UNION ALL
+  SELECT 3, 'average order', round(avg(total), 2)
+  FROM valid_orders
+  UNION ALL
+  SELECT 4, 'customers', count(DISTINCT customer_id)
+  FROM valid_orders
+  UNION ALL
+  SELECT 5, 'repeat customers', count(*)
+  FROM customer_orders
+  WHERE n >= 2
+  UNION ALL
+  SELECT 6, 'products never sold', count(*)
+  FROM products AS p
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM order_items AS oi
+    JOIN valid_orders AS v ON v.id = oi.order_id
+    WHERE oi.product_id = p.id
+  )
+  UNION ALL
+  SELECT 7, 'products out of stock', count(*)
+  FROM products
+  WHERE stock = 0
+)
+SELECT metric, value
+FROM report
+ORDER BY pos;
+```
+
+</Solution>
+
+</Exercise>
+
+Запустите готовый отчёт и представьте себе папку для совета: эта таблица главных цифр на первой странице, помесячный отчёт о выручке из [части 1](/learn/sql/shop-revenue-by-month) — на второй, лучшие покупатели и непроданные товары из [части 2](/learn/sql/shop-customers-and-products) — на третьей. Все цифры построены на одних и тех же определениях, а в следующем месяце вы просто запустите скрипты снова. В этом и есть настоящая цель аналитического SQL: **ответы, которым можно доверять и которые можно повторить**.
+
+Поздравляем, вы прошли Уровень 1! 🎉 На Уровне 2 вы изучите **оконные функции** (window functions: рейтинги, нарастающие итоги и рост месяц к месяцу в одном запросе), продвинутые запросы, индексы и производительность, а также представления, функции и триггеры.
+
+## Итоги
+
+- `UNION ALL` складывает результаты нескольких запросов; текстовый столбец вроде `'out of stock' AS alert` помечает, откуда пришла каждая строка.
+- Сравнивайте запас с **недавними продажами** (CTE за последние несколько месяцев) — такие сигналы умнее фиксированного порога.
+- Сохраняйте результаты в собственной таблице с ограничениями, заполняйте её через `INSERT ... SELECT ... RETURNING` и применяйте связанные изменения вместе в транзакции с `UPDATE ... FROM`.
+- Отчёт для совета может состоять из строки на метрику: общие CTE для определений, по маленькому запросу на метрику, `UNION ALL` и скрытый столбец позиции для порядка.
+- Определяйте «настоящий заказ», «выручку» и прочее **один раз**, чтобы все цифры во всех отчётах сходились.

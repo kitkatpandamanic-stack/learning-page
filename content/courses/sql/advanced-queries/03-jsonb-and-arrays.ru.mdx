@@ -1,0 +1,582 @@
+---
+title: JSONB и массивы
+description: Храните списки и гибкие документы в PostgreSQL с помощью массивов и JSONB, запрашивайте их операторами ->>, @> и ANY, собирайте JSON для API и узнайте, когда помогает индекс GIN.
+duration: 25
+xp: 25
+---
+
+До сих пор каждое значение было одним числом, строкой или датой: одно значение на ячейку. Но PostgreSQL умеет хранить и **несколько значений в одной ячейке**: **массив (array)** (`{vegan,quick}`) или целый **JSON-документ** (`{"type": "purchase", "items": [2, 5]}`).
+
+Это полезно в обе стороны. **Наружу**: агрегировать строки в список или JSON-документ, который приложение или API может сразу отправить в браузер. **Внутрь**: хранить гибкие данные — например, содержимое событий или настройки, — форма которых меняется слишком часто для фиксированных столбцов. Этот урок охватывает оба направления, а также индексы, которые сохраняют скорость. 🧺
+
+## Строки в списки: array_agg и string_agg
+
+Два агрегата превращают строки группы в одно значение. **`string_agg(text, separator)`** склеивает текст, а **`array_agg(value)`** строит массив. Оба принимают `ORDER BY` внутри скобок, чтобы управлять порядком элементов:
+
+<CodeExample output={` category |    ids     |                    cheapest_first
+----------+------------+-------------------------------------------------------
+ books    | {7,9,8}    | The Bamboo Code, Clean Python, Algorithms in Pictures
+ kitchen  | {14,13,15} | Bamboo Chopsticks, Tea Pot, Rice Cooker
+ snacks   | {6,4,5}    | Rice Crackers, Bamboo Crisps, Panda Cookies
+ tea      | {3,1,2}    | Earl Grey, Jasmine Tea, Matcha Powder
+ toys     | {11,12,10} | Wooden Puzzle, Kite, Plush Panda
+(5 rows)`}>
+
+```sql
+SELECT category,
+  array_agg(id ORDER BY price) AS ids,
+  string_agg(name, ', ' ORDER BY price) AS cheapest_first
+FROM products
+GROUP BY category
+ORDER BY category;
+```
+
+</CodeExample>
+
+PostgreSQL выводит массивы в фигурных скобках: `{14,13,15}`. Текстовые элементы с пробелами или запятыми при таком выводе берутся в двойные кавычки, например `{"Earl Grey",Kite}`. Без `ORDER BY` внутри агрегата элементы идут в том порядке, в каком случайно пришли строки, поэтому добавляйте его всякий раз, когда порядок важен (а обычно он важен).
+
+## Столбцы-массивы
+
+Столбец может хранить массив любого типа: `text[]`, `integer[]`, `date[]`. Классический пример — теги:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+       title       |         tags         | first_tag | tag_count
+-------------------+----------------------+-----------+-----------
+ Bamboo stir-fry   | {vegan,quick,wok}    | vegan     |         3
+ Dumpling soup     | {comfort,soup}       | comfort   |         2
+ Matcha cookies    | {vegan,baking,sweet} | vegan     |         3
+ Green tea noodles | {quick,vegan}        | quick     |         2
+(4 rows)`}>
+
+```sql
+CREATE TABLE recipes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  tags text[] NOT NULL DEFAULT '{}'
+);
+
+INSERT INTO recipes (title, tags) VALUES
+  ('Bamboo stir-fry', ARRAY['vegan', 'quick', 'wok']),
+  ('Dumpling soup', ARRAY['comfort', 'soup']),
+  ('Matcha cookies', ARRAY['vegan', 'baking', 'sweet']),
+  ('Green tea noodles', ARRAY['quick', 'vegan']);
+
+SELECT title, tags, tags[1] AS first_tag,
+  cardinality(tags) AS tag_count
+FROM recipes
+ORDER BY id;
+```
+
+</CodeExample>
+
+Массивы записываются через **`ARRAY[...]`** (или текстом `'{vegan,quick}'`). Один элемент достаётся через **`tags[1]`**. Осторожно: массивы в PostgreSQL нумеруются с **1**, а не с 0, а запрос несуществующего элемента даёт `NULL`, а не ошибку. **`cardinality(tags)`** считает элементы.
+
+## Поиск в массивах: ANY, @> и &&
+
+Три способа спросить «у каких рецептов есть этот тег?»:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+       title
+-------------------
+ Bamboo stir-fry
+ Green tea noodles
+ Matcha cookies
+(3 rows)
+
+       title
+-------------------
+ Bamboo stir-fry
+ Green tea noodles
+(2 rows)
+
+     title
+----------------
+ Dumpling soup
+ Matcha cookies
+(2 rows)`}>
+
+```sql
+CREATE TABLE recipes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  tags text[] NOT NULL DEFAULT '{}'
+);
+
+INSERT INTO recipes (title, tags) VALUES
+  ('Bamboo stir-fry', ARRAY['vegan', 'quick', 'wok']),
+  ('Dumpling soup', ARRAY['comfort', 'soup']),
+  ('Matcha cookies', ARRAY['vegan', 'baking', 'sweet']),
+  ('Green tea noodles', ARRAY['quick', 'vegan']);
+
+-- есть этот один тег
+SELECT title FROM recipes
+WHERE 'vegan' = ANY (tags)
+ORDER BY title;
+
+-- есть ВСЕ эти теги (содержит)
+SELECT title FROM recipes
+WHERE tags @> ARRAY['vegan', 'quick']
+ORDER BY title;
+
+-- есть ХОТЯ БЫ ОДИН из этих тегов (пересекается)
+SELECT title FROM recipes
+WHERE tags && ARRAY['soup', 'sweet']
+ORDER BY title;
+```
+
+</CodeExample>
+
+- **`value = ANY (array)`** истинно, если значение равно хотя бы одному элементу. Так же приложения передают список id **одним** параметром: `WHERE id = ANY ($1)`.
+- **`@>`** означает «содержит»: в левом массиве есть все элементы правого.
+- **`&&`** означает «пересекается»: у массивов есть хотя бы один общий элемент.
+
+## Списки обратно в строки: unnest
+
+**`unnest(array)`** делает противоположное `array_agg`: превращает каждый элемент в строку. Во `FROM` эта функция даёт по одной строке на каждую пару (рецепт, тег) — готово для обычного `GROUP BY`:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+   tag   | recipes
+---------+---------
+ vegan   |       3
+ quick   |       2
+ baking  |       1
+ comfort |       1
+ soup    |       1
+ sweet   |       1
+ wok     |       1
+(7 rows)`}>
+
+```sql
+CREATE TABLE recipes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  tags text[] NOT NULL DEFAULT '{}'
+);
+
+INSERT INTO recipes (title, tags) VALUES
+  ('Bamboo stir-fry', ARRAY['vegan', 'quick', 'wok']),
+  ('Dumpling soup', ARRAY['comfort', 'soup']),
+  ('Matcha cookies', ARRAY['vegan', 'baking', 'sweet']),
+  ('Green tea noodles', ARRAY['quick', 'vegan']);
+
+SELECT tag, count(*) AS recipes
+FROM recipes
+CROSS JOIN unnest(tags) AS tag
+GROUP BY tag
+ORDER BY recipes DESC, tag;
+```
+
+</CodeExample>
+
+Вот и облако тегов в пять строк. Если нужна позиция каждого элемента, добавьте её через `unnest(tags) WITH ORDINALITY AS t (tag, position)`.
+
+<Callout type="note" title="Массив или отдельная таблица?">
+
+Столбец-массив удобен для небольших списков, которые принадлежат одной строке и читаются вместе (теги, пара телефонных номеров). Но на элементы массива нельзя повесить внешний ключ (foreign key), а изменение одного элемента перезаписывает весь массив. Если у элементов есть свои данные, нужна целостность или частые изменения («у тегов есть цвета и владельцы»), используйте отдельную таблицу с одной строкой на элемент — нормализованную схему с уровня 1.
+
+</Callout>
+
+## JSONB: документы внутри столбца
+
+**JSON** — язык, на котором говорят приложения и API. В PostgreSQL два типа JSON:
+
+- **`json`** хранит текст ровно в том виде, в каком его передали (пробелы, порядок ключей и даже повторяющиеся ключи), и разбирает его заново при каждом чтении.
+- **`jsonb`** («JSON binary») разбирает его один раз в эффективную двоичную форму: такие данные быстрее запрашивать, их можно индексировать, при этом повторяющиеся ключи удаляются (побеждает последний), а ключи хранятся в собственном порядке.
+
+<CodeExample output={`         as_json          |     as_jsonb
+--------------------------+------------------
+ {"b": 1, "a": 2, "a": 3} | {"a": 3, "b": 1}
+(1 row)`}>
+
+```sql
+SELECT '{"b": 1, "a": 2, "a": 3}'::json AS as_json,
+  '{"b": 1, "a": 2, "a": 3}'::jsonb AS as_jsonb;
+```
+
+</CodeExample>
+
+Используйте **`jsonb`**, если только вам не нужно сохранить исходный текст в точности. Давайте сохраним несколько **событий (events)** приложения — такие собирает любая система аналитики, и у каждого типа события свои поля:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 5
+
+ id |   type_json   |  type_text  |   os    | os_again
+----+---------------+-------------+---------+----------
+  1 | "page_view"   | page_view   | ios     | ios
+  2 | "add_to_cart" | add_to_cart | ios     | ios
+  3 | "purchase"    | purchase    | ios     | ios
+  4 | "page_view"   | page_view   | android | android
+  5 | "purchase"    | purchase    | web     | web
+(5 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  happened_at timestamp NOT NULL,
+  payload jsonb NOT NULL
+);
+
+INSERT INTO events (happened_at, payload) VALUES
+  ('2025-06-01 09:00', '{"type": "page_view", "page": "/tea",
+    "device": {"os": "ios"}}'),
+  ('2025-06-01 09:02', '{"type": "add_to_cart", "product_id": 2,
+    "qty": 1, "device": {"os": "ios"}}'),
+  ('2025-06-01 09:05', '{"type": "purchase", "total": 28.00,
+    "items": [2, 5], "coupon": "PANDA10", "device": {"os": "ios"}}'),
+  ('2025-06-01 10:30', '{"type": "page_view", "page": "/books",
+    "device": {"os": "android"}}'),
+  ('2025-06-01 11:15', '{"type": "purchase", "total": 89.90,
+    "items": [15], "device": {"os": "web"}}');
+
+SELECT id,
+  payload -> 'type' AS type_json,
+  payload ->> 'type' AS type_text,
+  payload -> 'device' ->> 'os' AS os,
+  payload #>> '{device,os}' AS os_again
+FROM events
+ORDER BY id;
+```
+
+</CodeExample>
+
+Операторы, которые стоит запомнить:
+
+- **`->`** достаёт поле (или элемент массива по номеру, с 0) **как `jsonb`**. Поэтому у `type_json` сохраняются кавычки: это всё ещё JSON.
+- **`->>`** достаёт его **как `text`**. Используйте его для сравнения, вывода и приведения типов.
+- Соединяйте их в цепочку, чтобы спуститься глубже: `payload -> 'device' ->> 'os'`. Или передайте путь оператору **`#>>`**: `payload #>> '{device,os}'`.
+
+Отсутствующие поля не вызывают ошибок, а дают `NULL` — как и отсутствующий элемент массива.
+
+## Фильтрация JSONB: ->>, @> и ?
+
+Вот три обычных способа фильтрации. Каждый фрагмент здесь запускается на чистой базе данных, поэтому этот снова создаёт таблицу `events`:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 5
+
+ id | with_vat
+----+----------
+  3 |    33.60
+  5 |   107.88
+(2 rows)
+
+ id |    type
+----+-------------
+  1 | page_view
+  2 | add_to_cart
+  3 | purchase
+(3 rows)
+
+ id | coupon
+----+---------
+  3 | PANDA10
+(1 row)
+
+ id | product_id
+----+------------
+  3 |          2
+  3 |          5
+  5 |         15
+(3 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  happened_at timestamp NOT NULL,
+  payload jsonb NOT NULL
+);
+
+INSERT INTO events (happened_at, payload) VALUES
+  ('2025-06-01 09:00', '{"type": "page_view", "page": "/tea",
+    "device": {"os": "ios"}}'),
+  ('2025-06-01 09:02', '{"type": "add_to_cart", "product_id": 2,
+    "qty": 1, "device": {"os": "ios"}}'),
+  ('2025-06-01 09:05', '{"type": "purchase", "total": 28.00,
+    "items": [2, 5], "coupon": "PANDA10", "device": {"os": "ios"}}'),
+  ('2025-06-01 10:30', '{"type": "page_view", "page": "/books",
+    "device": {"os": "android"}}'),
+  ('2025-06-01 11:15', '{"type": "purchase", "total": 89.90,
+    "items": [15], "device": {"os": "web"}}');
+
+-- сравниваем поле как текст, приводим тип для вычислений
+SELECT id,
+  round((payload ->> 'total')::numeric * 1.2, 2) AS with_vat
+FROM events
+WHERE payload ->> 'type' = 'purchase'
+ORDER BY id;
+
+-- вхождение: содержит ли документ этот фрагмент?
+SELECT id, payload ->> 'type' AS type
+FROM events
+WHERE payload @> '{"device": {"os": "ios"}}'
+ORDER BY id;
+
+-- ключ существует
+SELECT id, payload ->> 'coupon' AS coupon
+FROM events
+WHERE payload ? 'coupon';
+
+-- по одной строке на каждый элемент JSON-массива
+SELECT e.id, item::int AS product_id
+FROM events AS e
+CROSS JOIN jsonb_array_elements_text(e.payload -> 'items') AS item
+ORDER BY e.id, product_id;
+```
+
+</CodeExample>
+
+- `->>` всегда возвращает текст, поэтому **приводите тип** перед вычислениями или сравнением чисел: `(payload ->> 'total')::numeric`. Сравнение чисел как текста преподносит сюрпризы (`'9' > '10'` — истина).
+- **`@>`** (содержит) проверяет, что документ справа «входит» в документ слева, включая вложенность. Именно этот оператор ускоряет индекс GIN — вы увидите это ниже.
+- **`?`** проверяет, что ключ верхнего уровня существует.
+- **`jsonb_array_elements_text`** (или `jsonb_array_elements`, который оставляет элементы в виде `jsonb`) разворачивает JSON-массив в строки.
+
+<Quiz
+  question={"payload — это {\"total\": 28.00}. Какое выражение даёт число, к которому можно прибавить 5?"}
+  options={[
+    "payload -> 'total' + 5",
+    "(payload ->> 'total')::numeric + 5",
+    "payload ->> 'total' + 5",
+    "payload @> 'total' + 5",
+  ]}
+  answer={1}
+  explanation="->> возвращает значение как текст, а ::numeric превращает этот текст в число. -> возвращает jsonb, у которого нет оператора +, а @> — это проверка вхождения, которая возвращает true или false."
+/>
+
+## Сборка JSON для API
+
+Обратное направление не менее полезно: пусть база данных сама придаёт форму JSON, который возвращает ваш API. **`jsonb_build_object(key, value, ...)`** строит объект, а **`jsonb_agg(value)`** агрегирует строки в JSON-массив:
+
+<CodeExample output={`                        customer_json
+--------------------------------------------------------------
+ {"name": "Mei Lin", "orders": [17, 34], "cancelled": 1}
+ {"name": "Sam Ortiz", "orders": [5, 22, 39], "cancelled": 1}
+ {"name": "Ada Brooks", "orders": [10, 27], "cancelled": 0}
+(3 rows)`}>
+
+```sql
+SELECT jsonb_build_object(
+    'name', c.name,
+    'orders', jsonb_agg(o.id ORDER BY o.id),
+    'cancelled', count(*) FILTER (WHERE o.status = 'cancelled')
+  ) AS customer_json
+FROM customers AS c
+JOIN orders AS o ON o.customer_id = c.id
+WHERE c.id <= 3
+GROUP BY c.id
+ORDER BY c.id;
+```
+
+</CodeExample>
+
+Один запрос, одно обращение к базе — и результат готов к отправке. Вложите `jsonb_build_object` внутрь `jsonb_agg`, чтобы получить массив объектов, а `to_jsonb(row)` превращает целую строку в объект с ключом на каждый столбец. **`jsonb_object_agg(key, value)`** собирает один объект из многих строк, например `{"tea": 3, "toys": 3}`.
+
+## Изменение JSONB
+
+Отредактировать часть значения на месте нельзя: вы строите новый документ и сохраняете его:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 1
+
+UPDATE 1
+
+UPDATE 1
+
+                              prefs
+-----------------------------------------------------------------
+ {"theme": "dark", "notify": {"email": false}, "language": "en"}
+(1 row)`}>
+
+```sql
+CREATE TABLE settings (
+  user_id integer PRIMARY KEY,
+  prefs jsonb NOT NULL
+);
+
+INSERT INTO settings VALUES
+  (1, '{"theme": "dark", "notify": {"email": true}, "beta": true}');
+
+UPDATE settings
+SET prefs = jsonb_set(prefs, '{notify,email}', 'false')
+WHERE user_id = 1;
+
+UPDATE settings
+SET prefs = (prefs - 'beta') || '{"language": "en"}'
+WHERE user_id = 1;
+
+SELECT prefs FROM settings;
+```
+
+</CodeExample>
+
+- **`jsonb_set(doc, path, new_value)`** заменяет значение по пути (новое значение должно быть JSON, отсюда `'false'`, а для строки — `'"text"'` с внутренними кавычками).
+- **`||`** объединяет два объекта (побеждают ключи справа), а **`-`** удаляет ключ. Следите за скобками: `-` связывает сильнее, чем `||`, поэтому `prefs || '{...}' - 'beta'` падает с ошибкой «operator is not unique».
+
+## Индексы для JSONB и массивов: GIN
+
+Обычный индекс B-tree сортирует значения целиком, а это никак не помогает с вопросом «содержит ли этот документ `{"os": "ios"}`?». Для этого в PostgreSQL есть **GIN** (Generalised Inverted Index, обобщённый инвертированный индекс): он индексирует каждый ключ и значение **внутри** каждого документа или массива — как предметный указатель в конце книги. Читать планы запросов как следует вы научитесь в следующем модуле, а пока — небольшое превью на 20 000 событий:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE INDEX
+
+ANALYZE
+
+                           QUERY PLAN
+----------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on big_events
+         Recheck Cond: (payload @> '{"user_id": 7}'::jsonb)
+         ->  Bitmap Index Scan on big_events_payload_idx
+               Index Cond: (payload @> '{"user_id": 7}'::jsonb)
+(5 rows)
+
+                         QUERY PLAN
+-------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on big_events
+         Filter: ((payload ->> 'user_id'::text) = '7'::text)
+(3 rows)`}>
+
+```sql
+CREATE TABLE big_events AS
+SELECT jsonb_build_object(
+  'type', (ARRAY['page_view', 'add_to_cart', 'purchase'])[g % 3 + 1],
+  'user_id', g % 1000
+) AS payload
+FROM generate_series(1, 20000) AS g;
+
+CREATE INDEX big_events_payload_idx
+  ON big_events USING gin (payload);
+ANALYZE big_events;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM big_events WHERE payload @> '{"user_id": 7}';
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM big_events WHERE payload ->> 'user_id' = '7';
+```
+
+</CodeExample>
+
+Запрос с `@>` использует индекс (**Bitmap Index Scan on big_events_payload_idx**). Запрос с `->>`, который задаёт тот же вопрос, читает **каждую строку** (**Seq Scan**), потому что индекс GIN по `payload` поддерживает `@>`, `?`, `?|` и `?&`, но не сравнения через `->>`. Поэтому:
+
+- Фильтруйте JSONB через **`@>`**, когда рассчитываете на индекс GIN. `USING gin (payload jsonb_path_ops)` создаёт индекс поменьше и побыстрее, который поддерживает только `@>`.
+- Для одного «горячего» поля подойдёт и обычный **индекс по выражению (expression index)**: `CREATE INDEX ON events ((payload ->> 'type'))` ускоряет `WHERE payload ->> 'type' = 'purchase'`.
+- Массивы получают индексы GIN точно так же: `CREATE INDEX ON recipes USING gin (tags)` ускоряет `@>` и `&&`.
+
+<Callout type="warning" title="JSONB не освобождает от проектирования">
+
+Соблазнительно сложить всё в один столбец `jsonb` и не проектировать таблицы. Не надо. У JSONB нет `NOT NULL`, нет внешних ключей и нет типов для отдельных полей, если не добавить ограничения `CHECK`; у планировщика плохая статистика о том, что внутри; а каждое обновление перезаписывает весь документ. Хорошее правило: поля, по которым вы **фильтруете, соединяете или сортируете**, или которые **есть в каждой строке**, заслуживают настоящих столбцов. JSONB — для по-настоящему изменчивой части: содержимого событий, вебхуков от сторонних сервисов, пользовательских настроек. В модуле о моделировании данных на уровне 3 JSONB, столбцы и схемы EAV сравниваются подробно.
+
+</Callout>
+
+Поиграйте с событиями: посчитайте покупки по ОС устройства, просуммируйте итоги или соберите JSON-сводку с помощью `jsonb_object_agg`.
+
+<TryIt language="sql" code={`CREATE TABLE events (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  payload jsonb NOT NULL
+);
+
+INSERT INTO events (payload) VALUES
+  ('{"type": "page_view", "device": {"os": "ios"}}'),
+  ('{"type": "purchase", "total": 28.00, "device": {"os": "ios"}}'),
+  ('{"type": "page_view", "device": {"os": "android"}}'),
+  ('{"type": "purchase", "total": 89.90, "device": {"os": "web"}}'),
+  ('{"type": "purchase", "total": 12.50, "device": {"os": "ios"}}');
+
+SELECT payload #>> '{device,os}' AS os,
+  count(*) AS events,
+  count(*) FILTER (WHERE payload @> '{"type": "purchase"}')
+    AS purchases,
+  sum((payload ->> 'total')::numeric) AS revenue
+FROM events
+GROUP BY os
+ORDER BY os;`} />
+
+<Quiz
+  question="У таблицы есть индекс GIN по столбцу payload типа jsonb. Какой фильтр может использовать этот индекс?"
+  options={[
+    "WHERE payload ->> 'type' = 'purchase'",
+    "WHERE payload @> '{\"type\": \"purchase\"}'",
+    "WHERE (payload ->> 'total')::numeric > 50",
+    "WHERE payload::text LIKE '%purchase%'",
+  ]}
+  answer={1}
+  explanation="Индекс GIN по умолчанию на столбце jsonb поддерживает вхождение (@>) и проверку существования ключа (?, ?|, ?&). Сравнениям через ->> нужен индекс по выражению для этого поля, а LIKE по текстовому представлению не может использовать ни тот, ни другой."
+/>
+
+<Exercise
+  language="sql"
+  title="Каталог товаров в JSON"
+  starter={`-- Одна строка на категорию, её товары — JSON-массивом
+SELECT category, count(*) AS product_count
+FROM products
+GROUP BY category
+ORDER BY category;`}
+  tests={[
+    { name: "Столбцы: category, product_count, products", check: "columns.join() === 'category,product_count,products'" },
+    { name: "Одна строка на категорию, отсортировано", check: "rows.map(r => r.category + ':' + r.product_count).join() === 'books:3,kitchen:3,snacks:3,tea:3,toys:3'" },
+    { name: "products — JSON-массив объектов с name, price и in_stock", check: "rows.every(r => Array.isArray(r.products) && r.products.every(p => Object.keys(p).sort().join() === 'in_stock,name,price'))" },
+    { name: "Сначала самые дорогие", check: "rows.find(r => r.category === 'tea').products.map(p => p.name).join() === 'Matcha Powder,Jasmine Tea,Earl Grey'" },
+    { name: "price — число, а in_stock — логическое значение", check: "(p => p.name === 'Earl Grey' && p.price === 5.25 && p.in_stock === false)(rows.find(r => r.category === 'tea').products[2])" },
+    { name: "Работает, когда каталог меняется", check: "(await rerun(\"INSERT INTO products (name, category, price, stock) VALUES ('Gyokuro', 'tea', 21.00, 3)\")).find(r => r.category === 'tea').products.map(p => p.name + ':' + p.in_stock).join() === 'Gyokuro:true,Matcha Powder:true,Jasmine Tea:true,Earl Grey:false'" },
+  ]}
+>
+
+Новому мобильному приложению магазина нужен каталог в формате JSON — прямо из базы данных. Верните одну строку на категорию со столбцами:
+
+- `category` и `product_count`,
+- `products`: **JSON-массив** объектов, по одному на товар, у каждого ровно три ключа: `name`, `price` (число) и `in_stock` (`true`, если `stock > 0`, — логическое значение JSON),
+- товары в каждом массиве отсортированы по цене, **сначала самые дорогие**,
+- строки отсортированы по категории.
+
+Для чая `products` должен выглядеть так: `[{"name": "Matcha Powder", "price": 14.00, "in_stock": true}, ...]`.
+
+<Hint>
+
+В запрос с `GROUP BY category` добавьте `jsonb_agg(jsonb_build_object('name', name, 'price', price, 'in_stock', stock > 0) ORDER BY price DESC) AS products`. Логическое выражение вроде `stock > 0` автоматически становится JSON-значением `true` или `false`.
+
+</Hint>
+
+<Solution>
+
+```sql
+SELECT category,
+  count(*) AS product_count,
+  jsonb_agg(
+    jsonb_build_object(
+      'name', name,
+      'price', price,
+      'in_stock', stock > 0
+    )
+    ORDER BY price DESC
+  ) AS products
+FROM products
+GROUP BY category
+ORDER BY category;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **`array_agg(x ORDER BY ...)`** и **`string_agg(text, ', ' ORDER BY ...)`** превращают строки группы в список; **`unnest(array)`** превращает список обратно в строки.
+- Столбцы-массивы (`text[]`) нумеруются с **1**; ищите в них через `x = ANY (arr)`, `@>` (содержит все) и `&&` (пересекается).
+- Предпочитайте **`jsonb`** вместо `json`. **`->`** возвращает `jsonb`, **`->>`** возвращает `text` (приводите тип для вычислений), **`#>>`** идёт по пути; отсутствующие ключи дают `NULL`.
+- Фильтруйте через `->>`, **`@>`** (вхождение) и **`?`** (ключ существует); разворачивайте JSON-массивы через `jsonb_array_elements(_text)`.
+- Собирайте готовый для API JSON с помощью **`jsonb_build_object`**, **`jsonb_agg`** и `to_jsonb(row)`; изменяйте его через `jsonb_set`, `||` и `-`.
+- Индексы **GIN** ускоряют `@>` и `?` для `jsonb` и массивов; для фильтров через `->>` используйте индексы по выражению. Поля, по которым вы фильтруете, соединяете или сортируете, держите в настоящих столбцах.

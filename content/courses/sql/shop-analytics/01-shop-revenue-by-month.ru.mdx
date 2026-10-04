@@ -1,0 +1,310 @@
+---
+title: "Аналитика магазина: выручка по месяцам"
+description: "Итоговый проект Уровня 1, часть 1: превратите сырые заказы в суммы заказов, выручку, средний чек и помесячный отчёт о выручке для совета директоров."
+duration: 18
+xp: 30
+---
+
+Добро пожаловать в итоговый проект Уровня 1! 🎉 У интернет-магазина с пандами из учебной базы на следующей неделе первое **заседание совета директоров**, и основатель прислал вам список вопросов:
+
+> 1. Сколько мы на самом деле продали — по месяцам?
+> 2. Кто наши лучшие покупатели и возвращаются ли люди?
+> 3. Какие товары никогда не продаются и что скоро закончится?
+> 4. Можно ли уместить главные цифры на одной странице?
+
+За три части вы ответите на все эти вопросы инструментами Уровня 1: **соединениями** (JOIN), **подзапросами** (subqueries), **CTE**, **изменением данных** и **собственными таблицами**. Эта часть посвящена вопросу 1 — выручке (revenue).
+
+## Сначала изучите данные
+
+Прежде чем что-то вычислять, посмотрите, что у вас есть. Аналитики, которые пропускают этот шаг, в итоге с большой уверенностью показывают неверные цифры. Сколько всего заказов, за какой период и в каких они статусах?
+
+<CodeExample output={` orders | first_order | last_order
+--------+-------------+------------
+     40 | 2025-01-07  | 2025-06-17
+(1 row)
+
+  status   | orders
+-----------+--------
+ delivered |     16
+ cancelled |      8
+ paid      |      8
+ shipped   |      8
+(4 rows)`}>
+
+```sql
+SELECT count(*) AS orders,
+  min(ordered_at)::date AS first_order,
+  max(ordered_at)::date AS last_order
+FROM orders;
+
+SELECT status, count(*) AS orders
+FROM orders
+GROUP BY status
+ORDER BY orders DESC, status;
+```
+
+</CodeExample>
+
+Сорок заказов с января по июнь 2025 года, и **восемь из них отменены**. Отменённый заказ не принёс денег, поэтому первое правило этого отчёта: **выручка не учитывает отменённые заказы**. Оплаченные (paid), отправленные (shipped) и доставленные (delivered) заказы учитываются.
+
+Второе, что стоит заметить: в `orders` **нет столбца с суммой**. Деньги лежат в `order_items` — по одной строке на каждый товар в заказе, с количеством `quantity` и ценой `unit_price` на момент продажи. Сумма заказа — это сумма `quantity * unit_price` по его позициям.
+
+## Шаг 1: сумма каждого заказа
+
+Большинство вопросов совета начинаются с одного и того же строительного блока: одна строка на заказ с его суммой. Это идеальная работа для **CTE** — именованного шага, на котором можно строить дальше (см. [CTE](/learn/sql/common-table-expressions)):
+
+<CodeExample output={` id |    day     |  status   | items | total
+----+------------+-----------+-------+--------
+  1 | 2025-01-07 | delivered |     4 | 102.00
+  2 | 2025-01-11 | shipped   |     6 | 200.17
+  3 | 2025-01-15 | paid      |     2 |   8.40
+  4 | 2025-01-19 | cancelled |     4 |  44.50
+  5 | 2025-01-24 | delivered |     6 | 149.73
+  6 | 2025-01-28 | delivered |     2 |  58.00
+(6 rows)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.ordered_at, o.status,
+    sum(oi.quantity) AS items,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT id, ordered_at::date AS day, status, items, total
+FROM order_totals
+ORDER BY id
+LIMIT 6;
+```
+
+</CodeExample>
+
+`GROUP BY o.id` достаточно, чтобы выбирать и другие столбцы `orders`: поскольку `id` — первичный ключ, PostgreSQL знает, что в каждой группе ровно один покупатель, одна дата и один статус.
+
+## Шаг 2: главные цифры
+
+Когда `order_totals` готов, главные показатели — это простые агрегаты по неотменённым заказам. **Средний чек** (average order value, AOV) — любимая метрика любого владельца магазина: сколько стоит типичный заказ.
+
+<CodeExample output={` orders | revenue | avg_order | customers
+--------+---------+-----------+-----------
+     32 | 2445.82 |     76.43 |        17
+(1 row)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT count(*) AS orders,
+  sum(total) AS revenue,
+  round(avg(total), 2) AS avg_order,
+  count(DISTINCT customer_id) AS customers
+FROM order_totals
+WHERE status <> 'cancelled';
+```
+
+</CodeExample>
+
+32 настоящих заказа от 17 разных покупателей принесли 2445.82, в среднем 76.43 за заказ.
+
+<Callout type="warning" title="Ловушка размножения строк при соединении">
+
+Почему бы не обойтись без CTE и не написать `count(*)` сразу после соединения `orders` с `order_items`? Потому что соединение даёт **одну строку на позицию**, а не на заказ: заказ с тремя товарами появится трижды. `count(*)` посчитал бы позиции, а `avg()` усреднил бы позиции вместо заказов. Это называется **размножением строк** (fan-out), и оно тихо ломает отчёты повсюду. Сначала агрегируйте позиции **по каждому заказу** (как это делает `order_totals`) или используйте `count(DISTINCT o.id)`, если нужно только количество.
+
+</Callout>
+
+Вот ловушка в действии рядом с правильными цифрами:
+
+<CodeExample output={` orders | avg_order
+--------+-----------
+     65 |     37.63
+(1 row)
+
+ orders | avg_order
+--------+-----------
+     32 |     76.43
+(1 row)`}>
+
+```sql
+-- неправильно: строки — это позиции, а не заказы
+SELECT count(*) AS orders,
+  round(avg(oi.quantity * oi.unit_price), 2) AS avg_order
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled';
+
+-- правильно: считаем разные заказы и делим выручку на них
+SELECT count(DISTINCT o.id) AS orders,
+  round(sum(oi.quantity * oi.unit_price)
+    / count(DISTINCT o.id), 2) AS avg_order
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+WHERE o.status <> 'cancelled';
+```
+
+</CodeExample>
+
+Неправильная версия утверждает, что было 65 заказов по 37.63: примерно вдвое больше заказов вдвое меньшей стоимости. Никаких ошибок, и цифры даже выглядят правдоподобно. Именно этим размножение строк и опасно.
+
+## Шаг 3: выручка по месяцам
+
+Совету нужен тренд, поэтому сгруппируйте суммы заказов по **месяцам**. `to_char(ordered_at, 'YYYY-MM')` превращает метку времени в сортируемую подпись вроде `2025-03`:
+
+<CodeExample output={`  month  | orders | revenue | avg_order
+---------+--------+---------+-----------
+ 2025-01 |      5 |  518.30 |    103.66
+ 2025-02 |      6 |  331.69 |     55.28
+ 2025-03 |      6 |  525.80 |     87.63
+ 2025-04 |      6 |  331.69 |     55.28
+ 2025-05 |      5 |  467.80 |     93.56
+ 2025-06 |      4 |  270.54 |     67.64
+(6 rows)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.ordered_at, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT to_char(ordered_at, 'YYYY-MM') AS month,
+  count(*) AS orders,
+  sum(total) AS revenue,
+  round(avg(total), 2) AS avg_order
+FROM order_totals
+WHERE status <> 'cancelled'
+GROUP BY month
+ORDER BY month;
+```
+
+</CodeExample>
+
+Лучшим месяцем стал март, а самым слабым — июнь, хотя последний июньский заказ пришёлся на 17-е число, так что месяц в данных, возможно, ещё не закончился. Прежде чем называть что-то спадом, всегда проверяйте, **завершён ли последний период**!
+
+`date_trunc('month', ordered_at)` — другой распространённый способ группировать по месяцам. Он сохраняет настоящую метку времени (`2025-03-01 00:00:00`), что удобно для дальнейших вычислений с датами; `to_char` даёт более аккуратную подпись.
+
+<Quiz
+  question="В заказе 3 позиции. Вы соединяете orders с order_items и считаете count(*) по 10 таким заказам. Что получится?"
+  options={["10", "3", "30", "13"]}
+  answer={2}
+  explanation="Соединение даёт по строке на позицию, поэтому 10 заказов по 3 позиции превращаются в 30 строк, и count(*) считает все 30. Чтобы посчитать заказы, используйте count(DISTINCT o.id) или сначала агрегируйте по заказу."
+/>
+
+## Шаг 4: откуда приходят деньги
+
+Основатель спросит, какие **категории** зарабатывают деньги. Соедините позиции с товарами и сравните каждую категорию с общей суммой с помощью **скалярного подзапроса** (scalar subquery):
+
+<CodeExample output={` category | revenue | pct
+----------+---------+------
+ kitchen  | 1160.10 | 47.4
+ books    |  830.41 | 34.0
+ toys     |  287.40 | 11.8
+ snacks   |   86.91 |  3.6
+ tea      |   81.00 |  3.3
+(5 rows)`}>
+
+```sql
+SELECT p.category,
+  sum(oi.quantity * oi.unit_price) AS revenue,
+  round(100 * sum(oi.quantity * oi.unit_price) / (
+    SELECT sum(oi2.quantity * oi2.unit_price)
+    FROM order_items AS oi2
+    JOIN orders AS o2 ON o2.id = oi2.order_id
+    WHERE o2.status <> 'cancelled'
+  ), 1) AS pct
+FROM order_items AS oi
+JOIN orders AS o ON o.id = oi.order_id
+JOIN products AS p ON p.id = oi.product_id
+WHERE o.status <> 'cancelled'
+GROUP BY p.category
+ORDER BY revenue DESC;
+```
+
+</CodeExample>
+
+Кухонные товары и книги приносят больше 80% выручки, а чай и снеки почти незаметны. Именно такие фразы совет директоров и запоминает. (Группировка по категориям здесь защищена от размножения строк: каждая строка действительно является позицией, и мы складываем выручку по позициям.)
+
+<Callout type="tip" title="Запишите определение">
+
+«Выручка» кажется очевидной, пока два отчёта не начнут расходиться. Учитываются ли отменённые заказы? Возвраты? Доставка? Налоги? Настоящие аналитические команды пишут однострочное определение рядом с каждой метрикой («выручка = сумма цен позиций оплаченных, отправленных и доставленных заказов»), и каждый запрос использует одно и то же определение. Общий CTE вроде `order_totals` — это то, как такое определение живёт в SQL.
+
+</Callout>
+
+<Exercise
+  language="sql"
+  title="Помесячный отчёт о выручке"
+  starter={`WITH order_totals AS (
+  SELECT o.id, o.ordered_at, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT to_char(ordered_at, 'YYYY-MM') AS month,
+  sum(total) AS revenue
+FROM order_totals
+GROUP BY month;
+`}
+  tests={[
+    { name: "Столбцы: month, orders, items_sold, revenue", check: "columns.join() === 'month,orders,items_sold,revenue'" },
+    { name: "Одна строка на месяц, с января по июнь, по порядку", check: "rows.map(r => r.month).join() === '2025-01,2025-02,2025-03,2025-04,2025-05,2025-06'" },
+    { name: "Отменённые заказы не учитываются", check: "rows.map(r => r.revenue).join() === '518.3,331.69,525.8,331.69,467.8,270.54'" },
+    { name: "orders считает заказы, а items_sold складывает количества", check: "rows.map(r => r.orders).join() === '5,6,6,6,5,4' && rows.map(r => r.items_sold).join() === '20,26,22,26,20,16'" },
+    { name: "Новые заказы попадают в нужный месяц", check: "(r => r.length === 7 && r[6].month === '2025-07' && r[6].orders === 1 && r[6].items_sold === 4 && r[6].revenue === 56)(await rerun(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (18, '2025-07-02 10:00', 'paid') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, 1, 4, 14.00 FROM o\"))" },
+    { name: "Отменённый заказ не добавляет месяц", check: "(await rerun(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (19, '2025-08-02 10:00', 'cancelled') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, 2, 1, 14.00 FROM o\")).every(r => r.month !== '2025-08')" },
+  ]}
+>
+
+Доделайте отчёт, который совет увидит первым. Для каждого месяца с продажами покажите:
+
+- `month`: месяц в виде `'YYYY-MM'`,
+- `orders`: сколько было оформлено заказов,
+- `items_sold`: сколько всего единиц товара продано (сумма количеств),
+- `revenue`: выручку за месяц,
+
+учитывая только **неотменённые** заказы; месяцы — в хронологическом порядке. Убедитесь, что `orders` считает **заказы**, а не позиции!
+
+<Hint>
+
+Добавьте `sum(oi.quantity) AS items` в CTE `order_totals`, чтобы каждый заказ нёс своё количество единиц. Затем во внешнем запросе отфильтруйте `WHERE status <> 'cancelled'`, выберите `count(*) AS orders` и `sum(items) AS items_sold` рядом с выручкой и закончите `ORDER BY month`. Поскольку внешний запрос читает по одной строке на заказ, `count(*)` считает заказы.
+
+</Hint>
+
+<Solution>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.ordered_at, o.status,
+    sum(oi.quantity) AS items,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT to_char(ordered_at, 'YYYY-MM') AS month,
+  count(*) AS orders,
+  sum(items) AS items_sold,
+  sum(total) AS revenue
+FROM order_totals
+WHERE status <> 'cancelled'
+GROUP BY month
+ORDER BY month;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Изучите данные, прежде чем считать: количества, диапазоны дат и статусы подсказывают, что должна включать «выручка».
+- Стройте отчёты на общем CTE вроде `order_totals`: **одна строка на заказ** с его суммой.
+- Выручка, число заказов и средний чек получаются агрегатами по этому CTE **без отменённых заказов**.
+- Соединения **размножают строки**: после соединения с `order_items` строки — это позиции. Сначала агрегируйте по заказу или используйте `count(DISTINCT ...)`.
+- Для помесячных трендов группируйте по `to_char(ordered_at, 'YYYY-MM')` и проверяйте, завершён ли последний период.
+- Скалярный подзапрос даёт каждой группе её долю от общей суммы.

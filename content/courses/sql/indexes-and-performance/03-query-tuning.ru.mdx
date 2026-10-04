@@ -1,0 +1,438 @@
+---
+title: Настройка медленных запросов
+description: Пишите условия, дружественные к индексам (sargable), не выбирайте всё подряд, листайте страницы по ключу вместо OFFSET, избавляйтесь от N+1 и держите статистику планировщика свежей.
+duration: 25
+xp: 25
+---
+
+Вы умеете читать планы и знаете свои индексы. И всё же в реальных проектах большинству медленных запросов не хватает вовсе не индекса: они написаны так, что **мешают** индексу работать, или требуют гораздо больше работы, чем нужно странице. Хорошая новость: эти проблемы повторяются, и когда вы знаете шаблоны, то будете замечать их на код-ревью за секунды. 🔧
+
+Этот урок — обзор пяти приёмов настройки (tuning), которыми вы будете пользоваться чаще всего.
+
+## Sargable-условия: не трогайте столбец
+
+Условие называется **sargable** (от «Search ARGument ABLE» — «пригодное как аргумент поиска»), когда база данных может найти подходящие строки по индексу. Правило простое: **оставляйте индексированный столбец «голым» с одной стороны сравнения**, а все вычисления переносите на другую сторону.
+
+Индекс по `bought_on` отсортирован по `bought_on`. Он не отсортирован по `extract(month FROM bought_on)`, поэтому условие на это выражение не может его использовать, и PostgreSQL приходится вычислять выражение для каждой строки:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE INDEX
+
+ANALYZE
+
+                                                      QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on purchases
+         Filter: ((EXTRACT(year FROM bought_on) = '2024'::numeric) AND (EXTRACT(month FROM bought_on) = '3'::numeric))
+(3 rows)
+
+                                          QUERY PLAN
+----------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Index Scan using purchases_bought_on_idx on purchases
+         Index Cond: ((bought_on >= '2024-03-01'::date) AND (bought_on < '2024-04-01'::date))
+(3 rows)`}>
+
+```sql
+CREATE TABLE purchases AS
+SELECT g AS id,
+  g % 5000 + 1 AS customer_id,
+  date '2024-01-01' + g / 200 AS bought_on,
+  (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+CREATE INDEX purchases_bought_on_idx ON purchases (bought_on);
+ANALYZE purchases;
+
+-- Не sargable: столбец обёрнут в функцию
+EXPLAIN (COSTS OFF)
+SELECT sum(amount) AS revenue
+FROM purchases
+WHERE extract(year FROM bought_on) = 2024
+  AND extract(month FROM bought_on) = 3;
+
+-- Sargable: те же строки, но как диапазон по «голому» столбцу
+EXPLAIN (COSTS OFF)
+SELECT sum(amount) AS revenue
+FROM purchases
+WHERE bought_on >= '2024-03-01'
+  AND bought_on < '2024-04-01';
+```
+
+</CodeExample>
+
+Оба запроса возвращают одни и те же строки, но индекс может использовать только второй. Обратите внимание на **полуоткрытый диапазон (half-open range)**: `>=` первого дня и `<` первого дня **следующего** месяца. Он одинаково правилен для `date`, `timestamp` и `timestamptz`, а вот `BETWEEN '2024-03-01' AND '2024-03-31'` молча теряет всё, что после полуночи 31 марта, если столбец — timestamp.
+
+Частые не-sargable шаблоны и как их переписать:
+
+| Вместо | Пишите |
+| --- | --- |
+| `extract(year FROM d) = 2024` | `d >= '2024-01-01' AND d < '2025-01-01'` |
+| `created_at::date = '2024-03-01'` | `created_at >= '2024-03-01' AND created_at < '2024-03-02'` |
+| `amount * 1.2 > 120` | `amount > 120 / 1.2` |
+| `lower(email) = 'mei@x.io'` | то же самое **плюс** индекс по `lower(email)` |
+| `coalesce(deleted, false) = false` | `deleted IS NOT TRUE` или сделайте столбец `NOT NULL` |
+| `name LIKE '%son'` | другой инструмент (полнотекстовый поиск, `pg_trgm`) |
+
+### Осторожно: несовпадение типов
+
+Более коварный способ обернуть столбец в функцию — сравнить его со значением **другого типа**. Здесь `id` — целое число, а `42.0` — numeric, поэтому PostgreSQL приводит **каждый id** к numeric, чтобы их сравнить:
+
+<CodeExample output={`CREATE TABLE AS
+
+ALTER TABLE
+
+ANALYZE
+
+            QUERY PLAN
+----------------------------------
+ Seq Scan on purchases
+   Filter: ((id)::numeric = 42.0)
+(2 rows)
+
+                  QUERY PLAN
+----------------------------------------------
+ Index Scan using purchases_pkey on purchases
+   Index Cond: (id = 42)
+(2 rows)`}>
+
+```sql
+CREATE TABLE purchases AS
+SELECT g AS id, (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+ALTER TABLE purchases ADD PRIMARY KEY (id);
+ANALYZE purchases;
+
+EXPLAIN (COSTS OFF) SELECT * FROM purchases WHERE id = 42.0;
+EXPLAIN (COSTS OFF) SELECT * FROM purchases WHERE id = 42;
+```
+
+</CodeExample>
+
+Выдаёт проблему `(id)::numeric` в Filter. В коде приложения такое случается, когда драйвер передаёт параметр не того типа, — например, число JavaScript превратилось в дробное, или столбец `id` хранится как `text`, а ищут по нему числом. Если в плане приведение типа стоит **на стороне столбца**, исправьте типы.
+
+## Не пишите SELECT * в коде приложения
+
+`SELECT *` идеально подходит для изучения данных — именно так его и использовал этот курс. Но в коде, который выполняется тысячи раз в минуту, перечисляйте нужные столбцы:
+
+- **Меньше данных читать и передавать.** В таблице `products` может быть `description` на 20 КБ и большой JSON-столбец `attributes`. Странице со списком товаров, которой нужны название и цена, незачем тащить всё это через базу данных, сеть и память приложения для каждой строки.
+- **Сканирование только по индексу.** Как вы видели в [прошлом уроке](/learn/sql/choosing-indexes), запрос, которому нужны только индексированные столбцы, может вообще не обращаться к таблице. С `SELECT *` так не получится никогда.
+- **Стабильный код.** Когда кто-то добавляет или переставляет столбцы, `SELECT *` молча меняет то, что получает ваш код. Явно перечисленные столбцы ломаются громко — или не ломаются вовсе.
+
+## Пагинация: ключ лучше OFFSET
+
+Классический способ показывать результаты постранично — `LIMIT … OFFSET …`. Это просто, и на первой странице быстро. Но `OFFSET 50000` не перепрыгивает к строке 50 001: базе данных приходится каждый раз **сформировать и выбросить** первые 50 000 строк. Страница 2500 ленты в 2500 раз медленнее первой.
+
+**Пагинация по ключу (keyset pagination)**, её ещё называют **методом поиска (seek method)**, запоминает, где **закончилась** последняя страница, и запрашивает строки после неё. При индексе по столбцам сортировки каждая страница стоит одинаково:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE INDEX
+
+ANALYZE
+
+                                            QUERY PLAN
+--------------------------------------------------------------------------------------------------
+ Limit (actual rows=20.00 loops=1)
+   ->  Index Scan Backward using purchases_day_id_idx on purchases (actual rows=50020.00 loops=1)
+         Index Searches: 1
+(3 rows)
+
+                                          QUERY PLAN
+-----------------------------------------------------------------------------------------------
+ Limit (actual rows=20.00 loops=1)
+   ->  Index Scan Backward using purchases_day_id_idx on purchases (actual rows=20.00 loops=1)
+         Index Cond: (ROW(bought_on, id) < ROW('2024-09-07'::date, 50001))
+         Index Searches: 1
+(4 rows)`}>
+
+```sql
+CREATE TABLE purchases AS
+SELECT g AS id,
+  date '2024-01-01' + g / 200 AS bought_on,
+  (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+CREATE INDEX purchases_day_id_idx ON purchases (bought_on, id);
+ANALYZE purchases;
+
+-- Страница 2501 с OFFSET: читает 50 020 строк, чтобы показать 20
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT id, bought_on, amount
+FROM purchases
+ORDER BY bought_on DESC, id DESC
+LIMIT 20 OFFSET 50000;
+
+-- Та же страница по ключу: «после последней показанной строки»
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT id, bought_on, amount
+FROM purchases
+WHERE (bought_on, id) < ('2024-09-07', 50001)
+ORDER BY bought_on DESC, id DESC
+LIMIT 20;
+```
+
+</CodeExample>
+
+Сравните `actual rows` у Index Scan: **50 020** против **20**. Как работает пагинация по ключу:
+
+1. Первая страница — обычный `ORDER BY bought_on DESC, id DESC LIMIT 20`.
+2. Приложение запоминает значения сортировки **последней строки**, здесь `('2024-09-07', 50001)`, — обычно в ссылке «следующая страница» или в непрозрачном токене-курсоре.
+3. Следующая страница запрашивает строки, которые идут **после** неё в порядке сортировки. Для сортировки по убыванию это `<`, записанное как **сравнение строк (row comparison)** `(bought_on, id) < (…, …)`: оно сравнивает столбец за столбцом, как в словаре, и B-tree по `(bought_on, id)` может обслужить его напрямую.
+
+**`id` для разрешения ничьих (tie-breaker)** обязателен: на каждый день приходится 200 покупок, и без уникального последнего столбца на границах страниц строки будут пропадать или повторяться. Страницы по ключу ещё и **стабильны**: с OFFSET новая строка, вставленная сверху, сдвигает всё на одну позицию, и пользователь видит строку дважды, а странице по ключу это безразлично.
+
+Компромисс: нельзя сразу перейти на страницу 37 — только на следующую (или предыдущую). Для лент, бесконечной прокрутки и API это подходит идеально. Для админской таблицы, где действительно нужны номера страниц, OFFSET вполне годится, пока страницы неглубокие.
+
+<Callout type="tip" title="Подсчёт тоже дорог">
+
+«Страница 1 из 41 237» требует `count(*)` по всем подходящим строкам, а это часто медленнее, чем сама страница. Многие продукты показывают «Далее» без общего числа или с приблизительной оценкой. Оценка для всей таблицы, `SELECT reltuples FROM pg_class WHERE relname = 'purchases'`, ничего не стоит.
+
+</Callout>
+
+<Quiz
+  question="В запросе написано WHERE (created_at, id) < ('2025-06-01 12:00', 900) ORDER BY created_at DESC, id DESC LIMIT 20. Зачем здесь id?"
+  options={[
+    "Он сам по себе ускоряет запрос, даже без индекса",
+    "У многих строк может быть одинаковый created_at, поэтому id делает позицию уникальной и не даёт строкам пропадать или повторяться между страницами",
+    "PostgreSQL требует как минимум двух столбцов в сравнении строк",
+    "Он ставит самые новые id первыми, чего требует LIMIT",
+  ]}
+  answer={1}
+  explanation="Ключ — это позиция последней строки в порядке сортировки. Если у нескольких строк один и тот же created_at, по одной метке времени нельзя понять, где закончилась страница. Уникальный столбец в роли tie-breaker делает позицию точной."
+/>
+
+## Запросы N+1: убийца на стороне приложения
+
+Некоторые из худших проблем с производительностью не связаны ни с одним конкретным запросом: каждый запрос быстрый, но их **тысячи**. Классика — **проблема N+1 (N+1 problem)**: один запрос, чтобы получить список, и потом ещё по одному запросу **на каждый элемент**:
+
+```js
+// ❌ 1 запрос за заказами + по 1 запросу на каждый заказ
+const orders = await db.query(
+  "SELECT id, customer_id FROM orders ORDER BY id LIMIT 100",
+);
+for (const order of orders) {
+  order.customer = await db.query(
+    "SELECT name FROM customers WHERE id = $1",
+    [order.customer_id],
+  );
+}
+```
+
+Это 101 обращение к базе. Даже если каждое занимает быструю 1 мс (сам запрос выполняется за микросекунды, время уходит на сеть и драйвер), странице нужно 100 мс, прежде чем она сделает что-то ещё, а при 1000 строк — целая секунда. В профилировщике или в логе базы данных это выглядит как один и тот же крошечный запрос, повторённый снова и снова.
+
+ORM позволяют легко сделать такое случайно: обращение к `order.customer` в шаблоне незаметно выполняет запрос каждый раз. Но в них есть и лекарство — **жадная загрузка (eager loading)**: `include` в Prisma или Sequelize, `selectinload()` / `joinedload()` в SQLAlchemy, `select_related()` / `prefetch_related()` в Django.
+
+Исправление на SQL — запросить **всё сразу** с помощью соединения:
+
+<CodeExample output={` id |     name
+----+--------------
+  1 | Sofia Rossi
+  2 | Diego López
+  3 | Ravi Patel
+  4 | Chloe Martin
+(4 rows)`}>
+
+```sql
+SELECT o.id, c.name
+FROM orders AS o
+JOIN customers AS c ON c.id = o.customer_id
+ORDER BY o.id
+LIMIT 4;
+```
+
+</CodeExample>
+
+Если второй запрос трудно превратить в соединение (другой сервис, кэш или структура кода), объедините запросы **пакетом (batch)**: соберите id и получите их все одним `= ANY(…)`. Приложение передаёт id одним параметром-массивом, `WHERE id = ANY($1)`:
+
+<CodeExample output={` id |     name
+----+--------------
+  3 | Ada Brooks
+  4 | Kenji Mori
+  8 | Sofia Rossi
+ 10 | Anna Ivanova
+(4 rows)`}>
+
+```sql
+-- Всего два запроса, сколько бы ни было заказов
+SELECT id, name
+FROM customers
+WHERE id = ANY (ARRAY[3, 8, 4, 10])
+ORDER BY id;
+```
+
+</CodeExample>
+
+Два запроса вместо N+1, каким бы ни было N. Именно это под капотом делают `prefetch_related` / `selectinload` в ORM.
+
+## Статистика: держите планировщик в курсе
+
+Каждое решение, которое вы видели в этом модуле, опиралось на **оценки** планировщика, а оценки берутся из **статистики**. Когда статистики нет или она устарела, планировщик гадает вслепую. Посмотрите, что происходит со свежей таблицей до и после `ANALYZE`:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 20000
+
+                                        QUERY PLAN
+-------------------------------------------------------------------------------------------
+ Seq Scan on app_logs  (cost=0.00..264.00 rows=54 width=68) (actual rows=18000.00 loops=1)
+   Filter: (level = 'info'::text)
+   Rows Removed by Filter: 2000
+(3 rows)
+
+ANALYZE
+
+                                          QUERY PLAN
+----------------------------------------------------------------------------------------------
+ Seq Scan on app_logs  (cost=0.00..378.00 rows=18000 width=20) (actual rows=18000.00 loops=1)
+   Filter: (level = 'info'::text)
+   Rows Removed by Filter: 2000
+(3 rows)
+
+ n_distinct |   most_common_vals   | most_common_freqs
+------------+----------------------+-------------------
+          3 | {info,warning,error} | {0.9,0.09,0.01}
+(1 row)`}>
+
+```sql
+CREATE TABLE app_logs (
+  id integer PRIMARY KEY,
+  level text NOT NULL,
+  message text NOT NULL
+);
+
+INSERT INTO app_logs
+SELECT g,
+  CASE WHEN g % 100 = 0 THEN 'error'
+       WHEN g % 10 = 0 THEN 'warning'
+       ELSE 'info' END,
+  'event ' || g
+FROM generate_series(1, 20000) AS g;
+
+-- Статистики ещё нет: догадка вслепую
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM app_logs WHERE level = 'info';
+
+ANALYZE app_logs;
+
+-- Со статистикой: точно в цель
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM app_logs WHERE level = 'info';
+
+-- Что ANALYZE узнал о столбце
+SELECT n_distinct, most_common_vals, most_common_freqs
+FROM pg_stats
+WHERE tablename = 'app_logs' AND attname = 'level';
+```
+
+</CodeExample>
+
+До `ANALYZE` планировщик ожидал **54** строки, а получил **18 000** — ошибка в 333 раза. Здесь это неважно (разумный план только один), но подставьте такую оценку в соединение — и планировщик радостно выберет Nested Loop, который выполнится 18 000 раз вместо одного. После `ANALYZE` оценка точная. Представление **`pg_stats`** показывает, что планировщик знает: 3 различных значения и насколько часто встречается каждое (90% info, 9% warning, 1% error).
+
+Как статистика остаётся свежей — и когда нет:
+
+- **Autovacuum** в фоне запускает `ANALYZE` для таблицы, когда в ней изменилось достаточно данных (по умолчанию около 10% строк). Для обычной нагрузки этого хватает.
+- **После массовой загрузки или большой миграции** запускайте `ANALYZE` сами. Autovacuum может не успеть до вашего следующего запроса, и тот будет спланирован по старым цифрам. То же касается базы, только что восстановленной из дампа: запустите `ANALYZE` (или `vacuumdb --analyze-only`), прежде чем пускать туда трафик.
+- **Огромным таблицам с перекошенными данными** может понадобиться выборка побольше: `ALTER TABLE app_logs ALTER COLUMN level SET STATISTICS 1000;` (по умолчанию 100).
+- **Связанные столбцы (correlated columns)** (например, город и страна) обманывают планировщик: он считает условия независимыми и перемножает их селективности. `CREATE STATISTICS … (dependencies) ON city, country FROM …` объясняет ему эту связь.
+
+<Callout type="note" title="Порядок работы при настройке">
+
+1. **Найдите** важные запросы: самые медленные по суммарному времени в `pg_stat_statements`, а не тот, что «кажется» медленным.
+2. Выполните для него **`EXPLAIN (ANALYZE, BUFFERS)`** на данных продакшен-объёма (на копии или обернув в `BEGIN` … `ROLLBACK`).
+3. Ищите обычных подозреваемых: оценки, далёкие от фактического числа строк; Seq Scan, возвращающий мало строк; огромное «Rows Removed by Filter»; сортировки, которые сбрасываются на диск; Nested Loop с большим `loops`.
+4. Сначала исправьте **запрос** (sargable-условия, меньше столбцов, пагинация по ключу, пакетные запросы), затем **индексы**, затем **статистику**. Железо и настройки — в последнюю очередь.
+5. Измерьте снова и приложите планы «до» и «после» к пул-реквесту.
+
+</Callout>
+
+<Quiz
+  question="Сразу после импорта 5 миллионов строк в пустую таблицу простой запрос для отчёта выбирает странный план с Nested Loop и работает несколько минут. Что попробовать в первую очередь?"
+  options={[
+    "Перезапустить сервер базы данных",
+    "Выполнить ANALYZE для таблицы, чтобы у планировщика появилась статистика о новых данных",
+    "Удалить все индексы таблицы",
+    "Переписать запрос с OFFSET",
+  ]}
+  answer={1}
+  explanation="Сразу после массовой загрузки у таблицы может не быть статистики или она устарела, поэтому планировщик сильно ошибается в числе строк и может выбрать план, ужасный для миллионов строк. ANALYZE занимает секунды и часто сразу всё исправляет. Чтобы убедиться, сравните оценочное и фактическое число строк в EXPLAIN ANALYZE."
+/>
+
+<Exercise
+  language="sql"
+  title="Исправьте отчёт о месячной выручке"
+  starter={`-- 60 000 счетов с января 2024 по май 2025
+CREATE TABLE invoices AS
+SELECT g AS id,
+  g % 3000 + 1 AS customer_id,
+  timestamp '2024-01-01' + g * interval '12 minutes 1 second'
+    AS issued_at,
+  (g * 7) % 300 + 9.99 AS total
+FROM generate_series(1, 60000) AS g;
+CREATE INDEX invoices_issued_at_idx ON invoices (issued_at);
+ANALYZE invoices;
+
+-- Выручка за март 2025: верно, но сканирует все счета
+SELECT count(*) AS invoices, sum(total) AS revenue
+FROM invoices
+WHERE extract(year FROM issued_at) = 2025
+  AND extract(month FROM issued_at) = 3;
+`}
+  tests={[
+    { name: "Столбцы — invoices, revenue", check: "columns.join() === 'invoices,revenue'" },
+    { name: "Тот же ответ, что и у медленной версии", check: "rows.length === 1 && rows[0].invoices === 3715 && rows[0].revenue === 593647.85" },
+    { name: "В плане нет Seq Scan", check: "!(await query('EXPLAIN (COSTS OFF) ' + lastQuery)).some(r => r['QUERY PLAN'].includes('Seq Scan'))" },
+    { name: "issued_at не обёрнут в функцию и не приведён к другому типу", check: "!/extract|date_part|date_trunc|to_char|issued_at\\s*::/i.test(lastQuery)" },
+    { name: "Учитывает счёт, выставленный 31 марта в 23:59", check: "(await query(lastQuery))[0].invoices + 1 === (await rerun(\"INSERT INTO invoices VALUES (60001, 1, '2025-03-31 23:59', 100)\"))[0].invoices" },
+    { name: "Не учитывает счёт, выставленный в полночь 1 апреля", check: "(await query(lastQuery))[0].invoices === (await rerun(\"INSERT INTO invoices VALUES (60002, 1, '2025-04-01 00:00', 100)\"))[0].invoices" },
+  ]}
+>
+
+Запрос «выручка за месяц» на финансовой панели верный, но читает все 60 000 счетов, потому что `issued_at` обёрнут в `extract()` и индекс по `issued_at` использовать нельзя.
+
+Перепишите последний запрос так, чтобы он:
+
+- возвращал **те же** `invoices` и `revenue` за март 2025,
+- использовал индекс (без Seq Scan в плане),
+- по-прежнему учитывал счёт, выставленный 31 марта в 23:59, и не учитывал счёт, выставленный в полночь 1 апреля.
+
+Проверьте план, поставив `EXPLAIN (COSTS OFF)` перед запросом, а затем уберите его: последней инструкцией должен быть сам отчёт.
+
+<Hint>
+
+Сравнивайте «голый» столбец с **полуоткрытым диапазоном**: `issued_at >= '2025-03-01'` и `issued_at < '2025-04-01'`. Избегайте `BETWEEN '2025-03-01' AND '2025-03-31'`: для timestamp `'2025-03-31'` означает полночь в **начале** 31 марта, так что весь последний день потеряется.
+
+</Hint>
+
+<Solution>
+
+```sql
+-- 60 000 счетов с января 2024 по май 2025
+CREATE TABLE invoices AS
+SELECT g AS id,
+  g % 3000 + 1 AS customer_id,
+  timestamp '2024-01-01' + g * interval '12 minutes 1 second'
+    AS issued_at,
+  (g * 7) % 300 + 9.99 AS total
+FROM generate_series(1, 60000) AS g;
+CREATE INDEX invoices_issued_at_idx ON invoices (issued_at);
+ANALYZE invoices;
+
+-- Выручка за март 2025 как диапазон по «голому» столбцу
+SELECT count(*) AS invoices, sum(total) AS revenue
+FROM invoices
+WHERE issued_at >= '2025-03-01'
+  AND issued_at < '2025-04-01';
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Sargable**-условия оставляют индексированный столбец «голым»: используйте полуоткрытые диапазоны (`>= start AND < next`) вместо `extract()` или приведений типа, переносите арифметику на другую сторону и следите за несовпадением типов, из-за которого столбец приводится к другому типу.
+- В коде приложения перечисляйте нужные столбцы вместо **`SELECT *`**: меньше данных, сканирование только по индексу, стабильный код.
+- **Пагинация по ключу** (`WHERE (sort_col, id) < (last values) ORDER BY … LIMIT n`) стоит одинаково на любой странице; `OFFSET n` читает и выбрасывает n строк.
+- **Запросы N+1** превращают одну страницу в сотни обращений к базе: используйте соединение, пакетный запрос с `= ANY($1)` или жадную загрузку в вашей ORM.
+- Планировщик хорош ровно настолько, насколько хороша его **статистика**: запускайте `ANALYZE` после массовых загрузок, смотрите `pg_stats` и сравнивайте оценочное и фактическое число строк в `EXPLAIN ANALYZE`.
