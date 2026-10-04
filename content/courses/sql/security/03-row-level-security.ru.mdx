@@ -1,0 +1,462 @@
+---
+title: Защита на уровне строк
+description: Пусть база данных решает, какие строки видит и меняет каждый пользователь или арендатор — с политиками, USING и WITH CHECK, FORCE ROW LEVEL SECURITY и тестами через SET ROLE.
+duration: 25
+xp: 30
+---
+
+Привилегии работают на уровне таблиц и столбцов: роль либо может читать `notes`, либо нет. Большинству приложений нужно что-то тоньше: **каждый пользователь может читать таблицу заметок, но только свои строки**. Обычно это правило живёт в коде приложения в виде `WHERE owner_id = …`, о котором должен помнить каждый запрос. Стоит один раз забыть (в новом эндпоинте, отчёте или админке) — и один клиент видит данные другого. Это одна из самых частых серьёзных ошибок в мультиарендных (multi-tenant) системах. **Защита на уровне строк (row-level security, RLS)** переносит правило в базу данных, где оно автоматически применяется к каждому запросу. 🧱
+
+Во всех примерах используется небольшая таблица заметок, принадлежащих клиентам из учебной базы, и роль `app_user`, которая изображает веб-приложение:
+
+```sql
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL REFERENCES customers (id),
+  body text NOT NULL
+);
+
+INSERT INTO notes (owner_id, body) VALUES
+  (1, 'Mei: buy jasmine tea'),
+  (1, 'Mei: call Sam'),
+  (2, 'Sam: fix the kite'),
+  (3, 'Ada: read The Bamboo Code');
+
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+```
+
+## Включаем: по умолчанию всё запрещено
+
+`ALTER TABLE … ENABLE ROW LEVEL SECURITY` включает RLS. С этого момента обычная роль видит только строки, которые разрешает какая-нибудь **политика (policy)**. Если политик нет совсем, это значит **ничего**:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+CREATE ROLE
+
+GRANT
+
+ALTER TABLE
+
+SET
+
+ visible
+---------
+       0
+(1 row)
+
+RESET
+
+ visible_to_postgres
+---------------------
+                   4
+(1 row)`}>
+
+```sql
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL REFERENCES customers (id),
+  body text NOT NULL
+);
+INSERT INTO notes (owner_id, body) VALUES
+  (1, 'Mei: buy jasmine tea'), (1, 'Mei: call Sam'),
+  (2, 'Sam: fix the kite'), (3, 'Ada: read The Bamboo Code');
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+SET ROLE app_user;
+SELECT count(*) AS visible FROM notes;
+RESET ROLE;
+
+SELECT count(*) AS visible_to_postgres FROM notes;
+```
+
+</CodeExample>
+
+Ошибки нет, просто нет строк: RLS работает как **фильтр**, словно невидимый `WHERE`. Второй подсчёт показывает главное исключение: на **суперпользователей**, роли с `BYPASSRLS` и (как вы скоро увидите) **владельца таблицы** RLS не действует.
+
+## Кто текущий пользователь?
+
+Политике нужно знать, кто спрашивает. Есть два распространённых ответа:
+
+1. **Отдельная роль базы данных на каждого пользователя** (`current_user`). Просто, но для веб-приложений встречается редко: понадобились бы тысячи ролей и отдельное подключение на каждого пользователя.
+2. **Одна роль для приложения плюс параметр (setting)**, который приложение задаёт в начале каждого запроса: `set_config('app.user_id', '42', …)`. Политики читают его через `current_setting('app.user_id', true)`. Параметры с точкой в имени, вроде `app.user_id`, можно придумывать самим.
+
+## Пишем политики: USING и WITH CHECK
+
+У политики две части:
+
+- **`USING (…)`**: какие **существующие** строки роль может видеть, изменять или удалять.
+- **`WITH CHECK (…)`**: какие **новые** строки (вставленные или полученные в результате обновления) допустимы. Если её не указать, `USING` используется для обоих случаев.
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 4
+
+CREATE ROLE
+
+GRANT
+
+ALTER TABLE
+
+CREATE POLICY
+
+SET
+
+ set_config
+------------
+ 1
+(1 row)
+
+ id |         body
+----+----------------------
+  1 | Mei: buy jasmine tea
+  2 | Mei: call Sam
+(2 rows)
+
+UPDATE 0
+
+DELETE 2
+
+ERROR:  new row violates row-level security policy for table "notes"`}>
+
+```sql
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL REFERENCES customers (id),
+  body text NOT NULL
+);
+INSERT INTO notes (owner_id, body) VALUES
+  (1, 'Mei: buy jasmine tea'), (1, 'Mei: call Sam'),
+  (2, 'Sam: fix the kite'), (3, 'Ada: read The Bamboo Code');
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY notes_own ON notes
+  TO app_user
+  USING (owner_id = current_setting('app.user_id', true)::integer)
+  WITH CHECK (owner_id = current_setting('app.user_id', true)::integer);
+
+-- Запрос от Mei (клиент 1)
+SET ROLE app_user;
+SELECT set_config('app.user_id', '1', false);
+
+SELECT id, body FROM notes ORDER BY id;
+
+-- Заметка Sam невидима, поэтому изменить её тоже нельзя
+UPDATE notes SET body = 'hacked' WHERE id = 3;
+DELETE FROM notes;
+
+-- Запись заметки за другого пользователя: WITH CHECK отказывает
+INSERT INTO notes (owner_id, body) VALUES (2, 'Mei was here');
+```
+
+</CodeExample>
+
+Внимательно посмотрите на результаты. `UPDATE 0`: для Mei заметки Sam просто не существует. `DELETE 2` без `WHERE` удалил **только собственные заметки Mei**: политика добавляется к каждой инструкции. А `INSERT` громко падает, потому что нарушение `WITH CHECK` — это ошибка, а не фильтр.
+
+### Политики для отдельных команд и их сочетание
+
+`CREATE POLICY … FOR SELECT | INSERT | UPDATE | DELETE | ALL` ограничивает политику одним видом инструкций, а `TO role` — определёнными ролями. Когда действует несколько **разрешительных (permissive)** политик (это вариант по умолчанию), строка допускается, если её разрешает **любая** из них (они объединяются через `OR`). **Ограничительная политика (`RESTRICTIVE`)** должна выполняться **дополнительно** (она объединяется через `AND`) — это удобно для правил, которые действуют поверх всего остального:
+
+<TryIt language="sql" code={`CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL,
+  body text NOT NULL,
+  shared boolean NOT NULL DEFAULT false,
+  archived boolean NOT NULL DEFAULT false
+);
+INSERT INTO notes (owner_id, body, shared, archived) VALUES
+  (1, 'Mei: private', false, false),
+  (2, 'Sam: shared with everyone', true, false),
+  (2, 'Sam: private', false, false),
+  (2, 'Sam: old shared note', true, true);
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+-- Разрешительные: свои заметки ИЛИ общие (для чтения)
+CREATE POLICY own_notes ON notes TO app_user
+  USING (owner_id = current_setting('app.user_id', true)::integer);
+CREATE POLICY read_shared ON notes FOR SELECT TO app_user
+  USING (shared);
+
+-- Ограничительная: архивные заметки скрыты от всех и всегда
+CREATE POLICY hide_archived ON notes AS RESTRICTIVE TO app_user
+  USING (NOT archived);
+
+SET ROLE app_user;
+SELECT set_config('app.user_id', '1', false);
+SELECT id, body FROM notes ORDER BY id;`} />
+
+## Владелец таблицы и FORCE
+
+RLS не действует на **владельца** таблицы. Это удобно для миграций и опасно, когда приложение подключается **как владелец**, а в небольших проектах так бывает очень часто: вы включаете RLS, пишете аккуратные политики — а они молча ничего не делают. Вот ловушка и решение — **`FORCE ROW LEVEL SECURITY`**:
+
+<CodeExample output={`CREATE ROLE
+
+CREATE TABLE
+
+INSERT 0 2
+
+ALTER TABLE
+
+ALTER TABLE
+
+CREATE POLICY
+
+ set_config
+------------
+ 1
+(1 row)
+
+SET
+
+ owner_sees
+------------
+          2
+(1 row)
+
+RESET
+
+ALTER TABLE
+
+SET
+
+ owner_sees_with_force
+-----------------------
+                     1
+(1 row)`}>
+
+```sql
+CREATE ROLE app_owner NOLOGIN;
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner_id integer NOT NULL,
+  body text NOT NULL
+);
+INSERT INTO notes (owner_id, body) VALUES
+  (1, 'Mei: buy jasmine tea'), (2, 'Sam: fix the kite');
+ALTER TABLE notes OWNER TO app_owner;
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY notes_own ON notes
+  USING (owner_id = current_setting('app.user_id', true)::integer);
+
+SELECT set_config('app.user_id', '1', false);
+
+SET ROLE app_owner;
+SELECT count(*) AS owner_sees FROM notes;
+RESET ROLE;
+
+ALTER TABLE notes FORCE ROW LEVEL SECURITY;
+
+SET ROLE app_owner;
+SELECT count(*) AS owner_sees_with_force FROM notes;
+```
+
+</CodeExample>
+
+Лучшая конфигурация сочетает оба урока этого модуля: приложение подключается под ролью, которая **не владеет** таблицами (минимальные привилегии), **и** вы включаете `FORCE` RLS на таблицах арендаторов как вторую страховку. Суперпользователи и роли с `BYPASSRLS` по-прежнему обходят RLS — это то, что нужно для резервных копий и администрирования, и ещё одна причина, по которой приложение никогда не должно быть суперпользователем.
+
+## Безопасная установка пользователя при пуле подключений
+
+Приложения делят несколько подключений к базе между множеством запросов (**пул подключений, connection pool**). Если запрос A задаст `app.user_id = 1` на всю сессию и забудет его сбросить, запрос B на том же подключении выполнится от имени пользователя 1. Поэтому задавайте параметр **на уровне транзакции**: третий аргумент `set_config` — это `is_local`, и `true` означает «до конца этой транзакции» (то же самое, что `SET LOCAL`):
+
+<CodeExample output={`BEGIN
+
+ set_config
+------------
+ 1
+(1 row)
+
+ during
+--------
+ 1
+(1 row)
+
+COMMIT
+
+ after | is_empty_text
+-------+---------------
+       | t
+(1 row)
+
+ as_integer
+------------
+       NULL
+(1 row)`}>
+
+```sql
+BEGIN;
+SELECT set_config('app.user_id', '1', true);
+SELECT current_setting('app.user_id', true) AS during;
+COMMIT;
+
+SELECT current_setting('app.user_id', true) AS after,
+  current_setting('app.user_id', true) = '' AS is_empty_text;
+
+SELECT nullif(current_setting('app.user_id', true), '')::integer
+  AS as_integer;
+```
+
+</CodeExample>
+
+Здесь важны две детали:
+
+- `current_setting(name, true)`: `true` означает «если параметра нет — ничего страшного, верни NULL», а не выбрасывай ошибку. Политика, сравнивающая с NULL, не подходит ни под одну строку, поэтому запрос, который забыл задать пользователя, **безопасно отказывает (fails closed)**: он не видит ни одной строки.
+- После того как значение, локальное для транзакции, перестаёт действовать, параметр существует, но равен **пустой строке**, а `''::integer` — это ошибка. Оберните его: `nullif(current_setting('app.user_id', true), '')::integer`.
+
+В коде приложения запрос тогда выглядит так:
+
+```js
+// node-postgres: по транзакции на запрос, пользователь задаётся внутри неё
+const client = await pool.connect();
+try {
+  await client.query("BEGIN");
+  await client.query("SELECT set_config('app.user_id', $1, true)", [
+    String(session.userId),
+  ]);
+  const { rows } = await client.query("SELECT * FROM notes");
+  await client.query("COMMIT");
+} finally {
+  client.release();
+}
+```
+
+## Ловушки, которые обходят ваши политики
+
+- **Представления (views)** по умолчанию выполняются с привилегиями **владельца** представления. Представление, созданное суперпользователем или владельцем таблицы, показывает все строки каждому, кто может его читать. Создавайте представления с `WITH (security_invoker = true)` (PostgreSQL 15+), чтобы RLS применялась к тому, кто выполняет запрос.
+- **Функции `SECURITY DEFINER`** тоже выполняются от имени своего владельца, поэтому тоже обходят RLS. Пишите их осторожно или не используйте с таблицами под RLS.
+- **Уникальность и внешние ключи выдают существование строк.** Вставка повторяющейся почты падает, даже если другая строка невидима, и пользователь узнаёт, что она существует. Проверки внешних ключей тоже игнорируют RLS.
+- **Производительность**: политика становится частью `WHERE` каждого запроса, поэтому **проиндексируйте** столбцы, которые она использует (`owner_id`, `tenant_id`). Если записать чтение параметра как подзапрос, `(SELECT current_setting(…))`, PostgreSQL вычислит его один раз на запрос, а не на каждую строку:
+
+```text
+EXPLAIN SELECT * FROM notes WHERE body LIKE '%tea%';   -- от имени app_user
+ Bitmap Heap Scan on notes
+   Recheck Cond: (owner_id = (InitPlan 1).col1)      ← политика
+   Filter: (body ~~ '%tea%'::text)                   ← ваш WHERE
+   InitPlan 1                                        ← параметр читается один раз
+   ->  Bitmap Index Scan on notes_owner_id_idx
+```
+
+<Callout type="tip" title="Тестируйте политики как код">
+
+Политики — это код безопасности, так что напишите для них тесты: для каждой роли и каждого пользователя выполните `SET ROLE`, задайте пользователя и проверьте, что видно, а что отклоняется: свои строки видны, чужие невидимы, вставки и обновления в чужого арендатора отклоняются, без заданного пользователя строк нет. Запускайте их в CI для каждой миграции. Ровно такую матрицу тестов вы напишете в упражнении ниже.
+
+</Callout>
+
+<Quiz
+  question="На invoices включена RLS с правильной политикой, но приложение всё равно видит счета всех арендаторов. Приложение подключается под ролью, которая создала таблицу. Почему?"
+  options={["Политики применяются только к SELECT", "Владельцы таблиц обходят RLS, если не задан FORCE ROW LEVEL SECURITY", "RLS вступает в силу только после перезапуска", "Политике нужен WITH CHECK"]}
+  answer={1}
+  explanation="По умолчанию на владельца таблицы её политики не действуют. Используйте ALTER TABLE ... FORCE ROW LEVEL SECURITY, а ещё лучше — подключайте приложение под ролью, которая не владеет таблицами."
+/>
+
+<Quiz
+  question="Политика использует USING (owner_id = current_setting('app.user_id', true)::integer) без WITH CHECK. Пользователь выполняет UPDATE notes SET owner_id = 99 WHERE id = 5 для своей заметки. Что произойдёт?"
+  options={["Обновление пройдёт, и заметка перейдёт к пользователю 99", "Ошибка: без WITH CHECK выражение USING проверяет и новую строку", "Ничего: UPDATE 0", "RLS игнорируется для UPDATE"]}
+  answer={1}
+  explanation="Если у политики нет WITH CHECK, её выражение USING применяется и к новым строкам. У обновлённой строки owner_id был бы 99, что не совпадает с текущим пользователем, поэтому обновление отклоняется с ошибкой."
+/>
+
+<Exercise
+  language="sql"
+  title="Изолируйте арендаторов"
+  starter={`CREATE TABLE tasks (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id integer NOT NULL,
+  title text NOT NULL,
+  done boolean NOT NULL DEFAULT false
+);
+INSERT INTO tasks (tenant_id, title) VALUES
+  (1, 'Write the brief'), (2, 'Order bamboo'),
+  (1, 'Review the design'), (2, 'Fix the kite'),
+  (3, 'Plan the launch'), (1, 'Ship it');
+
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tasks TO app_user;
+
+-- Здесь будет ваша настройка RLS.
+
+-- Тест: запрос от арендатора 1
+SET ROLE app_user;
+SELECT set_config('app.tenant_id', '1', false);
+SELECT id, title FROM tasks ORDER BY id;
+`}
+  tests={[
+    { name: "RLS на tasks включена и принудительна (FORCE)", check: "(await query(\"SELECT relrowsecurity AND relforcerowsecurity AS ok FROM pg_class WHERE relname = 'tasks'\"))[0].ok === true" },
+    { name: "Арендатор 1 видит ровно свои 3 задачи", check: "rows.map(r => r.title).join() === 'Write the brief,Review the design,Ship it'" },
+    { name: "Арендатор 2 видит свои 2 задачи", check: "await (async () => { await query('RESET ROLE'); await query('SET ROLE app_user'); await query(\"SELECT set_config('app.tenant_id', '2', false)\"); const r = await query('SELECT title FROM tasks ORDER BY id'); await query('RESET ROLE'); return r.map(x => x.title).join() === 'Order bamboo,Fix the kite'; })()" },
+    { name: "Без арендатора (или с пустым параметром) — нет строк, а не ошибка", check: "await (async () => { await query('RESET ROLE'); await query('SET ROLE app_user'); await query(\"SELECT set_config('app.tenant_id', '', false)\"); const r = await query('SELECT count(*) AS n FROM tasks').then(x => x[0].n, () => -1); await query('RESET ROLE'); return r === 0; })()" },
+    { name: "Арендатор 1 не может вставить задачу для арендатора 2", check: "await (async () => { await query('RESET ROLE'); await query('SET ROLE app_user'); await query(\"SELECT set_config('app.tenant_id', '1', false)\"); const allowed = await query(\"INSERT INTO tasks (tenant_id, title) VALUES (1, 'Mine')\").then(() => true, () => false); const refused = await query(\"INSERT INTO tasks (tenant_id, title) VALUES (2, 'Sneaky')\").then(() => false, () => true); return allowed && refused; })()" },
+    { name: "Арендатор 1 не может менять задачи арендатора 2 или переносить свои к арендатору 2", check: "await (async () => { await query('RESET ROLE'); await query('SET ROLE app_user'); await query(\"SELECT set_config('app.tenant_id', '1', false)\"); const other = await query(\"UPDATE tasks SET done = true WHERE id = 2 RETURNING id\"); await query('RESET ROLE'); const untouched = (await query('SELECT done FROM tasks WHERE id = 2'))[0].done === false; await query('SET ROLE app_user'); const moved = await query('UPDATE tasks SET tenant_id = 2 WHERE id = 1').then(() => false, () => true); return other.length === 0 && untouched && moved; })()" },
+  ]}
+>
+
+Инструмент для проектов хранит задачи всех компаний-клиентов в одной таблице, разделяя их по `tenant_id`. Приложение подключается как `app_user` и задаёт `app.tenant_id` для каждого запроса. Пусть разделение обеспечивает сама база данных:
+
+1. Включите **и сделайте принудительной** (FORCE) защиту на уровне строк для `tasks`.
+2. Добавьте для `app_user` политику, чтобы роль могла видеть, вставлять, обновлять и удалять только строки арендатора из `app.tenant_id` и не могла перенести строку к другому арендатору.
+3. Если `app.tenant_id` отсутствует **или пуст**, приложение не должно видеть **ни одной строки** (и не должно получать ошибку).
+
+Оставьте тест в конце: арендатор 1 должен увидеть свои 3 задачи.
+
+<Hint>
+
+Одна политика покрывает всё: `CREATE POLICY tenant_isolation ON tasks TO app_user USING (…) WITH CHECK (…);` с одинаковым условием в обеих частях: `tenant_id = nullif(current_setting('app.tenant_id', true), '')::integer`. Затем `ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;` и `ALTER TABLE tasks FORCE ROW LEVEL SECURITY;`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE tasks (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id integer NOT NULL,
+  title text NOT NULL,
+  done boolean NOT NULL DEFAULT false
+);
+INSERT INTO tasks (tenant_id, title) VALUES
+  (1, 'Write the brief'), (2, 'Order bamboo'),
+  (1, 'Review the design'), (2, 'Fix the kite'),
+  (3, 'Plan the launch'), (1, 'Ship it');
+
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tasks TO app_user;
+
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON tasks
+  TO app_user
+  USING (
+    tenant_id = nullif(current_setting('app.tenant_id', true), '')::integer
+  )
+  WITH CHECK (
+    tenant_id = nullif(current_setting('app.tenant_id', true), '')::integer
+  );
+
+CREATE INDEX tasks_tenant ON tasks (tenant_id);
+
+-- Тест: запрос от арендатора 1
+SET ROLE app_user;
+SELECT set_config('app.tenant_id', '1', false);
+SELECT id, title FROM tasks ORDER BY id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **`ENABLE ROW LEVEL SECURITY`** делает таблицу «по умолчанию всё запрещено»; **политики** говорят, какими строками может пользоваться каждая роль. Суперпользователи, роли с `BYPASSRLS` и **владелец** (если не включить **`FORCE`**) обходят RLS.
+- **`USING`** фильтрует существующие строки (невидимые строки нельзя изменить или удалить); **`WITH CHECK`** проверяет новые строки и выбрасывает ошибку. Разрешительные политики объединяются через `OR`, ограничительные (`RESTRICTIVE`) — через `AND`.
+- Определяйте пользователя через параметр: `set_config('app.user_id', …, true)` на каждую транзакцию, а читайте через `nullif(current_setting('app.user_id', true), '')`, чтобы при отсутствии пользователя не было видно ничего.
+- Следите за обходными путями: представления (используйте `security_invoker`), функции `SECURITY DEFINER`, проверки уникальности и внешних ключей. Индексируйте столбцы из политик.
+- Тестируйте политики через **`SET ROLE`** с разными пользователями, как любой другой код безопасности.

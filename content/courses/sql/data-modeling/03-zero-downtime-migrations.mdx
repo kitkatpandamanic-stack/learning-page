@@ -1,0 +1,526 @@
+---
+title: Zero-Downtime Migrations
+description: Change the schema of a busy database safely, with lock timeouts, changes that avoid rewrites, NOT VALID constraints, expand and contract, and backfills in batches.
+duration: 25
+xp: 30
+---
+
+A **migration** is a versioned script that changes the schema: add a column, a constraint, an index. On your laptop every migration takes milliseconds. In production the same `ALTER TABLE` can take the whole site down, because the table has 200 million rows and thousands of queries per second are using it. This lesson is about changing a database **while it's in use**, without downtime. 🚧
+
+## Every ALTER TABLE takes a lock
+
+A real incident, in short: a team added a nullable column to their `orders` table. The change itself takes a millisecond. The site was down for four minutes anyway. Here's why. Most `ALTER TABLE` forms need an **`ACCESS EXCLUSIVE`** lock, the strongest lock there is: nobody else can even read the table while it's held. You can see the locks your own transaction holds in `pg_locks`:
+
+<CodeExample output={`BEGIN
+
+ALTER TABLE
+
+        mode
+---------------------
+ AccessExclusiveLock
+(1 row)
+
+ROLLBACK
+
+BEGIN
+
+CREATE INDEX
+
+   mode
+-----------
+ ShareLock
+(1 row)
+
+ROLLBACK`}>
+
+```sql
+BEGIN;
+ALTER TABLE orders ADD COLUMN note text;
+
+SELECT mode
+FROM pg_locks
+WHERE relation = 'orders'::regclass
+  AND pid = pg_backend_pid();
+ROLLBACK;
+
+BEGIN;
+CREATE INDEX orders_status ON orders (status);
+
+SELECT mode
+FROM pg_locks
+WHERE relation = 'orders'::regclass
+  AND pid = pg_backend_pid();
+ROLLBACK;
+```
+
+</CodeExample>
+
+A plain `CREATE INDEX` takes a `SHARE` lock: reads continue, but every `INSERT`, `UPDATE` and `DELETE` waits until the index is built. Now the incident, as a timeline:
+
+```text
+10:00:00  A report starts: SELECT … FROM orders  (runs 4 minutes,
+          holds a weak ACCESS SHARE lock)
+10:00:05  Migration: ALTER TABLE orders ADD COLUMN note text;
+          needs ACCESS EXCLUSIVE, must wait for the report
+10:00:06  Checkout: SELECT … FROM orders WHERE id = …
+          waits too: it's queued BEHIND the waiting ALTER
+10:00:06+ every query on orders queues up; connections run out;
+          the site is down
+10:04:00  The report finishes; ALTER runs in 1 ms; the queue drains
+```
+
+The `ALTER` never did anything slow. It **waited**, and everything else waited behind it. The fix is to give up quickly instead of waiting: set a **`lock_timeout`** for migrations, and retry later if it fires:
+
+```sql
+SET lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN note text;
+-- ERROR:  canceling statement due to lock timeout
+-- → nothing changed, nobody was blocked for more than 2 s; retry
+```
+
+Also set a `statement_timeout` for migrations, and check `pg_stat_activity` for long-running queries before you start.
+
+## Fast changes and table rewrites
+
+Holding a strong lock for a millisecond is fine. Holding it while PostgreSQL **rewrites the whole table** (copies every row into a new file) is an outage. Some changes only update the catalog, others rewrite. You can tell by watching the table's file number, `pg_relation_filenode()`, which changes when the table is rewritten:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE TABLE
+
+INSERT 0 1
+
+CREATE FUNCTION
+
+ALTER TABLE
+
+ALTER TABLE
+
+ after_add_columns
+-------------------
+ f
+(1 row)
+
+ALTER TABLE
+
+ after_volatile_default
+------------------------
+ t
+(1 row)
+
+ALTER TABLE
+
+ after_type_change
+-------------------
+ t
+(1 row)`}>
+
+```sql
+CREATE TABLE events AS
+SELECT g AS id, 'click' AS kind
+FROM generate_series(1, 100000) AS g;
+
+CREATE TABLE file_seen (node oid);
+INSERT INTO file_seen SELECT pg_relation_filenode('events');
+
+-- true if events was rewritten since the last call
+CREATE FUNCTION rewritten() RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+  changed boolean;
+BEGIN
+  SELECT node <> pg_relation_filenode('events')
+  INTO changed FROM file_seen;
+  UPDATE file_seen SET node = pg_relation_filenode('events');
+  RETURN changed;
+END $$;
+
+ALTER TABLE events ADD COLUMN source text;
+ALTER TABLE events ADD COLUMN seen boolean NOT NULL DEFAULT false;
+SELECT rewritten() AS after_add_columns;
+
+ALTER TABLE events ADD COLUMN token uuid DEFAULT gen_random_uuid();
+SELECT rewritten() AS after_volatile_default;
+
+ALTER TABLE events ALTER COLUMN id TYPE bigint;
+SELECT rewritten() AS after_type_change;
+```
+
+</CodeExample>
+
+Adding a nullable column, or one with a **constant** default, is instant: PostgreSQL stores the default once in the catalog and fills it in when old rows are read. A **volatile** default (`gen_random_uuid()`, `clock_timestamp()`) has to be computed per row, so the table is rewritten. Changing a column's type usually rewrites too. A cheat sheet:
+
+| Change | Cost |
+| --- | --- |
+| `ADD COLUMN` (nullable, or a constant `DEFAULT`) | Instant |
+| `ADD COLUMN … DEFAULT gen_random_uuid()` | Rewrite |
+| `ALTER COLUMN … TYPE` (e.g. `integer` → `bigint`) | Rewrite (and rebuilds indexes) |
+| `varchar(50)` → `varchar(100)` or `text` | Instant |
+| `DROP COLUMN` | Instant (space is reclaimed later) |
+| `ADD CONSTRAINT … CHECK` / `FOREIGN KEY` | Scans the table while locked |
+| `SET NOT NULL` | Scans the table while locked (unless a valid check proves it) |
+| `CREATE INDEX` | Blocks writes while it builds |
+| `RENAME COLUMN` / `RENAME TO` | Instant, but breaks every query that uses the old name |
+
+## Constraints in two steps: NOT VALID, then VALIDATE
+
+Adding a `CHECK` or a foreign key scans every existing row **while holding the lock**. Split it in two:
+
+1. `ADD CONSTRAINT … NOT VALID`: enforced for new and changed rows from now on, but old rows aren't checked. Brief lock, no scan.
+2. `VALIDATE CONSTRAINT`: scans the old rows with a weaker **`SHARE UPDATE EXCLUSIVE`** lock, so reads and writes carry on.
+
+<CodeExample output={`ALTER TABLE
+
+BEGIN
+
+ALTER TABLE
+
+           mode
+--------------------------
+ ShareUpdateExclusiveLock
+(1 row)
+
+COMMIT
+
+        conname        | convalidated
+-----------------------+--------------
+ customers_email_lower | t
+(1 row)`}>
+
+```sql
+ALTER TABLE customers
+  ADD CONSTRAINT customers_email_lower
+  CHECK (email = lower(email)) NOT VALID;
+
+BEGIN;
+ALTER TABLE customers VALIDATE CONSTRAINT customers_email_lower;
+
+SELECT mode
+FROM pg_locks
+WHERE relation = 'customers'::regclass
+  AND pid = pg_backend_pid();
+COMMIT;
+
+SELECT conname, convalidated
+FROM pg_constraint
+WHERE conname = 'customers_email_lower';
+```
+
+</CodeExample>
+
+The same works for foreign keys (`ADD FOREIGN KEY … NOT VALID`) and, new in PostgreSQL 18, for `NOT NULL`:
+
+<CodeExample output={`ALTER TABLE
+
+UPDATE 2
+
+ALTER TABLE
+
+ attnotnull
+------------
+ t
+(1 row)`}>
+
+```sql
+ALTER TABLE customers
+  ADD CONSTRAINT customers_city_not_null NOT NULL city NOT VALID;
+
+UPDATE customers SET city = 'Unknown' WHERE city IS NULL;
+
+ALTER TABLE customers VALIDATE CONSTRAINT customers_city_not_null;
+
+SELECT attnotnull
+FROM pg_attribute
+WHERE attrelid = 'customers'::regclass AND attname = 'city';
+```
+
+</CodeExample>
+
+On older versions the recipe is: add `CHECK (city IS NOT NULL) NOT VALID`, validate it, then `SET NOT NULL` (PostgreSQL sees the valid check and skips the scan), then drop the check.
+
+### Indexes: CONCURRENTLY
+
+**`CREATE INDEX CONCURRENTLY`** builds an index without blocking writes. It takes longer (two passes over the table) and has rules of its own:
+
+<CodeExample output={`CREATE INDEX
+
+BEGIN
+
+ERROR:  CREATE INDEX CONCURRENTLY cannot run inside a transaction block`}>
+
+```sql
+CREATE INDEX CONCURRENTLY orders_status ON orders (status);
+
+BEGIN;
+CREATE INDEX CONCURRENTLY orders_customer ON orders (customer_id);
+```
+
+</CodeExample>
+
+- It **can't run inside a transaction**, so many migration tools need a "no transaction" flag for it.
+- If it fails (a deadlock, a duplicate in a unique index), it leaves an **invalid** index behind that still slows down writes. Find it with `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;`, drop it and try again.
+- For a new unique constraint, build `CREATE UNIQUE INDEX CONCURRENTLY` first, then `ADD CONSTRAINT … UNIQUE USING INDEX`, which takes the lock only for a moment.
+- `DROP INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY` exist too.
+
+## Expand and contract
+
+Some changes can't be made safe by any option: **renaming** a column, changing its type, splitting a table. The old application code is still running while you deploy, and during a rolling deploy old and new code run **at the same time**. Any change that breaks the old code is an outage. The answer is **expand and contract** (also called parallel change): never change things in place, add the new thing next to the old one, move over, then remove the old one.
+
+Here's the classic, painful one: `orders.id` is an `integer` and will run out at 2,147,483,647. Changing the type directly rewrites the table under an exclusive lock. Instead:
+
+```text
+EXPAND (old code keeps working)
+  1. ALTER TABLE orders ADD COLUMN id_new bigint;            instant
+  2. A trigger copies id → id_new on every INSERT/UPDATE     dual write
+  3. Backfill id_new for old rows, in batches                hours, online
+  4. CREATE UNIQUE INDEX CONCURRENTLY … ON orders (id_new);  online
+MIGRATE
+  5. In one short transaction (with lock_timeout): drop the trigger,
+     swap the names (id → id_old, id_new → id), make the new index
+     the primary key (ADD CONSTRAINT … PRIMARY KEY USING INDEX),
+     and move the sequence and foreign keys over
+CONTRACT (after the new code is fully deployed)
+  6. ALTER TABLE orders DROP COLUMN id_old;
+```
+
+Every step is small, can be paused, and leaves both old and new code working. Contract only when nothing reads the old column any more. Renaming a column works the same way: add the new column, dual-write, backfill, deploy code that reads the new one, then drop the old one. You'll write the expand step of a rename in the exercise.
+
+## Backfills in batches
+
+Step 3 above, filling a new column for 200 million existing rows, must **not** be one big `UPDATE`:
+
+- It's one transaction: it locks every row it touches until it ends, so normal updates to those rows wait.
+- Each updated row becomes a new row version (MVCC), so the table can double in size, and nothing can be vacuumed until the transaction ends.
+- Replicas fall behind while they replay one enormous change, and if it fails after an hour, all of it rolls back.
+
+Instead, update a few thousand rows at a time and **commit after each batch**. A procedure can do that (unlike a function, it may `COMMIT`). Walking the primary key in ranges keeps each batch an index lookup:
+
+<CodeExample output={`CREATE TABLE AS
+
+ALTER TABLE
+
+ALTER TABLE
+
+CREATE PROCEDURE
+
+NOTICE:  ids 1 to 5000
+NOTICE:  ids 5001 to 10000
+NOTICE:  ids 10001 to 15000
+NOTICE:  ids 15001 to 20000
+CALL
+
+ kind_code | events
+-----------+--------
+ CLICK     |  20000
+(1 row)`}>
+
+```sql
+CREATE TABLE events AS
+SELECT g AS id, 'click' AS kind
+FROM generate_series(1, 20000) AS g;
+ALTER TABLE events ADD PRIMARY KEY (id);
+ALTER TABLE events ADD COLUMN kind_code text;
+
+CREATE PROCEDURE backfill_kind_code(batch_size integer)
+LANGUAGE plpgsql AS $$
+DECLARE
+  next_id integer := 1;
+  last_id integer := (SELECT max(id) FROM events);
+BEGIN
+  WHILE next_id <= last_id LOOP
+    UPDATE events
+    SET kind_code = upper(kind)
+    WHERE id >= next_id AND id < next_id + batch_size
+      AND kind_code IS NULL;
+    RAISE NOTICE 'ids % to %', next_id, next_id + batch_size - 1;
+    COMMIT;
+    next_id := next_id + batch_size;
+  END LOOP;
+END $$;
+
+CALL backfill_kind_code(5000);
+
+SELECT kind_code, count(*) AS events
+FROM events
+GROUP BY kind_code;
+```
+
+</CodeExample>
+
+In production you'd also pause between batches (`PERFORM pg_sleep(0.1);`) and watch replication lag. Because the `UPDATE` skips rows that already have a value, the backfill can be stopped and restarted at any time. That property, being safe to run again, is called **idempotent**, and every migration step should have it.
+
+## PostgreSQL DDL is transactional
+
+Unlike MySQL or Oracle, PostgreSQL can roll back schema changes. A migration wrapped in `BEGIN … COMMIT` either applies completely or not at all:
+
+<CodeExample output={`BEGIN
+
+DROP TABLE
+
+ tables_named_movies
+---------------------
+                   0
+(1 row)
+
+ROLLBACK
+
+ movies
+--------
+     12
+(1 row)`}>
+
+```sql
+BEGIN;
+DROP TABLE movies;
+SELECT count(*) AS tables_named_movies
+FROM pg_tables
+WHERE tablename = 'movies';
+ROLLBACK;
+
+SELECT count(*) AS movies FROM movies;
+```
+
+</CodeExample>
+
+Keep those transactions **short**, though: every lock taken by any statement is held until the end of the transaction. A migration that adds a column and then runs a 10-minute backfill in the same transaction holds `ACCESS EXCLUSIVE` for 10 minutes.
+
+<Callout type="tip" title="A migration checklist">
+
+- Migrations live in version control and run with a tool (Flyway, Liquibase, Alembic, Prisma Migrate, golang-migrate, sqitch…), never by hand.
+- Set `lock_timeout` (a few seconds) and `statement_timeout`, and retry on timeout.
+- Prefer instant changes; avoid rewrites; use `NOT VALID` + `VALIDATE` and `CONCURRENTLY`.
+- Every step is backwards compatible with the code that's running now. Renames and type changes use expand and contract.
+- Backfills run in batches, outside the schema migration, and are idempotent.
+- Rehearse on a copy with production-sized data. Linters like **squawk** flag unsafe statements in review.
+
+</Callout>
+
+```bash
+# Typical commands in a deploy pipeline
+npx prisma migrate deploy
+alembic upgrade head
+flyway migrate
+```
+
+<Quiz
+  question="An ALTER TABLE that needs only a millisecond of work caused minutes of downtime. What is the most likely cause?"
+  options={["The table was rewritten", "It waited for its lock behind a long query, and every other query queued behind it", "PostgreSQL DDL isn't transactional", "The new column had a constant default"]}
+  answer={1}
+  explanation="A waiting ACCESS EXCLUSIVE request blocks every later query on the table, even plain SELECTs. Setting lock_timeout makes the migration give up quickly instead of building a queue."
+/>
+
+<Quiz
+  question="You need to rename users.username to users.handle on a busy app with rolling deploys. What's the safe first step?"
+  options={["ALTER TABLE users RENAME COLUMN username TO handle", "Add handle, keep both columns in sync with a trigger, and backfill in batches", "Drop username and recreate it as handle", "Create a view called handle"]}
+  answer={1}
+  explanation="A rename breaks every running copy of the old code at once. Expand first (new column, dual writes, backfill), switch the code over, then contract by dropping the old column."
+/>
+
+<Exercise
+  language="sql"
+  title="Expand: rename a column without downtime"
+  starter={`CREATE TABLE members (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+INSERT INTO members (name)
+SELECT 'Member ' || g FROM generate_series(1, 20000) AS g;
+
+-- The expand step of renaming name -> full_name:
+-- 1. Add a nullable text column full_name.
+-- 2. A BEFORE INSERT OR UPDATE trigger keeps name and full_name
+--    in sync: old code only writes name, new code only full_name.
+-- 3. A procedure backfills full_name in batches of 5000,
+--    committing and RAISE NOTICE-ing after each batch.
+-- 4. Finish by counting the rows still missing full_name.
+SELECT count(*) AS missing FROM members;
+`}
+  tests={[
+    { name: "members has full_name and still has name", check: "(await query(\"SELECT string_agg(column_name, ',' ORDER BY column_name) AS s FROM information_schema.columns WHERE table_name = 'members' AND column_name IN ('name', 'full_name')\"))[0].s === 'full_name,name'" },
+    { name: "Every row is backfilled, and the last query shows missing = 0", check: "columns.join() === 'missing' && rows[0].missing === 0 && (await query(\"SELECT count(*) AS n FROM members WHERE full_name IS DISTINCT FROM name\"))[0].n === 0" },
+    { name: "The backfill ran in batches (a NOTICE for each)", check: "__output.filter(l => l.startsWith('NOTICE:')).length >= 4" },
+    { name: "Old code inserting only name also fills full_name", check: "(await query(\"INSERT INTO members (name) VALUES ('Old App') RETURNING full_name\"))[0].full_name === 'Old App'" },
+    { name: "New code inserting only full_name also fills name", check: "(await query(\"INSERT INTO members (full_name) VALUES ('New App') RETURNING name\"))[0].name === 'New App'" },
+    { name: "Updates through either column stay in sync", check: "(await query(\"UPDATE members SET name = 'Renamed' WHERE id = 1 RETURNING full_name\"))[0].full_name === 'Renamed' && (await query(\"UPDATE members SET full_name = 'Moved' WHERE id = 2 RETURNING name\"))[0].name === 'Moved'" },
+  ]}
+>
+
+The team wants to rename `members.name` to `full_name` on a live system. Write the **expand** step:
+
+1. Add a nullable `text` column `full_name` (keep `name`: old code still uses it).
+2. Write a `BEFORE INSERT OR UPDATE` trigger that keeps the two columns in sync. Old code only ever writes `name`, new code only `full_name`, and both must see the same value.
+3. Write a procedure that backfills `full_name` for existing rows in batches of 5000, with a `COMMIT` and a `RAISE NOTICE` after each batch, and `CALL` it.
+4. End with `SELECT count(*) AS missing FROM members WHERE full_name IS NULL;`.
+
+<Hint>
+
+In the trigger function, handle inserts with `coalesce`: `NEW.full_name := coalesce(NEW.full_name, NEW.name);` and the same the other way round (a `BEFORE` trigger runs before `NOT NULL` is checked). For updates, copy whichever column changed: `IF NEW.name IS DISTINCT FROM OLD.name THEN NEW.full_name := NEW.name; ELSIF … END IF;`. For the backfill, copy the `backfill_kind_code` procedure from the lesson.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE members (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+INSERT INTO members (name)
+SELECT 'Member ' || g FROM generate_series(1, 20000) AS g;
+
+ALTER TABLE members ADD COLUMN full_name text;
+
+CREATE FUNCTION members_sync_name() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.full_name := coalesce(NEW.full_name, NEW.name);
+    NEW.name := coalesce(NEW.name, NEW.full_name);
+  ELSIF NEW.name IS DISTINCT FROM OLD.name THEN
+    NEW.full_name := NEW.name;
+  ELSIF NEW.full_name IS DISTINCT FROM OLD.full_name THEN
+    NEW.name := NEW.full_name;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER members_sync_name
+BEFORE INSERT OR UPDATE ON members
+FOR EACH ROW EXECUTE FUNCTION members_sync_name();
+
+CREATE PROCEDURE backfill_full_name(batch_size integer)
+LANGUAGE plpgsql AS $$
+DECLARE
+  next_id integer := 1;
+  last_id integer := (SELECT max(id) FROM members);
+BEGIN
+  WHILE next_id <= last_id LOOP
+    UPDATE members
+    SET full_name = name
+    WHERE id >= next_id AND id < next_id + batch_size
+      AND full_name IS NULL;
+    RAISE NOTICE 'ids % to %', next_id, next_id + batch_size - 1;
+    COMMIT;
+    next_id := next_id + batch_size;
+  END LOOP;
+END $$;
+
+CALL backfill_full_name(5000);
+
+SELECT count(*) AS missing
+FROM members
+WHERE full_name IS NULL;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Most `ALTER TABLE`s take an **`ACCESS EXCLUSIVE`** lock. A migration that **waits** for it blocks everyone behind it: always set **`lock_timeout`** and retry.
+- Prefer **instant** changes (nullable columns, constant defaults); avoid **rewrites** (volatile defaults, type changes) on big tables.
+- Add constraints with **`NOT VALID`**, then **`VALIDATE`** (weaker lock). PostgreSQL 18 supports this for `NOT NULL` too. Build indexes **`CONCURRENTLY`**.
+- Renames and type changes use **expand and contract**: add, dual-write, backfill, switch the code, then drop.
+- **Backfill in batches** with a commit per batch, idempotently, outside the schema change.
+- DDL is **transactional** in PostgreSQL, but locks last until the transaction ends, so keep it short.

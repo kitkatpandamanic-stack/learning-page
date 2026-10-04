@@ -1,0 +1,313 @@
+---
+title: CASE, условная агрегация и сводные таблицы
+description: Добавьте в запросы логику «если/иначе» с CASE, считайте несколько вещей за один проход с FILTER и превращайте строки в столбцы (и обратно), чтобы строить сводные таблицы.
+duration: 20
+xp: 25
+---
+
+Отчётам редко нужны сырые значения. Им нужны **метки** («budget», «premium»), **особый порядок** («оплачен, потом отправлен, потом доставлен») и **числа бок о бок** («заказы по месяцам, по столбцу на каждый статус») — такую таблицу иначе пришлось бы собирать вручную в электронной таблице.
+
+В этом уроке — инструменты для этого: **`CASE`** для логики «если/иначе», **`FILTER`** для условной агрегации (conditional aggregation) и шаблон, который объединяет их в **сводные таблицы (pivot tables)**. 🧮
+
+## CASE: «если/иначе» внутри запроса
+
+**`CASE` с условиями (searched CASE)** проверяет условия сверху вниз и возвращает результат **первого** истинного:
+
+<CodeExample output={`       name        | price | price_band
+-------------------+-------+------------
+ Bamboo Chopsticks |  4.20 | budget
+ Earl Grey         |  5.25 | standard
+ Jasmine Tea       |  6.50 | standard
+ Matcha Powder     | 14.00 | standard
+ Tea Pot           | 32.00 | premium
+ Rice Cooker       | 89.90 | premium
+(6 rows)`}>
+
+```sql
+SELECT name, price,
+  CASE
+    WHEN price < 5 THEN 'budget'
+    WHEN price < 20 THEN 'standard'
+    ELSE 'premium'
+  END AS price_band
+FROM products
+WHERE category IN ('tea', 'kitchen')
+ORDER BY price;
+```
+
+</CodeExample>
+
+Matcha Powder (14.00) получает «standard», а не «premium»: побеждает первое истинное условие, а остальные даже не проверяются, поэтому располагайте `WHEN` от самого частного к самому общему. Если ни одно условие не подошло и `ELSE` нет, `CASE` возвращает `NULL`. Пропущенный `ELSE` — частый источник загадочных `NULL`, так что полезно взять в привычку всегда его писать.
+
+`CASE` — это **выражение (expression)**, поэтому он работает везде, где допустимо значение: в `SELECT`, `WHERE`, `ORDER BY`, `GROUP BY`, внутри функций и даже внутри другого `CASE`.
+
+## Простой CASE и особый порядок сортировки
+
+Когда каждое условие сравнивает **одно и то же** значение через `=`, короче получается **простой `CASE` (simple CASE)**: значение пишется один раз, а дальше перечисляются совпадения. Любимое применение — особый порядок сортировки. По умолчанию статусы заказов сортируются по алфавиту (cancelled, delivered, paid, shipped), что человеку ни о чём не говорит; `CASE` в `ORDER BY` выстраивает их в том порядке, в каком заказ проходит путь:
+
+<CodeExample output={`  status   | orders
+-----------+--------
+ paid      |      8
+ shipped   |      8
+ delivered |     16
+ cancelled |      8
+(4 rows)`}>
+
+```sql
+SELECT status, count(*) AS orders
+FROM orders
+GROUP BY status
+ORDER BY CASE status
+    WHEN 'paid' THEN 1
+    WHEN 'shipped' THEN 2
+    WHEN 'delivered' THEN 3
+    ELSE 4
+  END;
+```
+
+</CodeExample>
+
+<Callout type="warning" title="Две ловушки CASE">
+
+- **`CASE x WHEN NULL` никогда не срабатывает.** Простая форма использует `=`, а `NULL = NULL` не истинно. Чтобы поймать отсутствующие значения, используйте форму с условиями: `CASE WHEN city IS NULL THEN 'unknown' ELSE city END` (или просто `coalesce(city, 'unknown')`).
+- **У всех результатов должен быть один тип.** `CASE WHEN stock > 0 THEN stock ELSE 'sold out' END` падает с ошибкой «invalid input syntax for type integer», потому что PostgreSQL пытается превратить `'sold out'` в число. Вместо этого приведите другие ветки к тексту: `THEN stock::text`.
+
+</Callout>
+
+## Группировка по CASE
+
+Поскольку `CASE` создаёт новое значение для каждой строки, по нему можно **группировать**. Так непрерывное число вроде цены превращается в **диапазоны (buckets)**:
+
+<CodeExample output={` price_band | products | cheapest | dearest
+------------+----------+----------+---------
+ budget     |        4 |     2.50 |    4.20
+ standard   |        7 |     5.25 |   18.00
+ premium    |        4 |    24.99 |   89.90
+(3 rows)`}>
+
+```sql
+SELECT
+  CASE
+    WHEN price < 5 THEN 'budget'
+    WHEN price < 20 THEN 'standard'
+    ELSE 'premium'
+  END AS price_band,
+  count(*) AS products,
+  min(price) AS cheapest,
+  max(price) AS dearest
+FROM products
+GROUP BY price_band
+ORDER BY min(price);
+```
+
+</CodeExample>
+
+PostgreSQL разрешает использовать в `GROUP BY` выходное имя `price_band`, так что `CASE` пишется один раз. Сортировка по `min(price)` сохраняет естественный порядок диапазонов без ещё одного `CASE`.
+
+## Условная агрегация с FILTER
+
+Сколько заказов было оплачено, отправлено, доставлено и отменено **в каждом месяце**? Можно выполнить четыре запроса, но **условная агрегация** делает это за один проход. Добавьте **`FILTER (WHERE ...)`** после агрегатной функции — и она увидит только подходящие строки:
+
+<CodeExample output={`  month  | orders | paid | shipped | delivered | cancelled
+---------+--------+------+---------+-----------+-----------
+ 2025-01 |      6 |    1 |       1 |         3 |         1
+ 2025-02 |      7 |    2 |       2 |         2 |         1
+ 2025-03 |      8 |    1 |       1 |         4 |         2
+ 2025-04 |      7 |    2 |       2 |         2 |         1
+ 2025-05 |      7 |    1 |       1 |         3 |         2
+ 2025-06 |      5 |    1 |       1 |         2 |         1
+(6 rows)`}>
+
+```sql
+SELECT to_char(ordered_at, 'YYYY-MM') AS month,
+  count(*) AS orders,
+  count(*) FILTER (WHERE status = 'paid') AS paid,
+  count(*) FILTER (WHERE status = 'shipped') AS shipped,
+  count(*) FILTER (WHERE status = 'delivered') AS delivered,
+  count(*) FILTER (WHERE status = 'cancelled') AS cancelled
+FROM orders
+GROUP BY month
+ORDER BY month;
+```
+
+</CodeExample>
+
+Поздравляем, это **сводная таблица**: статусы, которые в таблице `orders` были **значениями в строках**, стали **столбцами**. Каждая строка — месяц, каждый столбец — статус, а каждая ячейка — агрегат. Любители электронных таблиц почувствуют себя как дома.
+
+`FILTER` входит в стандарт SQL, но есть не во всех базах данных (в MySQL и SQL Server его нет). Переносимый способ, который часто встречается в старом коде, помещает `CASE` **внутрь** агрегата:
+
+```sql
+count(CASE WHEN status = 'paid' THEN 1 END) AS paid,
+sum(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS paid_too
+```
+
+`count` игнорирует значения `NULL`, которые возвращает `CASE` без `ELSE`, поэтому обе строки считают оплаченные заказы. В PostgreSQL предпочитайте `FILTER`: он прямо говорит, что имеется в виду, и работает с любым агрегатом (`sum`, `avg`, `array_agg`…).
+
+<Quiz
+  question="Что вернёт sum(amount) FILTER (WHERE status = 'paid') для группы, в которой нет ни одной оплаченной строки?"
+  options={["0", "NULL", "Ошибку", "Сумму всех строк группы"]}
+  answer={1}
+  explanation="FILTER оставляет агрегат без строк, а sum() от пустого набора строк — это NULL (count() от пустого набора — 0). Оберните его в coalesce(..., 0), если в отчёте должен быть 0."
+/>
+
+## Сводная таблица по деньгам: квартал за кварталом
+
+Тот же шаблон поворачивает любую метрику. Вот выручка по категориям, первый и второй кварталы 2025 года рядом, плюс изменение — его теперь легко посчитать, ведь числа стоят в одной строке:
+
+<CodeExample output={` category |   q1   |   q2   | change
+----------+--------+--------+---------
+ books    | 481.45 | 348.96 | -132.49
+ kitchen  | 675.10 | 485.00 | -190.10
+ snacks   |  44.19 |  42.72 |   -1.47
+ tea      |  35.25 |  45.75 |   10.50
+ toys     | 139.80 | 147.60 |    7.80
+(5 rows)`}>
+
+```sql
+SELECT p.category,
+  sum(oi.quantity * oi.unit_price)
+    FILTER (WHERE o.ordered_at < '2025-04-01') AS q1,
+  sum(oi.quantity * oi.unit_price)
+    FILTER (WHERE o.ordered_at >= '2025-04-01') AS q2,
+  sum(oi.quantity * oi.unit_price)
+    FILTER (WHERE o.ordered_at >= '2025-04-01')
+  - sum(oi.quantity * oi.unit_price)
+    FILTER (WHERE o.ordered_at < '2025-04-01') AS change
+FROM order_items AS oi
+JOIN orders AS o ON o.id = oi.order_id
+JOIN products AS p ON p.id = oi.product_id
+WHERE o.status <> 'cancelled'
+GROUP BY p.category
+ORDER BY p.category;
+```
+
+</CodeExample>
+
+<Callout type="note" title="Столбцы сводной таблицы фиксируются при написании запроса">
+
+SQL должен знать столбцы запроса до его выполнения, поэтому каждый столбец сводной таблицы прописывается вручную. Если завтра появится новый статус, столбец для него сам не появится. Функция PostgreSQL `crosstab()` (из расширения `tablefunc`, которого нет в этой браузерной базе данных) ограничена так же. Для по-настоящему динамических столбцов генерируйте SQL в приложении или возвращайте «длинные» строки (`month, status, orders`) и поручите поворот электронной таблице, BI-инструменту или фронтенду.
+
+</Callout>
+
+## Обратный поворот: столбцы снова в строки
+
+Иногда данные приходят в **широком** виде (столбец на каждый квартал), а нужны в **длинном** (строка на каждый квартал) — например, чтобы построить график или сделать `GROUP BY` по кварталу. Соедините каждую строку с небольшим списком **`VALUES`**, который создаёт строки. Ключевое слово **`LATERAL`** позволяет этому списку ссылаться на столбцы текущей строки:
+
+<CodeExample output={` category | quarter | revenue
+----------+---------+---------
+ tea      | Q1      |   35.25
+ tea      | Q2      |   45.75
+ toys     | Q1      |  139.80
+ toys     | Q2      |  147.60
+(4 rows)`}>
+
+```sql
+WITH by_quarter AS (
+  SELECT p.category,
+    sum(oi.quantity * oi.unit_price)
+      FILTER (WHERE o.ordered_at < '2025-04-01') AS q1,
+    sum(oi.quantity * oi.unit_price)
+      FILTER (WHERE o.ordered_at >= '2025-04-01') AS q2
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  JOIN products AS p ON p.id = oi.product_id
+  WHERE o.status <> 'cancelled'
+  GROUP BY p.category
+)
+SELECT b.category, v.quarter, v.revenue
+FROM by_quarter AS b
+CROSS JOIN LATERAL (
+  VALUES ('Q1', b.q1), ('Q2', b.q2)
+) AS v (quarter, revenue)
+WHERE b.category IN ('tea', 'toys')
+ORDER BY b.category, v.quarter;
+```
+
+</CodeExample>
+
+Каждая строка категории соединяется с двумя строками списка `VALUES` — по одной на квартал. `AS v (quarter, revenue)` даёт имя списку и его столбцам.
+
+Попробуйте: добавьте процент «Q2 к Q1», постройте сводную таблицу по странам вместо статусов или добавьте `avg()` с `FILTER`.
+
+<TryIt language="sql" code={`SELECT c.country,
+  count(*) AS orders,
+  count(*) FILTER (WHERE o.status = 'cancelled') AS cancelled,
+  round(100.0 * count(*) FILTER (WHERE o.status = 'cancelled')
+    / count(*), 1) AS cancel_pct
+FROM orders AS o
+JOIN customers AS c ON c.id = o.customer_id
+GROUP BY c.country
+ORDER BY cancel_pct DESC, c.country
+LIMIT 8;`} />
+
+<Quiz
+  question="CASE WHEN rating >= 7 THEN 'good' WHEN rating >= 8 THEN 'great' ELSE 'meh' END. Что получит фильм с рейтингом 8.4?"
+  options={["great", "good", "meh", "NULL"]}
+  answer={1}
+  explanation="CASE возвращает результат первого истинного условия. Первым проверяется 8.4 >= 7, и оно истинно, поэтому результат — 'good', а до ветки 'great' дело не доходит. Ставьте более строгое условие (>= 8) первым."
+/>
+
+<Exercise
+  language="sql"
+  title="Отчёт об остатках для закупщиков"
+  starter={`-- Одна строка на категорию: количества, стоимость запасов и действие
+SELECT category, count(*) AS products
+FROM products
+GROUP BY category
+ORDER BY category;`}
+  tests={[
+    { name: "Столбцы: category, products, out_of_stock, low_stock, stock_value, action", check: "columns.join() === 'category,products,out_of_stock,low_stock,stock_value,action'" },
+    { name: "Одна строка на категорию, отсортировано", check: "rows.map(r => r.category).join() === 'books,kitchen,snacks,tea,toys'" },
+    { name: "Считает товары, которых нет в наличии и которых мало", check: "rows.map(r => r.out_of_stock + '/' + r.low_stock).join() === '1/2,0/2,0/0,1/0,0/1'" },
+    { name: "stock_value — это цена, умноженная на остаток", check: "rows.map(r => r.stock_value).join() === '174.5,1391.6,827.55,428,762.6'" },
+    { name: "action — это reorder, watch или ok", check: "rows.map(r => r.action).join() === 'reorder,watch,ok,reorder,watch'" },
+    { name: "Работает, когда остатки меняются", check: "(await rerun(\"INSERT INTO products (name, category, price, stock) VALUES ('Seaweed Snack', 'snacks', 2.00, 0); UPDATE products SET stock = 5 WHERE name = 'Clean Python'\")).map(r => r.category + ':' + r.out_of_stock + '/' + r.low_stock + ':' + r.action).join() === 'books:0/3:watch,kitchen:0/2:watch,snacks:1/0:reorder,tea:1/0:reorder,toys:0/1:watch'" },
+  ]}
+>
+
+Закупщикам нужна одна строка на категорию со столбцами:
+
+- `category` и `products` (сколько в ней товаров),
+- `out_of_stock`: товары с `stock = 0`,
+- `low_stock`: товары, которых на складе от 1 до 9,
+- `stock_value`: сумма `price * stock`,
+- `action`: `'reorder'`, если что-то закончилось, иначе `'watch'`, если чего-то мало, иначе `'ok'`,
+- сортировка по категории.
+
+<Hint>
+
+Используйте `count(*) FILTER (WHERE stock = 0)` и `count(*) FILTER (WHERE stock BETWEEN 1 AND 9)`. Для `action` напишите `CASE` с условиями, который повторяет эти агрегаты: `CASE WHEN count(*) FILTER (WHERE stock = 0) > 0 THEN 'reorder' WHEN ... THEN 'watch' ELSE 'ok' END`. (Псевдонимы `out_of_stock` и `low_stock` нельзя использовать в том же списке `SELECT`; другой путь — CTE.)
+
+</Hint>
+
+<Solution>
+
+```sql
+SELECT category,
+  count(*) AS products,
+  count(*) FILTER (WHERE stock = 0) AS out_of_stock,
+  count(*) FILTER (WHERE stock BETWEEN 1 AND 9) AS low_stock,
+  sum(price * stock) AS stock_value,
+  CASE
+    WHEN count(*) FILTER (WHERE stock = 0) > 0 THEN 'reorder'
+    WHEN count(*) FILTER (WHERE stock BETWEEN 1 AND 9) > 0
+      THEN 'watch'
+    ELSE 'ok'
+  END AS action
+FROM products
+GROUP BY category
+ORDER BY category;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **`CASE` с условиями** (`CASE WHEN условие THEN ... ELSE ... END`) возвращает первый подходящий результат; без `ELSE` при отсутствии совпадений получается `NULL`.
+- **Простой `CASE`** (`CASE x WHEN значение THEN ...`) сравнивает одно значение через `=`, поэтому не может совпасть с `NULL`. У всех веток должен быть один тип.
+- `CASE` работает везде, где допустимо значение: метки в `SELECT`, особый порядок в `ORDER BY`, диапазоны в `GROUP BY`.
+- **`агрегат(...) FILTER (WHERE ...)`** агрегирует только подходящие строки: можно посчитать несколько вещей за один проход. Переносимая форма — `count(CASE WHEN ... THEN 1 END)`.
+- **Сводная таблица** — это `GROUP BY` по метке строки плюс по одному отфильтрованному агрегату на столбец; столбцы фиксируются при написании запроса.
+- **Обратный поворот (unpivot)** делается через `CROSS JOIN LATERAL (VALUES ...)`, по одной строке `VALUES` на столбец.

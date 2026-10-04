@@ -1,0 +1,299 @@
+---
+title: "Shop Analytics: Customers and Products"
+description: "Level 1 capstone, part 2: find the best customers, measure repeat buying, spot customers who never ordered, and catch the products that never really sold."
+duration: 18
+xp: 30
+---
+
+In [part 1](/learn/sql/shop-revenue-by-month) you worked out **how much** the shop sells. The board's next questions are about **who** buys and **what** they buy:
+
+> 2. Who are our best customers, and do people come back?
+> 3. Which products never sell?
+
+These questions are all about **comparing two tables**: customers with their orders, products with their sales. You'll lean on joins, `LEFT JOIN`, `NOT EXISTS` and CTEs, and you'll meet one of the sneakiest bugs in reporting SQL along the way.
+
+## The best customers
+
+Start from the same building block as part 1, one row per order with its total, then add it up **per customer**:
+
+<CodeExample output={`    name     | country | orders | spent
+-------------+---------+--------+--------
+ Ravi Patel  | India   |      3 | 282.23
+ Sam Ortiz   | Spain   |      2 | 273.83
+ Sofia Rossi | Italy   |      3 | 260.13
+ Diego López | Mexico  |      2 | 258.17
+ Kenji Mori  | Japan   |      2 | 207.67
+(5 rows)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+)
+SELECT c.name, c.country,
+  count(*) AS orders,
+  sum(t.total) AS spent
+FROM order_totals AS t
+JOIN customers AS c ON c.id = t.customer_id
+WHERE t.status <> 'cancelled'
+GROUP BY c.id
+ORDER BY spent DESC, c.name
+LIMIT 5;
+```
+
+</CodeExample>
+
+Ravi Patel tops the list with three orders. Notice the tie-breaker `c.name` in `ORDER BY`: if two customers spent the same, the list still comes out in the same order every time, which matters when the report is rerun next month.
+
+## Do customers come back?
+
+A **repeat buyer** is a customer with at least two (non-cancelled) orders. Repeat buyers are gold for a shop: winning a new customer costs far more than keeping one. Let's compute a `customer_stats` step and compare the two groups:
+
+<CodeExample output={` repeat_buyer | customers | revenue | avg_spent
+--------------+-----------+---------+-----------
+ t            |        12 | 1918.25 |    159.85
+ f            |         5 |  527.57 |    105.51
+(2 rows)`}>
+
+```sql
+WITH customer_stats AS (
+  SELECT o.customer_id,
+    count(DISTINCT o.id) AS orders,
+    sum(oi.quantity * oi.unit_price) AS spent
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.customer_id
+)
+SELECT orders >= 2 AS repeat_buyer,
+  count(*) AS customers,
+  sum(spent) AS revenue,
+  round(avg(spent), 2) AS avg_spent
+FROM customer_stats
+GROUP BY repeat_buyer
+ORDER BY repeat_buyer DESC;
+```
+
+</CodeExample>
+
+Twelve of the seventeen customers came back, and they bring in almost **80% of revenue**. Two details make this query work:
+
+- `count(DISTINCT o.id)` counts orders even though the join made one row per item (the fan-out trap from part 1).
+- `orders >= 2 AS repeat_buyer` is a **boolean expression used as a column**, and you can `GROUP BY` it like any other column: `t` for repeat buyers, `f` for one-time buyers. No special syntax needed to split customers into two groups.
+
+## Customers who never ordered
+
+The customers who signed up but never bought anything don't appear in `orders` at all, so no query that starts from `orders` can find them. You need customers **without** a matching order: an **anti-join**. Both classic forms work:
+
+<CodeExample output={`    name    | joined_on
+------------+------------
+ Grace Kim  | 2024-11-23
+ Tom Baker  | 2024-12-12
+ Nina Novak | 2025-01-05
+(3 rows)
+
+    name    | joined_on
+------------+------------
+ Grace Kim  | 2024-11-23
+ Tom Baker  | 2024-12-12
+ Nina Novak | 2025-01-05
+(3 rows)`}>
+
+```sql
+-- LEFT JOIN, keep the rows that found no order
+SELECT c.name, c.joined_on
+FROM customers AS c
+LEFT JOIN orders AS o ON o.customer_id = c.id
+WHERE o.id IS NULL
+ORDER BY c.joined_on;
+
+-- NOT EXISTS says the same thing in words
+SELECT c.name, c.joined_on
+FROM customers AS c
+WHERE NOT EXISTS (
+  SELECT 1 FROM orders AS o WHERE o.customer_id = c.id
+)
+ORDER BY c.joined_on;
+```
+
+</CodeExample>
+
+Three customers joined in the last few months of 2024 and early 2025 and haven't ordered yet: perfect for a welcome discount email. [`NOT EXISTS`](/learn/sql/queries-inside-queries) reads closest to the question ("customers for whom no order exists") and is the safest choice, as you're about to see.
+
+<Callout type="warning" title="Avoid NOT IN with a subquery">
+
+`WHERE c.id NOT IN (SELECT customer_id FROM orders)` looks like a third way, and it works here. But if the subquery ever returns a `NULL`, `NOT IN` returns **no rows at all**, because `x NOT IN (1, NULL)` is unknown rather than true. `NOT EXISTS` doesn't have this trap, so make it your habit.
+
+</Callout>
+
+## Best sellers
+
+On to products. Which ones bring in the most money? Join items to products and orders, leave out cancelled orders, and rank by revenue:
+
+<CodeExample output={`          name          | category | units | revenue
+------------------------+----------+-------+---------
+ Rice Cooker            | kitchen  |     9 |  809.10
+ Algorithms in Pictures | books    |    17 |  493.00
+ Tea Pot                | kitchen  |     9 |  288.00
+ Clean Python           | books    |     9 |  224.91
+ Wooden Puzzle          | toys     |    16 |  182.40
+(5 rows)`}>
+
+```sql
+SELECT p.name, p.category,
+  sum(oi.quantity) AS units,
+  sum(oi.quantity * oi.unit_price) AS revenue
+FROM order_items AS oi
+JOIN orders AS o ON o.id = oi.order_id
+JOIN products AS p ON p.id = oi.product_id
+WHERE o.status <> 'cancelled'
+GROUP BY p.id
+ORDER BY revenue DESC, p.name
+LIMIT 5;
+```
+
+</CodeExample>
+
+The Rice Cooker is the star: only 9 units, but at 89.90 each. Ranking by `units` instead would put very different products on top, so it's worth showing the board both numbers.
+
+## Products that never sold: a trap
+
+"Which products never sell?" sounds like the customers question again: products with no order items. Let's try:
+
+<CodeExample output={` name
+------
+(0 rows)`}>
+
+```sql
+SELECT p.name
+FROM products AS p
+LEFT JOIN order_items AS oi ON oi.product_id = p.id
+WHERE oi.product_id IS NULL;
+```
+
+</CodeExample>
+
+No rows: every product has been ordered at some point. Case closed? Not quite. **Ordered** isn't **sold**: some orders were cancelled. A product that only ever appeared in cancelled orders never brought in a penny. So the question really is: products with no item **in a non-cancelled order**.
+
+A natural first attempt adds the status filter to the `WHERE` clause, and it goes badly wrong:
+
+<CodeExample output={` name
+------
+(0 rows)`}>
+
+```sql
+SELECT p.name
+FROM products AS p
+LEFT JOIN order_items AS oi ON oi.product_id = p.id
+LEFT JOIN orders AS o ON o.id = oi.order_id
+WHERE o.status <> 'cancelled'
+  AND oi.product_id IS NULL;
+```
+
+</CodeExample>
+
+Still nothing, and this time it's a bug. For a product with no matching row, `o.status` is `NULL`, and `NULL <> 'cancelled'` is not true, so `WHERE` throws away **exactly the rows the anti-join was looking for**. A condition on the right-hand table in `WHERE` quietly turns a `LEFT JOIN` back into an inner join.
+
+The fix is to put the condition **inside** the test for a matching row. With `NOT EXISTS`, that's natural:
+
+<CodeExample output={`     name      | category | stock
+---------------+----------+-------
+ Matcha Powder | tea      |    12
+ Plush Panda   | toys     |    25
+ Rice Crackers | snacks   |    60
+(3 rows)`}>
+
+```sql
+SELECT p.name, p.category, p.stock
+FROM products AS p
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  WHERE oi.product_id = p.id
+    AND o.status <> 'cancelled'
+)
+ORDER BY p.name;
+```
+
+</CodeExample>
+
+Here the "match" spans two tables (an item **and** its order), which is awkward to express with `LEFT JOIN`s but reads naturally as a subquery. Three products have never really sold, and together they tie up 97 units of stock: Matcha Powder appeared in eight orders, and every single one was cancelled. That's a story for the board (is the price wrong? is the delivery time too long?), and a naive query would have hidden it completely.
+
+<Callout type="tip" title="Filters on the optional side go in ON">
+
+With a `LEFT JOIN`, a condition on the **optional** table belongs in the `ON` clause (or in a `NOT EXISTS` subquery), never in `WHERE`. In `ON`, it decides which rows count as a match; in `WHERE`, it deletes the unmatched rows afterwards. When an anti-join returns nothing, this is the first thing to check.
+
+</Callout>
+
+<Quiz
+  question="A query does products LEFT JOIN order_items LEFT JOIN orders, then WHERE o.status = 'delivered'. What happens to products that were never ordered?"
+  options={[
+    "They appear with NULL in the order columns",
+    "They are removed, because NULL = 'delivered' is not true",
+    "They appear once with status 'delivered'",
+    "The query fails with an error",
+  ]}
+  answer={1}
+  explanation="For a product with no orders, o.status is NULL, and NULL = 'delivered' is unknown, so WHERE drops the row. Put the condition in the ON clause of the join to keep unmatched products."
+/>
+
+<Exercise
+  language="sql"
+  title="Products that never really sold"
+  starter={`SELECT p.name, p.category, p.stock
+FROM products AS p
+LEFT JOIN order_items AS oi ON oi.product_id = p.id
+WHERE oi.product_id IS NULL
+ORDER BY p.name;
+`}
+  tests={[
+    { name: "Columns: name, category, stock", check: "columns.join() === 'name,category,stock'" },
+    { name: "Finds the 3 products that only appear in cancelled orders", check: "rows.map(r => r.name).join() === 'Matcha Powder,Plush Panda,Rice Crackers'" },
+    { name: "Shows their category and stock", check: "rows.map(r => r.category + ':' + r.stock).join() === 'tea:12,toys:25,snacks:60'" },
+    { name: "Brand-new products with no orders are included", check: "(await rerun(\"INSERT INTO products (name, category, price, stock) VALUES ('Bamboo Fan', 'kitchen', 7.50, 30)\")).map(r => r.name).join() === 'Bamboo Fan,Matcha Powder,Plush Panda,Rice Crackers'" },
+    { name: "A product leaves the list once a real order includes it", check: "(await rerun(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (18, '2025-07-01 12:00', 'paid') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, 10, 1, 18.00 FROM o\")).map(r => r.name).join() === 'Matcha Powder,Rice Crackers'" },
+    { name: "A new cancelled order doesn't count as a sale", check: "(await rerun(\"INSERT INTO products (name, category, price, stock) VALUES ('Bamboo Fan', 'kitchen', 7.50, 30); WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (19, '2025-07-02 12:00', 'cancelled') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, (SELECT id FROM products WHERE name = 'Bamboo Fan'), 2, 7.50 FROM o\")).map(r => r.name).join() === 'Bamboo Fan,Matcha Powder,Plush Panda,Rice Crackers'" },
+  ]}
+>
+
+The starter is the naive query from the lesson: it finds products that were never **ordered**, and returns nothing. The board wants products that were never **sold**: products that don't appear in any order that **wasn't cancelled**.
+
+Fix the query so that it returns those products with the columns `name`, `category` and `stock`, sorted by name. It must keep working when the shop adds new products or new orders arrive.
+
+<Hint>
+
+Replace the `LEFT JOIN` with `WHERE NOT EXISTS (SELECT 1 FROM order_items AS oi JOIN orders AS o ON o.id = oi.order_id WHERE oi.product_id = p.id AND o.status <> 'cancelled')`. The subquery joins items to their orders, so it can check the status of each one; the outer query keeps a product only when that subquery finds nothing.
+
+</Hint>
+
+<Solution>
+
+```sql
+SELECT p.name, p.category, p.stock
+FROM products AS p
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  WHERE oi.product_id = p.id
+    AND o.status <> 'cancelled'
+)
+ORDER BY p.name;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- Per-customer and per-product reports start from a join plus `GROUP BY customer` or `GROUP BY product`; use `count(DISTINCT o.id)` to count orders after joining items.
+- A boolean expression like `orders >= 2 AS repeat_buyer` can be grouped on to split rows into two groups.
+- An **anti-join** finds rows without a match: `LEFT JOIN ... WHERE right.id IS NULL`, or (clearer and safer) `NOT EXISTS`.
+- Avoid `NOT IN (subquery)`: one `NULL` in the subquery makes it return nothing.
+- Conditions on the optional side of a `LEFT JOIN` belong in `ON` or inside `NOT EXISTS`; in `WHERE` they silently turn it into an inner join.
+- "Ordered" isn't "sold": always ask which statuses a business question should count.

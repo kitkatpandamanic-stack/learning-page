@@ -92,6 +92,19 @@ a simple event loop and runs FastAPI's `TestClient` on it; `plt.show()` prints t
 as an image. The code is saved as `lesson.py`, so `pytest.main([__file__])` runs its
 tests, and checks can call `_panda_pytest()` (counts of passed/failed tests) or
 `_panda_pytest(patch={"add": buggy})` to make sure the learner's tests catch a bug.
+`requests` and `httpx` (sync and async) answer the practice API below from the browser
+too, Beautiful Soup can scrape its HTML shop (`/shop`, `/shop/<id>`, `/robots.txt`), and
+checks can read `_panda_requests`.
+
+SQL exercises add `language="sql"` (```sql fences). They run on PostgreSQL 18 compiled to
+WebAssembly ([PGlite](https://pglite.dev)), served from `public/vendor` like the TypeScript
+compiler. Every run starts from a fresh copy of the sample database in
+`src/lib/runner/sql-seed.ts` (a shop, a company and a film catalogue), runs the statements
+one by one and prints what psql would: aligned tables, command tags (`INSERT 0 3`), and
+errors with the line and a caret. Checks are JavaScript (they may `await`) and see `rows` and
+`columns` of the last result, `results`, `query(sql)`, `lastQuery` and `rerun(setupSql)`,
+which changes the data and runs the learner's last query again, so hard-coded answers fail;
+each check runs in a transaction that's rolled back afterwards (`src/lib/runner/execute-sql.ts`).
 
 JavaScript can `fetch` the built-in practice API at `https://api.pandadev.test`
 (`/movies`, `/weather?city=`, `/recipes`, `/users`, `/posts`, `/todos` with full CRUD,
@@ -147,6 +160,12 @@ Previews have an in-memory `localStorage` (the sandboxed page can't use the real
 site keeps its contents between runs, so pressing Run again behaves like reloading a page;
 Reset clears it, and checks always start with empty storage.
 
+Practice problems live in `content/practice/<language>/NN-slug.mdx` and appear at
+`/practice/<language>/<slug>`: frontmatter `title`, `description`, `difficulty` (easy, medium,
+hard: 10, 20 or 30 XP), `topic` (see `src/lib/practice-meta.ts`) and optionally a refresher
+`lesson`, then the statement and exactly one `<Exercise>`. Translations sit next to them as
+`NN-slug.ru.mdx`, like lessons.
+
 Each level ends with a capstone project. In `course.yml` a level's `capstone` is either a
 title, or `{ slug, title, description }` with its lessons ("parts") in
 `content/courses/<language>/<slug>/`, listed after the level's modules.
@@ -201,9 +220,9 @@ Production environment variables (Vercel → Project → Settings → Environmen
 Without the database or auth variables the site still works, just without sign-in and
 saved progress.
 
-In production a service worker (`public/sw.js`) keeps Python, the TypeScript compiler,
-React and the site's scripts after their first download, so the editor starts instantly
-on later visits, and keeps visited lessons for offline use. Printed values match Node's
+In production a service worker (`public/sw.js`) keeps Python, PostgreSQL, the TypeScript
+compiler, React and the site's scripts after their first download, so the editor starts
+instantly on later visits, and keeps visited lessons and practice problems for offline use. Printed values match Node's
 `console.log`, including line breaking and promises (`Promise { <pending> }`).
 
 ## Scripts

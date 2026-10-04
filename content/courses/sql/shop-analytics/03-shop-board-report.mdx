@@ -1,0 +1,364 @@
+---
+title: "Shop Analytics: Stock Alerts and the Board Report"
+description: "Level 1 capstone, part 3: raise stock alerts, save a restock list in your own table, and put the shop's headline numbers into one board report query."
+duration: 18
+xp: 30
+---
+
+Two questions left on the founder's list, and the second one is the big finish:
+
+> 3. … and what's about to run out?
+> 4. Can you put the headline numbers on one page?
+
+In this last part you'll raise **stock alerts**, turn them into a **restock list** stored in a table of your own design, and then build the **board report**: one query that answers the board's headline questions in a single, tidy table. Everything from Level 1 comes together here. 🐼📊
+
+## Stock alerts
+
+The warehouse wants two kinds of alert: products that are **out of stock** (stock 0) and products that are **running low** (fewer than 10 left). Each alert is a simple query; **`UNION ALL`** stacks them into one list, with a text label saying which alert it is:
+
+<CodeExample output={`    alert     |          name          | stock
+--------------+------------------------+-------
+ out of stock | Clean Python           |     0
+ out of stock | Earl Grey              |     0
+ low stock    | Algorithms in Pictures |     3
+ low stock    | Rice Cooker            |     4
+ low stock    | Tea Pot                |     6
+ low stock    | The Bamboo Code        |     7
+ low stock    | Wooden Puzzle          |     9
+(7 rows)`}>
+
+```sql
+SELECT 'out of stock' AS alert, name, stock
+FROM products
+WHERE stock = 0
+UNION ALL
+SELECT 'low stock', name, stock
+FROM products
+WHERE stock BETWEEN 1 AND 9
+ORDER BY alert DESC, stock, name;
+```
+
+</CodeExample>
+
+The column names come from the first `SELECT`, and the final `ORDER BY` sorts the combined result: `'out of stock'` sorts after `'low stock'` alphabetically, so `DESC` puts the urgent alerts first. Each part has its own `WHERE`, so a product can't land in both lists.
+
+## Will the stock last?
+
+A fixed limit like "fewer than 10" treats every product the same, but 9 Wooden Puzzles is plenty for a product that sells once a year and nothing for a best seller. A smarter rule compares stock with **recent sales**. The shop's rule: keep enough stock for **six months** at the pace of the last three (April to June). Anything below that gets reordered:
+
+<CodeExample output={`          name          | stock | sold_apr_jun | reorder
+------------------------+-------+--------------+---------
+ Earl Grey              |     0 |            5 |      10
+ Algorithms in Pictures |     3 |            6 |       9
+ Wooden Puzzle          |     9 |            9 |       9
+ Clean Python           |     0 |            4 |       8
+ The Bamboo Code        |     7 |            6 |       5
+ Rice Cooker            |     4 |            4 |       4
+(6 rows)`}>
+
+```sql
+WITH recent_sales AS (
+  SELECT oi.product_id, sum(oi.quantity) AS sold
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  WHERE o.status <> 'cancelled'
+    AND o.ordered_at >= '2025-04-01'
+  GROUP BY oi.product_id
+)
+SELECT p.name, p.stock, r.sold AS sold_apr_jun,
+  2 * r.sold - p.stock AS reorder
+FROM products AS p
+JOIN recent_sales AS r ON r.product_id = p.id
+WHERE p.stock < 2 * r.sold
+ORDER BY reorder DESC, p.name;
+```
+
+</CodeExample>
+
+Six products need restocking. Earl Grey and Clean Python are already sold out, and Algorithms in Pictures will be soon: 3 left, 6 sold in the last three months. Products that sold nothing recently don't appear, because the inner join with `recent_sales` drops them, which is what we want here: there's no point reordering what doesn't sell.
+
+## Saving the restock list
+
+The buyer wants to tick these off as she places the orders with suppliers, so the list should live in a **table**, not just on screen. Time to use what you learned about [designing tables](/learn/sql/creating-tables): an identity key, a foreign key to `products`, a `CHECK` on the quantity, and a default for the date. Then **`INSERT ... SELECT`** fills it straight from the query, and `RETURNING` shows what was saved:
+
+<CodeExample output={`CREATE TABLE
+
+ product_id | quantity
+------------+----------
+          3 |       10
+          7 |        5
+          8 |        9
+          9 |        8
+         11 |        9
+         15 |        4
+(6 rows)`}>
+
+```sql
+CREATE TABLE restock_requests (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL CHECK (quantity > 0),
+  requested_on date NOT NULL DEFAULT '2025-07-01',
+  done boolean NOT NULL DEFAULT false,
+  UNIQUE (product_id, requested_on)
+);
+
+INSERT INTO restock_requests (product_id, quantity)
+SELECT p.id, 2 * r.sold - p.stock
+FROM products AS p
+JOIN (
+  SELECT oi.product_id, sum(oi.quantity) AS sold
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  WHERE o.status <> 'cancelled'
+    AND o.ordered_at >= '2025-04-01'
+  GROUP BY oi.product_id
+) AS r ON r.product_id = p.id
+WHERE p.stock < 2 * r.sold
+RETURNING product_id, quantity;
+```
+
+</CodeExample>
+
+The `UNIQUE (product_id, requested_on)` rule means that running the script twice on the same day can't request the same product twice: the second insert fails instead of doubling the order.
+
+When the delivery arrives, two changes must happen **together**: the stock goes up and the requests are marked as done. That's a job for a **transaction** and for [`UPDATE ... FROM`](/learn/sql/update-and-delete), which updates rows using another table:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+BEGIN
+
+     name     | stock
+--------------+-------
+ Earl Grey    |    10
+ Clean Python |     8
+(2 rows)
+
+UPDATE 2
+
+COMMIT`}>
+
+```sql
+CREATE TABLE restock_requests (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL CHECK (quantity > 0),
+  requested_on date NOT NULL DEFAULT '2025-07-01',
+  done boolean NOT NULL DEFAULT false
+);
+
+INSERT INTO restock_requests (product_id, quantity)
+VALUES (3, 10), (9, 8);
+
+BEGIN;
+
+UPDATE products AS p
+SET stock = p.stock + r.quantity
+FROM restock_requests AS r
+WHERE r.product_id = p.id
+  AND NOT r.done
+RETURNING p.name, p.stock;
+
+UPDATE restock_requests SET done = true WHERE NOT done;
+
+COMMIT;
+```
+
+</CodeExample>
+
+If anything fails between `BEGIN` and `COMMIT`, neither change sticks, so the stock can never be increased twice or marked done without arriving.
+
+<Quiz
+  question="Why does the restock query JOIN recent_sales instead of using a LEFT JOIN?"
+  options={[
+    "A LEFT JOIN would be slower",
+    "Products with no recent sales should not be reordered, and the inner join leaves them out",
+    "UNION ALL requires an inner join",
+    "LEFT JOIN can't be used inside a CTE",
+  ]}
+  answer={1}
+  explanation="The inner join keeps only products that appear in recent_sales, so products that sold nothing from April to June drop out. With a LEFT JOIN they'd come back with a NULL sold value, and you'd need coalesce() to handle them."
+/>
+
+## The board report
+
+Board members don't want five tables; they want **one page of headline numbers**. In SQL, a neat way to build that page is one row per metric, with a `metric` name and a `value`:
+
+```text
+     metric      |  value
+-----------------+---------
+ revenue         | 2445.82
+ orders          |      32
+ ...
+```
+
+Each metric is its own small query returning one row; `UNION ALL` stacks them. A few things make it work:
+
+- **Shared CTEs**: define `order_totals` (and anything else several metrics need) once at the top, so all the numbers use the **same definitions**.
+- **Same column types**: every part of a `UNION` must produce compatible types. Counts (`bigint`) and money (`numeric`) mix fine; PostgreSQL turns them all into `numeric`.
+- **A fixed order**: a `UNION` has no natural order, so give each row a position number in a CTE and sort by it at the end, without showing it.
+
+Here's the shape with the first two metrics:
+
+<CodeExample output={` metric  |  value
+---------+---------
+ revenue | 2445.82
+ orders  |      32
+(2 rows)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+),
+valid_orders AS (
+  SELECT * FROM order_totals WHERE status <> 'cancelled'
+),
+report AS (
+  SELECT 1 AS pos, 'revenue' AS metric, sum(total) AS value
+  FROM valid_orders
+  UNION ALL
+  SELECT 2, 'orders', count(*)
+  FROM valid_orders
+)
+SELECT metric, value
+FROM report
+ORDER BY pos;
+```
+
+</CodeExample>
+
+The `valid_orders` step is the shop's definition of a real order, written down **once**. If the board later decides that `'paid'` orders shouldn't count until they ship, you change one line and every metric follows.
+
+<Callout type="tip" title="One definition, many reports">
+
+On a real team, `order_totals` and `valid_orders` would become **views** (saved queries, coming up in Level 2), so the board report, the finance export and the dashboard can't drift apart. Until then, keep shared steps at the top of the script and copy them exactly.
+
+</Callout>
+
+<Exercise
+  language="sql"
+  title="The board report"
+  starter={`WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+),
+valid_orders AS (
+  SELECT * FROM order_totals WHERE status <> 'cancelled'
+),
+report AS (
+  SELECT 1 AS pos, 'revenue' AS metric, sum(total) AS value
+  FROM valid_orders
+  UNION ALL
+  SELECT 2, 'orders', count(*)
+  FROM valid_orders
+)
+SELECT metric, value
+FROM report
+ORDER BY pos;
+`}
+  tests={[
+    { name: "Columns: metric, value", check: "columns.join() === 'metric,value'" },
+    { name: "Seven metrics, in the board's order", check: "rows.map(r => r.metric).join() === 'revenue,orders,average order,customers,repeat customers,products never sold,products out of stock'" },
+    { name: "Revenue, orders and average order are right", check: "rows.slice(0, 3).map(r => r.value).join() === '2445.82,32,76.43'" },
+    { name: "Customer numbers are right", check: "rows.slice(3, 5).map(r => r.value).join() === '17,12'" },
+    { name: "Product numbers are right", check: "rows.slice(5).map(r => r.value).join() === '3,2'" },
+    { name: "Every number follows new orders", check: "(await rerun(\"WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (18, '2025-07-01 12:00', 'delivered') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, 10, 2, 18.00 FROM o; WITH o AS (INSERT INTO orders (customer_id, ordered_at, status) VALUES (1, '2025-07-02 12:00', 'paid') RETURNING id) INSERT INTO order_items (order_id, product_id, quantity, unit_price) SELECT id, 4, 1, 2.99 FROM o\")).map(r => r.value).join() === '2484.81,34,73.08,18,13,2,2'" },
+    { name: "Stock changes show up too", check: "(await rerun(\"UPDATE products SET stock = 0 WHERE name = 'Kite'\"))[6].value === 3" },
+  ]}
+>
+
+Finish the board report. It must return the columns `metric` and `value`, with exactly these seven rows in this order:
+
+1. `revenue`: total revenue of orders that weren't cancelled,
+2. `orders`: the number of those orders,
+3. `average order`: their average total, rounded to 2 decimal places,
+4. `customers`: how many different customers placed at least one of them,
+5. `repeat customers`: how many customers placed **two or more** of them,
+6. `products never sold`: products that appear in no non-cancelled order,
+7. `products out of stock`: products with a stock of 0.
+
+The first two are done. Every number must come from the data, so the report stays correct when new orders arrive.
+
+<Hint>
+
+Metrics 3 and 4 read `valid_orders` too: `round(avg(total), 2)` and `count(DISTINCT customer_id)`. For 5, add a CTE such as `customer_orders AS (SELECT customer_id, count(*) AS n FROM valid_orders GROUP BY customer_id)` and count its rows `WHERE n >= 2`. For 6, count products `WHERE NOT EXISTS` an item in a non-cancelled order (as in part 2), and for 7, count products `WHERE stock = 0`. Give each part its `pos` number (3 to 7) and its metric name.
+
+</Hint>
+
+<Solution>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.customer_id, o.status,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  GROUP BY o.id
+),
+valid_orders AS (
+  SELECT * FROM order_totals WHERE status <> 'cancelled'
+),
+customer_orders AS (
+  SELECT customer_id, count(*) AS n
+  FROM valid_orders
+  GROUP BY customer_id
+),
+report AS (
+  SELECT 1 AS pos, 'revenue' AS metric, sum(total) AS value
+  FROM valid_orders
+  UNION ALL
+  SELECT 2, 'orders', count(*)
+  FROM valid_orders
+  UNION ALL
+  SELECT 3, 'average order', round(avg(total), 2)
+  FROM valid_orders
+  UNION ALL
+  SELECT 4, 'customers', count(DISTINCT customer_id)
+  FROM valid_orders
+  UNION ALL
+  SELECT 5, 'repeat customers', count(*)
+  FROM customer_orders
+  WHERE n >= 2
+  UNION ALL
+  SELECT 6, 'products never sold', count(*)
+  FROM products AS p
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM order_items AS oi
+    JOIN valid_orders AS v ON v.id = oi.order_id
+    WHERE oi.product_id = p.id
+  )
+  UNION ALL
+  SELECT 7, 'products out of stock', count(*)
+  FROM products
+  WHERE stock = 0
+)
+SELECT metric, value
+FROM report
+ORDER BY pos;
+```
+
+</Solution>
+
+</Exercise>
+
+Run the finished report, then picture the board pack: this headline table on page one, the monthly revenue report from [part 1](/learn/sql/shop-revenue-by-month) on page two, and the best customers and never-sold products from [part 2](/learn/sql/shop-customers-and-products) on page three. Every number comes from the same definitions, and next month you just run the scripts again. That's the real goal of analytics SQL: **answers you can trust and repeat**.
+
+Congratulations, you've finished Level 1! 🎉 In Level 2 you'll learn **window functions** (rankings, running totals and month-over-month growth in a single query), advanced queries, indexes and performance, and views, functions and triggers.
+
+## Recap
+
+- `UNION ALL` stacks the results of several queries; a text column like `'out of stock' AS alert` labels where each row came from.
+- Compare stock with **recent sales** (a CTE over the last few months) for smarter alerts than a fixed limit.
+- Save results in your own table with constraints, fill it with `INSERT ... SELECT ... RETURNING`, and apply related changes together in a transaction with `UPDATE ... FROM`.
+- A board report can be one row per metric: shared CTEs for the definitions, one small query per metric, `UNION ALL`, and a hidden position column for the order.
+- Define "valid order", "revenue" and friends **once**, so every number in every report agrees.

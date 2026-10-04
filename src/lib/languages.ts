@@ -142,7 +142,7 @@ export const languages: Language[] = [
     monogram: "SQ",
     description: "Talk to databases. Every developer needs it sooner or later.",
     usedFor: ["Databases", "Analytics", "Backend"],
-    status: "coming-soon",
+    status: "available",
     color: {
       text: "text-lang-sql",
       bg: "bg-lang-sql",

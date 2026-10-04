@@ -1,0 +1,554 @@
+---
+title: Секционирование больших таблиц
+description: Разбейте огромные таблицы на секции по диапазону, списку и хешу, найдите отсечение секций в EXPLAIN и удаляйте старые данные за миллисекунды, удаляя целые секции.
+duration: 22
+xp: 30
+---
+
+Знакомая история во многих компаниях: таблица `events` начиналась маленькой, а через три года в ней два миллиарда строк. Ночная задача, которая удаляет данные старше года, теперь работает шесть часов, всё это время держит блокировки, оставляет VACUUM гигабайты мёртвых строк — а диск всё равно заполнен. Решением стал не более быстрый `DELETE`. Решением было вообще перестать удалять строки и вместо этого **удалять целые месяцы** разом. 🗂️
+
+Именно это даёт **секционирование (partitioning)**. В этом уроке вы разобьёте таблицу на секции, увидите, как PostgreSQL пропускает секции, которые запросу не нужны, и узнаете, когда секционирование помогает, а когда только добавляет работы.
+
+## Что такое секционирование
+
+**Секционированная таблица (partitioned table)** для запросов выглядит как одна таблица, но сама строк не хранит. Её строки живут в таблицах поменьше, которые называются **секциями (partitions)**, а **ключ секционирования (partition key)** — один или несколько столбцов — решает, в какую секцию попадёт каждая строка:
+
+```text
+                 events  (partitioned table: no rows of its own)
+                    |
+     +--------------+---------------+
+     |              |               |
+events_2025_01  events_2025_02  events_2025_03
+ Jan rows        Feb rows        Mar rows
+```
+
+Вы выполняете `INSERT`, `SELECT`, `UPDATE` и `DELETE` через родительскую таблицу `events`, а PostgreSQL **направляет** каждую строку в нужную секцию. Становятся лучше три вещи:
+
+- **Отсечение секций (partition pruning)**: запрос с фильтром по ключу читает только те секции, в которых могут быть совпадения.
+- **Дешёвое хранение по сроку (retention)**: удалить месяц данных — это `DROP TABLE` одной секции. Он занимает миллисекунды и не оставляет мёртвых строк.
+- **Меньшие единицы обслуживания**: VACUUM, ANALYZE и перестроение индексов работают с одной секцией за раз, а старым секциям, которые больше не меняются, обслуживание почти не нужно.
+
+Секционирование — **не** шардирование: все секции по-прежнему живут в одной базе данных на одном сервере. И оно ускоряет не каждый запрос. Ниже вы увидите случаи, когда оно всё замедляет.
+
+## Секционирование по диапазону
+
+Самый распространённый вид — **секционирование по диапазону (range partitioning)** по времени. Вы объявляете родителя с `PARTITION BY RANGE (column)`, а затем создаёте каждую секцию с `FOR VALUES FROM (…) TO (…)`. Нижняя граница **включается**, а верхняя **исключается**, поэтому месячные секции стыкуются без пропусков и пересечений:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 9000
+
+   partition    | events
+----------------+--------
+ events_2025_01 |   3100
+ events_2025_02 |   2800
+ events_2025_03 |   3100
+(3 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  user_id integer NOT NULL,
+  kind text NOT NULL
+) PARTITION BY RANGE (created_on);
+
+CREATE TABLE events_2025_01 PARTITION OF events
+  FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_2025_02 PARTITION OF events
+  FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+CREATE TABLE events_2025_03 PARTITION OF events
+  FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+
+-- 100 событий в день в течение 90 дней, все вставлены через родителя
+INSERT INTO events (created_on, user_id, kind)
+SELECT date '2025-01-01' + g / 100, g % 50 + 1,
+  (ARRAY['view', 'click', 'buy'])[g % 3 + 1]
+FROM generate_series(0, 8999) AS g;
+
+SELECT tableoid::regclass AS partition, count(*) AS events
+FROM events
+GROUP BY partition
+ORDER BY partition;
+```
+
+</CodeExample>
+
+У каждой таблицы есть скрытый системный столбец **`tableoid`**: id таблицы, в которой строка физически хранится. Приведение к `regclass` превращает id в имя таблицы — удобный способ увидеть, куда попали строки. Каждая секция — тоже обычная таблица, поэтому `SELECT count(*) FROM events_2025_02` тоже работает.
+
+### Строкам некуда идти
+
+Что будет с событием из апреля? Секции для него нет, поэтому вставка завершается ошибкой:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+ERROR:  no partition of relation "events" found for row
+DETAIL:  Partition key of the failing row contains (created_on) = (2025-04-02).`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  kind text NOT NULL
+) PARTITION BY RANGE (created_on);
+
+CREATE TABLE events_2025_03 PARTITION OF events
+  FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+
+INSERT INTO events (created_on, kind) VALUES ('2025-04-02', 'view');
+```
+
+</CodeExample>
+
+В продакшене такая ошибка — это **авария**: в полночь первого числа все вставки падают, потому что никто не создал новую секцию. Поэтому команды всегда создают секции **заранее** — например, задачей по расписанию, которая держит наготове следующие три месяца, или популярным расширением **pg_partman**, которое делает именно это.
+
+Можно также добавить **секцию `DEFAULT`**, которая ловит все строки, не подошедшие ни одной другой секции:
+
+```sql
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+```
+
+<Callout type="warning" title="Держите секцию по умолчанию пустой">
+
+Секция по умолчанию предотвращает аварию, но у неё есть цена. Когда вы позже создаёте `events_2025_04`, PostgreSQL должен просмотреть секцию по умолчанию, чтобы убедиться, что ни одна её строка не относится к апрелю (и выдаёт ошибку, если такие есть). Большая секция по умолчанию делает создание каждой новой секции медленным и блокирует запись на время проверки. Относитесь к секции по умолчанию как к сигнализации: следите за ней, и если туда попадают строки — выясняйте почему.
+
+</Callout>
+
+## Отсечение секций
+
+А вот и награда. Когда запрос фильтрует по ключу секционирования, планировщик определяет, в каких секциях совпадающих строк **быть не может**, и исключает их из плана. Это **отсечение секций**, и `EXPLAIN` его показывает:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 9000
+
+ANALYZE
+
+                                         QUERY PLAN
+--------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on events_2025_02 events
+         Filter: ((created_on >= '2025-02-10'::date) AND (created_on < '2025-02-17'::date))
+(3 rows)
+
+                   QUERY PLAN
+-------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Seq Scan on events_2025_01 events_1
+               Filter: (kind = 'buy'::text)
+         ->  Seq Scan on events_2025_02 events_2
+               Filter: (kind = 'buy'::text)
+         ->  Seq Scan on events_2025_03 events_3
+               Filter: (kind = 'buy'::text)
+(8 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  user_id integer NOT NULL,
+  kind text NOT NULL
+) PARTITION BY RANGE (created_on);
+
+CREATE TABLE events_2025_01 PARTITION OF events
+  FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_2025_02 PARTITION OF events
+  FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+CREATE TABLE events_2025_03 PARTITION OF events
+  FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+
+INSERT INTO events (created_on, user_id, kind)
+SELECT date '2025-01-01' + g / 100, g % 50 + 1,
+  (ARRAY['view', 'click', 'buy'])[g % 3 + 1]
+FROM generate_series(0, 8999) AS g;
+
+ANALYZE events;
+
+-- фильтр по ключу: читается только февраль
+EXPLAIN (COSTS OFF)
+SELECT count(*)
+FROM events
+WHERE created_on >= '2025-02-10'
+  AND created_on < '2025-02-17';
+
+-- фильтра по ключу нет: читается каждая секция
+EXPLAIN (COSTS OFF)
+SELECT count(*)
+FROM events
+WHERE kind = 'buy';
+```
+
+</CodeExample>
+
+В первом плане упоминается только `events_2025_02`. Январь и март были **отсечены**: планировщик сравнил условие `WHERE` с границами каждой секции и ещё до выполнения убрал те, что не могут совпасть. Раз осталась одна секция, нет даже узла `Append`.
+
+Во втором запросе нет условия на `created_on`, поэтому планировщик ничего не может исключить. Он читает все три секции и склеивает результаты узлом **`Append`**. При 36 месячных секциях это 36 сканирований (или 36 поисков по индексу) там, где несекционированной таблице хватило бы одного. **Запросы без фильтра по ключу секционирования с секционированием становятся медленнее** — поэтому выбор ключа и есть самое важное решение.
+
+Отсечение происходит и **во время выполнения**: когда значение становится известно только при выполнении запроса (параметр подготовленного выражения или значение из соединения), в плане вместо этого появляется строка `Subplans Removed: N`.
+
+## Индексы и ключи в секционированных таблицах
+
+Индекс (index), созданный на родителе, создаётся на **каждой секции**, включая секции, добавленные позже:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE INDEX
+
+   tablename    |               indexname
+----------------+---------------------------------------
+ events         | events_user_id_created_on_idx
+ events_2025_01 | events_2025_01_user_id_created_on_idx
+ events_2025_02 | events_2025_02_user_id_created_on_idx
+(3 rows)
+
+ERROR:  unique constraint on partitioned table must include all partitioning columns
+DETAIL:  PRIMARY KEY constraint on table "events" lacks column "created_on" which is part of the partition key.`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  user_id integer NOT NULL
+) PARTITION BY RANGE (created_on);
+
+CREATE TABLE events_2025_01 PARTITION OF events
+  FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_2025_02 PARTITION OF events
+  FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+
+CREATE INDEX ON events (user_id, created_on);
+
+SELECT tablename, indexname
+FROM pg_indexes
+WHERE tablename LIKE 'events%'
+ORDER BY tablename;
+
+ALTER TABLE events ADD PRIMARY KEY (id);
+```
+
+</CodeExample>
+
+Последняя инструкция показывает главное ограничение. У каждой секции свои индексы, а индекса, охватывающего все секции, в PostgreSQL нет. Поэтому уникальность он может гарантировать только **внутри** секции, и первичный ключ (primary key) или ограничение уникальности (unique constraint) должны **включать ключ секционирования**. `PRIMARY KEY (id, created_on)` работает, а `PRIMARY KEY (id)` — нет.
+
+На практике столбец идентичности всё равно выдаёт уникальные id, так что `(id, created_on)` вполне подходит. Но правило вроде «каждый email уникален» нельзя обеспечить в таблице, секционированной по дате. Такие правила живут в несекционированной таблице или требуют ключа в ограничении. Внешние ключи (foreign keys), **ссылающиеся на** секционированную таблицу, тоже должны ссылаться на все столбцы её ключа.
+
+## Секционирование по списку и по хешу
+
+**Секционирование по списку (list partitioning)** помещает каждое перечисленное значение (или группу значений) в свою секцию. Оно естественно для небольшого фиксированного набора категорий, например регионов:
+
+```sql
+CREATE TABLE accounts (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  region text NOT NULL,
+  name text NOT NULL
+) PARTITION BY LIST (region);
+
+CREATE TABLE accounts_eu PARTITION OF accounts
+  FOR VALUES IN ('eu-west', 'eu-central');
+CREATE TABLE accounts_us PARTITION OF accounts
+  FOR VALUES IN ('us-east', 'us-west');
+```
+
+**Секционирование по хешу (hash partitioning)** равномерно распределяет строки по фиксированному числу секций, хешируя ключ. Используйте его, когда естественного диапазона нет и вы в основном хотите разрезать огромную таблицу на равные части поменьше:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 10000
+
+ partition | rows
+-----------+------
+ carts_p0  | 2489
+ carts_p1  | 2527
+ carts_p2  | 2530
+ carts_p3  | 2454
+(4 rows)
+
+          QUERY PLAN
+------------------------------
+ Seq Scan on carts_p2 carts
+   Filter: (customer_id = 42)
+(2 rows)`}>
+
+```sql
+CREATE TABLE carts (
+  customer_id integer NOT NULL,
+  product_id integer NOT NULL
+) PARTITION BY HASH (customer_id);
+
+CREATE TABLE carts_p0 PARTITION OF carts
+  FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE carts_p1 PARTITION OF carts
+  FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE carts_p2 PARTITION OF carts
+  FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE carts_p3 PARTITION OF carts
+  FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+INSERT INTO carts (customer_id, product_id)
+SELECT g, g % 15 + 1
+FROM generate_series(1, 10000) AS g;
+
+SELECT tableoid::regclass AS partition, count(*) AS rows
+FROM carts
+GROUP BY partition
+ORDER BY partition;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM carts WHERE customer_id = 42;
+```
+
+</CodeExample>
+
+Строки распределены почти поровну, а поиск по равенству ключа отсекается до одной секции. Секционирование по хешу не помогает запросам по диапазону (`customer_id < 100` всё равно читает все четыре секции) и не позволяет удалять старые данные, потому что в каждой секции вперемешку лежат старые и новые строки. Изменить число хеш-секций позже — значит переместить почти каждую строку, так что выбирайте число с запасом на рост.
+
+Виды можно и **комбинировать**: секции можно секционировать ещё раз (подсекционирование, sub-partitioning), например по месяцу, а затем по хешу. Прибегайте к этому только при измеренной причине, потому что число таблиц быстро умножается.
+
+## Хранение по сроку: удаляйте секции, а не строки
+
+Вернёмся к шестичасовому удалению. С месячными секциями убрать январь можно двумя быстрыми инструкциями, а добавить месяц, загруженный отдельно, — ещё несколькими:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 9000
+
+ALTER TABLE
+
+DROP TABLE
+
+CREATE TABLE
+
+INSERT 0 1
+
+ALTER TABLE
+
+ALTER TABLE
+
+   partition    | events
+----------------+--------
+ events_2025_02 |   2800
+ events_2025_03 |   3100
+ events_2025_04 |      1
+(3 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  user_id integer NOT NULL,
+  kind text NOT NULL
+) PARTITION BY RANGE (created_on);
+CREATE TABLE events_2025_01 PARTITION OF events
+  FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_2025_02 PARTITION OF events
+  FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+CREATE TABLE events_2025_03 PARTITION OF events
+  FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+INSERT INTO events (created_on, user_id, kind)
+SELECT date '2025-01-01' + g / 100, g % 50 + 1, 'view'
+FROM generate_series(0, 8999) AS g;
+
+-- хранение по сроку: январь покидает таблицу, а затем исчезает
+ALTER TABLE events DETACH PARTITION events_2025_01;
+DROP TABLE events_2025_01;
+
+-- апрель сначала загрузили в обычную таблицу
+CREATE TABLE events_2025_04 (LIKE events);
+INSERT INTO events_2025_04 (id, created_on, user_id, kind)
+VALUES (100001, '2025-04-01', 7, 'view');
+
+-- подходящий CHECK позволяет ATTACH не сканировать таблицу
+ALTER TABLE events_2025_04 ADD CONSTRAINT events_2025_04_range
+  CHECK (created_on >= '2025-04-01' AND created_on < '2025-05-01');
+ALTER TABLE events ATTACH PARTITION events_2025_04
+  FOR VALUES FROM ('2025-04-01') TO ('2025-05-01');
+
+SELECT tableoid::regclass AS partition, count(*) AS events
+FROM events
+GROUP BY partition
+ORDER BY partition;
+```
+
+</CodeExample>
+
+Сравните это с `DELETE FROM events WHERE created_on < '2025-02-01'`:
+
+| | `DELETE` старых строк | `DROP` старой секции |
+| --- | --- | --- |
+| Что делается | Каждая строка по одной помечается мёртвой | Удаляются файлы |
+| Время на миллиарде строк | Часы | Миллисекунды |
+| Мёртвые строки для VACUUM | Каждая удалённая строка | Нет |
+| Записанный WAL (реплики, бэкапы) | Много | Почти ничего |
+| Место на диске | Переиспользуется позже, не возвращается | Возвращается сразу |
+
+**`DETACH PARTITION`** превращает секцию обратно в обычную таблицу, так что её можно сначала заархивировать (выгрузить в дешёвое хранилище или перенести в другое табличное пространство), а удалить позже. В продакшене используйте `DETACH PARTITION … CONCURRENTLY`: так запросы к родителю не блокируются надолго. Внутри блока транзакции (transaction) эта команда выполняться не может, поэтому её запускают отдельно:
+
+```sql
+ALTER TABLE events DETACH PARTITION events_2025_01 CONCURRENTLY;
+```
+
+Загрузка большого месяца в отдельную таблицу и её **присоединение** (`ATTACH`) работают так же, только в обратную сторону. Ограничение `CHECK`, совпадающее с границами, позволяет PostgreSQL пропустить полное сканирование, которое иначе понадобилось бы для проверки строк, а `ATTACH` берёт лишь такую блокировку, при которой чтение и запись в другие секции продолжаются.
+
+<Callout type="tip" title="Как превратить существующую большую таблицу в секционированную">
+
+Нельзя просто превратить обычную таблицу в секционированную через `ALTER`. Обычный приём без простоя: создайте новую секционированную таблицу, **присоедините старую таблицу как одну секцию**, охватывающую все прошлые данные (сначала добавив подходящее ограничение `CHECK` как `NOT VALID`, а затем проверив его), направьте новые записи в родителя, а старую гигантскую секцию разделите позже или просто дайте ей устареть. Планируйте это как любую другую миграцию, с шагами expand и contract из урока [Миграции без простоя](/learn/sql/zero-downtime-migrations).
+
+</Callout>
+
+## Когда секционирование того стоит
+
+Секционирование добавляет движущихся частей: секции, которые надо создавать заранее, больше таблиц, которые рассматривает планировщик, и ограничения, обязанные включать ключ. Оно окупается, когда:
+
+- таблица **большая**: распространённое эмпирическое правило — таблица больше памяти сервера или заметно больше 100 ГБ;
+- есть правило **хранения по сроку** (храним 13 месяцев, остальное архивируем) — тогда удаление секций становится главной фишкой;
+- почти каждый важный запрос **фильтрует по ключу** (большинство запросов к недавним событиям спрашивают про «последние 7 дней»).
+
+Обычно это ошибка, когда таблица весит несколько гигабайт (хватит хорошего индекса), когда запросы редко фильтруют по ключу или когда вы создали бы **тысячи** крошечных секций. Время планирования растёт с числом секций, которые может затронуть запрос, поэтому ежедневные секции, хранящиеся десять лет (3650 таблиц), — это ловушка. Типичны месячные или недельные секции, а несколько сотен секций в сумме — комфортный максимум.
+
+<Quiz
+  question="Таблица events секционирована по диапазону created_on, по одной секции на месяц за три года. Какой запрос прочитает больше всего секций?"
+  options={[
+    "SELECT count(*) FROM events WHERE created_on = '2025-03-14'",
+    "SELECT * FROM events WHERE created_on >= '2025-03-01' AND created_on < '2025-03-08'",
+    "SELECT * FROM events WHERE user_id = 42 ORDER BY created_on DESC LIMIT 10",
+    "DELETE FROM events WHERE created_on < '2023-02-01'",
+  ]}
+  answer={2}
+  explanation="Планировщик может отсекать секции только по условиям на ключ секционирования. У запроса по user_id нет условия на created_on, поэтому он должен заглянуть во все 36 секций. Остальные три фильтруют по created_on и затрагивают одну или несколько секций."
+/>
+
+<Quiz
+  question="Таблица секционирована по RANGE (created_on). Почему ALTER TABLE events ADD PRIMARY KEY (id) завершается ошибкой?"
+  options={[
+    "У секционированных таблиц вообще не может быть первичных ключей",
+    "У каждой секции свой индекс, поэтому уникальность проверяется только внутри одной секции, и ключ должен включать created_on",
+    "Столбцы идентичности не могут быть первичными ключами",
+    "Сначала первичный ключ нужно вручную добавить в каждую секцию",
+  ]}
+  answer={1}
+  explanation="В PostgreSQL нет глобального индекса по всем секциям. Уникального индекса в каждой секции хватает для гарантии уникальности во всей таблице, только если в него входит ключ секционирования, поэтому PRIMARY KEY (id, created_on) работает, а PRIMARY KEY (id) отклоняется."
+/>
+
+<Exercise
+  language="sql"
+  title="Секционируйте журнал просмотров страниц"
+  starter={`-- 1. Создайте page_views, секционированную по RANGE на viewed_on:
+--    id bigint identity, viewed_on date, path text (все NOT NULL),
+--    первичный ключ (id, viewed_on)
+
+-- 2. Секции page_views_2025_04, page_views_2025_05,
+--    page_views_2025_06 и page_views_default
+
+-- 3. Данные (оставьте как есть)
+INSERT INTO page_views (viewed_on, path)
+SELECT date '2025-04-01' + g / 40,
+  (ARRAY['/', '/pricing', '/docs'])[g % 3 + 1]
+FROM generate_series(0, 4199) AS g;
+
+-- 4. Хранение по сроку: апрель уже слишком старый, удалите его полностью
+
+-- 5. Строки по секциям: столбцы partition и views
+SELECT count(*) AS views
+FROM page_views;
+`}
+  tests={[
+    { name: "page_views секционирована по диапазону на viewed_on", check: "(await query(\"SELECT partstrat, pg_get_partkeydef(partrelid) AS def FROM pg_partitioned_table WHERE partrelid = 'page_views'::regclass\")).some(r => r.partstrat === 'r' && r.def === 'RANGE (viewed_on)')" },
+    { name: "Первичный ключ — (id, viewed_on)", check: "(await query(\"SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'page_views'::regclass AND contype = 'p'\")).some(r => r.def === 'PRIMARY KEY (id, viewed_on)')" },
+    { name: "Остались май, июнь и секция по умолчанию; апрель удалён", check: "(await query(\"SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) AS bound FROM pg_inherits AS i JOIN pg_class AS c ON c.oid = i.inhrelid WHERE i.inhparent = 'page_views'::regclass ORDER BY c.relname\")).map(r => r.relname + ' ' + r.bound).join('; ') === \"page_views_2025_05 FOR VALUES FROM ('2025-05-01') TO ('2025-06-01'); page_views_2025_06 FOR VALUES FROM ('2025-06-01') TO ('2025-07-01'); page_views_default DEFAULT\" && (await query(\"SELECT to_regclass('page_views_2025_04') AS t\"))[0].t === null" },
+    { name: "Запрос за июнь отсекается до июньской секции", check: "(await query(\"EXPLAIN (COSTS OFF) SELECT count(*) FROM page_views WHERE viewed_on >= '2025-06-10' AND viewed_on < '2025-06-20'\")).map(r => r['QUERY PLAN']).join(' ').match(/on page_views_\\w+/g).join() === 'on page_views_2025_06'" },
+    { name: "Показывает partition и views, по строке на секцию, по имени", check: "columns.join() === 'partition,views' && rows.map(r => r.partition + ':' + r.views).join() === 'page_views_2025_05:1240,page_views_2025_06:1200,page_views_default:560'" },
+    { name: "Новые строки учитываются в нужной секции", check: "(await rerun(\"INSERT INTO page_views (viewed_on, path) VALUES ('2025-05-31', '/'), ('2026-01-01', '/')\")).map(r => r.views).join() === '1241,1200,561'" },
+  ]}
+>
+
+Сайт записывает каждый просмотр страницы, и команда хочет хранить только последние два полных месяца плюс всё, что новее. Постройте таблицу так, как построили бы её в продакшене: 📈
+
+1. Создайте **`page_views`** с `id bigint GENERATED ALWAYS AS IDENTITY`, `viewed_on date`, `path text` (все `NOT NULL`) и первичным ключом **`(id, viewed_on)`**, **секционированную по диапазону** на `viewed_on`.
+2. Создайте месячные секции **`page_views_2025_04`**, **`page_views_2025_05`** и **`page_views_2025_06`**, а также секцию по умолчанию **`page_views_default`** (данные доходят до июля, и эти строки должны попасть туда).
+3. Оставьте `INSERT` как есть: 40 просмотров в день с 1 апреля по 14 июля 2025 года.
+4. Хранение по сроку: удалите апрель **полностью** — и из `page_views`, и как таблицу.
+5. Завершите запросом, который показывает имя каждой оставшейся секции как **`partition`** и число её строк как **`views`**, отсортировав по имени секции.
+
+<Hint>
+
+Секции выглядят так: `CREATE TABLE page_views_2025_05 PARTITION OF page_views FOR VALUES FROM ('2025-05-01') TO ('2025-06-01');`, а секция по умолчанию — `CREATE TABLE page_views_default PARTITION OF page_views DEFAULT;`. Для хранения по сроку: `ALTER TABLE page_views DETACH PARTITION page_views_2025_04;`, затем `DROP TABLE page_views_2025_04;` (прямое удаление секции тоже работает). В последнем запросе группируйте по `tableoid::regclass`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE page_views (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  viewed_on date NOT NULL,
+  path text NOT NULL,
+  PRIMARY KEY (id, viewed_on)
+) PARTITION BY RANGE (viewed_on);
+
+CREATE TABLE page_views_2025_04 PARTITION OF page_views
+  FOR VALUES FROM ('2025-04-01') TO ('2025-05-01');
+CREATE TABLE page_views_2025_05 PARTITION OF page_views
+  FOR VALUES FROM ('2025-05-01') TO ('2025-06-01');
+CREATE TABLE page_views_2025_06 PARTITION OF page_views
+  FOR VALUES FROM ('2025-06-01') TO ('2025-07-01');
+CREATE TABLE page_views_default PARTITION OF page_views DEFAULT;
+
+INSERT INTO page_views (viewed_on, path)
+SELECT date '2025-04-01' + g / 40,
+  (ARRAY['/', '/pricing', '/docs'])[g % 3 + 1]
+FROM generate_series(0, 4199) AS g;
+
+ALTER TABLE page_views DETACH PARTITION page_views_2025_04;
+DROP TABLE page_views_2025_04;
+
+SELECT tableoid::regclass AS partition, count(*) AS views
+FROM page_views
+GROUP BY partition
+ORDER BY partition;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Секционированная таблица** направляет строки в **секции** по **ключу секционирования**; запросы, как обычно, идут через родителя.
+- Секционирование **по диапазону** (по времени, самое распространённое), **по списку** (по категории) и **по хешу** (равномерное распределение, без диапазонов); нижняя граница диапазона включается, верхняя исключается.
+- **Отсечение секций** пропускает секции, которые не могут совпасть, но только для условий на **ключ**. Запросы без него читают каждую секцию и становятся медленнее.
+- Индексы на родителе создаются на каждой секции; **ограничения уникальности и первичные ключи должны включать ключ секционирования**.
+- Создавайте секции **заранее** (задачей по расписанию или через pg_partman); держите **секцию по умолчанию** пустой.
+- Хранение по сроку через **`DETACH` + `DROP`** занимает миллисекунды и не оставляет мёртвых строк, в отличие от большого `DELETE`. Большие пакеты загружайте в таблицу и **присоединяйте (`ATTACH`)** её с подходящим ограничением `CHECK`.
+- Секционируйте большие таблицы с правилом хранения по сроку и ключом, который используют запросы; избегайте тысяч крошечных секций.

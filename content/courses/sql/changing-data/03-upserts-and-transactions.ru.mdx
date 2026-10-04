@@ -1,0 +1,356 @@
+---
+title: Upsert и транзакции
+description: Вставляйте или обновляйте за один шаг с ON CONFLICT и делайте несколько изменений по принципу «всё или ничего» с BEGIN, COMMIT, ROLLBACK и SAVEPOINT.
+duration: 18
+xp: 25
+---
+
+Как только приложение начинает записывать настоящие данные, возникают две проблемы.
+
+Первая: «добавь эту строку **или обнови её, если она уже есть**». Покупатель заново импортирует адресную книгу. Посетитель магазина нажимает «в корзину» на товаре, который уже лежит в корзине. Можно сначала проверить, а потом решить, но есть способ чище и безопаснее: **upsert** (update + insert, «обновить или вставить»).
+
+Вторая: оформление заказа — это вставка заказа, вставка его позиций **и** уменьшение запаса на складе. Если приложение упадёт на середине, получится заказ без позиций или позиции, которые так и не списали со склада. **Транзакции (transactions)** заставляют группу изменений произойти **целиком или не произойти вовсе**.
+
+## ON CONFLICT DO NOTHING
+
+Пришла новая пачка регистраций. Одна из них, Mei, уже является покупателем (её email занят), поэтому обычный `INSERT` упал бы с ошибкой дубликата ключа и не добавил бы **никого**. Добавьте `ON CONFLICT … DO NOTHING`, и PostgreSQL пропустит конфликтующие строки, а остальные вставит:
+
+<CodeExample output={`INSERT 0 1
+
+ customers
+-----------
+        21
+(1 row)`}>
+
+```sql
+INSERT INTO customers (name, email, city, country, joined_on)
+VALUES
+  ('Mei Lin', 'mei@pandadev.test', 'London', 'UK', '2025-07-01'),
+  ('Ola Nowak', 'ola@pandadev.test', 'Warsaw', 'Poland', '2025-07-01')
+ON CONFLICT (email) DO NOTHING;
+
+SELECT count(*) AS customers FROM customers;
+```
+
+</CodeExample>
+
+`INSERT 0 1`: одна строка добавлена, одна пропущена, ошибки нет. `(email)` в скобках — это **цель конфликта (conflict target)**: столбец (или столбцы), уникальность которого решает, «существует ли уже» строка.
+
+## ON CONFLICT DO UPDATE
+
+Часто существующую строку нужно не пропустить, а **обновить** новыми данными. Mei переехала в Эдинбург, и импорт об этом сообщает:
+
+<CodeExample output={` id |   name    |   city    | joined_on
+----+-----------+-----------+------------
+  1 | Mei Lin   | Edinburgh | 2024-01-15
+ 22 | Ola Nowak | Warsaw    | 2025-07-01
+(2 rows)`}>
+
+```sql
+INSERT INTO customers (name, email, city, country, joined_on)
+VALUES
+  ('Mei Lin', 'mei@pandadev.test', 'Edinburgh', 'UK', '2025-07-01'),
+  ('Ola Nowak', 'ola@pandadev.test', 'Warsaw', 'Poland', '2025-07-01')
+ON CONFLICT (email) DO UPDATE
+SET city = EXCLUDED.city
+RETURNING id, name, city, joined_on;
+```
+
+</CodeExample>
+
+Mei сохранила свой id (1) и исходный `joined_on`, изменился только город. Ola вставлена как новый покупатель.
+
+Заметили, что Ola получила id 22, а не 21? Попытка вставить Mei заняла номер 21 ещё до того, как обнаружился конфликт, а номера никогда не выдаются дважды. В id бывают **пропуски**, поэтому никогда не рассчитывайте, что они идут подряд.
+
+**`EXCLUDED`** — это строка, которую вы **пытались** вставить, та самая, что была «исключена» (excluded) из-за конфликта. Так что `EXCLUDED.city` — это `'Edinburgh'`, а просто `city` (или `customers.city`) — значение, которое уже лежит в таблице. Вы сами выбираете, какие именно столбцы перезаписать; здесь `joined_on` остаётся прежним.
+
+## Добавляем в корзину
+
+`EXCLUDED` по-настоящему раскрывается, когда вы **объединяете** старые и новые значения. В `order_items` каждый товар может встречаться в заказе только один раз: ключ — `(order_id, product_id)`. В заказе 3 уже есть 2 × Bamboo Chopsticks (товар 14). Покупатель добавляет ещё одну пачку и 2 × Jasmine Tea (товар 1):
+
+<CodeExample output={`INSERT 0 2
+
+ product_id | quantity | unit_price
+------------+----------+------------
+          1 |        2 |       6.50
+         14 |        3 |       4.20
+(2 rows)`}>
+
+```sql
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES
+  (3, 14, 1, 4.20),
+  (3, 1, 2, 6.50)
+ON CONFLICT (order_id, product_id) DO UPDATE
+SET quantity = order_items.quantity + EXCLUDED.quantity;
+
+SELECT product_id, quantity, unit_price
+FROM order_items
+WHERE order_id = 3
+ORDER BY product_id;
+```
+
+</CodeExample>
+
+Палочек стало не 2, а 3 (старое количество + новое), а чай появился новой позицией. Одна инструкция — что бы ни лежало в корзине раньше.
+
+## Цели конфликта нужно правило уникальности
+
+`ON CONFLICT (column)` работает, только если на этих самых столбцах есть **ограничение уникальности (unique constraint)** или первичный ключ (primary key). Названия товаров в учебной базе не объявлены уникальными, поэтому это не сработает:
+
+<CodeExample output={`ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification`}>
+
+```sql
+INSERT INTO products (name, category, price)
+VALUES ('Kite', 'toys', 16.00)
+ON CONFLICT (name) DO UPDATE
+SET price = EXCLUDED.price;
+```
+
+</CodeExample>
+
+Так PostgreSQL вас защищает: без правила уникальности понятие «строка, которая уже существует» не определено. Ограничения `UNIQUE` вы будете добавлять сами в модуле «Проектирование таблиц».
+
+<Callout type="tip" title="Почему бы не проверить сначала, а потом вставить или обновить?">
+
+Приложение могло бы выполнить `SELECT … WHERE email = …`, а затем решить, делать `INSERT` или `UPDATE`. Но между проверкой и записью может вклиниться **другой запрос** и вставить тот же email — тогда один из двух упадёт, или вы получите дубликат там, где уникальность ничем не обеспечена. `INSERT … ON CONFLICT` выполняет проверку и запись как один атомарный шаг, поэтому он безопасен, даже когда одновременно приходят тысячи запросов. (Для больших задач вида «синхронизируй эту таблицу с той» в PostgreSQL есть ещё инструкция `MERGE`.)
+
+</Callout>
+
+## Транзакции: всё или ничего
+
+**Транзакция (transaction)** — это группа инструкций, которые выполняются или не выполняются **вместе**. Она начинается с `BEGIN` и заканчивается `COMMIT`:
+
+<CodeExample output={`BEGIN
+
+INSERT 0 1
+
+INSERT 0 1
+
+UPDATE 1
+
+COMMIT`}>
+
+```sql
+BEGIN;
+
+INSERT INTO orders (customer_id, ordered_at, status)
+VALUES (19, '2025-07-01 10:00', 'paid');
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (currval('orders_id_seq'), 13, 1, 32.00);
+
+UPDATE products
+SET stock = stock - 1
+WHERE id = 13;
+
+COMMIT;
+```
+
+</CodeExample>
+
+`currval('orders_id_seq')` — это id, который только что сгенерировал `INSERT` в `orders` в **вашей** сессии, поэтому позиция ссылается на новый заказ без угадывания его номера. (Приём с CTE из [урока про INSERT](/learn/sql/insert-rows) тоже работает.)
+
+До `COMMIT` никто другой этих изменений не видит, а если что-то пойдёт не так (ошибка, сбой, потеря соединения), не произойдёт **ни одно** из них. После `COMMIT` все они сохранены навсегда — даже если через миллисекунду на сервере отключится питание.
+
+На самом деле вы всё это время пользовались транзакциями: вне `BEGIN … COMMIT` PostgreSQL оборачивает **каждую отдельную инструкцию** в собственную маленькую транзакцию. Именно поэтому `INSERT` с несколькими строками работает по принципу «всё или ничего».
+
+## ROLLBACK: кнопка отмены
+
+`ROLLBACK` завершает транзакцию, **отбрасывая** всё, что она сделала. Помните страшные инструкции без `WHERE`? Внутри транзакции у вас есть второй шанс:
+
+<CodeExample output={`BEGIN
+
+DELETE 80
+
+ items_left
+------------
+          0
+(1 row)
+
+ROLLBACK
+
+ items_left
+------------
+         80
+(1 row)`}>
+
+```sql
+BEGIN;
+
+DELETE FROM order_items;
+
+SELECT count(*) AS items_left FROM order_items;
+
+ROLLBACK;
+
+SELECT count(*) AS items_left FROM order_items;
+```
+
+</CodeExample>
+
+Внутри транзакции позиций не было; после `ROLLBACK` все 80 вернулись. Поэтому осторожные люди вносят рискованные исправления в настоящую базу именно так: `BEGIN`, выполнить изменение, проверить результат с помощью `SELECT`, а затем `COMMIT`, если всё верно, или `ROLLBACK`, если нет.
+
+Когда инструкция внутри транзакции **завершается ошибкой**, PostgreSQL помечает всю транзакцию как неудавшуюся. Всё, что идёт после, отклоняется, пока вы её не завершите, и даже `COMMIT` тогда выполняет откат. В `psql` это выглядит так:
+
+```text
+shop=# BEGIN;
+BEGIN
+shop=*# UPDATE products SET stock = stock - 1 WHERE id = 13;
+UPDATE 1
+shop=*# INSERT INTO orders (customer_id, ordered_at, status)
+shop-*#   VALUES (999, '2025-07-01 10:00', 'paid');
+ERROR:  insert or update on table "orders" violates foreign key
+constraint "orders_customer_id_fkey"
+DETAIL:  Key (customer_id)=(999) is not present in table "customers".
+shop=!# UPDATE products SET stock = stock - 1 WHERE id = 1;
+ERROR:  current transaction is aborted, commands ignored until end of
+transaction block
+shop=!# COMMIT;
+ROLLBACK
+```
+
+Обратите внимание на последнюю строку: вы попросили `COMMIT`, а PostgreSQL ответил `ROLLBACK`. Изменение запаса из первого `UPDATE` тоже пропало. Всё или ничего. (Среда выполнения на этом сайте останавливается на первой ошибке, поэтому здесь вы увидите только первую `ERROR`.)
+
+## SAVEPOINT: отменить часть транзакции
+
+Иногда нужно отменить только **несколько последних** шагов, а не всю транзакцию. **Точка сохранения (savepoint)** — это закладка внутри транзакции; `ROLLBACK TO SAVEPOINT` возвращается к ней и сохраняет всё, что было до неё:
+
+<CodeExample output={`BEGIN
+
+UPDATE 1
+
+SAVEPOINT
+
+UPDATE 15
+
+ROLLBACK
+
+COMMIT
+
+     name      | price | stock
+---------------+-------+-------
+ Earl Grey     |  5.25 |    20
+ Bamboo Crisps |  2.99 |   120
+(2 rows)`}>
+
+```sql
+BEGIN;
+
+UPDATE products SET stock = stock + 20 WHERE id = 3;
+
+SAVEPOINT before_sale;
+
+UPDATE products SET price = price / 2;  -- ой, нет WHERE!
+
+ROLLBACK TO SAVEPOINT before_sale;
+
+COMMIT;
+
+SELECT name, price, stock
+FROM products
+WHERE id IN (3, 4)
+ORDER BY id;
+```
+
+</CodeExample>
+
+Пополнение запаса Earl Grey (до точки сохранения) зафиксировано, а катастрофа с половинными ценами (после неё) отменена. Приложения и библиотеки используют точки сохранения, чтобы повторить один шаг или позволить одной части большой работы упасть, не потеряв остальное.
+
+<Callout type="warning" title="Держите транзакции короткими">
+
+Пока транзакция открыта, изменённые ею строки **заблокированы**: другие сессии, которые хотят их изменить, вынуждены ждать. Никогда не оставляйте транзакцию открытой, пока ждёте, что пользователь что-нибудь нажмёт, или пока вызываете медленный внешний сервис. `BEGIN`, работа с базой, `COMMIT` — сразу. Что происходит, когда две транзакции одновременно трогают одни и те же строки (уровни изоляции, блокировки и взаимоблокировки), — тема целого модуля на уровне 3.
+
+</Callout>
+
+<Quiz
+  question="Что такое EXCLUDED.city в INSERT … ON CONFLICT (email) DO UPDATE SET city = EXCLUDED.city?"
+  options={["Город, который уже хранится в таблице", "Город из строки, которую вы пытались вставить", "NULL, потому что строка была исключена", "Город первого покупателя в таблице"]}
+  answer={1}
+  explanation="EXCLUDED — это строка, которую предложил ваш INSERT и которая была исключена из-за конфликта. Существующее значение — это просто city (или customers.city)."
+/>
+
+<Quiz
+  question="Вы выполняете BEGIN, затем успешный UPDATE, затем INSERT с ошибкой, затем COMMIT. Что станет с UPDATE?"
+  options={["Он сохранится, потому что выполнился успешно", "Он будет отменён, потому что транзакция не удалась", "Он сохранится, только если выполнить COMMIT дважды", "PostgreSQL спросит, какие инструкции оставить"]}
+  answer={1}
+  explanation="Ошибка делает неудачной всю транзакцию. COMMIT после этого выполняет откат, так что успешный UPDATE тоже отменяется: всё или ничего."
+/>
+
+<Exercise
+  language="sql"
+  title="Дополните заказ в одной транзакции"
+  starter={`BEGIN;
+
+-- 1. Добавьте две позиции в заказ 3 (одна уже там есть!)
+
+-- 2. Спишите количества со склада
+
+COMMIT;
+
+SELECT product_id, quantity, unit_price
+FROM order_items
+WHERE order_id = 3
+ORDER BY product_id;
+`}
+  tests={[
+    { name: "В заказе 3 теперь 3 × Bamboo Chopsticks", check: "(await query(\"SELECT quantity FROM order_items WHERE order_id = 3 AND product_id = 14\"))[0].quantity === 3" },
+    { name: "В заказе 3 новая позиция: 2 × Jasmine Tea по 6.50", check: "(await query(\"SELECT quantity, unit_price FROM order_items WHERE order_id = 3 AND product_id = 1\")).map(r => r.quantity + '@' + r.unit_price).join() === '2@6.5'" },
+    { name: "Запас уменьшился: Jasmine Tea 38, Bamboo Chopsticks 199", check: "(await query(\"SELECT stock FROM products WHERE id IN (1, 14) ORDER BY id\")).map(r => r.stock).join() === '38,199'" },
+    { name: "Запас других товаров не изменился", check: "(await query(\"SELECT sum(stock) AS s FROM products WHERE id NOT IN (1, 14)\"))[0].s === 345" },
+    { name: "Изменения выполняются между BEGIN и COMMIT", check: "results.findIndex(r => r.command === 'BEGIN') >= 0 && results.findIndex(r => r.command === 'BEGIN') < results.findIndex(r => r.command.startsWith('INSERT')) && results.findIndex(r => r.command === 'COMMIT') > results.findLastIndex(r => r.command.startsWith('UPDATE'))" },
+    { name: "Последний SELECT выводит 2 позиции заказа", check: "columns.join() === 'product_id,quantity,unit_price' && rows.map(r => r.product_id).join() === '1,14'" },
+  ]}
+>
+
+Покупатель, оформивший заказ 3, добавляет в него **1 × Bamboo Chopsticks** (товар 14, 4.20) и **2 × Jasmine Tea** (товар 1, 6.50). В заказе 3 уже есть 2 × Bamboo Chopsticks, так что эта позиция должна вырасти до 3, а не добавиться второй раз.
+
+Внутри транзакции:
+
+1. Добавьте обе позиции в `order_items` **одним** `INSERT … ON CONFLICT`, складывая количества, если товар уже есть в заказе.
+2. Спишите количества со склада: Jasmine Tea уменьшается на 2, Bamboo Chopsticks — на 1.
+
+`COMMIT` и последний `SELECT` уже на месте.
+
+<Hint>
+
+Шаг 1 — это пример с корзиной из этого урока: `ON CONFLICT (order_id, product_id) DO UPDATE SET quantity = order_items.quantity + EXCLUDED.quantity`. Для шага 2 подойдут два небольших обновления: `UPDATE products SET stock = stock - 2 WHERE id = 1;` и такое же для товара 14 с 1.
+
+</Hint>
+
+<Solution>
+
+```sql
+BEGIN;
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES
+  (3, 14, 1, 4.20),
+  (3, 1, 2, 6.50)
+ON CONFLICT (order_id, product_id) DO UPDATE
+SET quantity = order_items.quantity + EXCLUDED.quantity;
+
+UPDATE products SET stock = stock - 2 WHERE id = 1;
+UPDATE products SET stock = stock - 1 WHERE id = 14;
+
+COMMIT;
+
+SELECT product_id, quantity, unit_price
+FROM order_items
+WHERE order_id = 3
+ORDER BY product_id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- `INSERT … ON CONFLICT (cols) DO NOTHING` пропускает строки, которые нарушили бы правило уникальности.
+- `ON CONFLICT (cols) DO UPDATE SET col = EXCLUDED.col` превращает конфликт в обновление; `EXCLUDED` — это строка, которую вы пытались вставить.
+- Цель конфликта должна совпадать с **ограничением уникальности** или первичным ключом.
+- Upsert — один атомарный шаг: это безопаснее, чем «проверить, потом вставить или обновить» из приложения.
+- `BEGIN … COMMIT` превращает несколько инструкций в операцию по принципу **«всё или ничего»**; каждая инструкция сама по себе уже маленькая транзакция.
+- `ROLLBACK` отбрасывает изменения транзакции; после ошибки откатывается вся транзакция.
+- `SAVEPOINT name` и `ROLLBACK TO SAVEPOINT name` отменяют только часть транзакции. Держите транзакции короткими.

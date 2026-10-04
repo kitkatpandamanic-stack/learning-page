@@ -1,0 +1,554 @@
+---
+title: Partitioning Big Tables
+description: Split huge tables into range, list and hash partitions, read partition pruning in EXPLAIN, and delete old data in milliseconds by dropping partitions.
+duration: 22
+xp: 30
+---
+
+A familiar story from many companies: the `events` table started small, and three years later it holds two billion rows. The nightly job that deletes data older than a year now runs for six hours, holds locks the whole time, leaves gigabytes of dead rows for VACUUM to clean up, and the disk is still full. The fix wasn't a faster `DELETE`. It was to stop deleting rows at all, and to **drop whole months** at once instead. 🗂️
+
+That's what **partitioning** gives you. In this lesson you'll split a table into partitions, watch PostgreSQL skip the partitions a query doesn't need, and learn when partitioning helps and when it only adds work.
+
+## What partitioning is
+
+A **partitioned table** looks like one table to your queries, but it stores no rows itself. Its rows live in smaller tables called **partitions**, and a **partition key** (one or more columns) decides which partition each row goes to:
+
+```text
+                 events  (partitioned table: no rows of its own)
+                    |
+     +--------------+---------------+
+     |              |               |
+events_2025_01  events_2025_02  events_2025_03
+ Jan rows        Feb rows        Mar rows
+```
+
+You `INSERT`, `SELECT`, `UPDATE` and `DELETE` through the parent table `events`, and PostgreSQL **routes** every row to the right partition. Three things get better:
+
+- **Partition pruning**: a query that filters on the key only reads the partitions that can contain matches.
+- **Cheap retention**: removing a month of data is `DROP TABLE` on one partition, which takes milliseconds and leaves no dead rows behind.
+- **Smaller maintenance units**: VACUUM, ANALYZE and index rebuilds work on one partition at a time, and old partitions that never change need almost no maintenance.
+
+Partitioning is **not** sharding: all partitions still live in the same database on the same server. And it doesn't make every query faster. You'll see the cases where it makes things slower further down.
+
+## Range partitioning
+
+The most common kind is **range partitioning** by time. You declare the parent with `PARTITION BY RANGE (column)`, then create each partition with `FOR VALUES FROM (…) TO (…)`. The lower bound is **included** and the upper bound is **excluded**, so monthly partitions fit together without gaps or overlaps:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 9000
+
+   partition    | events
+----------------+--------
+ events_2025_01 |   3100
+ events_2025_02 |   2800
+ events_2025_03 |   3100
+(3 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  user_id integer NOT NULL,
+  kind text NOT NULL
+) PARTITION BY RANGE (created_on);
+
+CREATE TABLE events_2025_01 PARTITION OF events
+  FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_2025_02 PARTITION OF events
+  FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+CREATE TABLE events_2025_03 PARTITION OF events
+  FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+
+-- 100 events a day for 90 days, all inserted through the parent
+INSERT INTO events (created_on, user_id, kind)
+SELECT date '2025-01-01' + g / 100, g % 50 + 1,
+  (ARRAY['view', 'click', 'buy'])[g % 3 + 1]
+FROM generate_series(0, 8999) AS g;
+
+SELECT tableoid::regclass AS partition, count(*) AS events
+FROM events
+GROUP BY partition
+ORDER BY partition;
+```
+
+</CodeExample>
+
+Every table has a hidden system column, **`tableoid`**: the id of the table a row physically lives in. Casting it to `regclass` turns the id into a table name, which makes it a handy way to see where rows went. Each partition is a normal table too, so `SELECT count(*) FROM events_2025_02` works as well.
+
+### Rows with nowhere to go
+
+What happens to an event from April? There's no partition for it, so the insert fails:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+ERROR:  no partition of relation "events" found for row
+DETAIL:  Partition key of the failing row contains (created_on) = (2025-04-02).`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  kind text NOT NULL
+) PARTITION BY RANGE (created_on);
+
+CREATE TABLE events_2025_03 PARTITION OF events
+  FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+
+INSERT INTO events (created_on, kind) VALUES ('2025-04-02', 'view');
+```
+
+</CodeExample>
+
+In production this error is an **outage**: at midnight on the first of the month, every insert fails because nobody created the new partition. So teams always create partitions **ahead of time**, for example a scheduled job that keeps the next three months ready, or the popular **pg_partman** extension, which does exactly that.
+
+You can also add a **`DEFAULT` partition** that catches every row no other partition accepts:
+
+```sql
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+```
+
+<Callout type="warning" title="Keep the default partition empty">
+
+A default partition stops the outage, but it has a cost. When you later create `events_2025_04`, PostgreSQL must scan the default partition to make sure none of its rows belong in April (and fails if some do). A big default partition makes every new partition slow to create and blocks writes while it checks. Treat the default partition as an alarm: monitor it, and if rows land there, find out why.
+
+</Callout>
+
+## Partition pruning
+
+Here's the payoff. When a query filters on the partition key, the planner works out which partitions **can't** contain matching rows and leaves them out of the plan. This is **partition pruning**, and `EXPLAIN` shows it:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 9000
+
+ANALYZE
+
+                                         QUERY PLAN
+--------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on events_2025_02 events
+         Filter: ((created_on >= '2025-02-10'::date) AND (created_on < '2025-02-17'::date))
+(3 rows)
+
+                   QUERY PLAN
+-------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Seq Scan on events_2025_01 events_1
+               Filter: (kind = 'buy'::text)
+         ->  Seq Scan on events_2025_02 events_2
+               Filter: (kind = 'buy'::text)
+         ->  Seq Scan on events_2025_03 events_3
+               Filter: (kind = 'buy'::text)
+(8 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  user_id integer NOT NULL,
+  kind text NOT NULL
+) PARTITION BY RANGE (created_on);
+
+CREATE TABLE events_2025_01 PARTITION OF events
+  FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_2025_02 PARTITION OF events
+  FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+CREATE TABLE events_2025_03 PARTITION OF events
+  FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+
+INSERT INTO events (created_on, user_id, kind)
+SELECT date '2025-01-01' + g / 100, g % 50 + 1,
+  (ARRAY['view', 'click', 'buy'])[g % 3 + 1]
+FROM generate_series(0, 8999) AS g;
+
+ANALYZE events;
+
+-- filters on the key: only February is read
+EXPLAIN (COSTS OFF)
+SELECT count(*)
+FROM events
+WHERE created_on >= '2025-02-10'
+  AND created_on < '2025-02-17';
+
+-- no filter on the key: every partition is read
+EXPLAIN (COSTS OFF)
+SELECT count(*)
+FROM events
+WHERE kind = 'buy';
+```
+
+</CodeExample>
+
+The first plan mentions only `events_2025_02`. January and March were **pruned**: the planner compared the `WHERE` condition with each partition's bounds and removed the ones that can't match, before running anything. With only one partition left, there's not even an `Append` node.
+
+The second query has no condition on `created_on`, so the planner can't rule anything out. It reads all three partitions and glues the results together with **`Append`**. With 36 monthly partitions, that's 36 scans (or 36 index lookups) where an unpartitioned table needed one. **Queries that don't filter on the partition key get slower with partitioning**, which is why choosing the key is the most important decision.
+
+Pruning also happens **at run time**: when the value is only known while the query runs (a parameter in a prepared statement, or a value from a join), the plan shows the line `Subplans Removed: N` instead.
+
+## Indexes and keys on partitioned tables
+
+An index created on the parent is created on **every partition**, including partitions you add later:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE INDEX
+
+   tablename    |               indexname
+----------------+---------------------------------------
+ events         | events_user_id_created_on_idx
+ events_2025_01 | events_2025_01_user_id_created_on_idx
+ events_2025_02 | events_2025_02_user_id_created_on_idx
+(3 rows)
+
+ERROR:  unique constraint on partitioned table must include all partitioning columns
+DETAIL:  PRIMARY KEY constraint on table "events" lacks column "created_on" which is part of the partition key.`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  user_id integer NOT NULL
+) PARTITION BY RANGE (created_on);
+
+CREATE TABLE events_2025_01 PARTITION OF events
+  FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_2025_02 PARTITION OF events
+  FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+
+CREATE INDEX ON events (user_id, created_on);
+
+SELECT tablename, indexname
+FROM pg_indexes
+WHERE tablename LIKE 'events%'
+ORDER BY tablename;
+
+ALTER TABLE events ADD PRIMARY KEY (id);
+```
+
+</CodeExample>
+
+The last statement shows the big limitation. Each partition has its own indexes, and PostgreSQL has no index that spans all partitions. So it can only promise uniqueness **within** a partition, and a primary key or unique constraint must **include the partition key**. `PRIMARY KEY (id, created_on)` works; `PRIMARY KEY (id)` doesn't.
+
+In practice the identity column still hands out unique ids, so `(id, created_on)` is fine. But a rule like "every email is unique" can't be enforced on a table partitioned by date. Rules like that belong in an unpartitioned table, or need the key in the constraint. Foreign keys **pointing to** a partitioned table must reference all columns of its key too.
+
+## List and hash partitioning
+
+**List partitioning** puts each listed value (or group of values) into its own partition. It's natural for a small, fixed set of categories such as regions:
+
+```sql
+CREATE TABLE accounts (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  region text NOT NULL,
+  name text NOT NULL
+) PARTITION BY LIST (region);
+
+CREATE TABLE accounts_eu PARTITION OF accounts
+  FOR VALUES IN ('eu-west', 'eu-central');
+CREATE TABLE accounts_us PARTITION OF accounts
+  FOR VALUES IN ('us-east', 'us-west');
+```
+
+**Hash partitioning** spreads rows evenly over a fixed number of partitions by hashing the key. Use it when there's no natural range, and you mainly want to cut a huge table into equal, smaller pieces:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 10000
+
+ partition | rows
+-----------+------
+ carts_p0  | 2489
+ carts_p1  | 2527
+ carts_p2  | 2530
+ carts_p3  | 2454
+(4 rows)
+
+          QUERY PLAN
+------------------------------
+ Seq Scan on carts_p2 carts
+   Filter: (customer_id = 42)
+(2 rows)`}>
+
+```sql
+CREATE TABLE carts (
+  customer_id integer NOT NULL,
+  product_id integer NOT NULL
+) PARTITION BY HASH (customer_id);
+
+CREATE TABLE carts_p0 PARTITION OF carts
+  FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE carts_p1 PARTITION OF carts
+  FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE carts_p2 PARTITION OF carts
+  FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE carts_p3 PARTITION OF carts
+  FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+INSERT INTO carts (customer_id, product_id)
+SELECT g, g % 15 + 1
+FROM generate_series(1, 10000) AS g;
+
+SELECT tableoid::regclass AS partition, count(*) AS rows
+FROM carts
+GROUP BY partition
+ORDER BY partition;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM carts WHERE customer_id = 42;
+```
+
+</CodeExample>
+
+The rows are spread almost evenly, and an equality lookup on the key is pruned to one partition. Hash partitioning can't help a range query (`customer_id < 100` still reads all four), and it can't drop old data, because every partition holds a mix of old and new rows. Changing the number of hash partitions later means moving almost every row, so pick a number with room to grow.
+
+You can also **combine** them: partitions can be partitioned again (sub-partitioning), for example by month and then by hash. Reach for that only with a measured reason, because the number of tables multiplies quickly.
+
+## Retention: drop, don't delete
+
+Back to the six-hour delete. With monthly partitions, removing January takes two quick statements, and adding a month that was loaded separately takes a few more:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 9000
+
+ALTER TABLE
+
+DROP TABLE
+
+CREATE TABLE
+
+INSERT 0 1
+
+ALTER TABLE
+
+ALTER TABLE
+
+   partition    | events
+----------------+--------
+ events_2025_02 |   2800
+ events_2025_03 |   3100
+ events_2025_04 |      1
+(3 rows)`}>
+
+```sql
+CREATE TABLE events (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_on date NOT NULL,
+  user_id integer NOT NULL,
+  kind text NOT NULL
+) PARTITION BY RANGE (created_on);
+CREATE TABLE events_2025_01 PARTITION OF events
+  FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_2025_02 PARTITION OF events
+  FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+CREATE TABLE events_2025_03 PARTITION OF events
+  FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+INSERT INTO events (created_on, user_id, kind)
+SELECT date '2025-01-01' + g / 100, g % 50 + 1, 'view'
+FROM generate_series(0, 8999) AS g;
+
+-- retention: January leaves the table, then disappears
+ALTER TABLE events DETACH PARTITION events_2025_01;
+DROP TABLE events_2025_01;
+
+-- April was loaded into a normal table first
+CREATE TABLE events_2025_04 (LIKE events);
+INSERT INTO events_2025_04 (id, created_on, user_id, kind)
+VALUES (100001, '2025-04-01', 7, 'view');
+
+-- a matching CHECK lets ATTACH skip scanning the table
+ALTER TABLE events_2025_04 ADD CONSTRAINT events_2025_04_range
+  CHECK (created_on >= '2025-04-01' AND created_on < '2025-05-01');
+ALTER TABLE events ATTACH PARTITION events_2025_04
+  FOR VALUES FROM ('2025-04-01') TO ('2025-05-01');
+
+SELECT tableoid::regclass AS partition, count(*) AS events
+FROM events
+GROUP BY partition
+ORDER BY partition;
+```
+
+</CodeExample>
+
+Compare that with `DELETE FROM events WHERE created_on < '2025-02-01'`:
+
+| | `DELETE` old rows | `DROP` the old partition |
+| --- | --- | --- |
+| Work done | Marks every row dead, one by one | Removes the files |
+| Time on a billion rows | Hours | Milliseconds |
+| Dead rows for VACUUM | Every deleted row | None |
+| WAL written (replicas, backups) | Lots | Almost none |
+| Disk space | Reused later, not returned | Returned at once |
+
+**`DETACH PARTITION`** turns a partition back into an ordinary table, so you can archive it first (dump it to cheap storage, or move it to another tablespace) and drop it later. In production, use `DETACH PARTITION … CONCURRENTLY`, which avoids blocking queries on the parent for long. It can't run inside a transaction block, so it's run on its own:
+
+```sql
+ALTER TABLE events DETACH PARTITION events_2025_01 CONCURRENTLY;
+```
+
+Loading a big month into a separate table and **attaching** it works the same way in reverse. The `CHECK` constraint that matches the bounds lets PostgreSQL skip the full scan it would otherwise do to validate the rows, and `ATTACH` only takes a lock that lets reads and writes on other partitions continue.
+
+<Callout type="tip" title="Turning an existing big table into a partitioned one">
+
+You can't just `ALTER` a normal table into a partitioned one. The usual zero-downtime trick: create the new partitioned table, **attach the old table as one partition** covering all past data (with a matching `CHECK` constraint added first as `NOT VALID`, then validated), point new writes at the parent, and split the old giant partition later, or simply let it age out. Plan it like any other migration, with the expand and contract steps from [Zero-Downtime Migrations](/learn/sql/zero-downtime-migrations).
+
+</Callout>
+
+## When partitioning is worth it
+
+Partitioning adds moving parts: partitions to create ahead of time, more tables for the planner to consider, and constraints that must include the key. It pays off when:
+
+- the table is **big**: a common rule of thumb is that the table is bigger than the server's memory, or well above 100 GB;
+- you have a **retention** rule (keep 13 months, archive the rest), which makes dropping partitions the killer feature;
+- almost every important query **filters on the key** (most queries on recent events ask about "the last 7 days").
+
+It's usually a mistake when the table is a few gigabytes (a good index is enough), when queries rarely filter on the key, or when you'd create **thousands** of tiny partitions. Planning time grows with the number of partitions a query might touch, so daily partitions kept for ten years (3,650 tables) are a trap. Monthly or weekly is typical, and a few hundred partitions in total is a comfortable maximum.
+
+<Quiz
+  question="The events table is range-partitioned by created_on, one partition per month for three years. Which query will read the most partitions?"
+  options={[
+    "SELECT count(*) FROM events WHERE created_on = '2025-03-14'",
+    "SELECT * FROM events WHERE created_on >= '2025-03-01' AND created_on < '2025-03-08'",
+    "SELECT * FROM events WHERE user_id = 42 ORDER BY created_on DESC LIMIT 10",
+    "DELETE FROM events WHERE created_on < '2023-02-01'",
+  ]}
+  answer={2}
+  explanation="The planner can only prune partitions using conditions on the partition key. The query on user_id has no condition on created_on, so it must look in all 36 partitions. The other three filter on created_on and touch one or a few partitions."
+/>
+
+<Quiz
+  question="A table is partitioned by RANGE (created_on). Why does ALTER TABLE events ADD PRIMARY KEY (id) fail?"
+  options={[
+    "Partitioned tables can't have primary keys at all",
+    "Each partition has its own index, so uniqueness can only be checked within one partition, and the key must include created_on",
+    "Identity columns can't be primary keys",
+    "The primary key must be added to each partition by hand first",
+  ]}
+  answer={1}
+  explanation="PostgreSQL has no global index across partitions. A unique index on each partition is only enough to guarantee uniqueness across the whole table if the partition key is part of it, so PRIMARY KEY (id, created_on) works and PRIMARY KEY (id) is refused."
+/>
+
+<Exercise
+  language="sql"
+  title="Partition a page-view log"
+  starter={`-- 1. Create page_views, partitioned by RANGE on viewed_on:
+--    id bigint identity, viewed_on date, path text (all NOT NULL),
+--    primary key (id, viewed_on)
+
+-- 2. Partitions page_views_2025_04, page_views_2025_05,
+--    page_views_2025_06 and page_views_default
+
+-- 3. The data (keep this as it is)
+INSERT INTO page_views (viewed_on, path)
+SELECT date '2025-04-01' + g / 40,
+  (ARRAY['/', '/pricing', '/docs'])[g % 3 + 1]
+FROM generate_series(0, 4199) AS g;
+
+-- 4. Retention: April is too old now, remove it completely
+
+-- 5. Rows per partition: columns partition and views
+SELECT count(*) AS views
+FROM page_views;
+`}
+  tests={[
+    { name: "page_views is range-partitioned on viewed_on", check: "(await query(\"SELECT partstrat, pg_get_partkeydef(partrelid) AS def FROM pg_partitioned_table WHERE partrelid = 'page_views'::regclass\")).some(r => r.partstrat === 'r' && r.def === 'RANGE (viewed_on)')" },
+    { name: "The primary key is (id, viewed_on)", check: "(await query(\"SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid = 'page_views'::regclass AND contype = 'p'\")).some(r => r.def === 'PRIMARY KEY (id, viewed_on)')" },
+    { name: "May, June and a default partition are left; April is dropped", check: "(await query(\"SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) AS bound FROM pg_inherits AS i JOIN pg_class AS c ON c.oid = i.inhrelid WHERE i.inhparent = 'page_views'::regclass ORDER BY c.relname\")).map(r => r.relname + ' ' + r.bound).join('; ') === \"page_views_2025_05 FOR VALUES FROM ('2025-05-01') TO ('2025-06-01'); page_views_2025_06 FOR VALUES FROM ('2025-06-01') TO ('2025-07-01'); page_views_default DEFAULT\" && (await query(\"SELECT to_regclass('page_views_2025_04') AS t\"))[0].t === null" },
+    { name: "A June query is pruned to the June partition", check: "(await query(\"EXPLAIN (COSTS OFF) SELECT count(*) FROM page_views WHERE viewed_on >= '2025-06-10' AND viewed_on < '2025-06-20'\")).map(r => r['QUERY PLAN']).join(' ').match(/on page_views_\\w+/g).join() === 'on page_views_2025_06'" },
+    { name: "Shows partition and views, one row per partition, by name", check: "columns.join() === 'partition,views' && rows.map(r => r.partition + ':' + r.views).join() === 'page_views_2025_05:1240,page_views_2025_06:1200,page_views_default:560'" },
+    { name: "New rows are counted in the right partition", check: "(await rerun(\"INSERT INTO page_views (viewed_on, path) VALUES ('2025-05-31', '/'), ('2026-01-01', '/')\")).map(r => r.views).join() === '1241,1200,561'" },
+  ]}
+>
+
+A website logs every page view, and the team wants to keep only the last two full months plus anything newer. Build the table the way you'd build it in production: 📈
+
+1. Create **`page_views`** with `id bigint GENERATED ALWAYS AS IDENTITY`, `viewed_on date`, `path text` (all `NOT NULL`) and the primary key **`(id, viewed_on)`**, **partitioned by range** on `viewed_on`.
+2. Create monthly partitions **`page_views_2025_04`**, **`page_views_2025_05`** and **`page_views_2025_06`**, and a default partition **`page_views_default`** (the data runs into July, and those rows should land there).
+3. Keep the `INSERT` as it is: 40 views a day from 1 April to 14 July 2025.
+4. Retention: remove April **completely**, both from `page_views` and as a table.
+5. End with a query showing each remaining partition's name as **`partition`** and its row count as **`views`**, sorted by partition name.
+
+<Hint>
+
+Partitions look like `CREATE TABLE page_views_2025_05 PARTITION OF page_views FOR VALUES FROM ('2025-05-01') TO ('2025-06-01');` and the default one is `CREATE TABLE page_views_default PARTITION OF page_views DEFAULT;`. For retention, `ALTER TABLE page_views DETACH PARTITION page_views_2025_04;` then `DROP TABLE page_views_2025_04;` (dropping the partition directly works too). For the last query, group by `tableoid::regclass`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE page_views (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  viewed_on date NOT NULL,
+  path text NOT NULL,
+  PRIMARY KEY (id, viewed_on)
+) PARTITION BY RANGE (viewed_on);
+
+CREATE TABLE page_views_2025_04 PARTITION OF page_views
+  FOR VALUES FROM ('2025-04-01') TO ('2025-05-01');
+CREATE TABLE page_views_2025_05 PARTITION OF page_views
+  FOR VALUES FROM ('2025-05-01') TO ('2025-06-01');
+CREATE TABLE page_views_2025_06 PARTITION OF page_views
+  FOR VALUES FROM ('2025-06-01') TO ('2025-07-01');
+CREATE TABLE page_views_default PARTITION OF page_views DEFAULT;
+
+INSERT INTO page_views (viewed_on, path)
+SELECT date '2025-04-01' + g / 40,
+  (ARRAY['/', '/pricing', '/docs'])[g % 3 + 1]
+FROM generate_series(0, 4199) AS g;
+
+ALTER TABLE page_views DETACH PARTITION page_views_2025_04;
+DROP TABLE page_views_2025_04;
+
+SELECT tableoid::regclass AS partition, count(*) AS views
+FROM page_views
+GROUP BY partition
+ORDER BY partition;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **partitioned table** routes rows to **partitions** by a **partition key**; queries go through the parent as usual.
+- **Range** (by time, the most common), **list** (by category) and **hash** (even spread, no ranges) partitioning; the range lower bound is included, the upper excluded.
+- **Partition pruning** skips partitions that can't match, but only for conditions on the **key**. Queries without it read every partition and get slower.
+- Indexes on the parent are created on every partition; **unique constraints and primary keys must include the partition key**.
+- Create partitions **ahead of time** (a scheduled job or pg_partman); keep the **default partition** empty.
+- Retention by **`DETACH` + `DROP`** takes milliseconds and leaves no dead rows, unlike a big `DELETE`. Load big batches into a table and **`ATTACH`** it, with a matching `CHECK` constraint.
+- Partition big tables with a retention rule and a key that queries use; avoid thousands of tiny partitions.

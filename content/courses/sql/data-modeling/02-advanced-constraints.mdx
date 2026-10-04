@@ -1,0 +1,493 @@
+---
+title: Advanced Integrity Constraints
+description: Reusable domains, enum types, generated columns, exclusion constraints that stop double bookings, and deferrable constraints for changes that are briefly inconsistent.
+duration: 22
+xp: 30
+---
+
+In Level 1 you protected tables with `NOT NULL`, `UNIQUE`, `CHECK` and foreign keys. They catch more bugs than any code review, because they apply to **every** writer: the web app, the admin panel, the nightly import script and the colleague running a quick `UPDATE` in production. This lesson adds PostgreSQL's more powerful tools: rules you can **reuse**, values that **compute themselves**, constraints that compare a row with **other rows** ("no two bookings may overlap") and constraints that wait until **commit** to be checked. 🛡️
+
+## Domains: a type with rules attached
+
+Emails appear in many tables: customers, staff, newsletter sign-ups. Copying the same `CHECK` into each one means they'll drift apart. A **domain** is a named type with constraints built in, defined once and used anywhere:
+
+<CodeExample output={`CREATE DOMAIN
+
+CREATE DOMAIN
+
+CREATE TABLE
+
+INSERT 0 1
+
+ERROR:  value for domain email_address violates check constraint "email_address_check"`}>
+
+```sql
+CREATE DOMAIN email_address AS text
+  CHECK (VALUE ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$');
+
+CREATE DOMAIN amount AS numeric(10, 2)
+  CHECK (VALUE >= 0);
+
+CREATE TABLE invoices (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  billed_to email_address NOT NULL,
+  total amount NOT NULL
+);
+
+INSERT INTO invoices (billed_to, total)
+VALUES ('mei@pandadev.test', 42.50);
+
+INSERT INTO invoices (billed_to, total)
+VALUES ('not-an-email', 10);
+```
+
+</CodeExample>
+
+Inside the domain's `CHECK`, `VALUE` is the value being stored. To tighten a rule later, change it in one place: `ALTER DOMAIN email_address ADD CONSTRAINT … NOT VALID` adds a check for new values without scanning old ones, and `VALIDATE CONSTRAINT` checks the old ones when you're ready.
+
+<Callout type="tip">
+
+Keep domain checks to **format and range** rules that will always be true (`VALUE > 0`, a pattern). Business rules that change ("orders over 500 need approval") belong in a table's `CHECK` or in application code, where they're easier to change.
+
+</Callout>
+
+## Enum types
+
+`orders.status` is `text` with a `CHECK (status IN (…))`. An **enum type** is the alternative: a fixed, **ordered** list of labels, stored in 4 bytes. Let's convert the column:
+
+<CodeExample output={`CREATE TYPE
+
+ERROR:  operator does not exist: order_status = text
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.`}>
+
+```sql
+CREATE TYPE order_status AS ENUM
+  ('paid', 'shipped', 'delivered', 'cancelled');
+
+ALTER TABLE orders
+  ALTER COLUMN status TYPE order_status
+  USING status::order_status;
+```
+
+</CodeExample>
+
+The old `CHECK` compares `status` with `text` values, and an enum can't be compared with `text`. Drop the old constraint first. Then the enum's **order** becomes useful: `'paid' < 'shipped' < 'delivered'`, in the order you listed them, not alphabetically:
+
+<CodeExample output={`CREATE TYPE
+
+ALTER TABLE
+
+ALTER TABLE
+
+  status   | orders
+-----------+--------
+ shipped   |      8
+ delivered |     16
+(2 rows)
+
+ALTER TYPE
+
+                   labels
+---------------------------------------------
+ {paid,shipped,delivered,refunded,cancelled}
+(1 row)
+
+ERROR:  invalid input value for enum order_status: "lost"
+LINE 20: UPDATE orders SET status = 'lost' WHERE id = 1;
+                                    ^`}>
+
+```sql
+CREATE TYPE order_status AS ENUM
+  ('paid', 'shipped', 'delivered', 'cancelled');
+
+ALTER TABLE orders DROP CONSTRAINT orders_status_check;
+
+ALTER TABLE orders
+  ALTER COLUMN status TYPE order_status
+  USING status::order_status;
+
+-- Orders that have at least left the warehouse
+SELECT status, count(*) AS orders
+FROM orders
+WHERE status BETWEEN 'shipped' AND 'delivered'
+GROUP BY status
+ORDER BY status;
+
+ALTER TYPE order_status ADD VALUE 'refunded' AFTER 'delivered';
+SELECT enum_range(NULL::order_status) AS labels;
+
+UPDATE orders SET status = 'lost' WHERE id = 1;
+```
+
+</CodeExample>
+
+Adding a value is quick. **Removing or renaming** values is the catch: `ALTER TYPE … RENAME VALUE` exists, but there's no `DROP VALUE`, so retiring a status means creating a new type and converting the column. Here's how the three ways to restrict a column compare:
+
+| | `CHECK (status IN …)` | Enum type | Lookup table + foreign key |
+| --- | --- | --- | --- |
+| Add a value | Replace the constraint | `ADD VALUE` (fast) | `INSERT` a row |
+| Remove a value | Replace the constraint | New type + convert | `DELETE` (if unused) |
+| Extra data per value | No | No | Yes (label, sort order, colour…) |
+| Order | Alphabetical | Declared order | A `sort_order` column |
+
+Enums suit small lists that rarely change (`'low', 'medium', 'high'`). If product managers add values every month or need a label per value, use a lookup table.
+
+## Generated columns
+
+A **generated column** is computed from other columns of the same row. Nobody can write to it, so it can never be out of date:
+
+<CodeExample output={`ALTER TABLE
+
+ order_id | quantity | unit_price | line_total
+----------+----------+------------+------------
+        1 |        3 |      29.00 |      87.00
+        1 |        1 |      15.00 |      15.00
+        2 |        3 |       2.99 |       8.97
+(3 rows)
+
+ERROR:  column "line_total" can only be updated to DEFAULT
+DETAIL:  Column "line_total" is a generated column.`}>
+
+```sql
+ALTER TABLE order_items
+  ADD COLUMN line_total numeric(10, 2)
+  GENERATED ALWAYS AS (quantity * unit_price);
+
+SELECT order_id, quantity, unit_price, line_total
+FROM order_items
+ORDER BY order_id, product_id
+LIMIT 3;
+
+UPDATE order_items SET line_total = 0 WHERE order_id = 1;
+```
+
+</CodeExample>
+
+PostgreSQL 18 has two kinds:
+
+- **`VIRTUAL`** (the default since PostgreSQL 18): computed each time you read it, takes no space, and adding one doesn't rewrite the table. It can't be indexed.
+- **`STORED`**: computed on every insert and update and saved like a normal column. It costs space and adding one rewrites the table, but you **can** index it.
+
+A stored generated column is a clean way to make an awkward expression searchable and sortable. Libraries sort "The Bamboo Heist" under B, so let's give `movies` a sort key:
+
+<CodeExample output={`ALTER TABLE
+
+CREATE INDEX
+
+         title         |     sort_title
+-----------------------+--------------------
+ The Bamboo Heist      | bamboo heist
+ Bug in the Machine    | bug in the machine
+ Code Red              | code red
+ The Great Bamboo Race | great bamboo race
+ The Last Dumpling     | last dumpling
+(5 rows)`}>
+
+```sql
+ALTER TABLE movies
+  ADD COLUMN sort_title text
+  GENERATED ALWAYS AS (
+    lower(regexp_replace(title, '^(The|A) ', ''))
+  ) STORED;
+
+CREATE INDEX movies_sort_title ON movies (sort_title);
+
+SELECT title, sort_title
+FROM movies
+ORDER BY sort_title
+LIMIT 5;
+```
+
+</CodeExample>
+
+The expression may only use the current row and **immutable** functions: no `now()`, no subqueries, no other tables. (An "age" column computed from `now()` would be wrong tomorrow, which is exactly what PostgreSQL is protecting you from.)
+
+## Exclusion constraints: no overlapping bookings
+
+`UNIQUE` says "no two rows are **equal**". Some rules are "no two rows **overlap**": a meeting room can't be booked twice for the same hours, a hotel room for the same nights, an employee can't have two contracts covering the same day. An application check ("SELECT for an overlap, then INSERT") has a race: two requests can both find no overlap and both insert. An **exclusion constraint** makes the database refuse the second one:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+ERROR:  conflicting key value violates exclusion constraint "studio_bookings_during_excl"
+DETAIL:  Key (during)=(["2025-07-01 10:30:00","2025-07-01 11:30:00")) conflicts with existing key (during)=(["2025-07-01 09:00:00","2025-07-01 11:00:00")).`}>
+
+```sql
+CREATE TABLE studio_bookings (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  booked_by text NOT NULL,
+  during tsrange NOT NULL,
+  EXCLUDE USING gist (during WITH &&)
+);
+
+INSERT INTO studio_bookings (booked_by, during) VALUES
+  ('Mei', '[2025-07-01 09:00,2025-07-01 11:00)'),
+  ('Sam', '[2025-07-01 11:00,2025-07-01 12:00)');
+
+INSERT INTO studio_bookings (booked_by, during)
+VALUES ('Ada', '[2025-07-01 10:30,2025-07-01 11:30)');
+```
+
+</CodeExample>
+
+`EXCLUDE USING gist (during WITH &&)` reads: "refuse a new row if there is an existing row whose `during` **overlaps** (`&&`) this one". Sam's booking starting at 11:00 is fine because `)` excludes the end of Mei's range. Ada's overlaps both.
+
+### One rule per room
+
+With several rooms, two bookings only conflict if they're for the **same room** and overlap. That needs two comparisons: `room_id WITH =` and `during WITH &&`. On a normal server you'd run `CREATE EXTENSION btree_gist;` (it teaches GiST indexes the `=` of plain integers) and write exactly that. Extensions aren't available in this browser database, so the demo uses a trick that only needs built-in operators: a one-value range, `int4range(room_id, room_id, '[]')`, compared with `=`. Exclusion constraints can also have a `WHERE`, so cancelled bookings don't block anything:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+UPDATE 1
+
+INSERT 0 1
+
+ERROR:  conflicting key value violates exclusion constraint "room_bookings_int4range_stay_excl"
+DETAIL:  Key (int4range(room_id, room_id, '[]'::text), stay)=([1,2), [2025-07-03,2025-07-05)) conflicts with existing key (int4range(room_id, room_id, '[]'::text), stay)=([1,2), [2025-07-01,2025-07-04)).`}>
+
+```sql
+CREATE TABLE room_bookings (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id integer NOT NULL,
+  stay daterange NOT NULL,
+  cancelled boolean NOT NULL DEFAULT false,
+  -- With btree_gist: EXCLUDE USING gist
+  --   (room_id WITH =, stay WITH &&) WHERE (NOT cancelled)
+  EXCLUDE USING gist (
+    int4range(room_id, room_id, '[]') WITH =,
+    stay WITH &&
+  ) WHERE (NOT cancelled)
+);
+
+INSERT INTO room_bookings (room_id, stay) VALUES
+  (1, '[2025-07-01,2025-07-04)'),
+  (2, '[2025-07-01,2025-07-04)'),  -- other room: fine
+  (1, '[2025-07-04,2025-07-06)');  -- checks in as the
+                                   -- others leave: fine
+
+UPDATE room_bookings SET cancelled = true WHERE id = 3;
+
+INSERT INTO room_bookings (room_id, stay)
+VALUES (1, '[2025-07-05,2025-07-07)');  -- the slot is free again
+
+INSERT INTO room_bookings (room_id, stay)
+VALUES (1, '[2025-07-03,2025-07-05)');  -- overlaps booking 1
+```
+
+</CodeExample>
+
+The same tool closes the gap from the previous lesson: `EXCLUDE USING gist (product_id WITH =, valid WITH &&)` (with `btree_gist`) guarantees a product never has two prices for the same day.
+
+<Callout type="warning" title="Ranges need a convention">
+
+Always use **half-open** ranges, `[start,end)`: the end is excluded, so back-to-back bookings touch without overlapping and you never need "23:59:59". PostgreSQL normalises `daterange` to `[)` anyway, but for `tsrange` and `tstzrange` it's up to you. Use `tstzrange` for real-world times, so a booking means the same instant in every time zone.
+
+</Callout>
+
+## Deferrable constraints
+
+Normally a constraint is checked **immediately**, row by row. Some correct changes are briefly inconsistent in the middle. Reordering a playlist with a unique `position` is the classic example:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+ERROR:  duplicate key value violates unique constraint "playlist_position_key"
+DETAIL:  Key ("position")=(2) already exists.`}>
+
+```sql
+CREATE TABLE playlist (
+  song text NOT NULL,
+  position integer NOT NULL UNIQUE
+);
+
+INSERT INTO playlist VALUES ('Intro', 1), ('Verse', 2), ('Outro', 3);
+
+-- Make room for a new first song
+UPDATE playlist SET position = position + 1;
+```
+
+</CodeExample>
+
+Moving 'Intro' to position 2 collides with 'Verse', which hasn't moved yet. When the whole statement finishes, every position is unique again, but the check ran too early. Declare the constraint **`DEFERRABLE`** and the check waits:
+
+- `DEFERRABLE INITIALLY IMMEDIATE`: checked at the **end of each statement**, and you can postpone it further with `SET CONSTRAINTS … DEFERRED`.
+- `DEFERRABLE INITIALLY DEFERRED`: checked at **`COMMIT`**.
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+UPDATE 3
+
+BEGIN
+
+SET
+
+UPDATE 1
+
+UPDATE 1
+
+COMMIT
+
+ position | song
+----------+-------
+        2 | Verse
+        3 | Intro
+        4 | Outro
+(3 rows)`}>
+
+```sql
+CREATE TABLE playlist (
+  song text NOT NULL,
+  position integer NOT NULL,
+  CONSTRAINT playlist_position_unique
+    UNIQUE (position) DEFERRABLE INITIALLY IMMEDIATE
+);
+
+INSERT INTO playlist VALUES ('Intro', 1), ('Verse', 2), ('Outro', 3);
+
+UPDATE playlist SET position = position + 1;  -- now fine
+
+-- Swap two songs in two statements: defer until COMMIT
+BEGIN;
+SET CONSTRAINTS playlist_position_unique DEFERRED;
+UPDATE playlist SET position = 3 WHERE song = 'Intro';
+UPDATE playlist SET position = 2 WHERE song = 'Verse';
+COMMIT;
+
+SELECT position, song FROM playlist ORDER BY position;
+```
+
+</CodeExample>
+
+Deferrable foreign keys solve the chicken-and-egg problem too: a `departments.head_id` that must point to an employee, while each employee must belong to a department. With both keys `DEFERRABLE INITIALLY DEFERRED`, you insert both rows in one transaction in any order.
+
+<Callout type="note" title="The costs of deferring">
+
+A deferred check fails at `COMMIT`, far from the statement that caused it, which makes errors harder to trace. A deferrable unique constraint can't be the target of `ON CONFLICT` or of a foreign key, and it's slightly slower. Make constraints deferrable only where you need it.
+
+</Callout>
+
+<Quiz
+  question="Two users try to book room 4 for overlapping dates at the same moment. The app first SELECTs for an overlap, then INSERTs. What reliably prevents a double booking?"
+  options={["Checking twice in the app", "A UNIQUE constraint on (room_id, start_date)", "An exclusion constraint with room_id WITH = and stay WITH &&", "A generated column"]}
+  answer={2}
+  explanation="Both requests can SELECT before either INSERTs, so both see no overlap. Only a constraint enforced by the database closes that race. UNIQUE only catches identical start dates, not overlaps."
+/>
+
+<Quiz
+  question="Which of these generated column expressions does PostgreSQL reject?"
+  options={["quantity * unit_price", "lower(email)", "split_part(email, '@', 2)", "current_date - joined_on"]}
+  answer={3}
+  explanation="current_date changes every day, so it isn't immutable: the stored value would silently go stale. Generated columns may only use the row's own columns and immutable functions."
+/>
+
+<Exercise
+  language="sql"
+  title="A booking system that can't double-book"
+  starter={`CREATE TABLE rooms (
+  id integer PRIMARY KEY,
+  name text NOT NULL
+);
+INSERT INTO rooms VALUES (1, 'Bamboo'), (2, 'Lotus');
+
+-- 1. An enum booking_status: 'held', 'confirmed', 'cancelled'
+-- 2. A domain guest_count: an integer from 1 to 8
+
+-- 3. Improve this table (see the task)
+CREATE TABLE stays (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id integer NOT NULL REFERENCES rooms (id),
+  guest text NOT NULL,
+  guests integer NOT NULL,
+  stay daterange NOT NULL,
+  status text NOT NULL DEFAULT 'held'
+);
+
+INSERT INTO stays (room_id, guest, guests, stay) VALUES
+  (1, 'Mei', 2, '[2025-07-01,2025-07-04)'),
+  (2, 'Sam', 1, '[2025-07-02,2025-07-03)'),
+  (1, 'Ada', 3, '[2025-07-04,2025-07-09)');
+
+SELECT guest, room_id, nights, status
+FROM stays
+ORDER BY id;
+`}
+  tests={[
+    { name: "booking_status has held, confirmed, cancelled in that order", check: "(await query(\"SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder) AS s FROM pg_enum WHERE enumtypid = 'booking_status'::regtype\"))[0].s === 'held,confirmed,cancelled'" },
+    { name: "stays.status uses booking_status (default 'held') and guests uses guest_count", check: "(await query(\"SELECT string_agg(column_name || ':' || coalesce(domain_name, udt_name), ',' ORDER BY column_name) AS s FROM information_schema.columns WHERE table_name = 'stays' AND column_name IN ('guests', 'status')\"))[0].s === 'guests:guest_count,status:booking_status' && rows.every(r => r.status === 'held')" },
+    { name: "guest_count refuses 0 and 9 guests but allows 8", check: "(await query(\"SELECT NOT pg_input_is_valid('0', 'guest_count') AND NOT pg_input_is_valid('9', 'guest_count') AND pg_input_is_valid('8', 'guest_count') AND pg_input_is_valid('1', 'guest_count') AS ok\"))[0].ok === true" },
+    { name: "nights is a generated column (3, 1, 5 for the sample stays)", check: "rows.map(r => r.nights).join() === '3,1,5' && (await query(\"SELECT is_generated FROM information_schema.columns WHERE table_name = 'stays' AND column_name = 'nights'\"))[0]?.is_generated === 'ALWAYS'" },
+    { name: "An overlapping stay in the same room is refused", check: "await query(\"INSERT INTO stays (room_id, guest, guests, stay) VALUES (1, 'Kenji', 1, '[2025-07-03,2025-07-05)')\").then(() => false, e => /exclusion/.test(e.message))" },
+    { name: "Other rooms and back-to-back stays are allowed", check: "await query(\"INSERT INTO stays (room_id, guest, guests, stay) VALUES (2, 'Kenji', 1, '[2025-07-01,2025-07-02)'), (2, 'Ravi', 2, '[2025-07-03,2025-07-08)')\").then(() => true, () => false)" },
+    { name: "Cancelled stays don't block the room", check: "await query(\"UPDATE stays SET status = 'cancelled' WHERE guest = 'Mei'\").then(() => query(\"INSERT INTO stays (room_id, guest, guests, stay) VALUES (1, 'Lena', 2, '[2025-07-02,2025-07-04)')\")).then(() => true, () => false)" },
+  ]}
+>
+
+Build the guest house's booking table so that bad data **can't** get in, whatever the app does:
+
+1. Create an enum **`booking_status`** with `'held'`, `'confirmed'`, `'cancelled'` (in that order).
+2. Create a domain **`guest_count`**: an `integer` from 1 to 8.
+3. Change the `stays` table: `guests` uses `guest_count`; `status` uses `booking_status` with the default `'held'`; add a generated column **`nights`** (the number of nights in `stay`); and add an exclusion constraint so that two stays in the **same room** can't overlap, unless one of them is **cancelled**.
+
+Keep the inserts and the final `SELECT`: it should show `nights` 3, 1 and 5.
+
+<Hint>
+
+`upper(stay) - lower(stay)` gives the nights (a `date` minus a `date` is an `integer`). For the constraint, copy the pattern from the lesson: `EXCLUDE USING gist (int4range(room_id, room_id, '[]') WITH =, stay WITH &&) WHERE (status <> 'cancelled')`. A domain's check is written with `VALUE`, e.g. `CHECK (VALUE BETWEEN 1 AND 8)`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE rooms (
+  id integer PRIMARY KEY,
+  name text NOT NULL
+);
+INSERT INTO rooms VALUES (1, 'Bamboo'), (2, 'Lotus');
+
+CREATE TYPE booking_status AS ENUM ('held', 'confirmed', 'cancelled');
+
+CREATE DOMAIN guest_count AS integer
+  CHECK (VALUE BETWEEN 1 AND 8);
+
+CREATE TABLE stays (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id integer NOT NULL REFERENCES rooms (id),
+  guest text NOT NULL,
+  guests guest_count NOT NULL,
+  stay daterange NOT NULL,
+  status booking_status NOT NULL DEFAULT 'held',
+  nights integer GENERATED ALWAYS AS (upper(stay) - lower(stay)),
+  EXCLUDE USING gist (
+    int4range(room_id, room_id, '[]') WITH =,
+    stay WITH &&
+  ) WHERE (status <> 'cancelled')
+);
+
+INSERT INTO stays (room_id, guest, guests, stay) VALUES
+  (1, 'Mei', 2, '[2025-07-01,2025-07-04)'),
+  (2, 'Sam', 1, '[2025-07-02,2025-07-03)'),
+  (1, 'Ada', 3, '[2025-07-04,2025-07-09)');
+
+SELECT guest, room_id, nights, status
+FROM stays
+ORDER BY id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **domain** is a reusable type with built-in checks (`CREATE DOMAIN email_address AS text CHECK (…)`).
+- An **enum** is a small, ordered, fixed list of labels: easy to add to, hard to remove from. Lookup tables are more flexible.
+- **Generated columns** compute themselves from the row: `VIRTUAL` (default in PostgreSQL 18, no storage, no index) or `STORED` (indexable). Only immutable expressions are allowed.
+- **Exclusion constraints** (`EXCLUDE USING gist (… WITH =, range WITH &&)`) stop overlaps, race-free, and can have a `WHERE`. On a real server, `btree_gist` lets you write `room_id WITH =` directly.
+- **Deferrable constraints** are checked at the end of the statement or at `COMMIT`, for changes that are briefly inconsistent. Use them sparingly.

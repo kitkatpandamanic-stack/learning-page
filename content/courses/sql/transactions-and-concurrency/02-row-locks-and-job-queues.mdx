@@ -1,0 +1,526 @@
+---
+title: Locks, Job Queues and Deadlocks
+description: How PostgreSQL locks rows and tables, SELECT FOR UPDATE and SKIP LOCKED job queues, why deadlocks happen and how to avoid them, and advisory locks for your own app.
+duration: 25
+xp: 30
+---
+
+A team ran a one-line migration on a Tuesday afternoon: `ALTER TABLE orders ADD COLUMN gift_note text`. On a test database it took 3 milliseconds. In production the site went **down for four minutes**. The `ALTER` itself was instant; the problem was a slow analytics query that had been reading `orders` for a while. The `ALTER` had to **wait** for it, and every normal query that arrived after the `ALTER` queued up **behind** it. Thousands of checkouts piled up waiting for a lock. 🔒
+
+Locks are how PostgreSQL keeps concurrent transactions from corrupting each other. Most of the time you never notice them. This lesson is about the times you do: row locks and `SELECT … FOR UPDATE`, job queues with `SKIP LOCKED`, deadlocks, table locks during migrations and advisory locks.
+
+<Callout type="note" title="One connection here, two in real life">
+
+Locks only matter between **different** sessions, and this in-browser database has just one. So the runnable examples show the syntax and what PostgreSQL records about locks, and the conflicts themselves are drawn as timelines with session **A** on the left and **B** on the right. Open two `psql` windows on your own computer to replay any of them.
+
+</Callout>
+
+## Row locks: writers wait for writers
+
+Every `UPDATE` and `DELETE` **locks the rows it changes** until its transaction ends. Thanks to MVCC (next lesson), that lock never blocks **readers**: a plain `SELECT` just sees the last committed version. It only blocks other **writers** of the same rows:
+
+```text
+A: BEGIN;
+A: UPDATE products SET stock = stock - 1
+     WHERE id = 1;          -- locks row 1
+                                B: SELECT stock FROM products
+                                     WHERE id = 1;  -- 40, no wait
+                                B: UPDATE products SET stock = 0
+                                     WHERE id = 1;  -- waits...
+A: COMMIT;                      B: -- ...continues: UPDATE 1
+```
+
+That's the rule to remember: **readers never wait for writers, and writers never wait for readers** in PostgreSQL. Only two transactions writing the same row queue up, and only until the first one ends. So the longer your transactions are, the longer everybody else waits.
+
+## SELECT … FOR UPDATE: lock while you decide
+
+Sometimes you must read a row, think, and then write. Last lesson showed what goes wrong if someone else writes in between. **`SELECT … FOR UPDATE`** reads the rows **and locks them** as if you had already updated them, so another `FOR UPDATE` or `UPDATE` of those rows waits until you commit:
+
+<CodeExample output={`BEGIN
+
+ id |     name      | stock
+----+---------------+-------
+  2 | Matcha Powder |    12
+(1 row)
+
+UPDATE 1
+
+    locked     |       mode
+---------------+------------------
+ products      | RowExclusiveLock
+ products      | RowShareLock
+ products_pkey | RowExclusiveLock
+ products_pkey | RowShareLock
+(4 rows)
+
+COMMIT`}>
+
+```sql
+BEGIN;
+
+SELECT id, name, stock
+FROM products
+WHERE id = 2
+FOR UPDATE;
+
+-- ...the app checks the stock, talks to the warehouse...
+UPDATE products SET stock = stock - 1 WHERE id = 2;
+
+SELECT relation::regclass AS locked, mode
+FROM pg_locks
+WHERE locktype = 'relation' AND pid = pg_backend_pid()
+  AND relation IN ('products'::regclass,
+    'products_pkey'::regclass)
+ORDER BY relation::regclass::text, mode;
+
+COMMIT;
+```
+
+</CodeExample>
+
+The **`pg_locks`** view lists the locks each session holds. Notice the table-level locks: `RowShareLock` from `FOR UPDATE` and `RowExclusiveLock` from the `UPDATE`, on the table and on its primary key index. These "row" modes on a table don't conflict with each other, so thousands of sessions can lock **different** rows of `products` at once. The row locks themselves aren't in `pg_locks` at all: PostgreSQL writes them **into the row** (in its hidden `xmax` column, as you'll see in the next lesson), so locking a million rows doesn't need a million entries in memory.
+
+`FOR UPDATE` has three lighter siblings, for when you need less:
+
+| Clause | Blocks other sessions from… | Typical use |
+| --- | --- | --- |
+| `FOR UPDATE` | updating, deleting or locking the row | read-then-write on the row |
+| `FOR NO KEY UPDATE` | the same, but lets foreign-key checks through | what a normal `UPDATE` takes |
+| `FOR SHARE` | updating or deleting the row (others may share) | "this row must not change until I commit" |
+| `FOR KEY SHARE` | deleting the row or changing its key | what foreign-key checks take automatically |
+
+### Not waiting: NOWAIT and lock_timeout
+
+By default a blocked statement waits **forever**. Two ways to say "don't":
+
+- **`FOR UPDATE NOWAIT`** fails at once with `could not obtain lock on row` if the row is locked. Good for "this seat is being booked by someone else, pick another".
+- **`SET lock_timeout = '2s'`** makes any statement in the session give up after 2 seconds: `canceling statement due to lock timeout`. A must before migrations, as you'll see below.
+
+## Job queues with SKIP LOCKED
+
+Many apps keep a **queue table** of background work: emails to send, images to resize, reports to build. Several **worker** processes take jobs from it. The naive version has two workers grab the **same** job:
+
+```text
+A: SELECT id FROM jobs WHERE status = 'queued'
+     ORDER BY id LIMIT 1;    -- 1
+                                B: SELECT id FROM jobs WHERE ...
+                                     ORDER BY id LIMIT 1;  -- 1
+A: UPDATE jobs SET status = 'running' WHERE id = 1;
+                                B: UPDATE jobs
+                                     SET status = 'running'
+                                     WHERE id = 1;
+-- both workers send the same email
+```
+
+`FOR UPDATE` alone fixes the duplicates, but then worker B **waits** for worker A's job instead of taking the next one: the workers run one at a time. **`FOR UPDATE SKIP LOCKED`** is the fix that turned PostgreSQL into a respectable queue: it simply **skips** rows another transaction has locked, so each worker gets a different job with no waiting:
+
+```text
+A: ... LIMIT 1 FOR UPDATE SKIP LOCKED;  -- job 1 (locks it)
+                                B: ... LIMIT 1
+                                     FOR UPDATE SKIP LOCKED;
+                                     -- 1 is locked: skip → job 2
+```
+
+The whole "claim a job" step is usually one statement: a subquery finds and locks the next job, and the `UPDATE` marks it as taken and returns it to the worker:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+ id |    kind    | attempts
+----+------------+----------
+  1 | send_email |        1
+(1 row)
+
+ id |     kind     | attempts
+----+--------------+----------
+  2 | resize_image |        1
+(1 row)
+
+ id |     kind     | status  | attempts
+----+--------------+---------+----------
+  1 | send_email   | running |        1
+  2 | resize_image | running |        1
+  3 | send_email   | queued  |        0
+(3 rows)`}>
+
+```sql
+CREATE TABLE jobs (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  kind text NOT NULL,
+  status text NOT NULL DEFAULT 'queued',
+  attempts integer NOT NULL DEFAULT 0
+);
+INSERT INTO jobs (kind)
+VALUES ('send_email'), ('resize_image'), ('send_email');
+
+UPDATE jobs
+SET status = 'running', attempts = attempts + 1
+WHERE id = (
+  SELECT id
+  FROM jobs
+  WHERE status = 'queued'
+  ORDER BY id
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, kind, attempts;
+
+UPDATE jobs
+SET status = 'running', attempts = attempts + 1
+WHERE id = (
+  SELECT id
+  FROM jobs
+  WHERE status = 'queued'
+  ORDER BY id
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, kind, attempts;
+
+SELECT * FROM jobs ORDER BY id;
+```
+
+</CodeExample>
+
+The second claim got job 2, because job 1 was no longer `queued`. With many workers running this at the same moment, each one gets a different job.
+
+Two designs for what happens next:
+
+- **Hold the lock while working**: claim inside `BEGIN`, do the work, mark the job `done`, `COMMIT`. If the worker crashes, its transaction rolls back and the job is `queued` again automatically. Simple, but the transaction stays open as long as the job runs, which is bad for minutes-long jobs (next lesson explains why).
+- **Claim, commit, then work**: the claim commits straight away with a `locked_until = now() + interval '5 minutes'` lease, and a job whose lease expired can be claimed again. Short transactions, but you must handle the "worker died" case yourself.
+
+<Callout type="tip" title="An index for the queue">
+
+The claim query runs constantly, and finished jobs pile up. A **partial index** on just the waiting jobs keeps it fast however big the table grows: `CREATE INDEX ON jobs (priority DESC, id) WHERE status = 'queued';`. Delete or archive finished jobs regularly too.
+
+</Callout>
+
+## Deadlocks
+
+A **deadlock** is two transactions each waiting for a lock the other one holds. Neither can ever continue:
+
+```text
+A: BEGIN;                       B: BEGIN;
+A: UPDATE accounts
+     SET balance = balance - 10
+     WHERE id = 1;  -- locks 1
+                                B: UPDATE accounts
+                                     SET balance = balance - 5
+                                     WHERE id = 2;  -- locks 2
+A: UPDATE accounts
+     SET balance = balance + 10
+     WHERE id = 2;  -- waits for B
+                                B: UPDATE accounts
+                                     SET balance = balance + 5
+                                     WHERE id = 1;  -- waits for A
+-- after deadlock_timeout (1 s), PostgreSQL picks a victim:
+                                B: ERROR:  deadlock detected
+                                   DETAIL: Process 812 waits for
+                                   ShareLock on transaction 5531;
+                                   blocked by process 790. ...
+A: -- continues: UPDATE 1
+```
+
+PostgreSQL checks for cycles after waiting `deadlock_timeout` (1 second by default) and aborts **one** of the transactions with SQLSTATE `40P01`. The other carries on. Deadlocks never hang forever, but each one costs a second of waiting plus a failed transaction.
+
+The cure is almost always the same: **lock things in a consistent order**. If every transfer locks the lower account id first, A and B can't each hold "the other one's" row. One way is to lock both rows up front, sorted:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+BEGIN
+
+ id | balance
+----+---------
+  1 |  100.00
+  2 |   50.00
+(2 rows)
+
+UPDATE 1
+
+UPDATE 1
+
+COMMIT`}>
+
+```sql
+CREATE TABLE accounts (
+  id integer PRIMARY KEY,
+  balance numeric(10, 2) NOT NULL
+);
+INSERT INTO accounts VALUES (1, 100), (2, 50);
+
+-- A transfer from 2 to 1: lock both rows, lowest id first
+BEGIN;
+SELECT id, balance
+FROM accounts
+WHERE id IN (2, 1)
+ORDER BY id
+FOR UPDATE;
+UPDATE accounts SET balance = balance - 5 WHERE id = 2;
+UPDATE accounts SET balance = balance + 5 WHERE id = 1;
+COMMIT;
+```
+
+</CodeExample>
+
+The other habits: keep transactions **short**, touch rows in the same order everywhere in the code (for batch updates, `ORDER BY id` in the subquery that selects the rows), and treat `40P01` like a serialization failure: **retry** the transaction.
+
+## Table locks and the migration incident
+
+Every statement also takes a lock on the **tables** it touches. The common ones, from weakest to strongest:
+
+| Lock mode | Taken by | Conflicts with |
+| --- | --- | --- |
+| `ACCESS SHARE` | `SELECT` | only `ACCESS EXCLUSIVE` |
+| `ROW SHARE` | `SELECT … FOR UPDATE / SHARE` | `EXCLUSIVE`, `ACCESS EXCLUSIVE` |
+| `ROW EXCLUSIVE` | `INSERT`, `UPDATE`, `DELETE` | `SHARE` and stronger |
+| `SHARE` | `CREATE INDEX` (without `CONCURRENTLY`) | writes (`ROW EXCLUSIVE`) |
+| `ACCESS EXCLUSIVE` | most `ALTER TABLE`, `DROP`, `TRUNCATE`, `VACUUM FULL` | **everything**, even `SELECT` |
+
+You can watch a migration take the strongest one:
+
+<CodeExample output={`BEGIN
+
+ALTER TABLE
+
+ locked_table |        mode
+--------------+---------------------
+ products     | AccessExclusiveLock
+(1 row)
+
+ROLLBACK`}>
+
+```sql
+BEGIN;
+ALTER TABLE products ADD COLUMN weight_g integer;
+
+SELECT relation::regclass AS locked_table, mode
+FROM pg_locks
+WHERE locktype = 'relation'
+  AND relation = 'products'::regclass;
+ROLLBACK;
+```
+
+</CodeExample>
+
+Now the incident makes sense. Lock requests wait in a **queue**, in order:
+
+```text
+A (report):  SELECT ... FROM orders ...      -- ACCESS SHARE, runs 4 min
+B (migrate): ALTER TABLE orders ADD ...      -- wants ACCESS EXCLUSIVE:
+                                             -- waits for A
+C, D, E... : SELECT * FROM orders WHERE ...  -- ACCESS SHARE would fit
+                                             -- with A, but queues
+                                             -- behind B!
+```
+
+The fix is cheap: run migrations with a **short `lock_timeout`** and retry them:
+
+```sql
+SET lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN gift_note text;
+-- ERROR: canceling statement due to lock timeout → try again later
+```
+
+Failing after 2 seconds blocks traffic for at most 2 seconds. Also use the non-blocking variants where they exist, such as `CREATE INDEX CONCURRENTLY` (the data modelling module covers safe migrations in depth).
+
+## Advisory locks: locks for your own ideas
+
+Sometimes the thing you need to protect isn't a row. "Only one server may run the nightly billing job." "Only one request at a time may rebuild this customer's cache." **Advisory locks** are locks on a **number** that PostgreSQL holds for you; what the number means is up to your app:
+
+<CodeExample output={` got_lock
+----------
+ t
+(1 row)
+
+ released
+----------
+ t
+(1 row)
+
+BEGIN
+
+ got_lock
+----------
+ t
+(1 row)
+
+ locktype |     mode      | granted
+----------+---------------+---------
+ advisory | ExclusiveLock | t
+(1 row)
+
+COMMIT
+
+ advisory_locks_left
+---------------------
+                   0
+(1 row)`}>
+
+```sql
+-- Session-level: held until unlocked or the session ends
+SELECT pg_try_advisory_lock(42) AS got_lock;
+SELECT pg_advisory_unlock(42) AS released;
+
+-- Transaction-level: released automatically at COMMIT/ROLLBACK
+BEGIN;
+SELECT pg_try_advisory_xact_lock(hashtext('nightly-billing'))
+  AS got_lock;
+SELECT locktype, mode, granted
+FROM pg_locks
+WHERE locktype = 'advisory';
+COMMIT;
+
+SELECT count(*) AS advisory_locks_left
+FROM pg_locks
+WHERE locktype = 'advisory';
+```
+
+</CodeExample>
+
+- **`pg_try_advisory_lock(n)`** returns `true` if it got the lock and `false` straight away if another session holds it. A cron job that starts with `IF NOT pg_try_advisory_lock(…) THEN exit` can safely run on every server: only one does the work.
+- **`pg_advisory_lock(n)`** (without "try") waits until the lock is free.
+- The **`_xact`** versions are released automatically at the end of the transaction, so you can't forget to unlock. Prefer them.
+- **`hashtext('name')`** turns a readable name into the number, a common convention.
+
+<Callout type="warning" title="Session advisory locks and connection poolers">
+
+A session-level advisory lock belongs to the **database connection**, not to your request. Behind a pooler like PgBouncer in transaction mode, your next statement may run on a different connection, so you may "unlock" on a connection that never held the lock while the real one stays locked forever. With poolers, use the `_xact` versions only.
+
+</Callout>
+
+## Who is blocking whom?
+
+When an app hangs in production, these queries (on a real server; they need other sessions to show anything) find the culprit:
+
+```sql
+-- Sessions that are waiting, and who blocks them
+SELECT pid, pg_blocking_pids(pid) AS blocked_by,
+  wait_event_type, state, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+
+-- Transactions open for more than 5 minutes
+SELECT pid, now() - xact_start AS open_for, state,
+  left(query, 60) AS query
+FROM pg_stat_activity
+WHERE xact_start < now() - interval '5 minutes'
+ORDER BY xact_start;
+
+-- Last resort: end the blocker
+SELECT pg_terminate_backend(12345);
+```
+
+The blocker is very often a session in state **`idle in transaction`**: an app that ran `BEGIN`, did something, and then went off to call an HTTP API or crashed without closing the transaction. It holds its locks the whole time. Setting `idle_in_transaction_session_timeout` makes PostgreSQL end such sessions automatically.
+
+<Quiz
+  question="Two workers run the same claim query with FOR UPDATE SKIP LOCKED at the same moment, and jobs 1 and 2 are queued. What happens?"
+  options={["Both get job 1", "One gets job 1, the other waits until the first commits and then gets job 1 too", "One gets job 1, the other skips it and gets job 2", "The second worker gets an error"]}
+  answer={2}
+  explanation="SKIP LOCKED makes the second worker ignore rows another transaction has locked, so it moves on to the next queued job instead of waiting. Plain FOR UPDATE would make it wait; no locking at all would let both take job 1."
+/>
+
+<Quiz
+  question="A migration runs ALTER TABLE orders ADD COLUMN note text while a long report reads orders. Why do ordinary SELECTs on orders start hanging?"
+  options={["ALTER TABLE rewrites the whole table first", "The ALTER waits for an ACCESS EXCLUSIVE lock, and new requests queue behind it even though they'd be compatible with the report", "SELECT always waits for writers in PostgreSQL", "The report holds an exclusive lock on orders"]}
+  answer={1}
+  explanation="Lock requests are granted in order. The ALTER needs ACCESS EXCLUSIVE, which conflicts with the report's ACCESS SHARE, so it waits. Every later SELECT conflicts with the waiting ALTER and queues behind it. A short lock_timeout on the migration limits the damage."
+/>
+
+<Exercise
+  language="sql"
+  title="Claim the next job"
+  starter={`CREATE TABLE jobs (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  kind text NOT NULL,
+  priority integer NOT NULL DEFAULT 0,
+  status text NOT NULL DEFAULT 'queued',
+  run_at timestamptz NOT NULL,
+  attempts integer NOT NULL DEFAULT 0
+);
+INSERT INTO jobs (kind, priority, status, run_at) VALUES
+  ('send_email',    0, 'queued', '2025-06-01 09:00'),
+  ('build_report',  5, 'queued', '2025-06-01 09:05'),
+  ('send_email',    5, 'queued', '2025-06-01 09:10'),
+  ('cleanup',       9, 'done',   '2025-06-01 07:00'),
+  ('yearly_backup', 9, 'queued', '2999-01-01 00:00'),
+  ('resize_image',  0, 'queued', '2025-06-01 08:00');
+
+-- Claim the next job: one statement, see the task
+SELECT id, kind, attempts
+FROM jobs
+WHERE status = 'queued'
+ORDER BY id
+LIMIT 1;`}
+  tests={[
+    { name: "Returns the columns id, kind, attempts", check: "columns.join() === 'id,kind,attempts'" },
+    { name: "Claims the most urgent due job: build_report (priority 5, oldest), attempts 1", check: "rows.length === 1 && rows[0].id === 2 && rows[0].kind === 'build_report' && rows[0].attempts === 1" },
+    { name: "Marks the claimed job as running", check: "(await query(\"SELECT status FROM jobs WHERE id = 2\"))[0].status === 'running'" },
+    { name: "Locks the row with FOR UPDATE SKIP LOCKED", check: "/FOR\\s+UPDATE\\s+SKIP\\s+LOCKED/i.test(lastQuery)" },
+    { name: "A new urgent job is claimed next", check: "(await rerun(\"INSERT INTO jobs (kind, priority, run_at) VALUES ('refund', 10, '2025-06-01 10:00')\")).map(r => r.kind).join() === 'refund'" },
+    { name: "Then by priority and run_at; done and future jobs are never claimed", check: "[(await rerun()), (await rerun()), (await rerun()), (await rerun())].map(rs => rs.map(r => r.id).join() || 'none').join() === '3,6,1,none'" },
+  ]}
+>
+
+Build the **claim** step for the shop's job queue. Each run of your statement must take **one** job and hand it to the worker. Replace the starter's last query with a single `UPDATE … RETURNING` statement that:
+
+1. picks the next job that is `queued` and **due** (`run_at <= now()`), the highest `priority` first, then the earliest `run_at`, then the lowest `id`,
+2. locks it with **`FOR UPDATE SKIP LOCKED`** so parallel workers never take the same job and never wait for each other,
+3. sets its `status` to `'running'` and adds 1 to `attempts`,
+4. returns `id`, `kind` and `attempts`.
+
+The checks run your statement again and again, like a worker would: it must claim a different job every time and return nothing once no due job is left (the `cleanup` job is done, and the backup isn't due until 2999).
+
+<Hint>
+
+Use the shape from the lesson: `UPDATE jobs SET … WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY priority DESC, run_at, id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id, kind, attempts;`. When the subquery finds no row, it returns NULL, `id = NULL` matches nothing, and the `UPDATE` returns no rows, which is exactly "no job for you".
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE jobs (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  kind text NOT NULL,
+  priority integer NOT NULL DEFAULT 0,
+  status text NOT NULL DEFAULT 'queued',
+  run_at timestamptz NOT NULL,
+  attempts integer NOT NULL DEFAULT 0
+);
+INSERT INTO jobs (kind, priority, status, run_at) VALUES
+  ('send_email',    0, 'queued', '2025-06-01 09:00'),
+  ('build_report',  5, 'queued', '2025-06-01 09:05'),
+  ('send_email',    5, 'queued', '2025-06-01 09:10'),
+  ('cleanup',       9, 'done',   '2025-06-01 07:00'),
+  ('yearly_backup', 9, 'queued', '2999-01-01 00:00'),
+  ('resize_image',  0, 'queued', '2025-06-01 08:00');
+
+UPDATE jobs
+SET status = 'running', attempts = attempts + 1
+WHERE id = (
+  SELECT id
+  FROM jobs
+  WHERE status = 'queued' AND run_at <= now()
+  ORDER BY priority DESC, run_at, id
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, kind, attempts;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- `UPDATE` and `DELETE` lock the rows they change until the transaction ends. Writers wait for writers of the **same rows**; readers and writers never block each other.
+- **`SELECT … FOR UPDATE`** locks rows you're about to change; `NOWAIT` and `lock_timeout` stop you from waiting forever. Row locks live in the rows, table-level modes in `pg_locks`.
+- **`FOR UPDATE SKIP LOCKED`** turns a table into a safe, parallel job queue: one `UPDATE … WHERE id = (SELECT … LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING …`.
+- **Deadlocks** are detected after `deadlock_timeout` and one transaction fails with `40P01`. Lock in a consistent order, keep transactions short and retry.
+- `ALTER TABLE` and friends take `ACCESS EXCLUSIVE`, and waiting lock requests block everything behind them: run migrations with a short **`lock_timeout`**.
+- **Advisory locks** lock an app-defined number; prefer the `_xact` versions, especially behind a connection pooler.
+- In production, `pg_stat_activity` with `pg_blocking_pids()` shows who blocks whom, and `idle in transaction` sessions are the usual suspects.

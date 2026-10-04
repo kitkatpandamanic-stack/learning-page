@@ -1,0 +1,411 @@
+---
+title: Рекурсивные CTE
+description: Обходите оргструктуры, генерируйте последовательности и ищите пути в сетях с WITH RECURSIVE, а ограничение глубины и предложение CYCLE защитят от бесконечных циклов.
+duration: 24
+xp: 25
+---
+
+У некоторых вопросов нет фиксированного числа шагов. «Кто подчиняется Alan Turing **напрямую или косвенно**?» — это может быть один уровень руководителей, а может быть десять. «Как доехать на поезде из Лондона в Рим?» — с двумя пересадками или с шестью. Обычный запрос делает фиксированное число соединений, поэтому на такие вопросы ответить не может.
+
+А **рекурсивное CTE (recursive CTE)** может. Оно выполняет запрос, подаёт результат обратно в тот же запрос и продолжает, пока не перестанут появляться новые строки. Так SQL обходит **деревья** (оргструктуры, категории, ветки комментариев, папки) и **графы** (сети, маршруты, зависимости). 🌳
+
+## Анатомия WITH RECURSIVE
+
+Вот самое маленькое полезное рекурсивное CTE: счёт от 1 до 5.
+
+<CodeExample output={` n
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)`}>
+
+```sql
+WITH RECURSIVE counter (n) AS (
+  SELECT 1                -- 1. якорь: с чего начать
+  UNION ALL
+  SELECT n + 1            -- 2. рекурсивная часть
+  FROM counter
+  WHERE n < 5             -- 3. когда остановиться
+)
+SELECT n FROM counter;
+```
+
+</CodeExample>
+
+У рекурсивного CTE всегда три одинаковые части:
+
+1. **Якорь (anchor, non-recursive term)**: обычный запрос, который даёт стартовые строки. Здесь — одна строка с `n = 1`.
+2. **`UNION ALL`** и **рекурсивная часть (recursive term)**: запрос, который ссылается на само CTE (`FROM counter`).
+3. **Условие остановки**, обычно `WHERE` в рекурсивной части.
+
+PostgreSQL выполняет это как цикл. Строки якоря попадают в «рабочую таблицу» (working table). Затем выполняется рекурсивная часть, **используя только строки предыдущего шага**, её новые строки становятся следующей рабочей таблицей, и так далее. Когда шаг не возвращает ни одной строки (здесь — когда `n < 5` перестаёт быть истинным), цикл заканчивается, а строки всех шагов вместе образуют результат:
+
+```text
+шаг 0 (якорь):     n = 1
+шаг 1:             n = 2         (из 1)
+шаг 2:             n = 3         (из 2)
+шаг 3:             n = 4         (из 3)
+шаг 4:             n = 5         (из 4)
+шаг 5:             строк нет     (5 < 5 ложно), готово
+```
+
+## Циклы с неизвестным числом шагов
+
+Для простых последовательностей чисел или дат проще `generate_series`. Рекурсия раскрывается, когда **каждый шаг зависит от предыдущего** и заранее неизвестно, сколько шагов понадобится. Вот кредит в 1000 под 10% годовых, который гасится по 300 в год: через сколько лет он будет выплачен?
+
+<CodeExample output={` year | balance
+------+---------
+    0 | 1000.00
+    1 |  800.00
+    2 |  580.00
+    3 |  338.00
+    4 |   71.80
+    5 |    0.00
+(6 rows)`}>
+
+```sql
+WITH RECURSIVE loan (year, balance) AS (
+  SELECT 0, 1000.00
+  UNION ALL
+  SELECT year + 1,
+    round(balance * 1.10 - least(300, balance * 1.10), 2)
+  FROM loan
+  WHERE balance > 0
+)
+SELECT year, balance FROM loan;
+```
+
+</CodeExample>
+
+Остаток каждого года вычисляется из предыдущего, и цикл сам останавливается, как только остаток доходит до нуля. (`least(300, ...)` делает последний платёж ровно таким, какой нужен.)
+
+## Спуск по дереву: оргструктура
+
+Таблица `employees` — это **дерево**: у каждого сотрудника есть `manager_id`, указывающий на другого сотрудника, а у CEO его нет. Чтобы нарисовать оргструктуру, якорь выбирает корень, а рекурсивная часть находит сотрудников, чей руководитель — строка с предыдущего шага. Для краткости здесь мы идём только по Engineering и Design:
+
+<CodeExample output={`           org_chart           |   job_title
+-------------------------------+----------------
+ Grace Hopper                  | CEO
+     Alan Turing               | CTO
+         Ada Lovelace          | Lead Engineer
+             Ken Thompson      | Engineer
+             Linus Park        | Engineer
+             Margaret Hamilton | Engineer
+         Barbara Liskov        | Architect
+     Don Norman                | Head of Design
+         Dieter Rams           | Designer
+         Susan Kare            | Designer
+(10 rows)`}>
+
+```sql
+WITH RECURSIVE org AS (
+  SELECT id, name, job_title, 0 AS depth, ARRAY[name] AS path
+  FROM employees
+  WHERE manager_id IS NULL
+  UNION ALL
+  SELECT e.id, e.name, e.job_title, org.depth + 1,
+    org.path || e.name
+  FROM employees AS e
+  JOIN org ON e.manager_id = org.id
+  WHERE e.department_id IN (1, 2)
+)
+SELECT repeat('    ', depth) || name AS org_chart, job_title
+FROM org
+ORDER BY path;
+```
+
+</CodeExample>
+
+Два дополнительных столбца делают большую работу:
+
+- **`depth`** начинается с 0 и растёт на 1 с каждым уровнем, поэтому `repeat('    ', depth)` делает отступ перед каждым именем.
+- **`path`** — это **массив (array)** имён сверху вниз до этого человека (`||` добавляет элемент в массив). Сортировка по нему ставит каждого сразу под его руководителем, как в дереве папок.
+
+Рекурсивная часть останавливается сама: инженеры никем не руководят, поэтому следующий после них шаг не находит строк.
+
+## Подъём по дереву: цепочка подчинения
+
+Переверните соединение — и вы пойдёте **вверх**. Начните с одного сотрудника и на каждом шаге находите руководителя строки с предыдущего шага:
+
+<CodeExample output={` steps |     name
+-------+--------------
+     0 | Ken Thompson
+     1 | Ada Lovelace
+     2 | Alan Turing
+     3 | Grace Hopper
+(4 rows)`}>
+
+```sql
+WITH RECURSIVE chain AS (
+  SELECT id, name, manager_id, 0 AS steps
+  FROM employees
+  WHERE name = 'Ken Thompson'
+  UNION ALL
+  SELECT m.id, m.name, m.manager_id, chain.steps + 1
+  FROM employees AS m
+  JOIN chain ON m.id = chain.manager_id
+)
+SELECT steps, name
+FROM chain
+ORDER BY steps;
+```
+
+</CodeExample>
+
+Весь фокус — в условии соединения. Вниз: `e.manager_id = org.id` («люди, чей руководитель — предыдущая строка»). Вверх: `m.id = chain.manager_id` («человек, который является руководителем предыдущей строки»). Перепутать их — самая частая ошибка в рекурсивных CTE, так что, когда пишете такое условие, проговорите его вслух.
+
+## Итоги для каждого поддерева
+
+Вопрос «сколько людей работает под каждым руководителем и во что обходятся их команды?» требует каждой пары **(руководитель, кто-то ниже него)**. Начните с того, что каждый сотрудник образует пару сам с собой, и пусть рекурсия добавит всех, кто ниже:
+
+<CodeExample output={`     name     | people_below | team_salary
+--------------+--------------+-------------
+ Grace Hopper |           19 |     1430500
+ Alan Turing  |            5 |      420000
+ Ada Lovelace |            3 |      217000
+ Mary Kay     |            3 |      147000
+ Don Norman   |            2 |      125000
+ Hana Sato    |            2 |       77500
+ Marie Curie  |            2 |      164000
+(7 rows)`}>
+
+```sql
+WITH RECURSIVE below AS (
+  SELECT id AS boss_id, id AS employee_id
+  FROM employees
+  UNION ALL
+  SELECT below.boss_id, e.id
+  FROM employees AS e
+  JOIN below ON e.manager_id = below.employee_id
+)
+SELECT boss.name,
+  count(*) - 1 AS people_below,
+  sum(e.salary) - boss.salary AS team_salary
+FROM below
+JOIN employees AS boss ON boss.id = below.boss_id
+JOIN employees AS e ON e.id = below.employee_id
+GROUP BY boss.id
+HAVING count(*) > 1
+ORDER BY people_below DESC, boss.name;
+```
+
+</CodeExample>
+
+`- 1` и `- boss.salary` убирают пару каждого руководителя с самим собой. Под Grace Hopper находятся все 19 остальных сотрудников.
+
+<Quiz
+  question="Какие строки видит рекурсивная часть рекурсивного CTE при каждом выполнении?"
+  options={[
+    "Все строки, полученные к этому моменту",
+    "Только строки, полученные на предыдущем шаге",
+    "Только строки якоря",
+    "Всю таблицу, с которой она соединяется",
+  ]}
+  answer={1}
+  explanation="Каждый шаг работает с рабочей таблицей — строками, которые дал предыдущий шаг. Поэтому цикл заканчивается, как только шаг не даёт новых строк. Итоговый результат — это строки всех шагов вместе."
+/>
+
+## Пути в графе
+
+В дереве к каждому узлу ведёт ровно один путь сверху. В **графе (graph)** маршрутов может быть много, а ещё бывают **циклы (cycles)**: Лондон → Париж → Лондон → Париж… и так бесконечно. Вот небольшая железнодорожная сеть и все способы добраться из Лондона в Рим:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 12
+
+                            route                            | hours
+-------------------------------------------------------------+-------
+ London → Paris → Milan → Rome                               |  12.5
+ London → Brussels → Paris → Milan → Rome                    |  13.5
+ London → Brussels → Cologne → Munich → Rome                 |  18.0
+ London → Brussels → Cologne → Munich → Milan → Rome         |  19.0
+ London → Paris → Brussels → Cologne → Munich → Rome         |  20.0
+ London → Paris → Brussels → Cologne → Munich → Milan → Rome |  21.0
+(6 rows)`}>
+
+```sql
+CREATE TABLE rail_links (
+  from_city text NOT NULL,
+  to_city text NOT NULL,
+  hours numeric NOT NULL
+);
+
+INSERT INTO rail_links VALUES
+  ('London', 'Paris', 2.5), ('Paris', 'London', 2.5),
+  ('London', 'Brussels', 2.0), ('Brussels', 'London', 2.0),
+  ('Paris', 'Brussels', 1.5), ('Brussels', 'Paris', 1.5),
+  ('Paris', 'Milan', 7.0), ('Brussels', 'Cologne', 2.0),
+  ('Cologne', 'Munich', 4.5), ('Munich', 'Milan', 7.5),
+  ('Munich', 'Rome', 9.5), ('Milan', 'Rome', 3.0);
+
+WITH RECURSIVE trips AS (
+  SELECT to_city AS city, ARRAY['London', to_city] AS route, hours
+  FROM rail_links
+  WHERE from_city = 'London'
+  UNION ALL
+  SELECT l.to_city, t.route || l.to_city, t.hours + l.hours
+  FROM trips AS t
+  JOIN rail_links AS l ON l.from_city = t.city
+  WHERE NOT l.to_city = ANY (t.route)
+)
+SELECT array_to_string(route, ' → ') AS route, hours
+FROM trips
+WHERE city = 'Rome'
+ORDER BY hours, route;
+```
+
+</CodeExample>
+
+Безопасность здесь обеспечивает строка **`WHERE NOT l.to_city = ANY (t.route)`**: никогда не ехать в город, который уже есть на этом маршруте. Без неё поезда между Лондоном, Парижем и Брюсселем ходили бы по кругу, и запрос никогда бы не завершился. Заметьте также, что итоговое `WHERE city = 'Rome'` стоит **снаружи** CTE: рекурсия исследует все маршруты, а внешний запрос выбирает те, что заканчиваются в Риме.
+
+<Callout type="warning" title="Типы рекурсивных столбцов должны совпадать">
+
+Если бы `hours` имел тип `numeric(4, 1)`, этот запрос упал бы с ошибкой «column 3 has type numeric(4,1) in non-recursive term but type numeric overall»: `t.hours + l.hours` даёт просто `numeric`, а это не совпадает с типом в якоре. Решение — приведение типа в якоре (`hours::numeric`). С текстом то же самое: `ARRAY[name]` и `path || e.name` должны быть одного типа.
+
+</Callout>
+
+## Как обезопасить рекурсию
+
+Рекурсивное CTE, которое никогда не останавливается, работает, пока не заполнит диск или пока кто-нибудь его не отменит. Данные, которым вы доверяете сегодня, завтра могут обзавестись циклом: один неверный `UPDATE` — и Grace Hopper подчиняется Linus Park, который (косвенно) подчиняется Grace Hopper. Ваши варианты, от самого простого к самому надёжному:
+
+- **Ограничение глубины**: несите с собой столбец `depth` и добавьте `WHERE depth < 20` в рекурсивную часть. Грубо, но железно.
+- **Список посещённых**: несите массив уже встреченных id и останавливайтесь через `NOT id = ANY (path)`, как в примере с поездами.
+- **Предложение `CYCLE`** (PostgreSQL 14+): оно ведёт учёт посещённых за вас. Укажите столбец (или столбцы), который идентифицирует строку, а также столбец-флаг и столбец пути, которые PostgreSQL заполнит сам:
+
+<CodeExample output={`UPDATE 1
+
+     name     | is_cycle
+--------------+----------
+ Linus Park   | f
+ Ada Lovelace | f
+ Alan Turing  | f
+ Grace Hopper | f
+ Linus Park   | t
+(5 rows)`}>
+
+```sql
+UPDATE employees SET manager_id = 4 WHERE name = 'Grace Hopper';
+
+WITH RECURSIVE chain AS (
+  SELECT id, name, manager_id
+  FROM employees
+  WHERE name = 'Linus Park'
+  UNION ALL
+  SELECT m.id, m.name, m.manager_id
+  FROM employees AS m
+  JOIN chain ON m.id = chain.manager_id
+) CYCLE id SET is_cycle USING visited
+SELECT name, is_cycle
+FROM chain;
+```
+
+</CodeExample>
+
+Когда шаг доходит до `id`, который уже есть на его пути, PostgreSQL выдаёт эту строку с `is_cycle = true` и дальше по ней не идёт. Отфильтруйте такие строки через `WHERE NOT is_cycle` или поднимайте тревогу по `WHERE is_cycle`, чтобы находить испорченные данные. Родственное предложение `SEARCH DEPTH FIRST BY id SET ordercol` даёт готовый столбец для сортировки дерева — примерно как наш `path`.
+
+<Callout type="tip" title="UNION вместо UNION ALL">
+
+С `UNION` PostgreSQL отбрасывает строки, которые уже выдавал, и это тоже обрывает некоторые циклы — но только если повторяющиеся строки **в точности** одинаковы. Как только строка несёт `depth` или `path`, все строки становятся разными, и `UNION` вас не спасёт. В продакшене также задайте `statement_timeout` для пользователя базы данных, под которым работает приложение, чтобы вышедший из-под контроля запрос отменялся через несколько секунд, а не мешал всем остальным.
+
+</Callout>
+
+Поэкспериментируйте с оргструктурой всей компании: уберите фильтр по отделам, покажите зарплаты, начните с другого человека или добавьте `WHERE depth < 2`.
+
+<TryIt language="sql" code={`WITH RECURSIVE org AS (
+  SELECT id, name, job_title, 0 AS depth, ARRAY[name] AS path
+  FROM employees
+  WHERE manager_id IS NULL
+  UNION ALL
+  SELECT e.id, e.name, e.job_title, org.depth + 1,
+    org.path || e.name
+  FROM employees AS e
+  JOIN org ON e.manager_id = org.id
+)
+SELECT repeat('    ', depth) || name AS org_chart, job_title
+FROM org
+ORDER BY path;`} />
+
+<Quiz
+  question="Рекурсивное CTE обходит граф, в котором могут быть циклы, и несёт столбец depth. Какое изменение надёжно не даст ему зациклиться навсегда?"
+  options={[
+    "Заменить UNION ALL на UNION",
+    "Добавить ORDER BY в итоговый SELECT",
+    "Добавить в рекурсивную часть ограничение глубины или проверку посещённых (или предложение CYCLE)",
+    "Поставить LIMIT 100 внутрь якоря",
+  ]}
+  answer={2}
+  explanation="Поскольку depth меняется на каждом шаге, одинаковых строк не бывает, и UNION нечего отбрасывать. Рекурсию останавливают ограничение глубины, проверка NOT id = ANY (path) или CYCLE ... SET ... USING. ORDER BY и LIMIT в якоре рекурсивную часть не останавливают."
+/>
+
+<Exercise
+  language="sql"
+  title="Все подчинённые Alan Turing"
+  starter={`WITH RECURSIVE team AS (
+  -- Прямые подчинённые Alan Turing
+  SELECT e.id, e.name, e.manager_id, 1 AS depth
+  FROM employees AS e
+  JOIN employees AS boss ON boss.id = e.manager_id
+  WHERE boss.name = 'Alan Turing'
+  -- добавьте рекурсивную часть здесь
+)
+SELECT name, depth
+FROM team
+ORDER BY depth, name;`}
+  tests={[
+    { name: "Столбцы: name, manager, depth", check: "columns.join() === 'name,manager,depth'" },
+    { name: "Находит всех 5 человек под Alan Turing", check: "rows.length === 5 && rows.map(r => r.name).join() === 'Ada Lovelace,Barbara Liskov,Ken Thompson,Linus Park,Margaret Hamilton'" },
+    { name: "depth равен 1 для прямых подчинённых и 2 для следующего уровня", check: "rows.map(r => r.depth).join() === '1,1,2,2,2'" },
+    { name: "manager — имя руководителя каждого сотрудника", check: "rows.map(r => r.manager).join() === 'Alan Turing,Alan Turing,Ada Lovelace,Ada Lovelace,Ada Lovelace'" },
+    { name: "Сам Alan Turing в список не входит", check: "!rows.some(r => r.name === 'Alan Turing')" },
+    { name: "Проходит любое число уровней", check: "(await rerun(\"INSERT INTO employees (name, department_id, manager_id, job_title, salary, hired_on) VALUES ('Lee Chen', 1, 4, 'Intern', 30000, '2025-06-02'), ('Rui Costa', 2, 9, 'Intern', 30000, '2025-06-02')\")).map(r => r.name + ':' + r.manager + ':' + r.depth).join() === 'Ada Lovelace:Alan Turing:1,Barbara Liskov:Alan Turing:1,Ken Thompson:Ada Lovelace:2,Linus Park:Ada Lovelace:2,Margaret Hamilton:Ada Lovelace:2,Lee Chen:Linus Park:3'" },
+  ]}
+>
+
+CTO, Alan Turing, хочет получить список **всех сотрудников своей части компании**: его прямых подчинённых, их подчинённых и так далее, на любую глубину. Покажите:
+
+- `name`: сотрудник,
+- `manager`: **имя** его непосредственного руководителя,
+- `depth`: 1 для прямых подчинённых Alan, 2 для тех, кто под ними, и так далее,
+- сортировка по глубине, затем по имени. Самого Alan в списке нет.
+
+В заготовке уже есть якорь. Добавьте рекурсивную часть и имя руководителя.
+
+<Hint>
+
+Рекурсивная часть соединяет `employees AS e` с `team` по условию `e.manager_id = team.id` и выбирает `team.depth + 1`. Проще всего получить имя руководителя, если нести его в CTE: выберите `boss.name AS manager` в якоре и `team.name` в рекурсивной части (предыдущая строка **и есть** руководитель). Затем `SELECT name, manager, depth FROM team`.
+
+</Hint>
+
+<Solution>
+
+```sql
+WITH RECURSIVE team AS (
+  SELECT e.id, e.name, boss.name AS manager, 1 AS depth
+  FROM employees AS e
+  JOIN employees AS boss ON boss.id = e.manager_id
+  WHERE boss.name = 'Alan Turing'
+  UNION ALL
+  SELECT e.id, e.name, team.name, team.depth + 1
+  FROM employees AS e
+  JOIN team ON e.manager_id = team.id
+)
+SELECT name, manager, depth
+FROM team
+ORDER BY depth, name;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **`WITH RECURSIVE`** = запрос-**якорь**, `UNION ALL` и **рекурсивная часть**, которая ссылается на CTE. Каждый шаг видит только строки предыдущего шага; цикл заканчивается, когда шаг ничего не возвращает.
+- Используйте рекурсию, когда каждый шаг зависит от предыдущего и число шагов заранее неизвестно; для простых последовательностей проще `generate_series`.
+- **Вниз по дереву**: `JOIN cte ON child.parent_id = cte.id`. **Вверх по дереву**: `JOIN cte ON parent.id = cte.parent_id`. Несите `depth` и массив `path` для отступов и сортировки.
+- Создайте в якоре пару каждого узла с самим собой — и получите **итоги по поддеревьям** обычным `GROUP BY`.
+- **В графах бывают циклы**: защищайтесь ограничением глубины, `NOT id = ANY (path)` или `CYCLE id SET is_cycle USING path`. Один `UNION` не поможет, если строки несут depth или path.
+- Типы столбцов в якоре и рекурсивной части должны совпадать; при необходимости приводите тип в якоре.

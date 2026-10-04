@@ -1,0 +1,353 @@
+---
+title: SQL Injection
+description: See how SQL injection happens when code glues input into SQL, exploit it safely in the sandbox, and fix it with parameters, format() with %I and %L, and allow-lists.
+duration: 22
+xp: 30
+---
+
+**SQL injection** has been on every web security top-ten list for over twenty years, and it still causes major data breaches. The cause is always the same: a program builds SQL by **gluing user input into the SQL text**, so input that contains SQL syntax gets **run** as SQL. In this lesson you'll exploit it (safely, in your sandbox), then learn the fixes, which are simple and should be applied every single time. 💉
+
+## How it happens in application code
+
+Here's a search endpoint written the wrong way, in Python and in JavaScript:
+
+```python
+# Python (psycopg): DON'T
+city = request.args["city"]
+cur.execute(f"SELECT id, name FROM customers WHERE city = '{city}'")
+```
+
+```js
+// JavaScript (node-postgres): DON'T
+const city = req.query.city;
+await pool.query(`SELECT id, name FROM customers WHERE city = '${city}'`);
+```
+
+With `city = London` the database receives exactly what the developer expected. But the user controls `city`, and nothing stops it from containing a quote:
+
+```text
+input:  x' OR '1'='1
+query:  SELECT id, name FROM customers WHERE city = 'x' OR '1'='1'
+                                                    └──── attacker's SQL ────┘
+```
+
+The quote **ends the string early**, and the rest of the input becomes part of the query. `'1'='1'` is always true, so the `WHERE` matches every row.
+
+## Seeing it happen
+
+The same bug can live inside the database, in a PL/pgSQL function that builds a query string and runs it with `EXECUTE`. That lets you try real attacks right here:
+
+<CodeExample output={`CREATE FUNCTION
+
+ id |    name    |  city
+----+------------+--------
+  1 | Mei Lin    | London
+  3 | Ada Brooks | London
+(2 rows)
+
+ leaked
+--------
+     20
+(1 row)`}>
+
+```sql
+-- DON'T: input concatenated into SQL text
+CREATE FUNCTION find_customers(search_city text)
+RETURNS TABLE (id integer, name text, city text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT id, name, city FROM customers WHERE city = '''
+    || search_city || ''' ORDER BY id';
+END $$;
+
+SELECT * FROM find_customers('London');
+
+SELECT count(*) AS leaked
+FROM find_customers($$x' OR '1'='1$$);
+```
+
+</CodeExample>
+
+(`$$…$$` is **dollar quoting**: a string literal in which `'` needs no escaping. It just makes the attack strings easier to read.)
+
+Returning extra customers is only the start. With **`UNION`**, an attacker can make the query return rows from **any table** the connection can read, as long as the column count and types fit. And `--` comments out the rest of the original query:
+
+<CodeExample output={`CREATE FUNCTION
+
+ id |      name      |  city
+----+----------------+--------
+  7 | Barbara Liskov | 105000
+ 18 | Marie Curie    | 112000
+  2 | Alan Turing    | 130000
+  1 | Grace Hopper   | 150000
+(4 rows)`}>
+
+```sql
+CREATE FUNCTION find_customers(search_city text)
+RETURNS TABLE (id integer, name text, city text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT id, name, city FROM customers WHERE city = '''
+    || search_city || ''' ORDER BY id';
+END $$;
+
+SELECT * FROM find_customers(
+  $$x' UNION SELECT id, name, salary::text FROM employees
+     WHERE salary > 100000 ORDER BY 3 --$$
+);
+```
+
+</CodeExample>
+
+A "find customers by city" box just leaked executive salaries. Real attackers go further:
+
+- **Stacked queries**: `x'; DROP TABLE orders; --` works with drivers that send several statements in one string.
+- **Blind injection**: when nothing is shown, they ask yes/no questions (`… AND (SELECT salary FROM employees WHERE id = 1) > 100000 --`) and watch whether the page changes, or time it with `pg_sleep(5)`.
+- **Error-based**: they trigger errors whose messages contain data, e.g. `CAST((SELECT email FROM customers LIMIT 1) AS integer)`.
+
+Escaping quotes by hand ("replace `'` with `''`") is not a fix: it's easy to forget once, and it doesn't help with numbers, identifiers or `LIKE` patterns.
+
+## The fix: parameters
+
+A **parameterised query** sends the SQL text and the values **separately**. The SQL is parsed first, with placeholders like `$1`; the values arrive afterwards and are only ever treated as **data**. Whatever the user types, it can't change the structure of the query. You can see the same mechanism in plain SQL with `PREPARE` and `EXECUTE`:
+
+<CodeExample output={`PREPARE
+
+ id |    name
+----+------------
+  1 | Mei Lin
+  3 | Ada Brooks
+(2 rows)
+
+ id | name
+----+------
+(0 rows)`}>
+
+```sql
+PREPARE customers_in(text) AS
+  SELECT id, name
+  FROM customers
+  WHERE city = $1
+  ORDER BY id;
+
+EXECUTE customers_in('London');
+
+EXECUTE customers_in($$x' OR '1'='1$$);
+```
+
+</CodeExample>
+
+The attack string is now just a strange city name that matches nobody. In PL/pgSQL, dynamic SQL gets parameters with **`EXECUTE … USING`**:
+
+<CodeExample output={`CREATE FUNCTION
+
+ leaked
+--------
+      0
+(1 row)`}>
+
+```sql
+CREATE FUNCTION find_customers(search_city text)
+RETURNS TABLE (id integer, name text, city text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT id, name, city FROM customers
+     WHERE city = $1 ORDER BY id'
+    USING search_city;
+END $$;
+
+SELECT count(*) AS leaked
+FROM find_customers($$x' OR '1'='1$$);
+```
+
+</CodeExample>
+
+(If a query doesn't need to be dynamic at all, don't use `EXECUTE`: plain SQL inside a function is parameterised automatically.) In application code, every driver supports parameters. Use them for **every** value, even ones you "know" are safe:
+
+```python
+# Python (psycopg 3): the driver sends city separately
+cur.execute(
+    "SELECT id, name FROM customers WHERE city = %s",
+    (city,),
+)
+# %s here is a placeholder, NOT Python's % formatting:
+# never write "... = %s" % city
+```
+
+```js
+// JavaScript (node-postgres)
+const { rows } = await pool.query(
+  "SELECT id, name FROM customers WHERE city = $1",
+  [city],
+);
+```
+
+ORMs and query builders parameterise for you, until you use their "raw" escape hatches. Know which ones are safe in your stack:
+
+```js
+// Prisma
+await prisma.$queryRaw`SELECT * FROM customers WHERE city = ${city}`;
+//   safe: a tagged template turns ${city} into a parameter
+await prisma.$queryRawUnsafe(`SELECT … WHERE city = '${city}'`);
+//   unsafe: a plain string, glued together
+```
+
+```python
+# SQLAlchemy
+session.execute(text("SELECT * FROM customers WHERE city = :city"),
+                {"city": city})            # safe
+session.execute(text(f"SELECT * FROM customers WHERE city = '{city}'"))
+                                           # unsafe
+```
+
+## Dynamic identifiers: format() and allow-lists
+
+Parameters can only stand for **values**. Table names, column names, `ASC`/`DESC` and keywords can't be parameters, yet apps often need them ("sort by the column the user clicked"). For those, use PostgreSQL's quoting functions, or better, an **allow-list**.
+
+**`format()`** builds SQL text safely: `%I` quotes an **identifier** (adds double quotes when needed and escapes them), `%L` quotes a **literal** (adds single quotes and escapes them). `quote_ident()` and `quote_literal()` do the same one value at a time:
+
+<CodeExample output={`                       safe_sql
+------------------------------------------------------
+ SELECT name FROM "Customers" WHERE city = 'O''Brien'
+(1 row)
+
+        attack_becomes_a_name
+-------------------------------------
+ ORDER BY "price; DROP TABLE orders"
+(1 row)`}>
+
+```sql
+SELECT format(
+  'SELECT %I FROM %I WHERE city = %L',
+  'name', 'Customers', $$O'Brien$$
+) AS safe_sql;
+
+SELECT format('ORDER BY %I', $$price; DROP TABLE orders$$)
+  AS attack_becomes_a_name;
+```
+
+</CodeExample>
+
+The attack is turned into one long, harmless (and non-existent) column name. Even so, prefer an **allow-list** for identifiers: check the input against the few values you expect, and refuse anything else. It's simpler to reason about, and it gives users a clear error instead of "column does not exist":
+
+```js
+const SORTABLE = { name: "name", price: "price", newest: "created_at" };
+const column = SORTABLE[req.query.sort] ?? "name";       // allow-list
+const direction = req.query.dir === "desc" ? "DESC" : "ASC";
+await pool.query(
+  `SELECT * FROM products WHERE category = $1
+   ORDER BY ${column} ${direction}`,                      // only our strings
+  [req.query.category],                                   // a parameter
+);
+```
+
+<Callout type="warning" title="LIKE needs one more step">
+
+`WHERE name ILIKE $1` with the parameter `'%' + input + '%'` is safe from injection, but the user can still type `%` and `_`, which are **wildcards**. A search for `%%%%%%%%` can turn into a very slow query. Escape them before adding your own: in SQL, `replace(replace(replace(input, '\', '\\'), '%', '\%'), '_', '\_')`.
+
+</Callout>
+
+## Defence in depth
+
+Parameters stop injection. These limit the damage when a bug slips through anyway:
+
+- **Least privilege** (from the [roles lesson](/learn/sql/roles-and-privileges)): an app role without DDL can't `DROP TABLE`, and one without access to `employees` can't leak salaries through a `UNION`.
+- **Row-level security** (next lesson): even a query that loses its `WHERE` only sees the current user's rows.
+- **Generic error messages** for users. Detailed PostgreSQL errors help attackers; log them on the server instead.
+- **Second-order injection**: data that was stored safely can still be dangerous when it's **later** glued into SQL, for example a stored "report filter" or a table name saved in a settings row. Treat values from your own database as untrusted input too.
+- **Linters**: Bandit and Semgrep (Python), ESLint plugins (JavaScript) and code review should flag any string building around `execute`/`query`.
+
+<Callout type="note" title="Web application firewalls">
+
+A WAF that blocks requests containing `' OR 1=1` catches script kiddies, not determined attackers: there are endless ways to write the same SQL. It's a seat belt, not a fix. Fix the query.
+
+</Callout>
+
+<Quiz
+  question="Which of these is safe from SQL injection?"
+  options={["Escaping the input with email.replace(\"'\", \"''\") and gluing it in", "pool.query('SELECT * FROM users WHERE email = $1', [email])", "cur.execute(f\"SELECT * FROM users WHERE email = '{email}'\")", "prisma.$queryRawUnsafe with the email glued into the string"]}
+  answer={1}
+  explanation="Only the parameterised query sends the value separately from the SQL text. Hand-escaping is fragile, and the other two glue the input straight into the query."
+/>
+
+<Quiz
+  question="Users can choose which column to sort by. How should the column name get into the query?"
+  options={["As a parameter, like ORDER BY $1", "Concatenated as-is, because column names can't contain SQL", "Checked against an allow-list of known columns (or quoted with format('%I'))", "Escaped by replacing ' with ''"]}
+  answer={2}
+  explanation="Parameters can only be values: ORDER BY $1 sorts by a constant and changes nothing. Identifiers must be validated against an allow-list or quoted with %I / quote_ident."
+/>
+
+<Exercise
+  language="sql"
+  title="Fix the product search"
+  starter={`-- DON'T: this search can be injected through both arguments.
+CREATE FUNCTION search_products(cat text, sort_by text)
+RETURNS TABLE (name text, category text, price numeric)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'SELECT name, category, price FROM products'
+    || ' WHERE category = ''' || cat || ''''
+    || ' ORDER BY ' || sort_by || ', name';
+END $$;
+
+SELECT * FROM search_products('tea', 'price');
+`}
+  tests={[
+    { name: "search_products('tea', 'price') returns the teas, cheapest first", check: "columns.join() === 'name,category,price' && rows.map(r => r.name).join() === 'Earl Grey,Jasmine Tea,Matcha Powder'" },
+    { name: "Sorting by name and by stock works", check: "(await query(\"SELECT string_agg(name, ',') AS s FROM search_products('toys', 'name')\"))[0].s === 'Kite,Plush Panda,Wooden Puzzle' && (await query(\"SELECT string_agg(name, ',') AS s FROM search_products('books', 'stock')\"))[0].s === 'Clean Python,Algorithms in Pictures,The Bamboo Code'" },
+    { name: "An injection in cat returns nothing", check: "(await query(\"SELECT count(*) AS n FROM search_products($$x' OR '1'='1$$, 'price')\"))[0].n === 0" },
+    { name: "A category containing a quote works", check: "(await query(\"INSERT INTO products (name, category, price) VALUES ('Yo-yo', 'kids'' toys', 3)\"), (await query(\"SELECT count(*) AS n FROM search_products('kids'' toys', 'name')\"))[0].n === 1)" },
+    { name: "An injection in sort_by is refused", check: "await query(\"SELECT * FROM search_products('tea', '(SELECT CASE WHEN (SELECT salary FROM employees WHERE id = 1) > 100000 THEN price ELSE stock END)')\").then(() => false, () => true)" },
+    { name: "Only name, price and stock are allowed for sort_by", check: "await query(\"SELECT * FROM search_products('tea', 'id')\").then(() => false, () => true)" },
+  ]}
+>
+
+The shop's search function glues both arguments into its SQL. Rewrite it (same name, same arguments and same result columns) so that:
+
+1. `cat` is passed as a **parameter** with `EXECUTE … USING`.
+2. `sort_by` must be one of **`name`**, **`price`** or **`stock`**: anything else raises an exception (`RAISE EXCEPTION 'cannot sort by %', sort_by;`).
+3. The allowed column goes into the SQL with **`format()`** and `%I`. Keep `name` as the second sort key.
+
+<Hint>
+
+Start the function body with the allow-list: `IF sort_by NOT IN ('name', 'price', 'stock') THEN RAISE EXCEPTION …; END IF;`. Then `RETURN QUERY EXECUTE format('SELECT name, category, price FROM products WHERE category = $1 ORDER BY %I, name', sort_by) USING cat;`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE FUNCTION search_products(cat text, sort_by text)
+RETURNS TABLE (name text, category text, price numeric)
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF sort_by NOT IN ('name', 'price', 'stock') THEN
+    RAISE EXCEPTION 'cannot sort by %', sort_by;
+  END IF;
+
+  RETURN QUERY EXECUTE format(
+    'SELECT name, category, price FROM products
+     WHERE category = $1
+     ORDER BY %I, name',
+    sort_by
+  ) USING cat;
+END $$;
+
+SELECT * FROM search_products('tea', 'price');
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- SQL injection happens when input is **glued into SQL text**; a quote in the input ends the string and the rest runs as SQL (`OR '1'='1'`, `UNION SELECT …`, stacked queries, blind and error-based attacks).
+- The fix is **parameters** for every value: `$1` with node-postgres, `%s` with psycopg, `EXECUTE … USING` in PL/pgSQL, `PREPARE`/`EXECUTE` in plain SQL. Beware ORMs' "raw/unsafe" methods.
+- Identifiers can't be parameters: use an **allow-list**, or `format()` with **`%I`** (identifiers) and **`%L`** (literals), or `quote_ident()` / `quote_literal()`.
+- Escape `%` and `_` in `LIKE` input.
+- Limit the damage with least privilege, row-level security, generic error messages and linters, and treat stored data as untrusted too.

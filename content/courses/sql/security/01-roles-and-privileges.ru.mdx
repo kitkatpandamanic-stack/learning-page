@@ -1,0 +1,367 @@
+---
+title: Роли и привилегии
+description: Создавайте роли для входа и групповые роли, выдавайте через GRANT и отзывайте через REVOKE ровно то, что нужно, настраивайте права по умолчанию и проектируйте роли по принципу минимальных привилегий.
+duration: 22
+xp: 30
+---
+
+Вот сценарий, который встречается во многих отчётах об утечках: веб-приложение подключается к базе данных как `postgres`, суперпользователь. Одна ошибка с SQL-инъекцией — и злоумышленник может прочитать любую таблицу, удалить базу и даже выполнять команды оболочки на сервере (суперпользователю разрешён `COPY … TO PROGRAM`). Ошибка была в приложении, но **ущерб** нанесли привилегии. Этот модуль посвящён безопасности баз данных, и начинается он с самой действенной защиты из всех: **принципа минимальных привилегий (least privilege)**, когда каждое подключение может делать ровно то, что нужно для его работы, и ничего больше. 🔐
+
+## Роли: пользователи и группы в одном понятии
+
+В PostgreSQL одно понятие покрывает и пользователей, и группы: **роль (role)**. Роль с атрибутом `LOGIN` может подключаться, то есть это «пользователь»; роль без него — «группа», в которую вступают другие роли, чтобы получить её привилегии (privileges). Роли принадлежат всему серверу, а не одной базе данных.
+
+<CodeExample output={`CREATE ROLE
+
+CREATE ROLE
+
+CREATE ROLE
+
+   rolname   | rolcanlogin | rolsuper | rolconnlimit
+-------------+-------------+----------+--------------
+ analyst_mei | t           | f        |           -1
+ postgres    | t           | t        |           -1
+ readers     | f           | f        |           -1
+ shop_app    | t           | f        |           50
+(4 rows)
+
+   member    | member_of
+-------------+-----------
+ analyst_mei | readers
+(1 row)`}>
+
+```sql
+CREATE ROLE readers NOLOGIN;
+CREATE ROLE analyst_mei LOGIN IN ROLE readers;
+CREATE ROLE shop_app LOGIN CONNECTION LIMIT 50;
+
+SELECT rolname, rolcanlogin, rolsuper, rolconnlimit
+FROM pg_roles
+WHERE rolname IN ('readers', 'analyst_mei', 'shop_app', 'postgres')
+ORDER BY rolname;
+
+-- Кто в какой группе состоит?
+SELECT m.rolname AS member, g.rolname AS member_of
+FROM pg_auth_members AS am
+JOIN pg_roles AS m ON m.oid = am.member
+JOIN pg_roles AS g ON g.oid = am.roleid
+WHERE m.rolname = 'analyst_mei';
+```
+
+</CodeExample>
+
+Вы подключены как `postgres` — **суперпользователь (superuser)**: для него не выполняется ни одна проверка прав. Для этой песочницы и для аварийных ситуаций это нормально; для приложения — никогда. Атрибуты, которые стоит знать:
+
+| Атрибут | Значение |
+| --- | --- |
+| `LOGIN` | Может подключаться («пользователь») |
+| `SUPERUSER` | Обходит все проверки. Только для администраторов БД |
+| `CREATEDB`, `CREATEROLE` | Может создавать базы данных / управлять ролями |
+| `BYPASSRLS` | Игнорирует защиту на уровне строк (урок 3) |
+| `INHERIT` | Автоматически пользуется привилегиями своих групп (по умолчанию) |
+| `CONNECTION LIMIT n`, `VALID UNTIL '…'` | Лимит подключений, срок действия |
+
+В реальной жизни роли для входа задают пароль и не хранят его в файлах миграций. В `psql` команда `\password` запрашивает пароль и отправляет на сервер только его хеш:
+
+```text
+postgres=# CREATE ROLE shop_app LOGIN;
+postgres=# \password shop_app
+Enter new password for user "shop_app":
+```
+
+Членство в группе обычно выдают отдельно, уже после создания роли. Начиная с PostgreSQL 16 можно также указать, **как** участник может пользоваться группой: `INHERIT` (автоматически получать её привилегии), `SET` (может выполнить `SET ROLE` в неё) и `ADMIN` (может добавлять других участников):
+
+<TryIt language="sql" code={`CREATE ROLE readers NOLOGIN;
+CREATE ROLE analyst_sam LOGIN;
+
+GRANT readers TO analyst_sam WITH INHERIT TRUE, SET FALSE;
+
+SELECT r.rolname AS member, g.rolname AS member_of,
+  am.inherit_option, am.set_option, am.admin_option
+FROM pg_auth_members AS am
+JOIN pg_roles AS r ON r.oid = am.member
+JOIN pg_roles AS g ON g.oid = am.roleid
+WHERE r.rolname = 'analyst_sam';
+
+-- Отменить можно так: REVOKE readers FROM analyst_sam;`} />
+
+## GRANT и REVOKE
+
+У каждого объекта есть **владелец (owner)** — роль, которая его создала, — и владелец может делать с ним что угодно. Все остальные изначально **не** имеют никаких привилегий на таблицы. Вы выдаёте их с помощью `GRANT` и забираете с помощью `REVOKE`. Чтобы проверить, что может другая роль, переключитесь на неё через **`SET ROLE`** (суперпользователь может стать кем угодно) и вернитесь обратно через `RESET ROLE`:
+
+<CodeExample output={`CREATE ROLE
+
+GRANT
+
+SET
+
+ current_user
+--------------
+ analyst
+(1 row)
+
+ category | products
+----------+----------
+ books    |        3
+ kitchen  |        3
+ snacks   |        3
+ tea      |        3
+ toys     |        3
+(5 rows)
+
+ERROR:  permission denied for table employees`}>
+
+```sql
+CREATE ROLE analyst NOLOGIN;
+GRANT SELECT ON products, orders, order_items TO analyst;
+
+SET ROLE analyst;
+SELECT current_user;
+
+SELECT category, count(*) AS products
+FROM products
+GROUP BY category
+ORDER BY category;
+
+SELECT name, salary FROM employees;
+```
+
+</CodeExample>
+
+Привилегии на таблицы: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES` (создавать внешний ключ, указывающий на таблицу), `TRIGGER` и, начиная с PostgreSQL 17, `MAINTAIN` (`VACUUM`, `ANALYZE`, `REINDEX`…). `GRANT ALL` означает их все сразу — и это редко то, что вам нужно.
+
+### Привилегии на столбцы
+
+Привилегии могут быть уже, чем таблица целиком. Службе поддержки нужно искать клиентов, но видеть их почту ей незачем:
+
+<CodeExample output={`CREATE ROLE
+
+GRANT
+
+GRANT
+
+SET
+
+ id |   name    | country
+----+-----------+---------
+  1 | Mei Lin   | UK
+  2 | Sam Ortiz | Spain
+(2 rows)
+
+ERROR:  permission denied for table customers`}>
+
+```sql
+CREATE ROLE support NOLOGIN;
+GRANT SELECT (id, name, country) ON customers TO support;
+GRANT UPDATE (city) ON customers TO support;
+
+SET ROLE support;
+
+SELECT id, name, country
+FROM customers
+ORDER BY id
+LIMIT 2;
+
+SELECT * FROM customers;
+```
+
+</CodeExample>
+
+`SELECT *` падает, потому что запрашивает все столбцы, включая `email`. (Привилегии на столбцы отлично подходят для такой задачи, но для этой роли `SELECT *` перестаёт работать. **Представление (view)** только с разрешёнными столбцами часто оказывается удобнее.)
+
+### Подвох с последовательностями
+
+Вставка в таблицу со значением по умолчанию `serial` (или похожим на identity) вызывает ещё и `nextval()` у **последовательности (sequence)** этой таблицы, а для этого нужна отдельная привилегия:
+
+<CodeExample output={`CREATE ROLE
+
+GRANT
+
+SET
+
+ERROR:  permission denied for sequence orders_id_seq`}>
+
+```sql
+CREATE ROLE checkout NOLOGIN;
+GRANT INSERT ON orders TO checkout;
+
+SET ROLE checkout;
+INSERT INTO orders (customer_id, ordered_at, status)
+VALUES (1, '2025-07-01 12:00', 'paid');
+```
+
+</CodeExample>
+
+Решение — `GRANT USAGE ON SEQUENCE orders_id_seq TO checkout;` или `GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO …`. (Столбцам, объявленным как `GENERATED … AS IDENTITY`, это не нужно: их последовательность используется от имени таблицы.)
+
+### Проверка привилегий
+
+`has_table_privilege()`, `has_column_privilege()` и похожие функции отвечают на вопрос «может ли эта роль это сделать?» без переключения ролей и учитывают привилегии, унаследованные от групп:
+
+<CodeExample output={`CREATE ROLE
+
+GRANT
+
+ whole_table | name_column | email_column
+-------------+-------------+--------------
+ f           | t           | f
+(1 row)`}>
+
+```sql
+CREATE ROLE support NOLOGIN;
+GRANT SELECT (id, name, country) ON customers TO support;
+
+SELECT
+  has_table_privilege('support', 'customers', 'SELECT')
+    AS whole_table,
+  has_column_privilege('support', 'customers', 'name', 'SELECT')
+    AS name_column,
+  has_column_privilege('support', 'customers', 'email', 'SELECT')
+    AS email_column;
+```
+
+</CodeExample>
+
+В `psql` команда `\dp customers` показывает привилегии таблицы, а `\du` выводит список ролей. Представления `information_schema.role_table_grants` и `column_privileges` дают ту же информацию в виде запросов.
+
+<Callout type="warning" title="Что PUBLIC получает по умолчанию">
+
+`PUBLIC` — это псевдороль, которая означает «все роли». По умолчанию она может **подключаться** к базам данных, создавать **временные таблицы** и **выполнять любые функции**. Начиная с PostgreSQL 15 она больше не может создавать таблицы в схеме `public`. Укрепите продакшен-базу командой `REVOKE ALL ON DATABASE shop FROM PUBLIC;` (а затем выдайте `CONNECT` своим ролям) и отзовите `EXECUTE` у всех функций, которые не должен вызывать кто угодно.
+
+</Callout>
+
+## Права по умолчанию: выдача прав на таблицы, которых ещё нет
+
+`GRANT SELECT ON ALL TABLES IN SCHEMA public TO readers` покрывает таблицы, которые существуют **сегодня**. Через месяц миграция добавляет `refunds`, и дашборды начинают падать с «permission denied». Это классический инцидент после деплоя. Его решают **права по умолчанию (default privileges)**: это выдачи прав, которые автоматически применяются к объектам, которые **определённая роль** создаст в будущем:
+
+<TryIt language="sql" code={`CREATE ROLE app_owner NOLOGIN;
+CREATE ROLE readers NOLOGIN;
+CREATE SCHEMA shop AUTHORIZATION app_owner;
+GRANT USAGE ON SCHEMA shop TO readers;
+
+-- Будущие таблицы, созданные app_owner в shop: readers может их читать
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA shop
+  GRANT SELECT ON TABLES TO readers;
+
+-- Более поздняя миграция, запущенная от имени владельца
+SET ROLE app_owner;
+CREATE TABLE shop.refunds (id integer, amount numeric(8, 2));
+INSERT INTO shop.refunds VALUES (1, 6.50);
+RESET ROLE;
+
+SET ROLE readers;
+SELECT * FROM shop.refunds;`} />
+
+Чаще всего спотыкаются о часть `FOR ROLE`: права по умолчанию принадлежат роли, которая **создаёт** объекты. Если миграцию запустит другая роль, её таблицы не получат никаких прав. Это ещё один повод поручить создание всех объектов одной роли-владельцу.
+
+## Схема ролей с минимальными привилегиями
+
+Большинство продакшен-баз в итоге приходят примерно к такой схеме:
+
+```text
+app_owner   NOLOGIN   владеет схемой и всеми таблицами
+migrator    LOGIN     участник app_owner; используется только конвейером деплоя
+app_rw      NOLOGIN   SELECT, INSERT, UPDATE, DELETE на таблицы;
+                      USAGE на последовательности; без DDL и TRUNCATE
+shop_app    LOGIN     участник app_rw; подключение веб-приложения
+readonly    NOLOGIN   только SELECT (или только на представления для отчётов)
+analyst_*   LOGIN     участники readonly, по одной роли на человека
+```
+
+- Приложение **не может менять схему**, так что ошибка с инъекцией не приведёт к `DROP TABLE`.
+- У каждого человека свой логин (внутри группы), поэтому в логах видно, *кто* что сделал, а уволившихся удаляют одной командой `DROP ROLE`.
+- Встроенные **предопределённые роли (predefined roles)** покрывают типичные потребности: `pg_read_all_data`, `pg_write_all_data`, `pg_monitor` (дашборды мониторинга), `pg_signal_backend` (отмена запросов).
+
+<Callout type="tip" title="SECURITY DEFINER: дверь под контролем">
+
+Иногда роли нужна одна узкая возможность, например «отменить свой заказ», но не «изменить любой заказ». Напишите функцию, которая делает ровно это, и объявите её `SECURITY DEFINER`: она выполняется с привилегиями своего **владельца**. Всегда добавляйте к таким функциям `SET search_path = pg_catalog, public` (иначе вызывающий может подсунуть свой оператор `=` или свою функцию раньше в пути поиска) и выполняйте `REVOKE EXECUTE … FROM PUBLIC`, прежде чем выдавать её ролям, которым она нужна.
+
+</Callout>
+
+<Quiz
+  question="Роль может делать SELECT из orders и имеет INSERT на orders, но её INSERT падает с ошибкой permission denied for sequence orders_id_seq. Почему?"
+  options={["Ей нужен UPDATE на orders", "Значение по умолчанию для id вызывает nextval(), а для этого нужен USAGE на последовательность", "Вставлять могут только суперпользователи", "Ей нужна привилегия REFERENCES"]}
+  answer={1}
+  explanation="Значение по умолчанию столбца serial — nextval('orders_id_seq'), а использование последовательности — это отдельная привилегия: GRANT USAGE ON SEQUENCE orders_id_seq TO нужной роли."
+/>
+
+<Quiz
+  question="В прошлом месяце вы выполнили GRANT SELECT ON ALL TABLES IN SCHEMA public TO readers. Таблицу, созданную вчера миграцией, прочитать нельзя. Что не даст этому повториться?"
+  options={["Вручную запускать GRANT заново после каждой миграции", "ALTER DEFAULT PRIVILEGES FOR ROLE <роль миграций> ... GRANT SELECT ON TABLES TO readers", "Сделать readers суперпользователем", "GRANT ALL ON SCHEMA public TO readers"]}
+  answer={1}
+  explanation="GRANT ... ON ALL TABLES действует только на существующие таблицы. Права по умолчанию применяются к таблицам, которые указанная роль создаст в будущем."
+/>
+
+<Exercise
+  language="sql"
+  title="Роли для магазина"
+  starter={`-- 1. shop_readonly (NOLOGIN): читает products, orders и
+--    order_items; в customers — только id, name и country.
+
+-- 2. shop_writer (NOLOGIN): участник shop_readonly; может
+--    делать INSERT в orders и order_items, использовать
+--    последовательность id заказов и UPDATE только status в orders.
+
+-- 3. checkout_app (LOGIN): участник shop_writer.
+
+-- Проверьте выданные права на таблицы:
+SELECT grantee, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee LIKE 'shop%'
+ORDER BY grantee, table_name, privilege_type;
+`}
+  tests={[
+    { name: "Все три роли существуют; входить может только checkout_app", check: "(await query(\"SELECT string_agg(rolname || ':' || rolcanlogin, ',' ORDER BY rolname) AS s FROM pg_roles WHERE rolname IN ('checkout_app', 'shop_readonly', 'shop_writer')\"))[0].s === 'checkout_app:true,shop_readonly:false,shop_writer:false'" },
+    { name: "shop_readonly читает products, orders, order_items, но не может писать или читать employees", check: "(await query(\"SELECT has_table_privilege('shop_readonly', 'products', 'SELECT') AND has_table_privilege('shop_readonly', 'orders', 'SELECT') AND has_table_privilege('shop_readonly', 'order_items', 'SELECT') AND NOT has_table_privilege('shop_readonly', 'employees', 'SELECT') AND NOT has_table_privilege('shop_readonly', 'orders', 'INSERT') AND NOT has_table_privilege('shop_readonly', 'products', 'UPDATE') AS ok\"))[0].ok === true" },
+    { name: "Customers: id, name, country читаются, email и таблица целиком — нет", check: "(await query(\"SELECT has_column_privilege('shop_readonly', 'customers', 'id', 'SELECT') AND has_column_privilege('shop_readonly', 'customers', 'name', 'SELECT') AND has_column_privilege('shop_readonly', 'customers', 'country', 'SELECT') AND NOT has_column_privilege('shop_readonly', 'customers', 'email', 'SELECT') AND NOT has_table_privilege('shop_readonly', 'customers', 'SELECT') AS ok\"))[0].ok === true" },
+    { name: "checkout_app наследует права через shop_writer и shop_readonly", check: "(await query(\"SELECT pg_has_role('checkout_app', 'shop_writer', 'MEMBER') AND pg_has_role('shop_writer', 'shop_readonly', 'MEMBER') AND has_table_privilege('checkout_app', 'products', 'SELECT') AND has_table_privilege('checkout_app', 'order_items', 'INSERT') AND has_sequence_privilege('checkout_app', 'orders_id_seq', 'USAGE') AS ok\"))[0].ok === true" },
+    { name: "Orders: status можно обновлять, другие столбцы — нет, удалять ничего нельзя", check: "(await query(\"SELECT has_column_privilege('checkout_app', 'orders', 'status', 'UPDATE') AND NOT has_column_privilege('checkout_app', 'orders', 'customer_id', 'UPDATE') AND NOT has_table_privilege('checkout_app', 'orders', 'DELETE') AND NOT has_table_privilege('shop_readonly', 'orders', 'UPDATE') AS ok\"))[0].ok === true" },
+    { name: "От имени checkout_app: оформить заказ можно, прочитать почту — нет", check: "await (async () => { await query('SET ROLE checkout_app'); const placed = await query(\"INSERT INTO orders (customer_id, ordered_at, status) VALUES (1, '2025-07-01', 'paid') RETURNING id\").then(r => r[0].id > 40, () => false); const hidden = await query('SELECT email FROM customers').then(() => false, () => true); return placed && hidden; })()" },
+  ]}
+>
+
+Настройте для магазина роли с минимальными привилегиями:
+
+1. **`shop_readonly`** (`NOLOGIN`): может читать `products`, `orders` и `order_items`, а в `customers` — только столбцы `id`, `name` и `country`.
+2. **`shop_writer`** (`NOLOGIN`): участник `shop_readonly`. Кроме того, может делать `INSERT` в `orders` и `order_items`, использовать последовательность `orders_id_seq` и делать `UPDATE` только столбца `status` в `orders`.
+3. **`checkout_app`** (`LOGIN`): логин сервиса оформления заказов, участник `shop_writer`.
+
+Оставьте в конце запрос для проверки.
+
+<Hint>
+
+Используйте `GRANT SELECT (id, name, country) ON customers TO shop_readonly;` для столбцов, `GRANT UPDATE (status) ON orders TO shop_writer;` для статуса и `GRANT shop_readonly TO shop_writer;` (или `CREATE ROLE shop_writer NOLOGIN IN ROLE shop_readonly;`) для членства.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE ROLE shop_readonly NOLOGIN;
+GRANT SELECT ON products, orders, order_items TO shop_readonly;
+GRANT SELECT (id, name, country) ON customers TO shop_readonly;
+
+CREATE ROLE shop_writer NOLOGIN IN ROLE shop_readonly;
+GRANT INSERT ON orders, order_items TO shop_writer;
+GRANT USAGE ON SEQUENCE orders_id_seq TO shop_writer;
+GRANT UPDATE (status) ON orders TO shop_writer;
+
+CREATE ROLE checkout_app LOGIN IN ROLE shop_writer;
+
+SELECT grantee, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee LIKE 'shop%'
+ORDER BY grantee, table_name, privilege_type;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Роль** — это пользователь (`LOGIN`) или группа (`NOLOGIN`); роли вступают в группы и **наследуют** их привилегии.
+- Владельцы могут всё; остальные получают только то, что вы выдали через **`GRANT`** (и теряют то, что отозвали через **`REVOKE`**): привилегии на таблицы, столбцы, последовательности, схемы и функции.
+- Проверяйте через **`SET ROLE`** / `RESET ROLE` или спрашивайте `has_table_privilege()` и похожие функции.
+- **Права по умолчанию** (`ALTER DEFAULT PRIVILEGES FOR ROLE … GRANT …`) покрывают таблицы, которые миграции создадут позже.
+- **Минимальные привилегии**: приложение никогда не подключается как суперпользователь или владелец; одна роль-владелец для DDL, роль чтения-записи для приложения, роли только для чтения для людей. Следите за тем, что `PUBLIC` получает по умолчанию.

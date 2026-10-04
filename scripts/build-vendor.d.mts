@@ -6,3 +6,5 @@ export const typescriptVendorDir: string;
 export function buildTypeScriptVendor(options?: { force?: boolean }): string;
 export const reactTypesVendorDir: string;
 export function buildReactTypesVendor(options?: { force?: boolean }): string;
+export const pgliteVendorDir: string;
+export function buildPgliteVendor(options?: { force?: boolean }): string;

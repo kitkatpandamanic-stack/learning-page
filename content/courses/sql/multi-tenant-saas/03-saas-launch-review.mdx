@@ -1,0 +1,559 @@
+---
+title: "Part 3: Launch review"
+description: Index and partition tenant data, handle very large tenants, plan zero-downtime migrations and tenant deletion, and run PandaTasks through a final pre-launch checklist.
+duration: 25
+xp: 35
+---
+
+PandaTasks launches next week. The schema keeps tenants apart (Part 1) and row-level security guards every query (Part 2). Now comes the review every serious team does before real customers arrive: will it be **fast** with thousands of tenants, can the team **change** it without downtime, can it **delete** a tenant on request, and can it **recover** from a bad day? 🚀
+
+## Indexes for tenant data
+
+With RLS, every query on a tenant table gets `tenant_id = current_tenant_id()` added to it. So the rule for indexes is simple: **every index on a tenant table starts with `tenant_id`**. Then the tenant filter and the query's own conditions use one index together, and each tenant's rows sit next to each other in it.
+
+Product has named the two hottest queries: the **project board** (tasks of one project, by status) and **"my open tasks"** for the person logged in. Here they are, run as the app, with the policy in place:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 3
+
+INSERT 0 15000
+
+CREATE FUNCTION
+
+ALTER TABLE
+
+CREATE POLICY
+
+CREATE ROLE
+
+GRANT
+
+CREATE INDEX
+
+CREATE INDEX
+
+ANALYZE
+
+SET
+
+ set_config
+------------
+ 2
+(1 row)
+
+                                                                         QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on tasks
+   Recheck Cond: ((tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::bigint) AND (assignee_id = 7) AND (status <> 'done'::text))
+   ->  Bitmap Index Scan on tasks_open_by_assignee_idx
+         Index Cond: ((tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::bigint) AND (assignee_id = 7))
+(4 rows)`}>
+
+```sql
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  status text NOT NULL DEFAULT 'todo',
+  assignee_id bigint,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id)
+);
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (2, 'Website'), (3, 'TPS reports');
+INSERT INTO tasks (tenant_id, project_id, title, status, assignee_id)
+SELECT g % 3 + 1, g % 3 + 1, 'Task ' || g,
+  (ARRAY['todo', 'doing', 'done', 'done'])[g % 4 + 1], g % 50 + 1
+FROM generate_series(1, 15000) AS g;
+
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON tasks
+  USING (tenant_id = current_tenant_id());
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT ON tasks TO app_user;
+
+-- the board: one project, by status
+CREATE INDEX tasks_board_idx
+  ON tasks (tenant_id, project_id, status);
+-- "my open tasks": a partial index skips the done ones
+CREATE INDEX tasks_open_by_assignee_idx
+  ON tasks (tenant_id, assignee_id)
+  WHERE status <> 'done';
+ANALYZE tasks;
+
+SET ROLE app_user;
+SELECT set_config('app.tenant_id', '2', false);
+
+-- "my open tasks": no tenant filter, the policy adds it
+EXPLAIN (COSTS OFF)
+SELECT id, title
+FROM tasks
+WHERE assignee_id = 7 AND status <> 'done';
+```
+
+</CodeExample>
+
+The long `Index Cond` line is the point. PostgreSQL **inlined** `current_tenant_id()` (it's a simple `STABLE` SQL function) and used the policy's condition on the **first column of the index**, together with `assignee_id`. It picked the **partial** index, because the query's `status <> 'done'` matches the index's `WHERE`, so done tasks aren't even in it. The developer wrote no tenant filter at all, and the query still only reads Globex's index entries. The board query uses `tasks_board_idx` the same way.
+
+Two more habits for tenant indexes:
+
+- **Unique constraints are per tenant** too: `UNIQUE (tenant_id, name)` doubles as an index for "find a project by name" in that tenant.
+- **Foreign keys need indexes on the referencing side**: `tasks (tenant_id, project_id)` is covered by the board index (its first two columns), so deleting a project doesn't scan all tasks.
+
+## Whales and noisy neighbours
+
+Tenants are never the same size. A typical SaaS has thousands of tiny tenants and a handful of **whales** that hold a big share of all rows. Track it from day one:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 17437
+
+  tenant  | tasks | share_pct
+----------+-------+-----------
+ tenant-1 |  9000 |      51.6
+ tenant-2 |  4500 |      25.8
+ tenant-3 |  2250 |      12.9
+ tenant-4 |  1125 |       6.5
+ tenant-5 |   562 |       3.2
+(5 rows)`}>
+
+```sql
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  title text NOT NULL
+);
+
+-- each tenant half the size of the one before
+INSERT INTO tasks (tenant_id, title)
+SELECT t, 'Task ' || g
+FROM generate_series(1, 5) AS t
+CROSS JOIN generate_series(1, 18000) AS g
+WHERE g <= 18000 / power(2, t);
+
+SELECT
+  'tenant-' || tenant_id AS tenant,
+  count(*) AS tasks,
+  round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS share_pct
+FROM tasks
+GROUP BY tenant_id
+ORDER BY tasks DESC, tenant_id;
+```
+
+</CodeExample>
+
+One tenant owns more than half of the data. Whales cause **noisy-neighbour** problems: their big reports eat the CPU and I/O that small tenants' page loads need. The usual defences, roughly in the order teams adopt them:
+
+- **Per-tenant limits** in the app (rate limits, page sizes, export queues) and a `statement_timeout` for the app role, so no request runs for minutes.
+- Heavy reports and exports on a **read replica**, or precomputed in summary tables.
+- **Sharding by `tenant_id`**: tools such as **Citus** spread tenants over many servers and keep all of a tenant's rows together, so joins stay local. That only works because every table has `tenant_id` and every key and foreign key includes it. Part 1's design keeps that door open.
+- Moving a single whale to its **own database**, which is easy to copy out (`WHERE tenant_id = …` on every table) but means the app must route that tenant's requests elsewhere.
+
+## Partitioning the activity log
+
+The **activity log** gets a row for every change in every tenant, and it's the first table to reach hundreds of millions of rows. It's append-only, read mostly as "recent activity of my tenant", and has a retention rule, so it's a perfect fit for **monthly range partitions**, as in [Partitioning Big Tables](/learn/sql/table-partitioning). RLS needs one extra thought:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 0 12001
+
+CREATE FUNCTION
+
+ALTER TABLE
+
+CREATE POLICY
+
+CREATE ROLE
+
+GRANT
+
+SET
+
+ set_config
+------------
+ 2
+(1 row)
+
+      partition       | events
+----------------------+--------
+ activity_log_2025_06 |   2057
+ activity_log_2025_07 |   1943
+(2 rows)
+
+ERROR:  permission denied for table activity_log_2025_06`}>
+
+```sql
+CREATE TABLE activity_log (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  created_at timestamp NOT NULL,
+  action text NOT NULL,
+  -- the partition key must be in the key; this order also
+  -- serves "latest activity of my tenant"
+  PRIMARY KEY (tenant_id, created_at, id)
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE activity_log_2025_06 PARTITION OF activity_log
+  FOR VALUES FROM ('2025-06-01') TO ('2025-07-01');
+CREATE TABLE activity_log_2025_07 PARTITION OF activity_log
+  FOR VALUES FROM ('2025-07-01') TO ('2025-08-01');
+
+INSERT INTO activity_log (tenant_id, created_at, action)
+SELECT g % 3 + 1,
+  timestamp '2025-06-01' + g * interval '7 minutes',
+  'task.updated'
+FROM generate_series(0, 12000) AS g;
+
+CREATE FUNCTION current_tenant_id() RETURNS bigint
+LANGUAGE sql STABLE
+AS $$
+  SELECT nullif(current_setting('app.tenant_id', true), '')::bigint
+$$;
+
+-- RLS and privileges on the PARENT only
+ALTER TABLE activity_log ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON activity_log
+  USING (tenant_id = current_tenant_id())
+  WITH CHECK (tenant_id = current_tenant_id());
+CREATE ROLE app_user NOLOGIN;
+GRANT SELECT, INSERT ON activity_log TO app_user;
+
+SET ROLE app_user;
+SELECT set_config('app.tenant_id', '2', false);
+
+-- through the parent: policies apply, only tenant 2's rows
+SELECT tableoid::regclass AS partition, count(*) AS events
+FROM activity_log
+GROUP BY partition
+ORDER BY partition;
+
+-- straight at a partition: refused
+SELECT count(*) FROM activity_log_2025_06;
+```
+
+</CodeExample>
+
+Policies on a partitioned table apply to queries **through the parent**. A query that names a partition directly checks that partition's own RLS settings, which are separate, and here it has none. That's safe only because `app_user` has **no privileges on the partitions**, so the direct query is refused. Keep it that way: grant on the parent, never on partitions, and let the guard query from Part 2 include `relkind = 'p'` tables.
+
+Retention depends on the plan: enterprise keeps two years, free tenants 30 days. Dropping monthly partitions enforces the **longest** rule cheaply. For shorter per-plan rules, either run a small batched `DELETE` per free tenant each night, or simply **hide** older rows in the app and let them age out with the partition. Agree on which one before launch, and write it in the privacy policy.
+
+## A migration plan that won't take the site down
+
+After launch, every schema change runs while customers are working. The first one is already planned: tasks get a `priority`. Before writing any migration, know which `ALTER TABLE` statements are cheap and which **rewrite** the whole table under an exclusive lock. `relfilenode`, the id of the table's data file, changes when the table is rewritten:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 20000
+
+CREATE TABLE
+
+INSERT 0 1
+
+ALTER TABLE
+
+ rewritten
+-----------
+ f
+(1 row)
+
+ALTER TABLE
+
+ rewritten
+-----------
+ t
+(1 row)`}>
+
+```sql
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  title text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+INSERT INTO tasks (tenant_id, title)
+SELECT g % 10 + 1, 'Task ' || g
+FROM generate_series(1, 20000) AS g;
+
+CREATE TABLE file_before (node oid);
+INSERT INTO file_before
+SELECT relfilenode FROM pg_class WHERE relname = 'tasks';
+
+-- a constant default: stored in the catalog, instant
+ALTER TABLE tasks ADD COLUMN priority smallint NOT NULL DEFAULT 2;
+SELECT relfilenode <> (SELECT node FROM file_before) AS rewritten
+FROM pg_class
+WHERE relname = 'tasks';
+
+-- changing the type: every row is rewritten, under a lock
+ALTER TABLE tasks ALTER COLUMN priority TYPE integer;
+SELECT relfilenode <> (SELECT node FROM file_before) AS rewritten
+FROM pg_class
+WHERE relname = 'tasks';
+```
+
+</CodeExample>
+
+Adding a column with a constant default (PostgreSQL 11+) is a catalog change that takes milliseconds. Changing its type rewrote all 20,000 rows; on a whale-sized table that's minutes of downtime. PandaTasks' migration rules, based on [Zero-Downtime Migrations](/learn/sql/zero-downtime-migrations), written down for the team:
+
+```text
+1. Every migration starts with:  SET lock_timeout = '3s';
+   (if a long query blocks the ALTER, fail fast and retry,
+    instead of queueing every other query behind it)
+2. New columns: nullable or with a constant default. Never a rewrite.
+3. Indexes:   CREATE INDEX CONCURRENTLY ... (outside a transaction)
+4. Constraints and foreign keys: add NOT VALID, then
+              ALTER TABLE ... VALIDATE CONSTRAINT ... in a later step
+5. Backfills: in batches (e.g. 5,000 rows, one tenant at a time),
+              each batch its own transaction, with a pause between
+6. Expand / contract: add the new thing, deploy code that writes
+   both, backfill, switch reads, and only then drop the old thing.
+```
+
+`NOT VALID` makes PostgreSQL enforce a new constraint for **new** rows immediately, without checking existing rows under a heavy lock. `VALIDATE CONSTRAINT` then checks the old rows with a lock that lets reads and writes continue.
+
+## Exporting and deleting a tenant
+
+When a customer leaves and asks for their data to be deleted, everything with their `tenant_id` must go: tasks, projects, memberships, activity, files, and their copies in caches and search indexes. With `ON DELETE CASCADE` from `tenants`, `DELETE FROM tenants WHERE id = 42` does it in **one transaction**. For a small tenant that's fine. For a whale, it's millions of row deletions in one transaction: long locks, a huge burst of WAL for the replicas, and dead rows everywhere. Delete big tenants in **batches**, children first, then the tenant row last:
+
+```sql
+-- repeat until it deletes 0 rows, one transaction per batch
+DELETE FROM tasks
+WHERE (tenant_id, id) IN (
+  SELECT tenant_id, id
+  FROM tasks
+  WHERE tenant_id = 42
+  LIMIT 5000
+);
+```
+
+Remember the backups: deleted data lives on in old backups until they expire. Your privacy policy should say how long that is (for example "within 35 days").
+
+## The launch checklist
+
+| Area | Check | Where you learned it |
+| --- | --- | --- |
+| Isolation | Composite keys include `tenant_id`; RLS enabled and forced on every tenant table; guard query and isolation tests in CI | Parts 1 and 2, security module |
+| Roles | App connects as `app_user`; no superuser, no owner, no `BYPASSRLS`; views use `security_invoker` | Security module |
+| Requests | Tenant set per transaction with `set_config(…, true)`; pooler in transaction mode; timeouts set | Scaling module |
+| Performance | Every index starts with `tenant_id`; hot queries checked with `EXPLAIN` as `app_user` | This part, indexes module |
+| Big tables | Activity log partitioned by month, partitions created ahead, retention job | Scaling module |
+| Concurrency | Short transactions; job queue with `SKIP LOCKED`; retries for serialization and deadlock errors | Transactions module |
+| Changes | Migration rules: `lock_timeout`, `CONCURRENTLY`, `NOT VALID`, batched backfills | Data modelling module |
+| Recovery | PITR backups with tested restores; RPO and RTO agreed; replica and failover | Scaling module |
+| Tenants | Per-plan limits enforced; whale monitoring; batched tenant deletion | This part |
+
+<Quiz
+  question="The activity_log table is partitioned by month and has RLS enabled on the parent. Why must app_user have no privileges on the individual partitions?"
+  options={[
+    "Partitions can't have privileges at all",
+    "Queries that name a partition directly don't use the parent's policies, so with privileges they could read every tenant's rows",
+    "Privileges on partitions make partition pruning stop working",
+    "Without privileges on partitions, inserts through the parent fail",
+  ]}
+  answer={1}
+  explanation="Row-level security is checked for the table named in the query. Through the parent, the parent's policies apply; a query naming a partition uses that partition's own (here absent) RLS. Granting privileges only on the parent means direct access to partitions is simply refused, while inserts and selects through the parent work normally."
+/>
+
+<Quiz
+  question="Which migration is safe to run on the 400-million-row tasks table during working hours?"
+  options={[
+    "ALTER TABLE tasks ALTER COLUMN title TYPE varchar(200)",
+    "ALTER TABLE tasks ADD COLUMN archived boolean NOT NULL DEFAULT false, after SET lock_timeout = '3s'",
+    "CREATE INDEX tasks_due_idx ON tasks (tenant_id, due_on) inside a transaction",
+    "UPDATE tasks SET priority = 2 in one statement",
+  ]}
+  answer={1}
+  explanation="A constant default is stored in the catalog, so adding the column is instant, and lock_timeout makes it give up quickly instead of blocking everyone if it can't get its lock. Changing a column type rewrites the table, a plain CREATE INDEX blocks writes for the whole build (use CONCURRENTLY, outside a transaction), and a single 400-million-row UPDATE is one giant transaction."
+/>
+
+<Exercise
+  language="sql"
+  title="The launch review"
+  starter={`CREATE TYPE plan AS ENUM ('free', 'pro', 'enterprise');
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  plan plan NOT NULL
+);
+CREATE TABLE plan_limits (
+  plan plan PRIMARY KEY,
+  max_projects integer -- NULL means unlimited
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  status text NOT NULL DEFAULT 'todo',
+  assignee_id bigint,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id)
+);
+INSERT INTO tenants (slug, plan) VALUES
+  ('acme', 'pro'), ('globex', 'free'), ('initech', 'enterprise');
+INSERT INTO plan_limits (plan, max_projects) VALUES
+  ('free', 2), ('pro', 20), ('enterprise', NULL);
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (1, 'Billing'),
+  (2, 'Website'), (2, 'Blog'), (2, 'Shop'),
+  (3, 'TPS reports');
+INSERT INTO tasks (tenant_id, project_id, title, status, assignee_id)
+SELECT p.tenant_id, p.id, 'Task ' || g,
+  (ARRAY['todo', 'doing', 'done', 'done'])[g % 4 + 1],
+  g % 50 + 1
+FROM generate_series(1, 14000) AS g
+JOIN projects AS p ON p.id = g % 7 + 1;
+ANALYZE tasks;
+
+-- 1. The two indexes
+
+-- 2. The usage report
+SELECT slug, plan
+FROM tenants
+ORDER BY slug;
+`}
+  tests={[
+    { name: "tasks_board_idx covers (tenant_id, project_id, status)", check: "(await query(\"SELECT indexdef FROM pg_indexes WHERE indexname = 'tasks_board_idx'\")).some(r => r.indexdef.endsWith('(tenant_id, project_id, status)'))" },
+    { name: "tasks_open_by_assignee_idx is partial: only tasks not done", check: "(await query(\"SELECT indexdef FROM pg_indexes WHERE indexname = 'tasks_open_by_assignee_idx'\")).some(r => r.indexdef.endsWith(\"(tenant_id, assignee_id) WHERE (status <> 'done'::text)\"))" },
+    { name: "Every index on tasks starts with tenant_id", check: "(r => r.length >= 3 && r.every(x => x.first === 'tenant_id'))(await query(\"SELECT a.attname AS first FROM pg_index AS i JOIN pg_attribute AS a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] WHERE i.indrelid = 'tasks'::regclass\"))" },
+    { name: "My open tasks uses the partial index", check: "(await query(\"EXPLAIN (COSTS OFF) SELECT id FROM tasks WHERE tenant_id = 2 AND assignee_id = 5 AND status <> 'done'\")).some(r => r['QUERY PLAN'].includes('tasks_open_by_assignee_idx'))" },
+    { name: "Report columns: slug, plan, projects, open_tasks, over_limit", check: "columns.join() === 'slug,plan,projects,open_tasks,over_limit'" },
+    { name: "Counts projects and open tasks per tenant", check: "rows.map(r => [r.slug, r.plan, r.projects, r.open_tasks].join(':')).join() === 'acme:pro:3:3000,globex:free:3:3000,initech:enterprise:1:1000'" },
+    { name: "Only globex is over its plan's limit", check: "rows.map(r => r.over_limit).join() === 'false,true,false'" },
+    { name: "A new tenant with no projects shows zeros, not over the limit", check: "(await rerun(\"INSERT INTO tenants (slug, plan) VALUES ('hooli', 'free')\")).some(r => r.slug === 'hooli' && r.projects === 0 && r.open_tasks === 0 && r.over_limit === false)" },
+    { name: "Unlimited plans are never over the limit", check: "(await rerun(\"INSERT INTO projects (tenant_id, name) SELECT 3, 'Project ' || g FROM generate_series(1, 30) AS g\")).some(r => r.slug === 'initech' && r.projects === 31 && r.over_limit === false)" },
+  ]}
+>
+
+Last step before launch: make the hot queries fast and give the founders their plan-limits report. ✅
+
+1. Create the two indexes from this lesson, with these exact names: **`tasks_board_idx`** on `(tenant_id, project_id, status)`, and the partial index **`tasks_open_by_assignee_idx`** on `(tenant_id, assignee_id)` for tasks whose status isn't `'done'`.
+2. Replace the last query with the **usage report**, one row per tenant (including tenants with no projects), sorted by `slug`:
+   - **`slug`**, **`plan`**
+   - **`projects`**: how many projects the tenant has
+   - **`open_tasks`**: how many of its tasks are not `'done'`
+   - **`over_limit`**: `true` if `projects` is more than the plan's `max_projects`, `false` otherwise, including for plans with no limit (`NULL`). Never `NULL`.
+
+<Hint>
+
+Counting two different child tables in one `GROUP BY` multiplies the rows (each project is repeated once per task), so count each one separately: two scalar subqueries in the `SELECT` list, `(SELECT count(*) FROM projects AS p WHERE p.tenant_id = t.id)`, or two small CTEs grouped by `tenant_id` and joined with `LEFT JOIN` + `coalesce(…, 0)`. Join `plan_limits` on `plan`. For the limit, `coalesce(projects > max_projects, false)` turns the `NULL` of unlimited plans into `false`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TYPE plan AS ENUM ('free', 'pro', 'enterprise');
+CREATE TABLE tenants (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  plan plan NOT NULL
+);
+CREATE TABLE plan_limits (
+  plan plan PRIMARY KEY,
+  max_projects integer -- NULL means unlimited
+);
+CREATE TABLE projects (
+  tenant_id bigint NOT NULL REFERENCES tenants,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  name text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+CREATE TABLE tasks (
+  tenant_id bigint NOT NULL,
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  project_id bigint NOT NULL,
+  title text NOT NULL,
+  status text NOT NULL DEFAULT 'todo',
+  assignee_id bigint,
+  PRIMARY KEY (tenant_id, id),
+  FOREIGN KEY (tenant_id, project_id)
+    REFERENCES projects (tenant_id, id)
+);
+INSERT INTO tenants (slug, plan) VALUES
+  ('acme', 'pro'), ('globex', 'free'), ('initech', 'enterprise');
+INSERT INTO plan_limits (plan, max_projects) VALUES
+  ('free', 2), ('pro', 20), ('enterprise', NULL);
+INSERT INTO projects (tenant_id, name) VALUES
+  (1, 'Website'), (1, 'Mobile app'), (1, 'Billing'),
+  (2, 'Website'), (2, 'Blog'), (2, 'Shop'),
+  (3, 'TPS reports');
+INSERT INTO tasks (tenant_id, project_id, title, status, assignee_id)
+SELECT p.tenant_id, p.id, 'Task ' || g,
+  (ARRAY['todo', 'doing', 'done', 'done'])[g % 4 + 1],
+  g % 50 + 1
+FROM generate_series(1, 14000) AS g
+JOIN projects AS p ON p.id = g % 7 + 1;
+ANALYZE tasks;
+
+CREATE INDEX tasks_board_idx
+  ON tasks (tenant_id, project_id, status);
+CREATE INDEX tasks_open_by_assignee_idx
+  ON tasks (tenant_id, assignee_id)
+  WHERE status <> 'done';
+
+WITH project_counts AS (
+  SELECT tenant_id, count(*) AS projects
+  FROM projects
+  GROUP BY tenant_id
+),
+open_counts AS (
+  SELECT tenant_id, count(*) AS open_tasks
+  FROM tasks
+  WHERE status <> 'done'
+  GROUP BY tenant_id
+)
+SELECT
+  t.slug,
+  t.plan,
+  coalesce(pc.projects, 0) AS projects,
+  coalesce(oc.open_tasks, 0) AS open_tasks,
+  coalesce(coalesce(pc.projects, 0) > l.max_projects, false)
+    AS over_limit
+FROM tenants AS t
+JOIN plan_limits AS l ON l.plan = t.plan
+LEFT JOIN project_counts AS pc ON pc.tenant_id = t.id
+LEFT JOIN open_counts AS oc ON oc.tenant_id = t.id
+ORDER BY t.slug;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- With RLS, **every index on a tenant table starts with `tenant_id`**; check hot queries with `EXPLAIN` **as `app_user`** to see the policy used as an index condition. Partial indexes fit "open items" queries.
+- Track tenant sizes: **whales** cause noisy-neighbour problems. Limits, timeouts, replicas and, eventually, **sharding by `tenant_id`** (possible because every key includes it).
+- Partition append-only tenant data (the **activity log**) by month; put RLS and privileges on the **parent only**.
+- Know which `ALTER TABLE` rewrites the table. Migrations use **`lock_timeout`**, **`CONCURRENTLY`**, **`NOT VALID` + `VALIDATE`**, batched backfills and expand/contract.
+- Delete big tenants in **batches**, and remember the copies in backups, caches and search indexes.
+- Go through the **launch checklist**: isolation, roles, requests, performance, big tables, concurrency, changes, recovery, tenants.
+
+Congratulations: you've designed, secured and reviewed a multi-tenant database the way senior teams do it, and finished the SQL course! 🎉🐼

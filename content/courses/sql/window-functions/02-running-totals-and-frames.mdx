@@ -1,0 +1,420 @@
+---
+title: Running Totals, Moving Averages and Frames
+description: Build running totals and moving averages with window frames, and learn the difference between ROWS and RANGE before it bites you.
+duration: 22
+xp: 25
+---
+
+"Revenue so far this year." "The average of the last 7 days." "What share of sales do our top five products bring in?" Dashboards are full of numbers like these, and they all have the same shape: for each row, add up or average **some of the rows around it**.
+
+In the [previous lesson](/learn/sql/window-functions-and-ranking) a window was either the whole result or a whole partition. In this one you'll learn to control **exactly which rows** each calculation sees, with **window frames**. 📈
+
+## Running totals
+
+Add an `ORDER BY` inside `OVER` to `sum()` and it turns into a **running total**: each row gets the sum of everything up to and including itself. Here's the shop's monthly revenue (cancelled orders don't count) and the total so far:
+
+<CodeExample output={`  month  | revenue | revenue_to_date
+---------+---------+-----------------
+ 2025-01 |  518.30 |          518.30
+ 2025-02 |  331.69 |          849.99
+ 2025-03 |  525.80 |         1375.79
+ 2025-04 |  331.69 |         1707.48
+ 2025-05 |  467.80 |         2175.28
+ 2025-06 |  270.54 |         2445.82
+(6 rows)`}>
+
+```sql
+WITH monthly AS (
+  SELECT to_char(o.ordered_at, 'YYYY-MM') AS month,
+    sum(oi.quantity * oi.unit_price) AS revenue
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY month
+)
+SELECT month, revenue,
+  sum(revenue) OVER (ORDER BY month) AS revenue_to_date
+FROM monthly
+ORDER BY month;
+```
+
+</CodeExample>
+
+March's `revenue_to_date` is January + February + March. The last row is the half-year total. (Months as `'YYYY-MM'` text sort correctly, which is why `to_char` is handy here.)
+
+## Running totals per group
+
+Add `PARTITION BY` and the running total starts again for every group. Here's each customer's **lifetime spend** growing order by order, for the first four customers:
+
+<CodeExample output={` customer_id | order_id |    day     | total  | lifetime_spend
+-------------+----------+------------+--------+----------------
+           1 |       17 | 2025-03-14 | 200.17 |         200.17
+           2 |        5 | 2025-01-24 | 149.73 |         149.73
+           2 |       22 | 2025-04-04 | 124.10 |         273.83
+           3 |       10 | 2025-02-13 |  36.24 |          36.24
+           3 |       27 | 2025-04-25 |  22.80 |          59.04
+           4 |       15 | 2025-03-06 |   7.50 |           7.50
+           4 |       32 | 2025-05-15 | 200.17 |         207.67
+(7 rows)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.customer_id, o.id, o.ordered_at,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+)
+SELECT customer_id, id AS order_id, ordered_at::date AS day, total,
+  sum(total) OVER (
+    PARTITION BY customer_id
+    ORDER BY ordered_at
+  ) AS lifetime_spend
+FROM order_totals
+WHERE customer_id <= 4
+ORDER BY customer_id, ordered_at;
+```
+
+</CodeExample>
+
+Customer 4's lifetime spend jumps from 7.50 to 207.67 with their second order. That's the kind of moment a shop might celebrate with a "VIP" badge.
+
+## Window frames: which rows does each row see?
+
+Why does `sum(...) OVER (ORDER BY month)` give a running total and not the grand total? Because of the **frame**. A window has up to three parts:
+
+```text
+OVER (
+  PARTITION BY ...   -- which group of rows
+  ORDER BY ...       -- in what order
+  frame              -- which of those rows, relative to the current row
+)
+```
+
+When you write an `ORDER BY` but no frame, PostgreSQL uses a default frame: **`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`**, "from the first row of the partition up to this one". Without `ORDER BY`, the frame is the whole partition. That's the whole trick behind running totals.
+
+You can write the frame yourself. Its general shape is:
+
+```text
+{ ROWS | RANGE | GROUPS } BETWEEN start AND end
+
+start / end:  UNBOUNDED PRECEDING     the first row of the partition
+              n PRECEDING             n rows (or a distance) before
+              CURRENT ROW
+              n FOLLOWING             n rows (or a distance) after
+              UNBOUNDED FOLLOWING     the last row of the partition
+```
+
+A short form like `ROWS UNBOUNDED PRECEDING` means "between unbounded preceding and the current row".
+
+<Callout type="note" title="Frames only matter for some functions">
+
+Frames affect aggregates (`sum`, `avg`, `count`, `min`, `max`…) and `first_value`, `last_value` and `nth_value`, which you'll meet in the next lesson. The numbering functions (`row_number`, `rank`, `dense_rank`) and `lag`/`lead` ignore the frame and always look at the whole partition.
+
+</Callout>
+
+## ROWS vs RANGE: the peer trap
+
+The default frame says **`RANGE`**, not `ROWS`, and the difference is easy to miss. `ROWS` counts physical rows. `RANGE` works with **values** of the `ORDER BY` expression: rows with the same value (PostgreSQL calls them **peers**) are always inside or outside the frame together.
+
+Watch what happens with a running total of items ordered by `order_id`, where one order has several items:
+
+<CodeExample output={` order_id | product_id | quantity | range_total | rows_total
+----------+------------+----------+-------------+------------
+        1 |          8 |        3 |           4 |          3
+        1 |         12 |        1 |           4 |          4
+        2 |          4 |        3 |          10 |          7
+        2 |         11 |        1 |          10 |          8
+        2 |         15 |        2 |          10 |         10
+        3 |         14 |        2 |          12 |         12
+(6 rows)`}>
+
+```sql
+SELECT order_id, product_id, quantity,
+  sum(quantity) OVER (ORDER BY order_id) AS range_total,
+  sum(quantity) OVER (
+    ORDER BY order_id, product_id
+    ROWS UNBOUNDED PRECEDING
+  ) AS rows_total
+FROM order_items
+WHERE order_id <= 3
+ORDER BY order_id, product_id;
+```
+
+</CodeExample>
+
+The three rows of order 2 are peers, so with the default `RANGE` frame they all see each other and get the same total, 10. With `ROWS`, every row adds just itself. Neither is wrong: `range_total` answers "items ordered up to and including this order", `rows_total` answers "items so far, row by row".
+
+<Callout type="warning" title="Running totals that don't add up">
+
+If a running total suddenly "jumps" by two rows at once, you've hit peers: the `ORDER BY` inside `OVER` isn't unique. Two payments on the same day get the same `RANGE` total. The fix is to use `ROWS` **and** make the order unique with a tie-breaker (`ORDER BY booked_on, id`). Without a tie-breaker, `ROWS` picks an arbitrary order among the peers, and the numbers can change from run to run.
+
+</Callout>
+
+## Moving averages with ROWS
+
+A **moving average** (or rolling average) smooths out noisy numbers: each point is the average of the last few. "The last 3 months" is a frame of `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`: two rows before, plus this one.
+
+When several columns use the same window, name it once with a **`WINDOW` clause** (it goes after `GROUP BY`/`HAVING` and before `ORDER BY`) and refer to it by name:
+
+<CodeExample output={`  month  | revenue | avg_3_months | months_used
+---------+---------+--------------+-------------
+ 2025-01 |  518.30 |       518.30 |           1
+ 2025-02 |  331.69 |       425.00 |           2
+ 2025-03 |  525.80 |       458.60 |           3
+ 2025-04 |  331.69 |       396.39 |           3
+ 2025-05 |  467.80 |       441.76 |           3
+ 2025-06 |  270.54 |       356.68 |           3
+(6 rows)`}>
+
+```sql
+WITH monthly AS (
+  SELECT to_char(o.ordered_at, 'YYYY-MM') AS month,
+    sum(oi.quantity * oi.unit_price) AS revenue
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY month
+)
+SELECT month, revenue,
+  round(avg(revenue) OVER last_3, 2) AS avg_3_months,
+  count(*) OVER last_3 AS months_used
+FROM monthly
+WINDOW last_3 AS (
+  ORDER BY month
+  ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+)
+ORDER BY month;
+```
+
+</CodeExample>
+
+Revenue swings between 270 and 525 a month, but the moving average stays in a much narrower band and shows the trend: drifting down since March. Look at `months_used`, though: January's "3-month average" is really one month, and February's is two. At the start of the data the frame is simply shorter. Real dashboards often hide those first rows, or show them greyed out, so nobody reads too much into them.
+
+## RANGE with distances: time-based windows
+
+`ROWS BETWEEN 2 PRECEDING` means "the last three **rows**", which is only "the last three months" if no month is missing. Real data has gaps: a quiet week with no orders, a holiday. When the `ORDER BY` is a number, date or timestamp, **`RANGE`** can take a **distance** instead, so the frame becomes "everything within 14 days before this row", however many rows that is:
+
+<CodeExample output={` id |    day     | total  | revenue_14_days | orders_14_days
+----+------------+--------+-----------------+----------------
+  1 | 2025-01-07 | 102.00 |          102.00 |              1
+  2 | 2025-01-11 | 200.17 |          302.17 |              2
+  3 | 2025-01-15 |   8.40 |          310.57 |              3
+  5 | 2025-01-24 | 149.73 |          358.30 |              3
+  6 | 2025-01-28 |  58.00 |          216.13 |              3
+  7 | 2025-02-01 | 124.10 |          331.83 |              3
+  8 | 2025-02-05 |  52.20 |          384.03 |              4
+ 10 | 2025-02-13 |  36.24 |          212.54 |              3
+ 11 | 2025-02-17 |  78.50 |          166.94 |              3
+(9 rows)`}>
+
+```sql
+WITH order_totals AS (
+  SELECT o.id, o.ordered_at, sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+)
+SELECT id, ordered_at::date AS day, total,
+  sum(total) OVER last_14_days AS revenue_14_days,
+  count(*) OVER last_14_days AS orders_14_days
+FROM order_totals
+WHERE ordered_at < '2025-02-20'
+WINDOW last_14_days AS (
+  ORDER BY ordered_at
+  RANGE BETWEEN interval '14 days' PRECEDING AND CURRENT ROW
+)
+ORDER BY ordered_at;
+```
+
+</CodeExample>
+
+Look at `orders_14_days`: the number of orders inside the window changes from row to row (three on 24 January, four on 5 February), because the frame is measured in **days**, not rows. A `ROWS` frame would always take a fixed number of orders, however far apart in time they were.
+
+Two more frame tools, for completeness:
+
+- **`GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW`** counts **groups of peers** instead of rows: "this date and the previous date that has data".
+- **`EXCLUDE CURRENT ROW`** (or `EXCLUDE TIES`, `EXCLUDE GROUP`) leaves rows out of the frame, e.g. "the average of the **other** orders this week".
+
+<Quiz
+  question="Which frame gives a 7-day moving average over a table with exactly one row per day and no gaps?"
+  options={[
+    "ROWS BETWEEN 7 PRECEDING AND CURRENT ROW",
+    "ROWS BETWEEN 6 PRECEDING AND CURRENT ROW",
+    "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+    "ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING, which is always the same thing",
+  ]}
+  answer={1}
+  explanation="6 preceding rows plus the current row is 7 rows. 7 PRECEDING would average 8 days. A centred window (3 preceding and 3 following) is also 7 rows, but it uses future days, so it's a different measure. If days could be missing, RANGE BETWEEN interval '6 days' PRECEDING AND CURRENT ROW is safer."
+/>
+
+## Cumulative share: the 80/20 check
+
+Running totals combine nicely with `sum(...) OVER ()`, the grand total. Divide one by the other and you get a **cumulative share**. Sort the products by revenue, and you can see how few products bring in most of the money (the famous **Pareto** or 80/20 rule):
+
+<CodeExample output={`          name          | revenue | cumulative_pct
+------------------------+---------+----------------
+ Rice Cooker            |  809.10 |           33.1
+ Algorithms in Pictures |  493.00 |           53.2
+ Tea Pot                |  288.00 |           65.0
+ Clean Python           |  224.91 |           74.2
+ Wooden Puzzle          |  182.40 |           81.7
+ The Bamboo Code        |  112.50 |           86.3
+ Kite                   |  105.00 |           90.6
+ Bamboo Chopsticks      |   63.00 |           93.1
+ Panda Cookies          |   60.00 |           95.6
+ Earl Grey              |   42.00 |           97.3
+ Jasmine Tea            |   39.00 |           98.9
+ Bamboo Crisps          |   26.91 |          100.0
+(12 rows)`}>
+
+```sql
+WITH product_revenue AS (
+  SELECT p.name, sum(oi.quantity * oi.unit_price) AS revenue
+  FROM order_items AS oi
+  JOIN orders AS o ON o.id = oi.order_id
+  JOIN products AS p ON p.id = oi.product_id
+  WHERE o.status <> 'cancelled'
+  GROUP BY p.id
+)
+SELECT name, revenue,
+  round(100 * sum(revenue) OVER (
+    ORDER BY revenue DESC, name
+    ROWS UNBOUNDED PRECEDING
+  ) / sum(revenue) OVER (), 1) AS cumulative_pct
+FROM product_revenue
+ORDER BY revenue DESC, name;
+```
+
+</CodeExample>
+
+Five of the twelve products that sold anything bring in over 80% of the revenue. That's the kind of insight that changes what a shop puts on its home page. Notice the `ROWS` frame and the `name` tie-breaker: two products with equal revenue would otherwise share a cumulative share.
+
+Experiment: change the frame of the moving average, try `GROUPS` or `EXCLUDE CURRENT ROW`, or turn the 14-day window into a 30-day one.
+
+<TryIt language="sql" code={`WITH monthly AS (
+  SELECT to_char(o.ordered_at, 'YYYY-MM') AS month,
+    sum(oi.quantity * oi.unit_price) AS revenue
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY month
+)
+SELECT month, revenue,
+  sum(revenue) OVER w AS frame_sum,
+  count(*) OVER w AS rows_in_frame
+FROM monthly
+WINDOW w AS (
+  ORDER BY month
+  ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+)
+ORDER BY month;`} />
+
+<Quiz
+  question="A ledger has two payments on 5 March. You write sum(amount) OVER (ORDER BY booked_on). What do the two 5 March rows show?"
+  options={[
+    "Different balances, one per payment",
+    "The same balance, including both payments, because the default RANGE frame treats rows with the same date as peers",
+    "NULL, because of the tie",
+    "An error: ORDER BY inside OVER must be unique",
+  ]}
+  answer={1}
+  explanation="With ORDER BY and no frame, the frame is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, and peers (rows with the same ORDER BY value) are included together. For a balance per row, use ROWS and a unique order, like ORDER BY booked_on, id."
+/>
+
+<Exercise
+  language="sql"
+  title="A bank statement with running balances"
+  starter={`CREATE TABLE ledger (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account text NOT NULL,
+  booked_on date NOT NULL,
+  amount numeric(10, 2) NOT NULL
+);
+
+INSERT INTO ledger (account, booked_on, amount) VALUES
+  ('mei', '2025-03-01', 100.00),
+  ('mei', '2025-03-03', -20.00),
+  ('sam', '2025-03-03', 50.00),
+  ('mei', '2025-03-05', -15.50),
+  ('mei', '2025-03-05', 40.00),
+  ('sam', '2025-03-06', -30.00),
+  ('mei', '2025-03-09', -60.00),
+  ('sam', '2025-03-10', 25.00);
+
+-- Add balance and avg_last_3
+SELECT account, booked_on, amount
+FROM ledger
+ORDER BY account, booked_on, id;`}
+  tests={[
+    { name: "Columns are account, booked_on, amount, balance, avg_last_3", check: "columns.join() === 'account,booked_on,amount,balance,avg_last_3'" },
+    { name: "Each account has its own running balance", check: "rows.map(r => r.balance).join() === '100,80,64.5,104.5,44.5,50,20,45'" },
+    { name: "Same-day transactions get their own balance", check: "rows.filter(r => r.booked_on === '2025-03-05').map(r => r.balance).join() === '64.5,104.5'" },
+    { name: "avg_last_3 averages up to 3 transactions, rounded to 2 places", check: "rows.map(r => r.avg_last_3).join() === '100,40,21.5,1.5,-11.83,50,10,15'" },
+    { name: "Works when the data changes", check: "(await rerun(\"INSERT INTO ledger (account, booked_on, amount) VALUES ('mei', '2025-03-02', 10), ('ola', '2025-03-01', 5)\")).map(r => r.account + ':' + r.balance).join() === 'mei:100,mei:110,mei:90,mei:74.5,mei:114.5,mei:54.5,ola:5,sam:50,sam:20,sam:45'" },
+  ]}
+>
+
+Build a bank statement from the `ledger` table (the starter creates it). For every transaction show:
+
+- `account`, `booked_on` and `amount`,
+- `balance`: the account's running total, transaction by transaction. Two transactions on the same day each get their own balance (the one with the lower `id` comes first),
+- `avg_last_3`: the average amount of this transaction and the account's two transactions before it, rounded to 2 decimal places,
+- sorted by account, then `booked_on`, then `id`.
+
+<Hint>
+
+Both columns use the same window: `PARTITION BY account ORDER BY booked_on, id`. For the balance, the frame is `ROWS UNBOUNDED PRECEDING` (with the default `RANGE` frame, the two 5 March rows would get the same balance). For the average, it's `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`, wrapped in `round(..., 2)`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE ledger (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account text NOT NULL,
+  booked_on date NOT NULL,
+  amount numeric(10, 2) NOT NULL
+);
+
+INSERT INTO ledger (account, booked_on, amount) VALUES
+  ('mei', '2025-03-01', 100.00),
+  ('mei', '2025-03-03', -20.00),
+  ('sam', '2025-03-03', 50.00),
+  ('mei', '2025-03-05', -15.50),
+  ('mei', '2025-03-05', 40.00),
+  ('sam', '2025-03-06', -30.00),
+  ('mei', '2025-03-09', -60.00),
+  ('sam', '2025-03-10', 25.00);
+
+SELECT account, booked_on, amount,
+  sum(amount) OVER (
+    PARTITION BY account
+    ORDER BY booked_on, id
+    ROWS UNBOUNDED PRECEDING
+  ) AS balance,
+  round(avg(amount) OVER (
+    PARTITION BY account
+    ORDER BY booked_on, id
+    ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+  ), 2) AS avg_last_3
+FROM ledger
+ORDER BY account, booked_on, id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- `sum(x) OVER (ORDER BY ...)` is a **running total**; add `PARTITION BY` to restart it for every group.
+- The **frame** decides which rows of the partition each row sees. With `ORDER BY` and no frame, it's `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`; without `ORDER BY`, the whole partition.
+- **`RANGE`** treats rows with equal `ORDER BY` values (**peers**) as one; **`ROWS`** counts physical rows. For per-row balances use `ROWS` plus a unique tie-breaker.
+- `ROWS BETWEEN n PRECEDING AND CURRENT ROW` gives **moving averages**; watch the shorter frames at the start of the data.
+- `RANGE BETWEEN interval '14 days' PRECEDING AND CURRENT ROW` gives **time-based** windows that cope with gaps.
+- The **`WINDOW`** clause names a window once so several columns can share it.
+- `running sum / sum(...) OVER ()` gives a **cumulative share**, the 80/20 check.

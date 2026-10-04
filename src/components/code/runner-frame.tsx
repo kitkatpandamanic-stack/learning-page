@@ -27,6 +27,7 @@ export const languageLabel: Record<RunLanguage, string> = {
   python: "Python",
   react: "React",
   tsx: "React + TypeScript",
+  sql: "SQL",
 };
 
 export const runnerFrameClass =

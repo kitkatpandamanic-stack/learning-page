@@ -1,0 +1,441 @@
+---
+title: "Part 2: Cohort retention and conversion funnels"
+description: Group customers into cohorts by their first order, build a retention table that tells "not yet" from "never", and measure a conversion funnel.
+duration: 25
+xp: 30
+---
+
+Part 1's growth numbers have a blind spot. Revenue can rise every month while the shop **loses** most of its customers, as long as marketing keeps buying new ones. That's a leaky bucket, and it gets very expensive. The two most important product charts exist to catch it:
+
+- A **cohort retention table**: of the customers who started in January, how many came back one, two, three months later?
+- A **conversion funnel**: of the people who visit the site, how many view a product, add it to the cart, check out and actually pay?
+
+Both are classic analyst interview questions, and both are built from tools you know: CTEs, `FILTER` and window functions. 🔁
+
+## Cohorts: grouping customers by when they started
+
+A **cohort** is a group of people who started at the same time. Here a customer's cohort is the **month of their first paid order**. We need two small CTEs, both following Part 1's definitions (cancelled orders don't count):
+
+- `activity`: one row per customer per month in which they were active. `DISTINCT` removes the duplicates if someone orders twice in a month.
+- `cohorts`: each customer's first active month, the `min()` of their activity.
+
+<CodeExample output={`   cohort   | customers
+------------+-----------
+ 2025-01-01 |         5
+ 2025-02-01 |         6
+ 2025-03-01 |         4
+ 2025-04-01 |         1
+ 2025-05-01 |         1
+(5 rows)`}>
+
+```sql
+WITH activity AS (
+  SELECT DISTINCT customer_id,
+    date_trunc('month', ordered_at)::date AS month
+  FROM orders
+  WHERE status <> 'cancelled'
+),
+cohorts AS (
+  SELECT customer_id, min(month) AS cohort
+  FROM activity
+  GROUP BY customer_id
+)
+SELECT cohort, count(*) AS customers
+FROM cohorts
+GROUP BY cohort
+ORDER BY cohort;
+```
+
+</CodeExample>
+
+Five customers started in January, six in February, and so on. The April and May cohorts are tiny: those two customers' earlier orders were cancelled, so their first **paid** order came later.
+
+## Months since the first order
+
+Next, every activity row gets a **month number**: 0 for the cohort month itself, 1 for the month after, and so on. **`age(later, earlier)`** returns an interval like `2 mons` or `1 year 3 mons`, and `extract` takes it apart:
+
+<CodeExample output={`   cohort   | month_no | customers
+------------+----------+-----------
+ 2025-01-01 |        0 |         5
+ 2025-01-01 |        2 |         2
+ 2025-01-01 |        3 |         2
+ 2025-01-01 |        4 |         1
+ 2025-01-01 |        5 |         3
+ 2025-02-01 |        0 |         6
+ 2025-02-01 |        2 |         3
+ 2025-02-01 |        3 |         1
+(8 rows)`}>
+
+```sql
+WITH activity AS (
+  SELECT DISTINCT customer_id,
+    date_trunc('month', ordered_at)::date AS month
+  FROM orders
+  WHERE status <> 'cancelled'
+),
+cohorts AS (
+  SELECT customer_id, min(month) AS cohort
+  FROM activity
+  GROUP BY customer_id
+)
+SELECT c.cohort,
+  (extract(year FROM age(a.month, c.cohort)) * 12
+    + extract(month FROM age(a.month, c.cohort)))::int AS month_no,
+  count(*) AS customers
+FROM activity AS a
+JOIN cohorts AS c USING (customer_id)
+WHERE c.cohort <= '2025-02-01'
+GROUP BY c.cohort, month_no
+ORDER BY c.cohort, month_no;
+```
+
+</CodeExample>
+
+(The `WHERE` only keeps the output short.) This is the retention data in **long format**: one row per cohort and month number. Notice the holes: nobody in either cohort ordered in month 1, so there's simply **no row** for it. Pandas' tea and cookies apparently last about two months. 🍵
+
+We need `years * 12 + months` because `age()` rolls over: 14 months is `1 year 2 mons`, and `extract(month …)` alone would say 2.
+
+## The retention table
+
+People don't read long format; they read a **triangle**: one row per cohort, one column per month number, each cell the percentage of the cohort that was active. Turning rows into columns is a **pivot**, which in PostgreSQL is `max(…) FILTER (WHERE month_no = n)` per column.
+
+But there's a trap. The February cohort's month 5 is **July**, and our data stops in June. If we just count, that cell says `0%`, which reads as "everybody left". The truth is "we don't know yet". A good retention table leaves those cells **empty**.
+
+The fix is to build a **grid** first: every cohort with every month number that has already happened, then LEFT JOIN the activity onto it. Cells in the grid get a number (possibly 0); cells outside it stay NULL:
+
+<CodeExample output={`   cohort   | size | m1 |  m2  |  m3  |  m4  |  m5
+------------+------+----+------+------+------+------
+ 2025-01-01 |    5 |  0 |   40 |   40 |   20 |   60
+ 2025-02-01 |    6 |  0 |   50 |   17 |    0 | NULL
+ 2025-03-01 |    4 |  0 |   50 |   25 | NULL | NULL
+ 2025-04-01 |    1 |  0 |    0 | NULL | NULL | NULL
+ 2025-05-01 |    1 |  0 | NULL | NULL | NULL | NULL
+(5 rows)`}>
+
+```sql
+WITH activity AS (
+  SELECT DISTINCT customer_id,
+    date_trunc('month', ordered_at)::date AS month
+  FROM orders
+  WHERE status <> 'cancelled'
+),
+cohorts AS (
+  SELECT customer_id, min(month) AS cohort
+  FROM activity
+  GROUP BY customer_id
+),
+cohort_activity AS (
+  SELECT c.cohort, a.customer_id,
+    (extract(year FROM age(a.month, c.cohort)) * 12
+      + extract(month FROM age(a.month, c.cohort)))::int AS month_no
+  FROM activity AS a
+  JOIN cohorts AS c USING (customer_id)
+),
+grid AS (
+  SELECT cohort, count(*) AS size, n AS month_no
+  FROM cohorts
+  CROSS JOIN generate_series(0, 5) AS n
+  GROUP BY cohort, n
+  HAVING cohort + n * interval '1 month' <= '2025-06-01'
+),
+retention AS (
+  SELECT g.cohort, g.size, g.month_no,
+    round(100.0 * count(ca.customer_id) / g.size) AS pct
+  FROM grid AS g
+  LEFT JOIN cohort_activity AS ca
+    ON ca.cohort = g.cohort AND ca.month_no = g.month_no
+  GROUP BY g.cohort, g.size, g.month_no
+)
+SELECT cohort, size,
+  max(pct) FILTER (WHERE month_no = 1) AS m1,
+  max(pct) FILTER (WHERE month_no = 2) AS m2,
+  max(pct) FILTER (WHERE month_no = 3) AS m3,
+  max(pct) FILTER (WHERE month_no = 4) AS m4,
+  max(pct) FILTER (WHERE month_no = 5) AS m5
+FROM retention
+GROUP BY cohort, size
+ORDER BY cohort;
+```
+
+</CodeExample>
+
+Reading the triangle:
+
+- **Rows** compare a cohort with itself over time. Of January's 5 customers, 40% came back in month 2 and 60% in month 5.
+- **Columns** compare cohorts at the same age. Month 2 retention went from 40% (January) to 50% (February and March): if a product change shipped in February, this is where you'd see it.
+- The **diagonal edge** is today. Everything below it is NULL because it hasn't happened yet.
+
+Month 0 isn't shown because it's always 100%: that's how a cohort is defined.
+
+<Callout type="warning" title="Small cohorts lie">
+
+The April cohort has **one** customer, so its cells can only be 0% or 100%. One person changing their mind swings the number by 100 points. Real dashboards show the cohort size next to the percentages (like our `size` column), fade out cells built from fewer than, say, 30 people, or merge small cohorts into quarters. Percentages without their denominators are how bad decisions get made.
+
+</Callout>
+
+## The conversion funnel
+
+The second chart follows visitors through the shop, step by step. Apps record **events** for this: one row each time a user does something. Our sample database has no events, so we'll generate a day's worth for 300 visitors. Every run starts fresh, so the funnel queries below all begin with this `CREATE TABLE`. Each visitor gets a fixed "luck" number from 0 to 99 that decides how far they get (desktop visitors are a bit luckier), so the data is the same every time:
+
+<CodeExample output={`CREATE TABLE AS
+
+ user_id | device  |    event     |     happened_at
+---------+---------+--------------+---------------------
+       2 | mobile  | visit        | 2025-06-02 08:20:00
+       3 | desktop | visit        | 2025-06-02 08:29:00
+       3 | desktop | view_product | 2025-06-02 08:31:00
+       3 | desktop | add_to_cart  | 2025-06-02 08:33:00
+       3 | desktop | checkout     | 2025-06-02 08:35:00
+       3 | desktop | purchase     | 2025-06-02 08:37:00
+(6 rows)`}>
+
+```sql
+CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+SELECT *
+FROM events
+WHERE user_id IN (2, 3)
+ORDER BY happened_at;
+```
+
+</CodeExample>
+
+User 2 visited and left. User 3, on a desktop, went all the way to a purchase. (`unnest(…) WITH ORDINALITY` numbers the array elements 1 to 5, and `true::int` is 1, so the `WHERE` keeps the first 1 to 5 steps.)
+
+Now the funnel itself. Two habits make it robust:
+
+1. The **steps are defined in the query** with a `VALUES` list, in order. Event names alone don't say which step comes first, and a step nobody reached must still show up (with 0), so we LEFT JOIN the events onto the steps.
+2. We count **distinct users**, not events: someone who adds three things to the cart is still one person at that step.
+
+<CodeExample output={`CREATE TABLE AS
+
+ step_no |    event     | users | pct_of_first | pct_of_previous
+---------+--------------+-------+--------------+-----------------
+       1 | visit        |   300 |        100.0 |            NULL
+       2 | view_product |   195 |         65.0 |            65.0
+       3 | add_to_cart  |    99 |         33.0 |            50.8
+       4 | checkout     |    63 |         21.0 |            63.6
+       5 | purchase     |    42 |         14.0 |            66.7
+(5 rows)`}>
+
+```sql
+CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+WITH steps (step_no, event) AS (
+  VALUES (1, 'visit'), (2, 'view_product'), (3, 'add_to_cart'),
+    (4, 'checkout'), (5, 'purchase')
+),
+counts AS (
+  SELECT s.step_no, s.event, count(DISTINCT e.user_id) AS users
+  FROM steps AS s
+  LEFT JOIN events AS e ON e.event = s.event
+  GROUP BY s.step_no, s.event
+)
+SELECT step_no, event, users,
+  round(100.0 * users / first_value(users) OVER w, 1) AS pct_of_first,
+  round(100.0 * users / nullif(lag(users) OVER w, 0), 1)
+    AS pct_of_previous
+FROM counts
+WINDOW w AS (ORDER BY step_no)
+ORDER BY step_no;
+```
+
+</CodeExample>
+
+The two percentages answer different questions:
+
+- **`pct_of_first`** (from `first_value`) is the overall conversion: 14% of visitors bought something.
+- **`pct_of_previous`** (from `lag`) shows where people **drop off**. The biggest leak is view product → add to cart: about half the people who look at a product leave. But look at checkout → purchase: a third of the people who had already decided to pay didn't. That's usually a payment problem, and often the cheapest one to fix. 💳
+
+<Callout type="note" title="Open and closed funnels">
+
+Our generated users always do the steps in order. Real event data is messier: someone buys from a cart they filled yesterday, without a "view_product" today. An **open** funnel (what we built) counts everyone who did each step. A **closed** funnel only counts users who did every earlier step first, for example with `bool_and` per user or by checking the timestamps, and it can never go up from one step to the next. Both are fine; the dashboard must say which one it shows.
+
+</Callout>
+
+## Comparing segments
+
+A funnel gets really useful when you split it: by device, country, campaign or app version. With `FILTER`, each segment becomes a column. Try it, then add a third column that counts all devices together:
+
+<TryIt language="sql" code={`CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+WITH steps (step_no, event) AS (
+  VALUES (1, 'visit'), (2, 'view_product'), (3, 'add_to_cart'),
+    (4, 'checkout'), (5, 'purchase')
+)
+SELECT s.step_no, s.event,
+  count(DISTINCT e.user_id) FILTER (WHERE e.device = 'mobile')
+    AS mobile,
+  count(DISTINCT e.user_id) FILTER (WHERE e.device = 'desktop')
+    AS desktop
+FROM steps AS s
+LEFT JOIN events AS e ON e.event = s.event
+GROUP BY s.step_no, s.event
+ORDER BY s.step_no;`}
+/>
+
+Desktop visitors are half as many, but they buy almost as often in absolute numbers: 20 of 100 against 22 of 200. That's the kind of finding that changes a roadmap ("fix the mobile checkout first").
+
+<Quiz
+  question="In a cohort retention table, the March cohort's month 4 cell would be July, but the data ends in June. What should the cell show?"
+  options={["0%, because nobody was active in July", "100%, like month 0", "Nothing (NULL), because that month hasn't happened yet", "The average of the other cohorts' month 4"]}
+  answer={2}
+  explanation="0% would claim that every customer left, which we don't know. Cells for months that haven't happened yet must be empty. Building a grid of cohort and month numbers that already happened, then LEFT JOINing the activity, gives 0 only where 0 is true."
+/>
+
+<Quiz
+  question="A funnel query uses count(*) instead of count(DISTINCT user_id) per step. What goes wrong?"
+  options={["Nothing, both give the same numbers", "Steps with repeated events (like adding three items to the cart) count the same person several times, so a step can look bigger than the one before", "count(*) can't be used with GROUP BY", "Steps nobody reached disappear"]}
+  answer={1}
+  explanation="A funnel counts people, not clicks. One user with three add_to_cart events would count three times, inflating that step and its conversion rate, sometimes to more than 100% of the previous step."
+/>
+
+<Exercise
+  language="sql"
+  title="The funnel per device"
+  starter={`CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+-- One row per device and step:
+-- device, step_no, event, users, pct_of_previous
+WITH steps (step_no, event) AS (
+  VALUES (1, 'visit'), (2, 'view_product'), (3, 'add_to_cart'),
+    (4, 'checkout'), (5, 'purchase')
+)
+SELECT s.step_no, s.event, count(DISTINCT e.user_id) AS users
+FROM steps AS s
+LEFT JOIN events AS e ON e.event = s.event
+GROUP BY s.step_no, s.event
+ORDER BY s.step_no;`}
+  tests={[
+    { name: "Columns are device, step_no, event, users, pct_of_previous", check: "columns.join() === 'device,step_no,event,users,pct_of_previous'" },
+    { name: "10 rows: desktop steps 1 to 5, then mobile steps 1 to 5", check: "rows.length === 10 && rows.map(r => r.device[0] + r.step_no).join() === 'd1,d2,d3,d4,d5,m1,m2,m3,m4,m5'" },
+    { name: "Distinct users per device and step", check: "rows.map(r => r.users).join() === '100,71,39,27,20,200,124,60,36,22'" },
+    { name: "pct_of_previous is per device, rounded to 1 decimal, NULL for the first step", check: "rows.map(r => r.pct_of_previous).join() === ',71,54.9,69.2,74.1,,62,48.4,60,61.1' && rows[5].pct_of_previous === null" },
+    { name: "A user with repeated events counts once", check: "(await rerun(\"INSERT INTO events SELECT user_id, device, event, happened_at + interval '1 hour' FROM events WHERE user_id = 2\")).map(r => r.users).join() === '100,71,39,27,20,200,124,60,36,22'" },
+    { name: "A step nobody reached shows 0 users", check: "(await rerun(\"DELETE FROM events WHERE device = 'desktop' AND event = 'purchase'\")).filter(r => r.device === 'desktop').map(r => r.users + '/' + r.pct_of_previous).join() === '100/null,71/71,39/54.9,27/69.2,0/0'" },
+  ]}
+>
+
+The mobile team wants to see their funnel next to desktop's. The starter creates the `events` table and has the overall funnel. Change the query so it returns **one row per device and step** with these columns:
+
+- `device`, `step_no`, `event`,
+- `users`: the number of **different** users of that device who did that step,
+- `pct_of_previous`: `users` as a percentage of the previous step **of the same device**, rounded to 1 decimal place (NULL for step 1).
+
+Sort by device, then step. A step that no user of a device reached must still appear with `0` users: the checks delete every desktop purchase and expect a desktop `purchase` row with `0`.
+
+<Hint>
+
+You need every combination of device and step, even without events, so start from a grid: `steps CROSS JOIN (VALUES ('desktop'), ('mobile')) AS d (device)`, then LEFT JOIN `events` on both `event` and `device`. Count `DISTINCT e.user_id` grouped by device, step_no and event in a `counts` CTE. Then `lag(users) OVER (PARTITION BY device ORDER BY step_no)` gives the previous step of the same device; divide with `nullif(…, 0)`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+WITH steps (step_no, event) AS (
+  VALUES (1, 'visit'), (2, 'view_product'), (3, 'add_to_cart'),
+    (4, 'checkout'), (5, 'purchase')
+),
+counts AS (
+  SELECT d.device, s.step_no, s.event,
+    count(DISTINCT e.user_id) AS users
+  FROM steps AS s
+  CROSS JOIN (VALUES ('desktop'), ('mobile')) AS d (device)
+  LEFT JOIN events AS e
+    ON e.event = s.event AND e.device = d.device
+  GROUP BY d.device, s.step_no, s.event
+)
+SELECT device, step_no, event, users,
+  round(100.0 * users / nullif(lag(users) OVER w, 0), 1)
+    AS pct_of_previous
+FROM counts
+WINDOW w AS (PARTITION BY device ORDER BY step_no)
+ORDER BY device, step_no;
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- **Cohorts** from each customer's first paid month, with `min()` over a distinct activity CTE.
+- **Month numbers** with `age()` and `extract`, remembering that `age()` rolls months over into years.
+- A **retention triangle** pivoted with `max(…) FILTER (WHERE …)`, built on a grid so months that haven't happened yet are NULL instead of a misleading 0%, with cohort sizes next to the percentages.
+- A **conversion funnel** with the steps defined in a `VALUES` list, distinct users per step, and overall (`first_value`) and step-to-step (`lag`) conversion.
+- **Segments** side by side with `FILTER`, and per segment with `PARTITION BY`.
+
+In Part 3 you'll add rankings and moving averages, and then package everything as the final dashboard.

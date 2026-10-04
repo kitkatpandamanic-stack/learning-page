@@ -34,6 +34,7 @@ import { typeErrorResult, type TypeEnv } from "@/lib/runner/typecheck";
 import { runDom, type DomRun } from "@/lib/runner/run-dom";
 import { whenIdle } from "@/lib/idle";
 import { isPythonReady, preloadPython } from "@/lib/runner/run-python";
+import { isSqlReady, preloadSql } from "@/lib/runner/run-sql";
 import {
   isTypeScriptReady,
   preloadTypeScript,
@@ -189,6 +190,7 @@ export function CodeRunner({
   // the download doesn't slow the lesson itself down.
   React.useEffect(() => {
     if (language === "python") return whenIdle(preloadPython);
+    if (language === "sql") return whenIdle(preloadSql);
     if (typed) return whenIdle(() => preloadTypeScript(typeEnv));
   }, [language, typed, typeEnv]);
 
@@ -205,6 +207,7 @@ export function CodeRunner({
     setCheck(null);
     setStatus(
       (language === "python" && !isPythonReady()) ||
+        (language === "sql" && !isSqlReady()) ||
         (typed && !isTypeScriptReady(typeEnv))
         ? "loading"
         : null,

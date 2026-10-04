@@ -1,0 +1,379 @@
+---
+title: "Part 1: Active customers and growth"
+description: Define the dashboard's metrics, count monthly and daily active customers without gaps, and compare each month with the one before.
+duration: 22
+xp: 30
+---
+
+Welcome to the **Level 2 capstone**! 📊 The panda shop's product team wants a **dashboard**: one screen that answers "how are we doing?" every morning. Charts and tiles are the easy part. Behind every tile sits a **query**, and if the query is wrong, the whole company makes decisions on wrong numbers. You're the analyst who writes those queries.
+
+Over three parts you'll build the full query set:
+
+- **Part 1 (this lesson)**: active customers per day and per month, revenue, and **growth** compared with the previous period.
+- **Part 2**: a **cohort retention** table (do customers come back?) and a **conversion funnel** (where do visitors drop off?).
+- **Part 3**: **rankings** and **moving averages**, then the final dashboard, packaged as views.
+
+You'll use everything from Level 2: CTEs, window functions, `FILTER`, `generate_series`, views and a few performance habits.
+
+## The plan: define every metric first
+
+Before writing a single query, professional analysts write down **exactly** what each number means. "Active customers" sounds obvious until two people get two different answers: does a cancelled order count? Is a month a calendar month or the last 30 days? Our dashboard uses these definitions:
+
+| Metric | Definition |
+| --- | --- |
+| **Paid order** | An order whose status isn't `cancelled` (paid, shipped or delivered) |
+| **Revenue** | The sum of `quantity * unit_price` over the items of paid orders |
+| **Active customer** (in a period) | A customer with at least one paid order in that period |
+| **Period** | A calendar day or month of `ordered_at` |
+
+Our data lives in the sample shop: `orders` (40 orders from January to June 2025, each with a `status`) and `order_items` (the products in each order, with `quantity` and the `unit_price` paid).
+
+<Callout type="tip" title="Write the definitions where people can see them">
+
+Real dashboards show a small "ⓘ" next to each tile with its definition. When finance says revenue was 2,809 and your dashboard says 2,446, the definition table settles it in seconds: finance counted cancelled orders. Most "the numbers are wrong!" arguments are really "we defined it differently" arguments.
+
+</Callout>
+
+## One row per paid order
+
+Almost every tile needs the same building block: each paid order with its **total**. A CTE gives it a name, so the rest of the query reads like the definition table:
+
+<CodeExample output={` id | customer_id |     ordered_at      | total
+----+-------------+---------------------+--------
+  1 |           8 | 2025-01-07 12:17:00 | 102.00
+  2 |          15 | 2025-01-11 15:34:00 | 200.17
+  3 |           5 | 2025-01-15 18:51:00 |   8.40
+  5 |           2 | 2025-01-24 01:25:00 | 149.73
+  6 |           9 | 2025-01-28 04:42:00 |  58.00
+(5 rows)`}>
+
+```sql
+WITH paid_orders AS (
+  SELECT o.id, o.customer_id, o.ordered_at,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+)
+SELECT *
+FROM paid_orders
+ORDER BY id
+LIMIT 5;
+```
+
+</CodeExample>
+
+Order 4 is missing: it was cancelled. Notice `GROUP BY o.id` lets us select `o.customer_id` and `o.ordered_at` without grouping by them: `id` is the primary key of `orders`, so PostgreSQL knows each group has exactly one customer and one date.
+
+## Monthly active customers
+
+**`date_trunc('month', ordered_at)`** rounds a timestamp down to the first moment of its month, so every order in March lands in the same bucket. Casting it with `::date` drops the `00:00:00`. Then one `GROUP BY` gives orders, active customers and revenue per month:
+
+<CodeExample output={`   month    | orders | active_customers | revenue
+------------+--------+------------------+---------
+ 2025-01-01 |      5 |                5 |  518.30
+ 2025-02-01 |      6 |                6 |  331.69
+ 2025-03-01 |      6 |                6 |  525.80
+ 2025-04-01 |      6 |                6 |  331.69
+ 2025-05-01 |      5 |                5 |  467.80
+ 2025-06-01 |      4 |                4 |  270.54
+(6 rows)`}>
+
+```sql
+WITH paid_orders AS (
+  SELECT o.id, o.customer_id, o.ordered_at,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+)
+SELECT date_trunc('month', ordered_at)::date AS month,
+  count(*) AS orders,
+  count(DISTINCT customer_id) AS active_customers,
+  sum(total) AS revenue
+FROM paid_orders
+GROUP BY month
+ORDER BY month;
+```
+
+</CodeExample>
+
+The **active customers** column uses **`count(DISTINCT customer_id)`**: a customer with three orders in a month is still **one** active customer. In our small shop nobody orders twice in the same month, so `orders` and `active_customers` happen to match. Look at a longer period and they don't:
+
+<CodeExample output={` paid_orders | active_customers
+-------------+------------------
+          32 |               17
+(1 row)`}>
+
+```sql
+SELECT count(*) AS paid_orders,
+  count(DISTINCT customer_id) AS active_customers
+FROM orders
+WHERE status <> 'cancelled'
+  AND ordered_at >= '2025-01-01'
+  AND ordered_at < '2025-07-01';
+```
+
+</CodeExample>
+
+32 paid orders came from only 17 people in the first half of 2025. A dashboard that summed orders and called them "active customers" would show almost twice the real number.
+
+<Callout type="warning" title="Active customers don't add up">
+
+Monthly active customers **can't be summed** into a quarterly or yearly number: the same person is active in several months. Adding up January to June gives 32, but only 17 different people were active. Distinct counts must be computed for each period from the raw rows, which is why dashboards usually have one query per period size.
+
+</Callout>
+
+The date filter above also shows a good habit: **`ordered_at >= '2025-01-01' AND ordered_at < '2025-07-01'`** is a half-open range. It catches every moment of 30 June (even `23:59:59.5`), and an index on `ordered_at` can use it, unlike `date_trunc('month', ordered_at) = …` or `extract(…)` on the column.
+
+## No gaps allowed: a calendar with generate_series
+
+A chart of **daily** active customers has a problem: `GROUP BY` only returns days that **have** orders. Days with no orders simply vanish, and a line chart would draw a straight line across them as if business had been steady. The fix is to **generate a calendar** and LEFT JOIN the data onto it:
+
+<CodeExample output={`    day     | orders | active_customers
+------------+--------+------------------
+ 2025-01-01 |      0 |                0
+ 2025-01-02 |      0 |                0
+ 2025-01-03 |      0 |                0
+ 2025-01-04 |      0 |                0
+ 2025-01-05 |      0 |                0
+ 2025-01-06 |      0 |                0
+ 2025-01-07 |      1 |                1
+ 2025-01-08 |      0 |                0
+ 2025-01-09 |      0 |                0
+ 2025-01-10 |      0 |                0
+(10 rows)`}>
+
+```sql
+WITH days AS (
+  SELECT generate_series(date '2025-01-01', date '2025-01-10',
+    interval '1 day')::date AS day
+)
+SELECT d.day,
+  count(o.id) AS orders,
+  count(DISTINCT o.customer_id) AS active_customers
+FROM days AS d
+LEFT JOIN orders AS o
+  ON o.ordered_at >= d.day
+  AND o.ordered_at < d.day + 1
+  AND o.status <> 'cancelled'
+GROUP BY d.day
+ORDER BY d.day;
+```
+
+</CodeExample>
+
+Three details make this work:
+
+- **`generate_series(start, stop, step)`** returns one row per day, whether or not anything happened.
+- The order conditions live in the **`ON`** clause, not in `WHERE`. A `WHERE o.status <> 'cancelled'` would throw away the calendar rows that found no order (their `o.status` is NULL), and the gaps would be back.
+- **`count(o.id)`** counts only matched orders, so empty days show `0`. `count(*)` would say `1` for them, because the calendar row itself is counted.
+
+`date + 1` is the next day, so `o.ordered_at >= d.day AND o.ordered_at < d.day + 1` is the half-open range for one day again.
+
+## Growth vs the previous period
+
+The tile everybody looks at first says something like **"Revenue: 467.80 (+41.0% vs last month)"**. Comparing each row with the previous one is a job for **`lag()`** from the window functions module. A **`WINDOW`** clause names the window once, so you don't repeat `OVER (ORDER BY month)` in every column:
+
+<CodeExample output={`   month    | revenue | previous | change  | change_pct
+------------+---------+----------+---------+------------
+ 2025-01-01 |  518.30 |     NULL |    NULL |       NULL
+ 2025-02-01 |  331.69 |   518.30 | -186.61 |      -36.0
+ 2025-03-01 |  525.80 |   331.69 |  194.11 |       58.5
+ 2025-04-01 |  331.69 |   525.80 | -194.11 |      -36.9
+ 2025-05-01 |  467.80 |   331.69 |  136.11 |       41.0
+ 2025-06-01 |  270.54 |   467.80 | -197.26 |      -42.2
+(6 rows)`}>
+
+```sql
+WITH paid_orders AS (
+  SELECT o.id, o.ordered_at,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+),
+monthly AS (
+  SELECT date_trunc('month', ordered_at)::date AS month,
+    sum(total) AS revenue
+  FROM paid_orders
+  GROUP BY month
+)
+SELECT month, revenue,
+  lag(revenue) OVER w AS previous,
+  revenue - lag(revenue) OVER w AS change,
+  round(100 * (revenue - lag(revenue) OVER w)
+    / nullif(lag(revenue) OVER w, 0), 1) AS change_pct
+FROM monthly
+WINDOW w AS (ORDER BY month)
+ORDER BY month;
+```
+
+</CodeExample>
+
+- January has no previous month, so `lag()` gives NULL and so does everything calculated from it. That's honest: there's nothing to compare with. A dashboard shows "n/a" or "new", never `0%`.
+- **`nullif(x, 0)`** turns a zero into NULL, so a month after a month with no revenue gives NULL instead of crashing with *division by zero*.
+- The percentage is **relative to the previous month**: `(new - old) / old`. Going from 100 to 50 is -50%, but going back from 50 to 100 is +100%.
+
+<Callout type="danger" title="Never compare a month that isn't over">
+
+Our data stops on 17 June, so June looks like a 42% crash. It isn't: the month is only half done. Comparing a **partial** period with a full one is the most common dashboard bug in the world. Either show complete periods only, or compare **like for like**: the first 17 days of June against the first 17 days of May.
+
+</Callout>
+
+Here's that like-for-like comparison. `FILTER` (from the advanced queries module) splits one scan into two sums:
+
+<CodeExample output={` june_1_to_17 | may_1_to_17
+--------------+-------------
+       270.54 |      309.67
+(1 row)`}>
+
+```sql
+WITH paid_orders AS (
+  SELECT o.id, o.ordered_at,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+)
+SELECT
+  sum(total) FILTER (WHERE ordered_at >= '2025-06-01'
+    AND ordered_at < '2025-06-18') AS june_1_to_17,
+  sum(total) FILTER (WHERE ordered_at >= '2025-05-01'
+    AND ordered_at < '2025-05-18') AS may_1_to_17
+FROM paid_orders;
+```
+
+</CodeExample>
+
+Same number of days: June is about **13% behind** May (270.54 against 309.67), not 42%. Still a dip worth a look, but a very different headline from the same data. 🐼
+
+## Rolling windows: active in the last 30 days
+
+Product teams often prefer a **rolling** number: "customers active in the 30 days up to today", recalculated every day. It moves smoothly instead of jumping on the 1st of each month. For a calendar of every second Saturday, we count the distinct customers whose orders fall in the 30 days that end on that day. Try it, then change `30` to `60` and watch the numbers grow, because more people fit in a longer window:
+
+<TryIt language="sql" code={`WITH days AS (
+  SELECT generate_series(date '2025-02-01', date '2025-06-15',
+    interval '2 weeks')::date AS day
+)
+SELECT d.day,
+  count(DISTINCT o.customer_id) AS active_last_30_days
+FROM days AS d
+LEFT JOIN orders AS o
+  ON o.status <> 'cancelled'
+  AND o.ordered_at >= d.day - 30
+  AND o.ordered_at < d.day + 1
+GROUP BY d.day
+ORDER BY d.day;`}
+/>
+
+This is a **range join**: each calendar row matches every order in its window, so one order is counted for many days. That's exactly what we want here, but on millions of orders it gets expensive, which is why big dashboards precompute such numbers (more on that in Part 3).
+
+<Quiz
+  question="A query LEFT JOINs orders onto a calendar of days and uses count(*) per day. What does a day without orders show?"
+  options={["0", "1", "NULL", "The day is missing from the result"]}
+  answer={1}
+  explanation="With a LEFT JOIN the day still produces one row (with NULLs for the order columns), and count(*) counts rows, so it says 1. Use count(o.id), which skips NULLs, to get 0."
+/>
+
+<Quiz
+  question="Revenue was 200 in May and 150 in June. What is June's change vs the previous month?"
+  options={["-50%", "-25%", "+33.3%", "-33.3%"]}
+  answer={1}
+  explanation="Growth is relative to the previous period: (150 - 200) / 200 = -0.25, so -25%. Dividing by the new value instead (by 150) would give -33.3%, a common mistake."
+/>
+
+<Exercise
+  language="sql"
+  title="The monthly KPI table"
+  starter={`-- One row per month from January to June 2025:
+-- month, orders, active_customers, revenue, revenue_change_pct
+WITH paid_orders AS (
+  SELECT o.id, o.customer_id, o.ordered_at,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+)
+SELECT date_trunc('month', ordered_at)::date AS month,
+  count(*) AS orders
+FROM paid_orders
+GROUP BY month
+ORDER BY month;`}
+  tests={[
+    { name: "Columns are month, orders, active_customers, revenue, revenue_change_pct", check: "columns.join() === 'month,orders,active_customers,revenue,revenue_change_pct'" },
+    { name: "Six months, January to June, in order", check: "rows.length === 6 && rows.map(r => r.month).join() === '2025-01-01,2025-02-01,2025-03-01,2025-04-01,2025-05-01,2025-06-01'" },
+    { name: "Orders, active customers and revenue are right", check: "rows.map(r => r.orders).join() === '5,6,6,6,5,4' && rows.map(r => r.revenue).join() === '518.3,331.69,525.8,331.69,467.8,270.54'" },
+    { name: "Change is rounded to 1 decimal, NULL for January", check: "rows[0].revenue_change_pct === null && rows.slice(1).map(r => r.revenue_change_pct).join() === '-36,58.5,-36.9,41,-42.2'" },
+    { name: "A customer with two orders in a month is one active customer", check: "(await rerun(\"INSERT INTO orders (customer_id, ordered_at, status) VALUES (15, '2025-06-20 10:00', 'paid'); INSERT INTO order_items SELECT max(id), 1, 2, 6.50 FROM orders\")).map(r => r.orders + '/' + r.active_customers).join() === '5/5,6/6,6/6,6/6,5/5,5/4'" },
+    { name: "A month without paid orders still appears, with 0 and no division error", check: "(await rerun(\"UPDATE orders SET status = 'cancelled' WHERE ordered_at >= '2025-04-01' AND ordered_at < '2025-05-01'\")).map(r => r.orders + '/' + r.revenue + '/' + r.revenue_change_pct).join() === '5/518.3/null,6/331.69/-36,6/525.8/58.5,0/0/-100,5/467.8/null,4/270.54/-42.2'" },
+  ]}
+>
+
+The team wants the **monthly KPI table** behind the dashboard's main chart. Write one query that returns, for **every month from January to June 2025**:
+
+- `month`: the first day of the month, as a date,
+- `orders`: the number of paid orders,
+- `active_customers`: the number of different customers with a paid order,
+- `revenue`: the revenue of paid orders (`0`, not NULL, for a month without any),
+- `revenue_change_pct`: the change in revenue vs the previous month, in percent, rounded to 1 decimal place (NULL when there is no previous month or it had no revenue).
+
+Sort by month. Every month must appear even if it has **no paid orders at all**: the checks cancel all April orders and expect an April row with `0` orders.
+
+<Hint>
+
+Build a calendar CTE with `generate_series(date '2025-01-01', date '2025-06-01', interval '1 month')::date AS month`, then LEFT JOIN `paid_orders` on `date_trunc('month', p.ordered_at)::date = m.month`. Use `count(p.id)`, `count(DISTINCT p.customer_id)` and `coalesce(sum(p.total), 0)`, grouped by `m.month`, in a second CTE. In the final SELECT, compute the change with `lag(revenue) OVER w`, `nullif(…, 0)` and `round(…, 1)`, and add `WINDOW w AS (ORDER BY month)`.
+
+</Hint>
+
+<Solution>
+
+```sql
+WITH paid_orders AS (
+  SELECT o.id, o.customer_id, o.ordered_at,
+    sum(oi.quantity * oi.unit_price) AS total
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY o.id
+),
+months AS (
+  SELECT generate_series(date '2025-01-01', date '2025-06-01',
+    interval '1 month')::date AS month
+),
+monthly AS (
+  SELECT m.month,
+    count(p.id) AS orders,
+    count(DISTINCT p.customer_id) AS active_customers,
+    coalesce(sum(p.total), 0) AS revenue
+  FROM months AS m
+  LEFT JOIN paid_orders AS p
+    ON date_trunc('month', p.ordered_at)::date = m.month
+  GROUP BY m.month
+)
+SELECT month, orders, active_customers, revenue,
+  round(100 * (revenue - lag(revenue) OVER w)
+    / nullif(lag(revenue) OVER w, 0), 1) AS revenue_change_pct
+FROM monthly
+WINDOW w AS (ORDER BY month)
+ORDER BY month;
+```
+
+</Solution>
+
+</Exercise>
+
+## What you built
+
+- A **definition table** for every metric, and a `paid_orders` CTE that encodes it once.
+- **Monthly active customers** with `date_trunc` and `count(DISTINCT …)`, and why distinct counts can't be added up across periods.
+- A **gap-free calendar** with `generate_series` and a LEFT JOIN, with the filters in `ON` and `count(o.id)` instead of `count(*)`.
+- **Growth vs the previous period** with `lag()`, a named `WINDOW`, `nullif` against division by zero, and a like-for-like comparison for a month that isn't over.
+- A **rolling 30-day** active count with a range join.
+
+In Part 2 you'll answer the question growth numbers can't: do the customers you win **come back**?

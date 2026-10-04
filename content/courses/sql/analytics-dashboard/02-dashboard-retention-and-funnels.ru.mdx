@@ -1,0 +1,441 @@
+---
+title: "Часть 2: удержание по когортам и воронки конверсии"
+description: Разделите покупателей на когорты по первому заказу, постройте таблицу удержания, которая отличает «ещё нет» от «никогда», и измерьте воронку конверсии.
+duration: 25
+xp: 30
+---
+
+У цифр роста из Части 1 есть слепое пятно. Выручка может расти каждый месяц, пока магазин **теряет** большинство покупателей, — лишь бы маркетинг продолжал привлекать новых. Это дырявое ведро, и обходится оно очень дорого. Чтобы его поймать, существуют два самых важных продуктовых графика:
+
+- **Таблица удержания по когортам (cohort retention)**: сколько покупателей, начавших в январе, вернулись через один, два, три месяца?
+- **Воронка конверсии (conversion funnel)**: сколько из пришедших на сайт посмотрели товар, добавили его в корзину, перешли к оформлению и действительно заплатили?
+
+Оба — классические вопросы на собеседовании аналитика, и оба строятся из знакомых вам инструментов: CTE, `FILTER` и оконных функций. 🔁
+
+## Когорты: группируем покупателей по моменту старта
+
+**Когорта (cohort)** — это группа людей, которые начали в одно и то же время. Здесь когорта покупателя — это **месяц его первого оплаченного заказа**. Нам понадобятся два небольших CTE, оба по определениям из Части 1 (отменённые заказы не считаются):
+
+- `activity`: одна строка на покупателя на каждый месяц, в котором он был активен. `DISTINCT` убирает дубликаты, если кто-то заказал дважды за месяц.
+- `cohorts`: первый активный месяц каждого покупателя — `min()` по его активности.
+
+<CodeExample output={`   cohort   | customers
+------------+-----------
+ 2025-01-01 |         5
+ 2025-02-01 |         6
+ 2025-03-01 |         4
+ 2025-04-01 |         1
+ 2025-05-01 |         1
+(5 rows)`}>
+
+```sql
+WITH activity AS (
+  SELECT DISTINCT customer_id,
+    date_trunc('month', ordered_at)::date AS month
+  FROM orders
+  WHERE status <> 'cancelled'
+),
+cohorts AS (
+  SELECT customer_id, min(month) AS cohort
+  FROM activity
+  GROUP BY customer_id
+)
+SELECT cohort, count(*) AS customers
+FROM cohorts
+GROUP BY cohort
+ORDER BY cohort;
+```
+
+</CodeExample>
+
+Пять покупателей начали в январе, шесть — в феврале, и так далее. Апрельская и майская когорты крошечные: более ранние заказы этих двух покупателей были отменены, поэтому их первый **оплаченный** заказ случился позже.
+
+## Месяцы с первого заказа
+
+Теперь каждая строка активности получает **номер месяца**: 0 — сам месяц когорты, 1 — следующий месяц и так далее. **`age(later, earlier)`** возвращает интервал вроде `2 mons` или `1 year 3 mons`, а `extract` разбирает его на части:
+
+<CodeExample output={`   cohort   | month_no | customers
+------------+----------+-----------
+ 2025-01-01 |        0 |         5
+ 2025-01-01 |        2 |         2
+ 2025-01-01 |        3 |         2
+ 2025-01-01 |        4 |         1
+ 2025-01-01 |        5 |         3
+ 2025-02-01 |        0 |         6
+ 2025-02-01 |        2 |         3
+ 2025-02-01 |        3 |         1
+(8 rows)`}>
+
+```sql
+WITH activity AS (
+  SELECT DISTINCT customer_id,
+    date_trunc('month', ordered_at)::date AS month
+  FROM orders
+  WHERE status <> 'cancelled'
+),
+cohorts AS (
+  SELECT customer_id, min(month) AS cohort
+  FROM activity
+  GROUP BY customer_id
+)
+SELECT c.cohort,
+  (extract(year FROM age(a.month, c.cohort)) * 12
+    + extract(month FROM age(a.month, c.cohort)))::int AS month_no,
+  count(*) AS customers
+FROM activity AS a
+JOIN cohorts AS c USING (customer_id)
+WHERE c.cohort <= '2025-02-01'
+GROUP BY c.cohort, month_no
+ORDER BY c.cohort, month_no;
+```
+
+</CodeExample>
+
+(`WHERE` здесь только для того, чтобы вывод был короче.) Это данные удержания в **длинном формате (long format)**: одна строка на когорту и номер месяца. Обратите внимание на дыры: никто из обеих когорт не заказывал в месяц 1, поэтому строки для него просто **нет**. Видимо, чая и печенья пандам хватает примерно на два месяца. 🍵
+
+`years * 12 + months` нужно потому, что `age()` переносит месяцы в годы: 14 месяцев — это `1 year 2 mons`, и один только `extract(month …)` сказал бы 2.
+
+## Таблица удержания
+
+Люди не читают длинный формат — они читают **треугольник**: одна строка на когорту, один столбец на номер месяца, в каждой ячейке процент когорты, который был активен. Превращение строк в столбцы называется **сводной таблицей (pivot)**, и в PostgreSQL это `max(…) FILTER (WHERE month_no = n)` для каждого столбца.
+
+Но здесь есть ловушка. Месяц 5 февральской когорты — это **июль**, а наши данные заканчиваются в июне. Если просто посчитать, в ячейке будет `0%`, что читается как «все ушли». На самом деле правда — «мы ещё не знаем». Хорошая таблица удержания оставляет такие ячейки **пустыми**.
+
+Решение — сначала построить **сетку (grid)**: каждая когорта с каждым номером месяца, который уже наступил, — и затем присоединить к ней активность через LEFT JOIN. Ячейки внутри сетки получают число (возможно, 0), а ячейки за её пределами остаются NULL:
+
+<CodeExample output={`   cohort   | size | m1 |  m2  |  m3  |  m4  |  m5
+------------+------+----+------+------+------+------
+ 2025-01-01 |    5 |  0 |   40 |   40 |   20 |   60
+ 2025-02-01 |    6 |  0 |   50 |   17 |    0 | NULL
+ 2025-03-01 |    4 |  0 |   50 |   25 | NULL | NULL
+ 2025-04-01 |    1 |  0 |    0 | NULL | NULL | NULL
+ 2025-05-01 |    1 |  0 | NULL | NULL | NULL | NULL
+(5 rows)`}>
+
+```sql
+WITH activity AS (
+  SELECT DISTINCT customer_id,
+    date_trunc('month', ordered_at)::date AS month
+  FROM orders
+  WHERE status <> 'cancelled'
+),
+cohorts AS (
+  SELECT customer_id, min(month) AS cohort
+  FROM activity
+  GROUP BY customer_id
+),
+cohort_activity AS (
+  SELECT c.cohort, a.customer_id,
+    (extract(year FROM age(a.month, c.cohort)) * 12
+      + extract(month FROM age(a.month, c.cohort)))::int AS month_no
+  FROM activity AS a
+  JOIN cohorts AS c USING (customer_id)
+),
+grid AS (
+  SELECT cohort, count(*) AS size, n AS month_no
+  FROM cohorts
+  CROSS JOIN generate_series(0, 5) AS n
+  GROUP BY cohort, n
+  HAVING cohort + n * interval '1 month' <= '2025-06-01'
+),
+retention AS (
+  SELECT g.cohort, g.size, g.month_no,
+    round(100.0 * count(ca.customer_id) / g.size) AS pct
+  FROM grid AS g
+  LEFT JOIN cohort_activity AS ca
+    ON ca.cohort = g.cohort AND ca.month_no = g.month_no
+  GROUP BY g.cohort, g.size, g.month_no
+)
+SELECT cohort, size,
+  max(pct) FILTER (WHERE month_no = 1) AS m1,
+  max(pct) FILTER (WHERE month_no = 2) AS m2,
+  max(pct) FILTER (WHERE month_no = 3) AS m3,
+  max(pct) FILTER (WHERE month_no = 4) AS m4,
+  max(pct) FILTER (WHERE month_no = 5) AS m5
+FROM retention
+GROUP BY cohort, size
+ORDER BY cohort;
+```
+
+</CodeExample>
+
+Как читать треугольник:
+
+- **Строки** сравнивают когорту саму с собой во времени. Из 5 январских покупателей 40% вернулись в месяц 2 и 60% — в месяц 5.
+- **Столбцы** сравнивают когорты в одном и том же «возрасте». Удержание в месяц 2 выросло с 40% (январь) до 50% (февраль и март): если в феврале вышло изменение продукта, именно здесь вы бы его увидели.
+- **Диагональный край** — это сегодня. Всё ниже него — NULL, потому что ещё не наступило.
+
+Месяц 0 не показан, потому что он всегда 100%: так определяется когорта.
+
+<Callout type="warning" title="Маленькие когорты врут">
+
+В апрельской когорте **один** покупатель, поэтому её ячейки могут быть только 0% или 100%. Один человек, передумав, сдвигает число на 100 пунктов. Настоящие дашборды показывают размер когорты рядом с процентами (как наш столбец `size`), приглушают ячейки, построенные, скажем, меньше чем по 30 людям, или объединяют маленькие когорты в кварталы. Проценты без знаменателей — верный путь к плохим решениям.
+
+</Callout>
+
+## Воронка конверсии
+
+Второй график шаг за шагом прослеживает путь посетителей по магазину. Для этого приложения записывают **события (events)**: одна строка каждый раз, когда пользователь что-то делает. В нашей учебной базе событий нет, поэтому мы сгенерируем события за один день для 300 посетителей. Каждый запуск начинается с чистого листа, поэтому все запросы воронки ниже начинаются с этого `CREATE TABLE`. Каждый посетитель получает фиксированное число «удачи» от 0 до 99, которое решает, как далеко он пройдёт (посетителям с компьютера везёт чуть больше), так что данные каждый раз одинаковые:
+
+<CodeExample output={`CREATE TABLE AS
+
+ user_id | device  |    event     |     happened_at
+---------+---------+--------------+---------------------
+       2 | mobile  | visit        | 2025-06-02 08:20:00
+       3 | desktop | visit        | 2025-06-02 08:29:00
+       3 | desktop | view_product | 2025-06-02 08:31:00
+       3 | desktop | add_to_cart  | 2025-06-02 08:33:00
+       3 | desktop | checkout     | 2025-06-02 08:35:00
+       3 | desktop | purchase     | 2025-06-02 08:37:00
+(6 rows)`}>
+
+```sql
+CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+SELECT *
+FROM events
+WHERE user_id IN (2, 3)
+ORDER BY happened_at;
+```
+
+</CodeExample>
+
+Пользователь 2 зашёл и ушёл. Пользователь 3 с компьютера прошёл весь путь до покупки. (`unnest(…) WITH ORDINALITY` нумерует элементы массива от 1 до 5, а `true::int` равно 1, поэтому `WHERE` оставляет первые 1–5 шагов.)
+
+Теперь сама воронка. Её надёжной делают две привычки:
+
+1. **Шаги определены в запросе** списком `VALUES` по порядку. По одним названиям событий не понять, какой шаг идёт первым, а шаг, до которого никто не дошёл, всё равно должен появиться (с 0), поэтому мы присоединяем события к шагам через LEFT JOIN.
+2. Мы считаем **уникальных пользователей**, а не события: тот, кто добавил в корзину три вещи, на этом шаге всё равно один человек.
+
+<CodeExample output={`CREATE TABLE AS
+
+ step_no |    event     | users | pct_of_first | pct_of_previous
+---------+--------------+-------+--------------+-----------------
+       1 | visit        |   300 |        100.0 |            NULL
+       2 | view_product |   195 |         65.0 |            65.0
+       3 | add_to_cart  |    99 |         33.0 |            50.8
+       4 | checkout     |    63 |         21.0 |            63.6
+       5 | purchase     |    42 |         14.0 |            66.7
+(5 rows)`}>
+
+```sql
+CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+WITH steps (step_no, event) AS (
+  VALUES (1, 'visit'), (2, 'view_product'), (3, 'add_to_cart'),
+    (4, 'checkout'), (5, 'purchase')
+),
+counts AS (
+  SELECT s.step_no, s.event, count(DISTINCT e.user_id) AS users
+  FROM steps AS s
+  LEFT JOIN events AS e ON e.event = s.event
+  GROUP BY s.step_no, s.event
+)
+SELECT step_no, event, users,
+  round(100.0 * users / first_value(users) OVER w, 1) AS pct_of_first,
+  round(100.0 * users / nullif(lag(users) OVER w, 0), 1)
+    AS pct_of_previous
+FROM counts
+WINDOW w AS (ORDER BY step_no)
+ORDER BY step_no;
+```
+
+</CodeExample>
+
+Два процента отвечают на разные вопросы:
+
+- **`pct_of_first`** (из `first_value`) — общая конверсия: 14% посетителей что-то купили.
+- **`pct_of_previous`** (из `lag`) показывает, где люди **отваливаются**. Самая большая утечка — просмотр товара → добавление в корзину: примерно половина тех, кто посмотрел товар, уходит. Но взгляните на оформление → покупку: треть людей, которые уже решили заплатить, этого не сделали. Обычно это проблема с оплатой, и часто её дешевле всего исправить. 💳
+
+<Callout type="note" title="Открытые и закрытые воронки">
+
+Наши сгенерированные пользователи всегда проходят шаги по порядку. Настоящие события устроены сложнее: кто-то покупает из корзины, которую наполнил вчера, без сегодняшнего «view_product». **Открытая (open)** воронка (её мы и построили) считает всех, кто сделал каждый шаг. **Закрытая (closed)** воронка считает только пользователей, которые до этого прошли все предыдущие шаги, например с помощью `bool_and` по каждому пользователю или проверки меток времени, и она никогда не растёт от шага к шагу. Годятся обе, но дашборд должен говорить, какую из них он показывает.
+
+</Callout>
+
+## Сравниваем сегменты
+
+Воронка становится по-настоящему полезной, когда её разбивают: по устройству, стране, рекламной кампании или версии приложения. С `FILTER` каждый сегмент становится столбцом. Запустите запрос, а затем добавьте третий столбец, который считает все устройства вместе:
+
+<TryIt language="sql" code={`CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+WITH steps (step_no, event) AS (
+  VALUES (1, 'visit'), (2, 'view_product'), (3, 'add_to_cart'),
+    (4, 'checkout'), (5, 'purchase')
+)
+SELECT s.step_no, s.event,
+  count(DISTINCT e.user_id) FILTER (WHERE e.device = 'mobile')
+    AS mobile,
+  count(DISTINCT e.user_id) FILTER (WHERE e.device = 'desktop')
+    AS desktop
+FROM steps AS s
+LEFT JOIN events AS e ON e.event = s.event
+GROUP BY s.step_no, s.event
+ORDER BY s.step_no;`}
+/>
+
+Посетителей с компьютера вдвое меньше, но в абсолютных числах они покупают почти так же часто: 20 из 100 против 22 из 200. Именно такие находки меняют план развития продукта («сначала почините оформление заказа на мобильных»).
+
+<Quiz
+  question="В таблице удержания по когортам ячейка месяца 4 мартовской когорты приходится на июль, но данные заканчиваются в июне. Что должно быть в ячейке?"
+  options={["0%, потому что в июле никто не был активен", "100%, как в месяце 0", "Ничего (NULL), потому что этот месяц ещё не наступил", "Среднее по месяцу 4 других когорт"]}
+  answer={2}
+  explanation="0% означало бы, что ушли все покупатели, а этого мы не знаем. Ячейки месяцев, которые ещё не наступили, должны быть пустыми. Если построить сетку из когорт и уже наступивших номеров месяцев и присоединить к ней активность через LEFT JOIN, 0 появится только там, где это правда."
+/>
+
+<Quiz
+  question="Запрос воронки использует count(*) вместо count(DISTINCT user_id) для каждого шага. Что пойдёт не так?"
+  options={["Ничего, оба дают одинаковые числа", "На шагах с повторяющимися событиями (например, три товара, добавленные в корзину) один человек посчитается несколько раз, и шаг может выглядеть больше предыдущего", "count(*) нельзя использовать с GROUP BY", "Шаги, до которых никто не дошёл, исчезнут"]}
+  answer={1}
+  explanation="Воронка считает людей, а не клики. Один пользователь с тремя событиями add_to_cart посчитается трижды и раздует этот шаг и его конверсию — иногда до более чем 100% от предыдущего шага."
+/>
+
+<Exercise
+  language="sql"
+  title="Воронка по устройствам"
+  starter={`CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+-- Одна строка на устройство и шаг:
+-- device, step_no, event, users, pct_of_previous
+WITH steps (step_no, event) AS (
+  VALUES (1, 'visit'), (2, 'view_product'), (3, 'add_to_cart'),
+    (4, 'checkout'), (5, 'purchase')
+)
+SELECT s.step_no, s.event, count(DISTINCT e.user_id) AS users
+FROM steps AS s
+LEFT JOIN events AS e ON e.event = s.event
+GROUP BY s.step_no, s.event
+ORDER BY s.step_no;`}
+  tests={[
+    { name: "Столбцы: device, step_no, event, users, pct_of_previous", check: "columns.join() === 'device,step_no,event,users,pct_of_previous'" },
+    { name: "10 строк: шаги 1–5 для desktop, затем шаги 1–5 для mobile", check: "rows.length === 10 && rows.map(r => r.device[0] + r.step_no).join() === 'd1,d2,d3,d4,d5,m1,m2,m3,m4,m5'" },
+    { name: "Уникальные пользователи по устройству и шагу", check: "rows.map(r => r.users).join() === '100,71,39,27,20,200,124,60,36,22'" },
+    { name: "pct_of_previous считается по устройству, округлён до 1 знака, NULL для первого шага", check: "rows.map(r => r.pct_of_previous).join() === ',71,54.9,69.2,74.1,,62,48.4,60,61.1' && rows[5].pct_of_previous === null" },
+    { name: "Пользователь с повторяющимися событиями считается один раз", check: "(await rerun(\"INSERT INTO events SELECT user_id, device, event, happened_at + interval '1 hour' FROM events WHERE user_id = 2\")).map(r => r.users).join() === '100,71,39,27,20,200,124,60,36,22'" },
+    { name: "Шаг, до которого никто не дошёл, показывает 0 пользователей", check: "(await rerun(\"DELETE FROM events WHERE device = 'desktop' AND event = 'purchase'\")).filter(r => r.device === 'desktop').map(r => r.users + '/' + r.pct_of_previous).join() === '100/null,71/71,39/54.9,27/69.2,0/0'" },
+  ]}
+>
+
+Мобильная команда хочет видеть свою воронку рядом с воронкой для компьютеров. Заготовка создаёт таблицу `events` и содержит общую воронку. Измените запрос так, чтобы он возвращал **одну строку на устройство и шаг** со столбцами:
+
+- `device`, `step_no`, `event`,
+- `users`: число **разных** пользователей этого устройства, сделавших этот шаг,
+- `pct_of_previous`: `users` в процентах от предыдущего шага **того же устройства**, округлённое до 1 знака после запятой (NULL для шага 1).
+
+Отсортируйте по устройству, затем по шагу. Шаг, до которого не дошёл ни один пользователь устройства, всё равно должен появиться с `0` пользователей: проверки удаляют все покупки с компьютеров и ожидают строку desktop `purchase` с `0`.
+
+<Hint>
+
+Вам нужна каждая комбинация устройства и шага, даже без событий, поэтому начните с сетки: `steps CROSS JOIN (VALUES ('desktop'), ('mobile')) AS d (device)`, а затем присоедините `events` через LEFT JOIN и по `event`, и по `device`. В CTE `counts` посчитайте `DISTINCT e.user_id` с группировкой по device, step_no и event. Затем `lag(users) OVER (PARTITION BY device ORDER BY step_no)` даст предыдущий шаг того же устройства; делите через `nullif(…, 0)`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE events AS
+WITH visitors AS (
+  SELECT u AS user_id,
+    CASE WHEN u % 3 = 0 THEN 'desktop' ELSE 'mobile' END AS device,
+    u * 37 % 100 - CASE WHEN u % 3 = 0 THEN 9 ELSE 0 END AS luck
+  FROM generate_series(1, 300) AS u
+)
+SELECT v.user_id, v.device, s.event,
+  timestamp '2025-06-02 08:00' + v.user_id * interval '9 minutes'
+    + s.n * interval '2 minutes' AS happened_at
+FROM visitors AS v
+CROSS JOIN unnest(ARRAY['visit', 'view_product', 'add_to_cart',
+  'checkout', 'purchase']) WITH ORDINALITY AS s (event, n)
+WHERE s.n <= 1 + (v.luck < 62)::int + (v.luck < 30)::int
+  + (v.luck < 18)::int + (v.luck < 11)::int;
+
+WITH steps (step_no, event) AS (
+  VALUES (1, 'visit'), (2, 'view_product'), (3, 'add_to_cart'),
+    (4, 'checkout'), (5, 'purchase')
+),
+counts AS (
+  SELECT d.device, s.step_no, s.event,
+    count(DISTINCT e.user_id) AS users
+  FROM steps AS s
+  CROSS JOIN (VALUES ('desktop'), ('mobile')) AS d (device)
+  LEFT JOIN events AS e
+    ON e.event = s.event AND e.device = d.device
+  GROUP BY d.device, s.step_no, s.event
+)
+SELECT device, step_no, event, users,
+  round(100.0 * users / nullif(lag(users) OVER w, 0), 1)
+    AS pct_of_previous
+FROM counts
+WINDOW w AS (PARTITION BY device ORDER BY step_no)
+ORDER BY device, step_no;
+```
+
+</Solution>
+
+</Exercise>
+
+## Что вы построили
+
+- **Когорты** по первому оплаченному месяцу каждого покупателя — с `min()` поверх CTE с уникальной активностью.
+- **Номера месяцев** с `age()` и `extract`, помня, что `age()` переносит месяцы в годы.
+- **Треугольник удержания**, развёрнутый с помощью `max(…) FILTER (WHERE …)` и построенный на сетке, чтобы ещё не наступившие месяцы были NULL, а не обманчивыми 0%, — с размерами когорт рядом с процентами.
+- **Воронку конверсии** с шагами, определёнными в списке `VALUES`, уникальными пользователями на каждом шаге, общей конверсией (`first_value`) и конверсией от шага к шагу (`lag`).
+- **Сегменты** бок о бок с `FILTER` и по отдельности с `PARTITION BY`.
+
+В Части 3 вы добавите рейтинги и скользящие средние, а затем соберёте всё в итоговый дашборд.

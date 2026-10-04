@@ -3,6 +3,7 @@ import { withSentryConfig } from "@sentry/nextjs/config";
 import createNextIntlPlugin from "next-intl/plugin";
 
 import {
+  pgliteVendorName,
   reactTypesVendorName,
   reactVendorName,
 } from "./scripts/vendor-name.mjs";
@@ -55,6 +56,8 @@ const nextConfig: NextConfig = {
     NEXT_PUBLIC_REACT_VENDOR: reactVendor,
     // React's types, for type-checking TSX lessons (see build-vendor.mjs)
     NEXT_PUBLIC_REACT_TYPES: `/vendor/${reactTypesVendorName}`,
+    // PostgreSQL for SQL lessons (see build-vendor.mjs)
+    NEXT_PUBLIC_PGLITE: `/vendor/${pgliteVendorName}/index.js`,
   },
   async headers() {
     return [

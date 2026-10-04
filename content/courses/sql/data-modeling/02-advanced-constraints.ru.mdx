@@ -1,0 +1,493 @@
+---
+title: Продвинутые ограничения целостности
+description: Переиспользуемые домены, перечисления, генерируемые столбцы, ограничения-исключения против двойного бронирования и отложенные ограничения для временно несогласованных изменений.
+duration: 22
+xp: 30
+---
+
+На Уровне 1 вы защищали таблицы с помощью `NOT NULL`, `UNIQUE`, `CHECK` и внешних ключей. Они ловят больше ошибок, чем любое ревью кода, потому что действуют на **всех**, кто пишет в базу: веб-приложение, админку, ночной скрипт импорта и коллегу, который «быстренько» запускает `UPDATE` в продакшене. В этом уроке — более мощные инструменты PostgreSQL: правила, которые можно **переиспользовать**, значения, которые **вычисляются сами**, ограничения, сравнивающие строку с **другими строками** («никакие две брони не должны пересекаться»), и ограничения, которые ждут проверки до **фиксации транзакции (commit)**. 🛡️
+
+## Домены: тип с прикреплёнными правилами
+
+Адреса почты встречаются во многих таблицах: клиенты, сотрудники, подписчики рассылки. Если копировать один и тот же `CHECK` в каждую, со временем копии разойдутся. **Домен (domain)** — это именованный тип со встроенными ограничениями: его определяют один раз и используют где угодно:
+
+<CodeExample output={`CREATE DOMAIN
+
+CREATE DOMAIN
+
+CREATE TABLE
+
+INSERT 0 1
+
+ERROR:  value for domain email_address violates check constraint "email_address_check"`}>
+
+```sql
+CREATE DOMAIN email_address AS text
+  CHECK (VALUE ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$');
+
+CREATE DOMAIN amount AS numeric(10, 2)
+  CHECK (VALUE >= 0);
+
+CREATE TABLE invoices (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  billed_to email_address NOT NULL,
+  total amount NOT NULL
+);
+
+INSERT INTO invoices (billed_to, total)
+VALUES ('mei@pandadev.test', 42.50);
+
+INSERT INTO invoices (billed_to, total)
+VALUES ('not-an-email', 10);
+```
+
+</CodeExample>
+
+Внутри `CHECK` домена `VALUE` — это сохраняемое значение. Чтобы позже ужесточить правило, достаточно поменять его в одном месте: `ALTER DOMAIN email_address ADD CONSTRAINT … NOT VALID` добавляет проверку для новых значений, не просматривая старые, а `VALIDATE CONSTRAINT` проверяет старые, когда вы будете готовы.
+
+<Callout type="tip">
+
+Оставляйте в доменах только правила **формата и диапазона**, которые будут верны всегда (`VALUE > 0`, шаблон). Бизнес-правила, которые меняются («заказы дороже 500 требуют одобрения»), место в `CHECK` конкретной таблицы или в коде приложения — там их проще менять.
+
+</Callout>
+
+## Перечисления
+
+`orders.status` — это `text` с `CHECK (status IN (…))`. Альтернатива — **перечисление (enum type)**: фиксированный **упорядоченный** список меток, который занимает 4 байта. Давайте преобразуем столбец:
+
+<CodeExample output={`CREATE TYPE
+
+ERROR:  operator does not exist: order_status = text
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.`}>
+
+```sql
+CREATE TYPE order_status AS ENUM
+  ('paid', 'shipped', 'delivered', 'cancelled');
+
+ALTER TABLE orders
+  ALTER COLUMN status TYPE order_status
+  USING status::order_status;
+```
+
+</CodeExample>
+
+Старый `CHECK` сравнивает `status` со значениями типа `text`, а перечисление нельзя сравнивать с `text`. Сначала удалите старое ограничение. После этого пригодится **порядок** перечисления: `'paid' < 'shipped' < 'delivered'` — в том порядке, в котором вы их перечислили, а не по алфавиту:
+
+<CodeExample output={`CREATE TYPE
+
+ALTER TABLE
+
+ALTER TABLE
+
+  status   | orders
+-----------+--------
+ shipped   |      8
+ delivered |     16
+(2 rows)
+
+ALTER TYPE
+
+                   labels
+---------------------------------------------
+ {paid,shipped,delivered,refunded,cancelled}
+(1 row)
+
+ERROR:  invalid input value for enum order_status: "lost"
+LINE 20: UPDATE orders SET status = 'lost' WHERE id = 1;
+                                    ^`}>
+
+```sql
+CREATE TYPE order_status AS ENUM
+  ('paid', 'shipped', 'delivered', 'cancelled');
+
+ALTER TABLE orders DROP CONSTRAINT orders_status_check;
+
+ALTER TABLE orders
+  ALTER COLUMN status TYPE order_status
+  USING status::order_status;
+
+-- Заказы, которые хотя бы покинули склад
+SELECT status, count(*) AS orders
+FROM orders
+WHERE status BETWEEN 'shipped' AND 'delivered'
+GROUP BY status
+ORDER BY status;
+
+ALTER TYPE order_status ADD VALUE 'refunded' AFTER 'delivered';
+SELECT enum_range(NULL::order_status) AS labels;
+
+UPDATE orders SET status = 'lost' WHERE id = 1;
+```
+
+</CodeExample>
+
+Добавить значение легко. Подвох — в **удалении и переименовании**: `ALTER TYPE … RENAME VALUE` существует, но `DROP VALUE` нет, поэтому, чтобы вывести статус из употребления, придётся создать новый тип и преобразовать столбец. Вот как сравниваются три способа ограничить значения столбца:
+
+| | `CHECK (status IN …)` | Перечисление | Справочная таблица + внешний ключ |
+| --- | --- | --- | --- |
+| Добавить значение | Заменить ограничение | `ADD VALUE` (быстро) | `INSERT` строки |
+| Удалить значение | Заменить ограничение | Новый тип + преобразование | `DELETE` (если не используется) |
+| Дополнительные данные у значения | Нет | Нет | Да (подпись, порядок сортировки, цвет…) |
+| Порядок | По алфавиту | Порядок объявления | Столбец `sort_order` |
+
+Перечисления подходят для небольших списков, которые редко меняются (`'low', 'medium', 'high'`). Если продакт-менеджеры добавляют значения каждый месяц или каждому значению нужна подпись, используйте справочную таблицу.
+
+## Генерируемые столбцы
+
+**Генерируемый столбец (generated column)** вычисляется из других столбцов той же строки. Записать в него никто не может, поэтому он никогда не устаревает:
+
+<CodeExample output={`ALTER TABLE
+
+ order_id | quantity | unit_price | line_total
+----------+----------+------------+------------
+        1 |        3 |      29.00 |      87.00
+        1 |        1 |      15.00 |      15.00
+        2 |        3 |       2.99 |       8.97
+(3 rows)
+
+ERROR:  column "line_total" can only be updated to DEFAULT
+DETAIL:  Column "line_total" is a generated column.`}>
+
+```sql
+ALTER TABLE order_items
+  ADD COLUMN line_total numeric(10, 2)
+  GENERATED ALWAYS AS (quantity * unit_price);
+
+SELECT order_id, quantity, unit_price, line_total
+FROM order_items
+ORDER BY order_id, product_id
+LIMIT 3;
+
+UPDATE order_items SET line_total = 0 WHERE order_id = 1;
+```
+
+</CodeExample>
+
+В PostgreSQL 18 их два вида:
+
+- **`VIRTUAL`** (по умолчанию начиная с PostgreSQL 18): вычисляется при каждом чтении, не занимает места, и его добавление не переписывает таблицу. Индексировать его нельзя.
+- **`STORED`**: вычисляется при каждой вставке и обновлении и хранится как обычный столбец. Он занимает место, и его добавление переписывает таблицу, зато его **можно** индексировать.
+
+Хранимый генерируемый столбец — аккуратный способ сделать неудобное выражение доступным для поиска и сортировки. В библиотеках «The Bamboo Heist» ставят на букву B, так что дадим `movies` ключ сортировки:
+
+<CodeExample output={`ALTER TABLE
+
+CREATE INDEX
+
+         title         |     sort_title
+-----------------------+--------------------
+ The Bamboo Heist      | bamboo heist
+ Bug in the Machine    | bug in the machine
+ Code Red              | code red
+ The Great Bamboo Race | great bamboo race
+ The Last Dumpling     | last dumpling
+(5 rows)`}>
+
+```sql
+ALTER TABLE movies
+  ADD COLUMN sort_title text
+  GENERATED ALWAYS AS (
+    lower(regexp_replace(title, '^(The|A) ', ''))
+  ) STORED;
+
+CREATE INDEX movies_sort_title ON movies (sort_title);
+
+SELECT title, sort_title
+FROM movies
+ORDER BY sort_title
+LIMIT 5;
+```
+
+</CodeExample>
+
+Выражение может использовать только текущую строку и **неизменяемые (immutable)** функции: никаких `now()`, подзапросов и других таблиц. (Столбец «возраст», вычисленный из `now()`, завтра был бы уже неверным — именно от этого PostgreSQL вас и защищает.)
+
+## Ограничения-исключения: никаких пересекающихся броней
+
+`UNIQUE` говорит: «никакие две строки не **равны**». Некоторые правила звучат иначе: «никакие две строки не **пересекаются**». Переговорную нельзя забронировать дважды на одни и те же часы, гостиничный номер — на одни и те же ночи, у сотрудника не может быть двух договоров на один и тот же день. Проверка в приложении («сделать SELECT на пересечение, потом INSERT») подвержена гонке: два запроса могут оба не найти пересечения и оба выполнить вставку. **Ограничение-исключение (exclusion constraint)** заставляет базу данных отклонить второй:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+ERROR:  conflicting key value violates exclusion constraint "studio_bookings_during_excl"
+DETAIL:  Key (during)=(["2025-07-01 10:30:00","2025-07-01 11:30:00")) conflicts with existing key (during)=(["2025-07-01 09:00:00","2025-07-01 11:00:00")).`}>
+
+```sql
+CREATE TABLE studio_bookings (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  booked_by text NOT NULL,
+  during tsrange NOT NULL,
+  EXCLUDE USING gist (during WITH &&)
+);
+
+INSERT INTO studio_bookings (booked_by, during) VALUES
+  ('Mei', '[2025-07-01 09:00,2025-07-01 11:00)'),
+  ('Sam', '[2025-07-01 11:00,2025-07-01 12:00)');
+
+INSERT INTO studio_bookings (booked_by, during)
+VALUES ('Ada', '[2025-07-01 10:30,2025-07-01 11:30)');
+```
+
+</CodeExample>
+
+`EXCLUDE USING gist (during WITH &&)` читается так: «отклонить новую строку, если есть существующая строка, чей `during` **пересекается** (`&&`) с её». Бронь Sam с 11:00 допустима, потому что `)` исключает конец диапазона Mei. Бронь Ada пересекается с обеими.
+
+### Отдельное правило для каждой комнаты
+
+Когда комнат несколько, две брони конфликтуют, только если они относятся к **одной комнате** и пересекаются. Для этого нужны два сравнения: `room_id WITH =` и `during WITH &&`. На обычном сервере вы бы выполнили `CREATE EXTENSION btree_gist;` (оно учит GiST-индексы оператору `=` для простых целых чисел) и написали ровно это. В этой браузерной базе расширения недоступны, поэтому в примере используется трюк, которому хватает встроенных операторов: диапазон из одного значения, `int4range(room_id, room_id, '[]')`, который сравнивается через `=`. У ограничений-исключений тоже может быть `WHERE`, чтобы отменённые брони ничего не блокировали:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+UPDATE 1
+
+INSERT 0 1
+
+ERROR:  conflicting key value violates exclusion constraint "room_bookings_int4range_stay_excl"
+DETAIL:  Key (int4range(room_id, room_id, '[]'::text), stay)=([1,2), [2025-07-03,2025-07-05)) conflicts with existing key (int4range(room_id, room_id, '[]'::text), stay)=([1,2), [2025-07-01,2025-07-04)).`}>
+
+```sql
+CREATE TABLE room_bookings (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id integer NOT NULL,
+  stay daterange NOT NULL,
+  cancelled boolean NOT NULL DEFAULT false,
+  -- С btree_gist: EXCLUDE USING gist
+  --   (room_id WITH =, stay WITH &&) WHERE (NOT cancelled)
+  EXCLUDE USING gist (
+    int4range(room_id, room_id, '[]') WITH =,
+    stay WITH &&
+  ) WHERE (NOT cancelled)
+);
+
+INSERT INTO room_bookings (room_id, stay) VALUES
+  (1, '[2025-07-01,2025-07-04)'),
+  (2, '[2025-07-01,2025-07-04)'),  -- другая комната: можно
+  (1, '[2025-07-04,2025-07-06)');  -- заезд в день выезда
+                                   -- прежних гостей: можно
+
+UPDATE room_bookings SET cancelled = true WHERE id = 3;
+
+INSERT INTO room_bookings (room_id, stay)
+VALUES (1, '[2025-07-05,2025-07-07)');  -- даты снова свободны
+
+INSERT INTO room_bookings (room_id, stay)
+VALUES (1, '[2025-07-03,2025-07-05)');  -- пересекается с бронью 1
+```
+
+</CodeExample>
+
+Тот же инструмент закрывает пробел из прошлого урока: `EXCLUDE USING gist (product_id WITH =, valid WITH &&)` (с `btree_gist`) гарантирует, что у товара никогда не будет двух цен на один и тот же день.
+
+<Callout type="warning" title="Для диапазонов нужна договорённость">
+
+Всегда используйте **полуоткрытые** диапазоны `[start,end)`: конец исключён, поэтому брони встык соприкасаются, но не пересекаются, и вам никогда не понадобится «23:59:59». PostgreSQL и так приводит `daterange` к виду `[)`, но для `tsrange` и `tstzrange` это ваша забота. Для реального времени используйте `tstzrange`, чтобы бронь означала один и тот же момент в любом часовом поясе.
+
+</Callout>
+
+## Отложенные ограничения
+
+Обычно ограничение проверяется **сразу**, строка за строкой. Но некоторые правильные изменения посередине ненадолго нарушают правила. Классический пример — переупорядочивание плейлиста с уникальным `position`:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+ERROR:  duplicate key value violates unique constraint "playlist_position_key"
+DETAIL:  Key ("position")=(2) already exists.`}>
+
+```sql
+CREATE TABLE playlist (
+  song text NOT NULL,
+  position integer NOT NULL UNIQUE
+);
+
+INSERT INTO playlist VALUES ('Intro', 1), ('Verse', 2), ('Outro', 3);
+
+-- Освобождаем место для новой первой песни
+UPDATE playlist SET position = position + 1;
+```
+
+</CodeExample>
+
+Перенос 'Intro' на позицию 2 сталкивается с 'Verse', которая ещё не сдвинулась. Когда инструкция целиком завершится, все позиции снова будут уникальными, но проверка сработала слишком рано. Объявите ограничение **`DEFERRABLE` (отложенным)** — и проверка подождёт:
+
+- `DEFERRABLE INITIALLY IMMEDIATE`: проверяется в **конце каждой инструкции**, а с помощью `SET CONSTRAINTS … DEFERRED` её можно отложить ещё дальше.
+- `DEFERRABLE INITIALLY DEFERRED`: проверяется при **`COMMIT`**.
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 3
+
+UPDATE 3
+
+BEGIN
+
+SET
+
+UPDATE 1
+
+UPDATE 1
+
+COMMIT
+
+ position | song
+----------+-------
+        2 | Verse
+        3 | Intro
+        4 | Outro
+(3 rows)`}>
+
+```sql
+CREATE TABLE playlist (
+  song text NOT NULL,
+  position integer NOT NULL,
+  CONSTRAINT playlist_position_unique
+    UNIQUE (position) DEFERRABLE INITIALLY IMMEDIATE
+);
+
+INSERT INTO playlist VALUES ('Intro', 1), ('Verse', 2), ('Outro', 3);
+
+UPDATE playlist SET position = position + 1;  -- теперь можно
+
+-- Меняем две песни местами двумя инструкциями: откладываем до COMMIT
+BEGIN;
+SET CONSTRAINTS playlist_position_unique DEFERRED;
+UPDATE playlist SET position = 3 WHERE song = 'Intro';
+UPDATE playlist SET position = 2 WHERE song = 'Verse';
+COMMIT;
+
+SELECT position, song FROM playlist ORDER BY position;
+```
+
+</CodeExample>
+
+Отложенные внешние ключи решают и проблему курицы и яйца: `departments.head_id` должен указывать на сотрудника, а каждый сотрудник должен принадлежать отделу. Если оба ключа объявлены `DEFERRABLE INITIALLY DEFERRED`, вы вставляете обе строки в одной транзакции в любом порядке.
+
+<Callout type="note" title="Чем приходится платить за откладывание">
+
+Отложенная проверка падает при `COMMIT`, далеко от инструкции, которая её вызвала, поэтому причину ошибки труднее найти. Отложенное уникальное ограничение не может быть целью `ON CONFLICT` или внешнего ключа, и оно немного медленнее. Делайте ограничения отложенными только там, где это действительно нужно.
+
+</Callout>
+
+<Quiz
+  question="Два пользователя в один и тот же момент пытаются забронировать комнату 4 на пересекающиеся даты. Приложение сначала делает SELECT на пересечение, потом INSERT. Что надёжно предотвратит двойное бронирование?"
+  options={["Проверять дважды в приложении", "Ограничение UNIQUE на (room_id, start_date)", "Ограничение-исключение с room_id WITH = и stay WITH &&", "Генерируемый столбец"]}
+  answer={2}
+  explanation="Оба запроса могут выполнить SELECT до того, как любой из них сделает INSERT, поэтому оба не увидят пересечения. Закрыть эту гонку может только ограничение, которое проверяет сама база данных. UNIQUE ловит лишь одинаковые даты начала, а не пересечения."
+/>
+
+<Quiz
+  question="Какое из этих выражений для генерируемого столбца PostgreSQL отклонит?"
+  options={["quantity * unit_price", "lower(email)", "split_part(email, '@', 2)", "current_date - joined_on"]}
+  answer={3}
+  explanation="current_date меняется каждый день, поэтому это выражение не неизменяемое: сохранённое значение молча устарело бы. Генерируемые столбцы могут использовать только собственные столбцы строки и неизменяемые функции."
+/>
+
+<Exercise
+  language="sql"
+  title="Система бронирования без двойных броней"
+  starter={`CREATE TABLE rooms (
+  id integer PRIMARY KEY,
+  name text NOT NULL
+);
+INSERT INTO rooms VALUES (1, 'Bamboo'), (2, 'Lotus');
+
+-- 1. Перечисление booking_status: 'held', 'confirmed', 'cancelled'
+-- 2. Домен guest_count: целое число от 1 до 8
+
+-- 3. Улучшите эту таблицу (см. задание)
+CREATE TABLE stays (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id integer NOT NULL REFERENCES rooms (id),
+  guest text NOT NULL,
+  guests integer NOT NULL,
+  stay daterange NOT NULL,
+  status text NOT NULL DEFAULT 'held'
+);
+
+INSERT INTO stays (room_id, guest, guests, stay) VALUES
+  (1, 'Mei', 2, '[2025-07-01,2025-07-04)'),
+  (2, 'Sam', 1, '[2025-07-02,2025-07-03)'),
+  (1, 'Ada', 3, '[2025-07-04,2025-07-09)');
+
+SELECT guest, room_id, nights, status
+FROM stays
+ORDER BY id;
+`}
+  tests={[
+    { name: "В booking_status есть held, confirmed, cancelled именно в таком порядке", check: "(await query(\"SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder) AS s FROM pg_enum WHERE enumtypid = 'booking_status'::regtype\"))[0].s === 'held,confirmed,cancelled'" },
+    { name: "stays.status использует booking_status (по умолчанию 'held'), а guests — guest_count", check: "(await query(\"SELECT string_agg(column_name || ':' || coalesce(domain_name, udt_name), ',' ORDER BY column_name) AS s FROM information_schema.columns WHERE table_name = 'stays' AND column_name IN ('guests', 'status')\"))[0].s === 'guests:guest_count,status:booking_status' && rows.every(r => r.status === 'held')" },
+    { name: "guest_count не пропускает 0 и 9 гостей, но допускает 8", check: "(await query(\"SELECT NOT pg_input_is_valid('0', 'guest_count') AND NOT pg_input_is_valid('9', 'guest_count') AND pg_input_is_valid('8', 'guest_count') AND pg_input_is_valid('1', 'guest_count') AS ok\"))[0].ok === true" },
+    { name: "nights — генерируемый столбец (3, 1, 5 для примеров броней)", check: "rows.map(r => r.nights).join() === '3,1,5' && (await query(\"SELECT is_generated FROM information_schema.columns WHERE table_name = 'stays' AND column_name = 'nights'\"))[0]?.is_generated === 'ALWAYS'" },
+    { name: "Пересекающаяся бронь в той же комнате отклоняется", check: "await query(\"INSERT INTO stays (room_id, guest, guests, stay) VALUES (1, 'Kenji', 1, '[2025-07-03,2025-07-05)')\").then(() => false, e => /exclusion/.test(e.message))" },
+    { name: "Брони в других комнатах и брони встык разрешены", check: "await query(\"INSERT INTO stays (room_id, guest, guests, stay) VALUES (2, 'Kenji', 1, '[2025-07-01,2025-07-02)'), (2, 'Ravi', 2, '[2025-07-03,2025-07-08)')\").then(() => true, () => false)" },
+    { name: "Отменённые брони не блокируют комнату", check: "await query(\"UPDATE stays SET status = 'cancelled' WHERE guest = 'Mei'\").then(() => query(\"INSERT INTO stays (room_id, guest, guests, stay) VALUES (1, 'Lena', 2, '[2025-07-02,2025-07-04)')\")).then(() => true, () => false)" },
+  ]}
+>
+
+Постройте таблицу броней гостевого дома так, чтобы плохие данные **не могли** туда попасть, что бы ни делало приложение:
+
+1. Создайте перечисление **`booking_status`** со значениями `'held'`, `'confirmed'`, `'cancelled'` (именно в таком порядке).
+2. Создайте домен **`guest_count`**: `integer` от 1 до 8.
+3. Измените таблицу `stays`: `guests` использует `guest_count`; `status` использует `booking_status` со значением по умолчанию `'held'`; добавьте генерируемый столбец **`nights`** (число ночей в `stay`); и добавьте ограничение-исключение, чтобы две брони в **одной комнате** не могли пересекаться, если только одна из них не **отменена**.
+
+Оставьте вставки и итоговый `SELECT`: он должен показать `nights` 3, 1 и 5.
+
+<Hint>
+
+`upper(stay) - lower(stay)` даёт число ночей (`date` минус `date` — это `integer`). Для ограничения возьмите шаблон из урока: `EXCLUDE USING gist (int4range(room_id, room_id, '[]') WITH =, stay WITH &&) WHERE (status <> 'cancelled')`. Проверка домена пишется через `VALUE`, например `CHECK (VALUE BETWEEN 1 AND 8)`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE rooms (
+  id integer PRIMARY KEY,
+  name text NOT NULL
+);
+INSERT INTO rooms VALUES (1, 'Bamboo'), (2, 'Lotus');
+
+CREATE TYPE booking_status AS ENUM ('held', 'confirmed', 'cancelled');
+
+CREATE DOMAIN guest_count AS integer
+  CHECK (VALUE BETWEEN 1 AND 8);
+
+CREATE TABLE stays (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id integer NOT NULL REFERENCES rooms (id),
+  guest text NOT NULL,
+  guests guest_count NOT NULL,
+  stay daterange NOT NULL,
+  status booking_status NOT NULL DEFAULT 'held',
+  nights integer GENERATED ALWAYS AS (upper(stay) - lower(stay)),
+  EXCLUDE USING gist (
+    int4range(room_id, room_id, '[]') WITH =,
+    stay WITH &&
+  ) WHERE (status <> 'cancelled')
+);
+
+INSERT INTO stays (room_id, guest, guests, stay) VALUES
+  (1, 'Mei', 2, '[2025-07-01,2025-07-04)'),
+  (2, 'Sam', 1, '[2025-07-02,2025-07-03)'),
+  (1, 'Ada', 3, '[2025-07-04,2025-07-09)');
+
+SELECT guest, room_id, nights, status
+FROM stays
+ORDER BY id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Домен** — это переиспользуемый тип со встроенными проверками (`CREATE DOMAIN email_address AS text CHECK (…)`).
+- **Перечисление** — небольшой упорядоченный фиксированный список меток: добавлять в него легко, удалять трудно. Справочные таблицы гибче.
+- **Генерируемые столбцы** вычисляются из своей строки: `VIRTUAL` (по умолчанию в PostgreSQL 18, не занимает места, не индексируется) или `STORED` (можно индексировать). Допускаются только неизменяемые выражения.
+- **Ограничения-исключения** (`EXCLUDE USING gist (… WITH =, range WITH &&)`) не допускают пересечений без всяких гонок и могут иметь `WHERE`. На настоящем сервере `btree_gist` позволяет написать `room_id WITH =` напрямую.
+- **Отложенные ограничения** проверяются в конце инструкции или при `COMMIT` — для изменений, которые ненадолго нарушают правила. Используйте их экономно.

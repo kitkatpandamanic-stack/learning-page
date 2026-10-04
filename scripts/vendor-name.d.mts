@@ -7,3 +7,5 @@ export const reactTypePackages: {
   csstype: string;
 };
 export const reactTypesVendorName: string;
+export const pgliteDir: string;
+export const pgliteVendorName: string;

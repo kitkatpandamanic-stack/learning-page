@@ -1,0 +1,485 @@
+---
+title: Паттерны моделирования данных
+description: Мягкое удаление, таблицы истории, два способа хранить деревья и выбор между JSONB, обычными столбцами и EAV — с компромиссами каждого варианта.
+duration: 22
+xp: 30
+---
+
+На Уровне 1 вы нормализовали таблицы, пока каждый факт не оказался ровно в одном месте. Настоящие продукты быстро задают вопросы посложнее. «Клиент удалил аккаунт, но его старые счета нам всё ещё нужны». «Сколько стоил этот чай в марте прошлого года?» «Покажи все категории внутри „Еды“ на любой глубине». «У каждого типа товаров свои характеристики». Для каждого из этих случаев есть известный **паттерн (pattern)**, и у каждого паттерна есть своя цена. В этом уроке — четыре паттерна, которые встречаются чаще всего, и то, как выбирать между вариантами. 🧱
+
+## Мягкое удаление
+
+**Жёсткое удаление (hard delete)** убирает строку (row) из таблицы. В настоящем магазине это часто запрещено, да и сама база данных вас остановит, если на эту строку всё ещё ссылаются другие:
+
+<CodeExample output={`ERROR:  update or delete on table "customers" violates foreign key constraint "orders_customer_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".`}>
+
+```sql
+DELETE FROM customers
+WHERE id = 1;
+```
+
+</CodeExample>
+
+Заказы Mei ссылаются на её строку, поэтому внешний ключ (foreign key) не даёт её удалить. **Мягкое удаление (soft delete)** сохраняет строку, но помечает её как удалённую. Временная метка, допускающая NULL, подходит лучше логического флага: она заодно запоминает, *когда* строку удалили:
+
+<CodeExample output={`ALTER TABLE
+
+UPDATE 1
+
+CREATE VIEW
+
+ stored | active
+--------+--------
+     20 |     19
+(1 row)`}>
+
+```sql
+ALTER TABLE customers
+  ADD COLUMN deleted_at timestamptz;
+
+UPDATE customers
+SET deleted_at = '2025-07-01 10:00+00'
+WHERE id = 1;
+
+-- То, что должна читать остальная часть приложения
+CREATE VIEW active_customers AS
+SELECT id, name, email, city, country, joined_on
+FROM customers
+WHERE deleted_at IS NULL;
+
+SELECT count(*) AS stored,
+  (SELECT count(*) FROM active_customers) AS active
+FROM customers;
+```
+
+</CodeExample>
+
+Самую трудную часть берёт на себя представление (view). При мягком удалении **каждый** запрос должен помнить про `WHERE deleted_at IS NULL`, и тот, который забудет, покажет удалённые данные, отправит письма удалённым пользователям или посчитает их в выручке. Направьте приложение на представление (или используйте защиту на уровне строк из модуля о безопасности) — тогда забыть просто не получится.
+
+### Уникальность только среди «живых» строк
+
+Мягкое удаление ломает `UNIQUE`. Удалённая Mei по-прежнему владеет адресом `mei@pandadev.test`, поэтому зарегистрироваться снова со своей почтой она уже не сможет. Решение — **частичный уникальный индекс (partial unique index)**: он требует уникальности только среди строк, подходящих под его `WHERE`:
+
+<CodeExample output={`ALTER TABLE
+
+ALTER TABLE
+
+CREATE INDEX
+
+UPDATE 1
+
+INSERT 0 1
+
+ERROR:  duplicate key value violates unique constraint "customers_email_live"
+DETAIL:  Key (email)=(mei@pandadev.test) already exists.`}>
+
+```sql
+ALTER TABLE customers ADD COLUMN deleted_at timestamptz;
+ALTER TABLE customers DROP CONSTRAINT customers_email_key;
+
+CREATE UNIQUE INDEX customers_email_live
+  ON customers (email)
+  WHERE deleted_at IS NULL;
+
+UPDATE customers SET deleted_at = '2025-07-01' WHERE id = 1;
+
+-- Mei возвращается: можно, старая строка удалена
+INSERT INTO customers (name, email, country, joined_on)
+VALUES ('Mei Lin', 'mei@pandadev.test', 'UK', '2025-07-02');
+
+-- Второй живой аккаунт с той же почтой: отказ
+INSERT INTO customers (name, email, country, joined_on)
+VALUES ('Mei Again', 'mei@pandadev.test', 'UK', '2025-07-03');
+```
+
+</CodeExample>
+
+### Или: переносить удалённые строки в архив
+
+Альтернатива — действительно удалить строку, но сохранить её копию в **архивной таблице (archive table)**. Хватит одной инструкции, потому что `DELETE … RETURNING` может передать строки в `INSERT` внутри CTE:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 2
+
+         title          | year
+------------------------+------
+ The Great Bamboo Race  | 2014
+ Midnight in the Forest | 2015
+(2 rows)`}>
+
+```sql
+CREATE TABLE movies_archive (
+  LIKE movies,
+  archived_at timestamptz NOT NULL DEFAULT now()
+);
+
+WITH gone AS (
+  DELETE FROM movies
+  WHERE year < 2016
+  RETURNING *
+)
+INSERT INTO movies_archive
+SELECT * FROM gone;
+
+SELECT title, year
+FROM movies_archive
+ORDER BY year;
+```
+
+</CodeExample>
+
+| | Мягкое удаление (`deleted_at`) | Архивная таблица |
+| --- | --- | --- |
+| Отменить удаление | Один `UPDATE` | Скопировать строку обратно |
+| Повседневные запросы | Нужен фильтр (используйте представление) | Ничего не нужно помнить |
+| Внешние ключи | Продолжают работать | Основная таблица должна это допускать |
+| Размер таблицы и индексов | Растёт за счёт удалённых строк | Основная таблица остаётся маленькой |
+
+<Callout type="warning" title="Мягкое удаление — это не стирание">
+
+Законы о защите данных, например GDPR, дают людям право на **удаление** их данных. Строка с заполненным `deleted_at` всё ещё содержит имя, почту и адрес. Продумайте и путь настоящего удаления: удалите строку или **обезличьте** её (`name = 'Deleted user'`, `email = 'deleted-' || id || '@invalid'`), сохранив идентификаторы, которые нужны счетам.
+
+</Callout>
+
+## История: что было верно и когда
+
+`products.price` хранит только сегодняшнюю цену. Измените её — и старая пропадёт. Сохранить историю помогают два паттерна:
+
+1. **Копировать значение туда, где оно используется.** Учебная база уже так делает: `order_items.unit_price` копирует цену в момент заказа, поэтому суммы старых заказов не меняются, когда меняются цены. Так стоит поступать со всем, что зафиксировано юридически или финансово: ценами в счетах, адресами в отправлениях, налоговыми ставками.
+2. **Таблица истории с периодами действия.** Каждая строка говорит: «это значение было верным **в течение** такого-то периода». `daterange` с открытым концом означает «верно до сих пор»:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 5
+
+     name      | price
+---------------+-------
+ Jasmine Tea   |  5.90
+ Matcha Powder | 13.00
+(2 rows)
+
+ product_id | price
+------------+-------
+          1 |  6.50
+          2 | 14.00
+(2 rows)`}>
+
+```sql
+CREATE TABLE price_history (
+  product_id integer NOT NULL REFERENCES products (id),
+  price numeric(8, 2) NOT NULL,
+  valid daterange NOT NULL
+);
+
+INSERT INTO price_history (product_id, price, valid) VALUES
+  (1, 5.90, '[2024-01-01,2025-03-01)'),
+  (1, 6.50, '[2025-03-01,)'),
+  (2, 12.00, '[2024-01-01,2025-02-01)'),
+  (2, 13.00, '[2025-02-01,2025-05-01)'),
+  (2, 14.00, '[2025-05-01,)');
+
+-- Цены по состоянию на 15 февраля 2025 года
+SELECT p.name, h.price
+FROM price_history AS h
+JOIN products AS p ON p.id = h.product_id
+WHERE h.valid @> date '2025-02-15'
+ORDER BY p.id;
+
+-- Текущие цены: диапазоны, у которых ещё нет конца
+SELECT product_id, price
+FROM price_history
+WHERE upper_inf(valid)
+ORDER BY product_id;
+```
+
+</CodeExample>
+
+`@>` означает «содержит», а `[` / `)` — «начало включено, конец исключён», поэтому `[2025-02-01,2025-05-01)` и `[2025-05-01,)` соприкасаются, но не пересекаются. Смена цены превращается в две записи в **одной транзакции (transaction)**: закрыть открытый диапазон, затем вставить новый:
+
+```sql
+BEGIN;
+UPDATE price_history
+SET valid = daterange(lower(valid), '2025-07-01')
+WHERE product_id = 1 AND upper_inf(valid);
+
+INSERT INTO price_history (product_id, price, valid)
+VALUES (1, 6.90, '[2025-07-01,)');
+COMMIT;
+```
+
+Пока ничто не мешает двум строкам одного товара пересекаться по времени. Это правило вы добавите с помощью **ограничения-исключения (exclusion constraint)** в следующем уроке. В PostgreSQL 18 также появились **темпоральные ключи (temporal keys)** из стандарта SQL — `PRIMARY KEY (product_id, valid WITHOUT OVERLAPS)` — и внешние ключи с `PERIOD`. Для обычного столбца `integer` им нужно расширение `btree_gist`, которого нет в этой базе данных в браузере.
+
+<Callout type="note" title="Журнал аудита или темпоральная таблица?">
+
+**Журнал аудита (audit log)** (вы делали его с триггером на Уровне 2) записывает, *кто, что и когда изменил*: это отлично для расследований, но неудобно для запросов («какой была цена 15 февраля?» означает переиграть все изменения). **Темпоральная таблица (temporal table)** хранит, *что было верно и когда*, и отвечает на вопросы «по состоянию на дату» одним `WHERE`. Во многих системах есть и то и другое.
+
+</Callout>
+
+## Иерархии: два способа хранить дерево
+
+Категории, папки, ветки комментариев и оргструктуры — всё это **деревья (trees)**. Проще всего хранить дерево в виде **списка смежности (adjacency list)**: каждая строка ссылается на родителя, в точности как `employees.manager_id`. Чтобы прочитать целое поддерево, нужен рекурсивный CTE (вы писали их на Уровне 2):
+
+<CodeExample output={`       org_chart
+-----------------------
+ Alan Turing
+   Ada Lovelace
+   Barbara Liskov
+     Linus Park
+     Margaret Hamilton
+     Ken Thompson
+(6 rows)`}>
+
+```sql
+WITH RECURSIVE team AS (
+  SELECT id, name, 0 AS depth
+  FROM employees
+  WHERE name = 'Alan Turing'
+  UNION ALL
+  SELECT e.id, e.name, t.depth + 1
+  FROM employees AS e
+  JOIN team AS t ON e.manager_id = t.id
+)
+SELECT repeat('  ', depth) || name AS org_chart
+FROM team
+ORDER BY depth, id;
+```
+
+</CodeExample>
+
+В список смежности легко писать (чтобы перевести команду, достаточно поменять один `manager_id`), но каждое чтение поддерева обходит дерево уровень за уровнем. Когда чтений намного больше, храните **материализованный путь (materialised path)**: каждая строка держит идентификаторы от корня до себя самой. Хорошо подходит массив `integer[]` (он сортируется как числа, в отличие от текстового пути, где `'1.10'` оказывается раньше `'1.2'`):
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 7
+
+      tree
+-----------------
+ Shop
+   Food & drink
+     Tea
+       Green tea
+     Snacks
+   Home
+     Kitchen
+(7 rows)
+
+   name
+-----------
+ Tea
+ Green tea
+ Snacks
+(3 rows)
+
+              breadcrumb
+---------------------------------------
+ Shop > Food & drink > Tea > Green tea
+(1 row)`}>
+
+```sql
+CREATE TABLE categories (
+  id integer PRIMARY KEY,
+  name text NOT NULL,
+  path integer[] NOT NULL  -- id от корня до этой строки
+);
+
+INSERT INTO categories (id, name, path) VALUES
+  (1, 'Shop', '{1}'),
+  (2, 'Food & drink', '{1,2}'),
+  (3, 'Tea', '{1,2,3}'),
+  (4, 'Green tea', '{1,2,3,4}'),
+  (5, 'Snacks', '{1,2,5}'),
+  (6, 'Home', '{1,6}'),
+  (7, 'Kitchen', '{1,6,7}');
+
+-- Всё дерево по порядку, с отступом по глубине
+SELECT repeat('  ', cardinality(path) - 1) || name AS tree
+FROM categories
+ORDER BY path;
+
+-- Всё внутри 'Food & drink' (id 2) на любой глубине
+SELECT name
+FROM categories
+WHERE path @> ARRAY[2] AND id <> 2
+ORDER BY path;
+
+-- «Хлебные крошки» для 'Green tea': её предки
+SELECT string_agg(a.name, ' > ' ORDER BY cardinality(a.path))
+  AS breadcrumb
+FROM categories AS c
+JOIN categories AS a ON a.id = ANY (c.path)
+WHERE c.id = 4;
+```
+
+</CodeExample>
+
+Теперь каждый вопрос — это один нерекурсивный запрос, а `path @> ARRAY[2]` может использовать **GIN-индекс** по `path`. Платить приходится при записи: чтобы перенести «Tea» в «Home», нужно переписать путь у Tea **и у всех её потомков** в одной транзакции.
+
+| Паттерн | Прочитать поддерево | Перенести поддерево | Примечания |
+| --- | --- | --- | --- |
+| Список смежности (`parent_id`) | Рекурсивный CTE | Изменить одну строку | Просто и всегда согласованно; вариант по умолчанию |
+| Материализованный путь | Один запрос по индексу | Изменить всех потомков | Отлично для деревьев, которые в основном читают (категории, папки) |
+| Таблица замыканий (closure table) | Одно соединение | Меняется много строк | По строке на каждую пару «предок — потомок» |
+
+Расширение `ltree` даёт PostgreSQL специальный тип для путей с быстрыми операторами. В этой браузерной базе его нет, но на настоящем сервере на него стоит посмотреть.
+
+## Гибкие атрибуты: столбцы, JSONB или EAV
+
+У чайника есть объём и цвет, у книги — автор и число страниц, у игрушки — возрастной диапазон. Как хранить характеристики, которые у каждого товара свои? Вариантов три.
+
+**Обычные столбцы (columns)** — лучший выбор, когда атрибуты вам известны: у них есть типы, ограничения, статистика и простые запросы. Добавление столбца, допускающего NULL, происходит мгновенно (вы увидите это в уроке о миграциях), так что «может быть, потом добавим атрибуты» — не повод от них отказываться.
+
+**EAV** (entity–attribute–value, «сущность — атрибут — значение») хранит по строке на каждый атрибут: `(product_id, attribute, value)`. Выглядит бесконечно гибко, но каждое значение — это `text` (ни типов, ни `CHECK`, ни внешних ключей), а каждый атрибут, который нужно прочитать, — ещё одно соединение. EAV широко считается **антипаттерном (anti-pattern)** для всего, кроме разреженных данных, которые определяют сами пользователи.
+
+**JSONB** хранит гибкую часть в одном типизированном документе с поддержкой индексов — по документу на строку:
+
+<CodeExample output={`ALTER TABLE
+
+UPDATE 1
+
+UPDATE 1
+
+UPDATE 1
+
+    name     | colour | litres
+-------------+--------+--------
+ Tea Pot     | blue   |    1.2
+ Rice Cooker | white  |    1.8
+(2 rows)
+
+    name
+-------------
+ Plush Panda
+(1 row)`}>
+
+```sql
+ALTER TABLE products
+  ADD COLUMN specs jsonb NOT NULL DEFAULT '{}';
+
+UPDATE products SET specs = '{"litres": 1.8, "colour": "white"}'
+WHERE name = 'Rice Cooker';
+UPDATE products SET specs = '{"litres": 1.2, "colour": "blue"}'
+WHERE name = 'Tea Pot';
+UPDATE products SET specs = '{"colour": "black", "washable": true}'
+WHERE name = 'Plush Panda';
+
+SELECT name,
+  specs ->> 'colour' AS colour,
+  (specs ->> 'litres')::numeric AS litres
+FROM products
+WHERE specs ? 'litres'
+ORDER BY id;
+
+SELECT name
+FROM products
+WHERE specs @> '{"washable": true}';
+```
+
+</CodeExample>
+
+Хорошее правило: **основные поля, по которым ищут и на которые есть ограничения, — это столбцы; длинный хвост остального — JSONB.** Когда какой-то ключ JSON становится важным, превратите его в настоящий столбец (это умеет генерируемый столбец из следующего урока, и код, который пишет данные, менять не придётся). JSONB тоже можно защитить ограничениями `CHECK`: `CHECK (jsonb_typeof(specs -> 'litres') = 'number')` отклонит `"litres": "1.8"`, но пропустит товары без этого ключа (для них проверка даёт NULL, а `CHECK` не проходит только при `false`).
+
+| | Обычные столбцы | JSONB | EAV |
+| --- | --- | --- | --- |
+| Типы и ограничения | Полностью | Только `CHECK` | Нет (всё — текст) |
+| Запросы | Простые | Операторы (`->>`, `@>`) | По соединению на атрибут |
+| Индексы | B-tree по чему угодно | GIN по документу | Слабые |
+| Новый атрибут | `ALTER TABLE` (быстро) | Просто записать | Просто записать |
+
+<Callout type="tip" title="Типичный реальный инцидент">
+
+Команды, которые складывают всё в один столбец `data jsonb`, обычно понимают проблему в тот день, когда кто-то сохраняет `"price": "12.50"` (строку) рядом с `"price": 12.5` (числом), и каждый отчёт молча теряет половину строк. Если поле важно для бизнеса, дайте ему столбец и тип.
+
+</Callout>
+
+<Quiz
+  question="Клиентов удаляют мягко через deleted_at. Что обеспечит уникальность почты среди живых клиентов и при этом позволит удалённому клиенту зарегистрироваться снова?"
+  options={["UNIQUE (email, deleted_at)", "Уникальный индекс по email с WHERE deleted_at IS NULL", "Ограничение CHECK на email", "Представление, которое отфильтровывает удалённые строки"]}
+  answer={1}
+  explanation="Частичный уникальный индекс охватывает только строки, подходящие под его WHERE, поэтому удалённые строки не учитываются. UNIQUE (email, deleted_at) не работает, потому что NULL-значения считаются различными: у двух живых строк с одинаковой почтой deleted_at равен NULL, и обе будут разрешены."
+/>
+
+<Quiz
+  question="Дерево категорий читают тысячи раз в секунду и почти никогда не перестраивают. Какая модель подходит лучше всего?"
+  options={["Список смежности с рекурсивным CTE при каждом чтении", "Материализованный путь (массив id предков) с GIN-индексом", "EAV", "По отдельной таблице на каждый уровень дерева"]}
+  answer={1}
+  explanation="Материализованный путь превращает чтение поддерева и «хлебных крошек» в один запрос по индексу. Его цена — переписывание потомков при переносе поддерева — почти не важна, когда переносы редки."
+/>
+
+<Exercise
+  language="sql"
+  title="Снимаем товары с продажи — мягко"
+  starter={`-- 1. Добавьте в products столбец retired_at типа timestamptz,
+--    допускающий NULL.
+
+-- 2. Снимите с продажи 'Earl Grey' и 'Clean Python' (заполните retired_at).
+
+-- 3. Создайте представление on_sale (id, name, category, price)
+--    с товарами, которые не сняты с продажи.
+
+-- 4. Названия должны быть уникальны среди товаров в продаже
+--    без учёта регистра. Название снятого товара можно использовать снова.
+
+-- 5. Покажите представление, сначала самые дешёвые.
+SELECT * FROM products;
+`}
+  tests={[
+    { name: "В products есть столбец retired_at типа timestamptz", check: "(await query(\"SELECT data_type FROM information_schema.columns WHERE table_name = 'products' AND column_name = 'retired_at'\"))[0]?.data_type === 'timestamp with time zone'" },
+    { name: "С продажи сняты ровно Earl Grey и Clean Python", check: "(await query(\"SELECT string_agg(name, ',' ORDER BY id) AS s FROM products WHERE retired_at IS NOT NULL\"))[0].s === 'Earl Grey,Clean Python'" },
+    { name: "В представлении on_sale есть id, name, category, price и 13 строк", check: "(await query(\"SELECT string_agg(column_name, ',' ORDER BY ordinal_position) AS s FROM information_schema.columns WHERE table_name = 'on_sale'\"))[0].s === 'id,name,category,price' && (await query(\"SELECT count(*) AS n FROM on_sale\"))[0].n === 13" },
+    { name: "Последний запрос показывает on_sale, сначала самые дешёвые", check: "/on_sale/i.test(lastQuery) && rows.length === 13 && rows.every((r, i) => i === 0 || rows[i - 1].price <= r.price) && rows[0].name === 'Rice Crackers'" },
+    { name: "Второй товар в продаже с названием 'jasmine tea' отклоняется (без учёта регистра)", check: "await query(\"INSERT INTO products (name, category, price) VALUES ('jasmine tea', 'tea', 7)\").then(() => false, () => true)" },
+    { name: "Название снятого товара можно использовать снова", check: "await query(\"INSERT INTO products (name, category, price) VALUES ('Earl Grey', 'tea', 5.5)\").then(() => true, () => false)" },
+    { name: "Только что снятые товары исчезают из представления", check: "(await rerun(\"UPDATE products SET retired_at = '2025-07-01' WHERE name IN ('Kite', 'Tea Pot')\")).length === 11" },
+  ]}
+>
+
+Магазин время от времени перестаёт продавать какой-нибудь товар, но старые заказы всё ещё на него ссылаются, поэтому удалить его нельзя. Добавьте в `products` мягкое удаление:
+
+1. Добавьте столбец `retired_at` типа `timestamptz`, допускающий NULL.
+2. Снимите с продажи **Earl Grey** и **Clean Python** (подойдёт любая временная метка, например `'2025-07-01'`).
+3. Создайте представление **`on_sale`** со столбцами `id, name, category, price` для товаров, которые не сняты с продажи.
+4. Сделайте названия товаров уникальными среди товаров в продаже **без учёта регистра**, но так, чтобы название снятого товара можно было использовать снова.
+5. Закончите запросом к `on_sale`, сначала самые дешёвые.
+
+<Hint>
+
+Шаг 4 — это уникальный индекс, который одновременно и **индекс по выражению (expression index)**, и **частичный** индекс: `CREATE UNIQUE INDEX … ON products (lower(name)) WHERE retired_at IS NULL;`. Шаг 5: `SELECT * FROM on_sale ORDER BY price, id;`.
+
+</Hint>
+
+<Solution>
+
+```sql
+ALTER TABLE products
+  ADD COLUMN retired_at timestamptz;
+
+UPDATE products
+SET retired_at = '2025-07-01'
+WHERE name IN ('Earl Grey', 'Clean Python');
+
+CREATE VIEW on_sale AS
+SELECT id, name, category, price
+FROM products
+WHERE retired_at IS NULL;
+
+CREATE UNIQUE INDEX products_name_on_sale
+  ON products (lower(name))
+  WHERE retired_at IS NULL;
+
+SELECT *
+FROM on_sale
+ORDER BY price, id;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Мягкое удаление** (`deleted_at timestamptz`) сохраняет строки, на которые ссылаются другие строки. Спрячьте удалённые за **представлением**, сохраните уникальность с помощью **частичного уникального индекса** и всё равно продумайте настоящее стирание ради законов о защите данных. Альтернатива — **архивная таблица**, которую заполняет `DELETE … RETURNING`.
+- **Историю** храните, копируя значения туда, где они используются (`order_items.unit_price`), или с помощью **периодов действия** (`daterange`, `@>`, `upper_inf`); чтобы изменить значение, закройте старый диапазон и откройте новый в одной транзакции.
+- Деревья: **список смежности** прост и дёшев в изменении, но требует рекурсивного чтения; **материализованный путь** (`integer[]`, `@>`, GIN) делает чтение одним запросом, но перенос переписывает потомков.
+- Гибкие атрибуты: **столбцы** — для важного, **JSONB** — для длинного хвоста, а **EAV** избегайте, если только атрибуты действительно не задают сами пользователи.

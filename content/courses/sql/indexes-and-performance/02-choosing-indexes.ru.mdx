@@ -1,0 +1,541 @@
+---
+title: Как выбрать правильные индексы
+description: Как устроены индексы B-tree и когда нужны составные, частичные, функциональные, покрывающие и уникальные индексы. А ещё — когда индексы не помогают и чего они стоят.
+duration: 24
+xp: 25
+---
+
+В [прошлом уроке](/learn/sql/explain-query-plans) один `CREATE INDEX` превратил полное сканирование 100 000 строк в поиск 40 строк. Индексы — самый мощный рычаг производительности, который есть у разработчика баз данных: часто это выигрыш в 100 или 1000 раз за одну строчку SQL. 🚀
+
+Но они не бесплатны, и неправильный индекс хуже, чем никакого: он замедляет каждую запись и при этом не ускоряет ваш запрос. В этом уроке вы узнаете, как индексы устроены внутри, какие виды индексов есть в PostgreSQL и как подобрать подходящий для конкретного запроса.
+
+## Что такое индекс B-tree
+
+Когда вы пишете `CREATE INDEX`, PostgreSQL по умолчанию строит **B-tree** («сбалансированное дерево», balanced tree). Представьте значения индексируемого столбца в **отсортированном** виде, а над ними — несколько уровней указателей:
+
+```text
+                        [ root: 1000 | 2000 ]
+                 /               |                \
+       [ 250 | 500 | 750 ]  [ 1250 | 1500 ]  [ 2250 | 2500 ]
+        /     |      \  ...
+  leaf pages: 1 2 3 ... 249 | 250 251 ... (each entry → a row's address)
+```
+
+Чтобы найти `user_id = 42`, PostgreSQL начинает с корня (root), на каждом уровне следует по одному указателю и попадает на листовую страницу (leaf page), где лежит 42. Каждая запись в листе хранит значение и **адрес строки** в таблице (её `ctid`). Поскольку каждый уровень делит данные на сотни частей, даже среди 100 миллионов строк любое значение находится за 4–5 чтений страниц.
+
+Раз B-tree **отсортирован**, он помогает далеко не только с `=`:
+
+- **Сравнения и диапазоны**: `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN (…)`.
+- **Сортировка**: `ORDER BY` по индексированным столбцам, в прямом или обратном порядке, особенно вместе с `LIMIT`.
+- **Поиск по префиксу**: `LIKE 'abc%'` (в базах с правилом сортировки C, как эта; в остальных создавайте индекс с `text_pattern_ops`).
+- **`IS NULL`** и **`min()`/`max()`**.
+
+Вы всё это время пользовались B-tree, сами того не зная. **Первичный ключ (primary key)** и ограничение **`UNIQUE`** автоматически создают по такому индексу. Вот индексы учебной базы данных из системного представления `pg_indexes` (в psql их показывает `\di`):
+
+<CodeExample output={`  tablename  |      indexname
+-------------+----------------------
+ customers   | customers_email_key
+ customers   | customers_pkey
+ departments | departments_name_key
+ departments | departments_pkey
+ employees   | employees_pkey
+ movies      | movies_pkey
+ order_items | order_items_pkey
+ orders      | orders_pkey
+ products    | products_pkey
+(9 rows)`}>
+
+```sql
+SELECT tablename, indexname
+FROM pg_indexes
+WHERE schemaname = 'public'
+ORDER BY tablename, indexname;
+```
+
+</CodeExample>
+
+Обратите внимание, чего здесь **нет**: `orders.customer_id`, `order_items.product_id` и `employees.manager_id` — внешние ключи (foreign keys), и ни у одного из них нет индекса. PostgreSQL индексирует сторону, на которую ссылаются (первичный ключ), но **не** ссылающийся столбец. В большой базе там почти всегда нужен индекс: он нужен соединениям по этому столбцу, запросу «все заказы покупателя 7» и удалению покупателя (при котором нужно проверить, нет ли у него заказов).
+
+<Callout type="warning" title="Индексируйте внешние ключи">
+
+Отсутствие индекса на внешнем ключе — одна из самых частых проблем с производительностью в реальных приложениях. При удалении одной строки из `customers` PostgreSQL ищет подходящие строки в `orders`; без индекса на `orders.customer_id` это полное сканирование `orders` для **каждого** удаляемого покупателя.
+
+</Callout>
+
+## Составные индексы: порядок важен
+
+Индекс может охватывать несколько столбцов. Его записи отсортированы по первому столбцу, при равных значениях первого — по второму и так далее, в точности как телефонный справочник, отсортированный по фамилии, а затем по имени.
+
+Поэтому **порядок столбцов** решает всё. Справочник поможет найти «Smith, John» и всех «Smith», но совершенно бесполезен, если нужны все, кого зовут «John». Посмотрим на то же самое на таблице продаж с индексом по `(customer_id, sold_on)`:
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+CREATE INDEX
+
+                    QUERY PLAN
+---------------------------------------------------
+ Bitmap Heap Scan on sales
+   Recheck Cond: (customer_id = 7)
+   ->  Bitmap Index Scan on sales_customer_day_idx
+         Index Cond: (customer_id = 7)
+(4 rows)
+
+                                 QUERY PLAN
+-----------------------------------------------------------------------------
+ Bitmap Heap Scan on sales
+   Recheck Cond: ((customer_id = 7) AND (sold_on >= '2025-01-01'::date))
+   ->  Bitmap Index Scan on sales_customer_day_idx
+         Index Cond: ((customer_id = 7) AND (sold_on >= '2025-01-01'::date))
+(4 rows)
+
+                QUERY PLAN
+------------------------------------------
+ Seq Scan on sales
+   Filter: (sold_on = '2025-03-01'::date)
+(2 rows)`}>
+
+```sql
+CREATE TABLE sales AS
+SELECT g AS id,
+  g % 2000 + 1 AS customer_id,
+  date '2024-01-01' + g % 730 AS sold_on,
+  (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+ANALYZE sales;
+
+CREATE INDEX sales_customer_day_idx ON sales (customer_id, sold_on);
+
+-- 1. Только первый столбец: индекс используется
+EXPLAIN (COSTS OFF)
+SELECT * FROM sales WHERE customer_id = 7;
+
+-- 2. Оба столбца: индекс используется для обоих условий
+EXPLAIN (COSTS OFF)
+SELECT * FROM sales
+WHERE customer_id = 7 AND sold_on >= '2025-01-01';
+
+-- 3. Только второй столбец: индекс не подходит
+EXPLAIN (COSTS OFF)
+SELECT * FROM sales WHERE sold_on = '2025-03-01';
+```
+
+</CodeExample>
+
+Третьему запросу нужен один день по всем 2000 покупателям. В индексе записи за этот день разбросаны по 2000 разных мест (по одному на покупателя), поэтому PostgreSQL вместо индекса сканирует таблицу. Это **правило левого префикса (leftmost prefix rule)**: индекс по `(a, b, c)` обслуживает условия на `a`, на `a` и `b` или на `a`, `b` и `c`, но не на одни только `b` или `c`.
+
+Практические правила для порядка столбцов:
+
+1. Столбцы, которые сравниваются через **`=`**, идут **первыми**.
+2. Затем — столбец для **диапазона** (`>`, `BETWEEN`) **или** для **`ORDER BY`**. В упражнении прошлого урока `(user_id, viewed_at)` обслуживал `WHERE user_id = … ORDER BY viewed_at DESC LIMIT 5` вообще без Sort.
+3. Индекс по `(a, b)` обслуживает и запросы только по `a`, так что отдельный индекс по `a` обычно не нужен.
+
+<Callout type="note" title="Skip scan в PostgreSQL 18">
+
+Начиная с версии 18, PostgreSQL иногда может использовать индекс **без** его первого столбца: когда у первого столбца всего несколько различных значений (скажем, `status` с 3 значениями), он «перескакивает» по индексу по одному разу на каждое значение. Поэтому индекс по `(status, created_at)` теперь может помочь `WHERE created_at > …`. Приятный бонус, но не проектируйте индексы в расчёте на него: когда у первого столбца много различных значений, как у `customer_id` выше, правило левого префикса по-прежнему действует.
+
+</Callout>
+
+## Частичные индексы: индексируйте только нужные строки
+
+Часто приложение снова и снова обращается к маленькой «горячей» части большой таблицы: к **открытым** тикетам, **неоплаченным** счетам, задачам, которые ещё **ждут** выполнения. **Частичный индекс (partial index)** имеет условие `WHERE` и содержит только такие строки:
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+CREATE INDEX
+
+                   QUERY PLAN
+------------------------------------------------
+ Limit
+   ->  Index Scan using tasks_open_idx on tasks
+(2 rows)
+
+ index_size
+------------
+ 64 kB
+(1 row)`}>
+
+```sql
+-- 100 000 задач: 98% выполнены, 2% ещё открыты
+CREATE TABLE tasks AS
+SELECT g AS id,
+  CASE WHEN g % 50 = 0 THEN 'open' ELSE 'done' END AS status,
+  timestamp '2025-01-01' + g * interval '5 minutes' AS created_at
+FROM generate_series(1, 100000) AS g;
+ANALYZE tasks;
+
+CREATE INDEX tasks_open_idx ON tasks (created_at)
+  WHERE status = 'open';
+
+-- Самые старые открытые задачи для экрана задач команды
+EXPLAIN (COSTS OFF)
+SELECT * FROM tasks
+WHERE status = 'open'
+ORDER BY created_at
+LIMIT 10;
+
+SELECT pg_size_pretty(pg_relation_size('tasks_open_idx'))
+  AS index_size;
+```
+
+</CodeExample>
+
+В индексе всего 2000 записей, поэтому он крошечный (64 kB вместо пары мегабайт для всех 100 000 строк), держится в памяти, а записи в строки со статусом «done» его вообще не затрагивают. Из плана даже исчезло `Index Cond`: каждая запись в этом индексе — открытая задача, уже отсортированная по `created_at`.
+
+Подвох: планировщик использует частичный индекс, только если может **доказать**, что из `WHERE` запроса следует `WHERE` индекса. `WHERE status = 'open'` сработает; `WHERE status = $1` из приложения, когда значение неизвестно на этапе планирования, — может и нет.
+
+## Функциональные индексы
+
+Индекс по `email` хранит адреса как есть. Если ваш запрос ищет `WHERE lower(email) = …`, этот индекс не поможет: он отсортирован по `email`, а не по `lower(email)`. Решение — проиндексировать само **выражение (expression)**:
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+CREATE INDEX
+
+                      QUERY PLAN
+-------------------------------------------------------
+ Seq Scan on users
+   Filter: (lower(email) = 'user42@example.com'::text)
+(2 rows)
+
+CREATE INDEX
+
+                           QUERY PLAN
+-----------------------------------------------------------------
+ Bitmap Heap Scan on users
+   Recheck Cond: (lower(email) = 'user42@example.com'::text)
+   ->  Bitmap Index Scan on users_lower_email_idx
+         Index Cond: (lower(email) = 'user42@example.com'::text)
+(4 rows)`}>
+
+```sql
+CREATE TABLE users AS
+SELECT g AS id, 'User' || g || '@Example.com' AS email
+FROM generate_series(1, 100000) AS g;
+ANALYZE users;
+
+-- Обычный индекс по email не помогает lower(email)
+CREATE INDEX users_email_idx ON users (email);
+EXPLAIN (COSTS OFF)
+SELECT * FROM users WHERE lower(email) = 'user42@example.com';
+
+-- А индекс по выражению помогает
+CREATE INDEX users_lower_email_idx ON users (lower(email));
+EXPLAIN (COSTS OFF)
+SELECT * FROM users WHERE lower(email) = 'user42@example.com';
+```
+
+</CodeExample>
+
+Запрос должен использовать **точно такое же выражение**, как индекс. Функциональные индексы (expression indexes) часто применяют для поиска без учёта регистра (`lower(email)`), для частей дат и для значений внутри JSON (`(data ->> 'country')`). Функция должна быть **неизменяемой (immutable)** — всегда возвращать один и тот же результат для одних и тех же входных данных, — поэтому `now()` в индекс поместить нельзя.
+
+## Покрывающие индексы и сканирование только по индексу
+
+Обычно сканирование по индексу находит в индексе адрес строки, а затем достаёт саму строку из таблицы. Если **все столбцы, нужные запросу**, есть в индексе, PostgreSQL может вообще не обращаться к таблице: это **Index Only Scan**.
+
+`INCLUDE` добавляет в листовые записи индекса дополнительные столбцы — только чтобы их вернуть, а не чтобы по ним искать или сортировать. Так получается **покрывающий индекс (covering index)** для конкретного запроса:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE INDEX
+
+VACUUM
+
+                                     QUERY PLAN
+-------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Index Only Scan using sales_customer_idx on sales (actual rows=50.00 loops=1)
+         Index Cond: (customer_id = 7)
+         Heap Fetches: 0
+         Index Searches: 1
+(5 rows)`}>
+
+```sql
+CREATE TABLE sales AS
+SELECT g AS id,
+  g % 2000 + 1 AS customer_id,
+  (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+
+CREATE INDEX sales_customer_idx ON sales (customer_id)
+  INCLUDE (amount);
+
+-- VACUUM помечает страницы как видимые всем; ANALYZE обновляет статистику
+VACUUM ANALYZE sales;
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT sum(amount) AS total
+FROM sales
+WHERE customer_id = 7;
+```
+
+</CodeExample>
+
+**`Heap Fetches: 0`** означает, что из таблицы не прочитано ни одной строки: все 50 сумм пришли из индекса. На практике важны две детали:
+
+- **Видимость**: из-за того, как PostgreSQL обрабатывает параллельные транзакции, по одной записи индекса нельзя понять, видна ли вам строка. Сканирование только по индексу опирается на **карту видимости (visibility map)**, которую поддерживает в актуальном состоянии `VACUUM` (autovacuum делает это в фоне). В таблице с большим количеством недавних изменений вы увидите много обращений к куче (heap fetches).
+- **Не перестарайтесь**: каждый включённый столбец увеличивает индекс. Используйте покрывающие индексы для нескольких очень частых и очень важных запросов.
+
+<Quiz
+  question="В таблице есть индекс по (country, city). Какой запрос НЕ может использовать его как обычный поиск по первому столбцу?"
+  options={[
+    "WHERE country = 'UK'",
+    "WHERE country = 'UK' AND city = 'London'",
+    "WHERE city = 'London'",
+    "WHERE country = 'UK' ORDER BY city",
+  ]}
+  answer={2}
+  explanation="Индекс отсортирован сначала по country, затем по city. Запросы с заданной страной могут сразу перейти к ней. А «все строки, где город — London» разбросаны по всем странам, так что по правилу левого префикса индекс напрямую этот запрос не обслуживает (в лучшем случае PostgreSQL 18 сделает skip scan, если стран немного)."
+/>
+
+## Уникальные индексы
+
+**Уникальный индекс (unique index)** не допускает повторяющихся значений. Ограничения `UNIQUE` реализованы именно так, но такой индекс можно создать и напрямую — тогда уникальность можно сочетать с приёмами выше. Например, адреса электронной почты, которые должны быть уникальными **без учёта регистра**:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE INDEX
+
+INSERT 0 1
+
+ERROR:  duplicate key value violates unique constraint "members_email_lower_idx"
+DETAIL:  Key (lower(email))=(mei@pandadev.test) already exists.`}>
+
+```sql
+CREATE TABLE members (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text NOT NULL
+);
+
+CREATE UNIQUE INDEX members_email_lower_idx
+  ON members (lower(email));
+
+INSERT INTO members (email) VALUES ('Mei@PandaDev.test');
+INSERT INTO members (email) VALUES ('mei@pandadev.test');
+```
+
+</CodeExample>
+
+PostgreSQL сообщает (по-английски), что повторяющееся значение ключа нарушает ограничение уникальности, и показывает, какой именно ключ уже существует.
+
+**Частичный уникальный индекс** обеспечивает правила вроде «у пользователя может быть сколько угодно старых подписок, но только **одна активная**»:
+
+```sql
+CREATE UNIQUE INDEX one_active_subscription
+  ON subscriptions (user_id)
+  WHERE active;
+```
+
+Таким правилам место в базе данных: приложение, которое перед вставкой проверяет «а нет ли уже такой?», можно обойти двумя запросами, пришедшими в один и тот же момент. Уникальный индекс обойти нельзя.
+
+## Когда индексы не помогают
+
+Индекс — не волшебная кнопка «сделать быстро». PostgreSQL игнорирует индекс, когда:
+
+- **Условию соответствует большая доля таблицы.** Если 98% задач имеют статус `done`, то `WHERE status = 'done'` всё равно читает почти все страницы, и Seq Scan быстрее, чем прыжки через индекс. Индексы блистают на **селективных (selective)** условиях.
+- **Таблица маленькая.** Несколько страниц быстрее прочитать за один раз.
+- **Столбец обёрнут в функцию или вычисление**: `WHERE lower(email) = …` при индексе по `email` или `WHERE extract(year FROM sold_on) = 2025`. Переписывать такие условия вы научитесь в [уроке о настройке запросов](/learn/sql/query-tuning).
+- **Шаблон начинается с подстановочного символа**: `LIKE '%gmail.com'` не может использовать B-tree, потому что индекс отсортирован по **началу** текста. (С такими шаблонами справляются полнотекстовый поиск или GIN-индексы расширения `pg_trgm`.)
+- **Первого столбца составного индекса нет в запросе** (если не считать skip scan в PostgreSQL 18).
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+CREATE INDEX
+
+            QUERY PLAN
+-----------------------------------
+ Seq Scan on tasks
+   Filter: (status = 'done'::text)
+(2 rows)
+
+                 QUERY PLAN
+--------------------------------------------
+ Index Scan using tasks_status_idx on tasks
+   Index Cond: (status = 'open'::text)
+(2 rows)`}>
+
+```sql
+CREATE TABLE tasks AS
+SELECT g AS id,
+  CASE WHEN g % 50 = 0 THEN 'open' ELSE 'done' END AS status
+FROM generate_series(1, 100000) AS g;
+ANALYZE tasks;
+
+CREATE INDEX tasks_status_idx ON tasks (status);
+
+-- 98% строк: индекс того не стоит
+EXPLAIN (COSTS OFF) SELECT * FROM tasks WHERE status = 'done';
+
+-- 2% строк: индекс используется
+EXPLAIN (COSTS OFF) SELECT * FROM tasks WHERE status = 'open';
+```
+
+</CodeExample>
+
+Тот же индекс, тот же столбец — два разных плана. Планировщик знает из статистики, насколько часто встречается каждое значение, и решает для каждого запроса отдельно.
+
+## Чего стоят индексы
+
+Каждый индекс — это вторая копия части ваших данных, которую нужно синхронизировать при каждом изменении:
+
+- **Запись становится медленнее.** `INSERT` в таблицу с 6 индексами записывает строку **и** 6 записей в индексы. `UPDATE` и `DELETE` тоже должны их обновлять. Таблица с интенсивной записью (логи, события) и десятью индексами может тратить большую часть времени на поддержку индексов.
+- **Диск и память.** Индексы занимают место и конкурируют с данными за кэш. Двухстолбцовый индекс на `sales` выше занимает около 40% от размера таблицы.
+- **Планирование.** Чем больше индексов, тем больше планов приходится рассматривать планировщику.
+
+Поэтому индексируйте под запросы, которые действительно выполняются, и удаляйте те индексы, которыми никто не пользуется. На настоящем сервере найти их помогут представления статистики:
+
+```sql
+-- Индексы, которые ни разу не использовались с момента сброса статистики
+SELECT relname AS table_name, indexrelname AS index_name,
+  pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+ORDER BY pg_relation_size(indexrelid) DESC;
+```
+
+<Callout type="danger" title="Создание индексов на работающей базе">
+
+Обычный `CREATE INDEX` **блокирует все записи** в таблицу, пока не завершится, а на большой таблице это может занять минуты: вставки и обновления вашего приложения просто зависают. В продакшене используйте `CREATE INDEX CONCURRENTLY` — он строит индекс, не блокируя запись (это медленнее, не работает внутри транзакции, а при ошибке оставляет индекс `INVALID`, который нужно удалить и создать заново). То же касается `DROP INDEX CONCURRENTLY`.
+
+</Callout>
+
+В PostgreSQL есть и другие типы индексов для других задач: **GIN** для JSONB, массивов и полнотекстового поиска, **GiST** для диапазонов и геометрии, **BRIN** для огромных таблиц, строки которых хранятся в естественном порядке (например, логи, которые только дописываются по времени), и **hash** только для равенства. Для всего остального правильный выбор по умолчанию — B-tree.
+
+<Quiz
+  question="В таблицу из 50 миллионов строк логов приходит 5000 вставок в секунду, а запрашивают её только по диапазонам created_at. Коллега хочет на всякий случай добавить индексы на все 12 столбцов. Какой совет лучший?"
+  options={[
+    "Отличная идея: чем больше индексов, тем быстрее запросы",
+    "Индексировать только то, что используют реальные запросы (здесь created_at), потому что каждый лишний индекс замедляет каждую вставку и занимает диск и память",
+    "Никогда не индексировать таблицу логов",
+    "Проиндексировать все 12 столбцов, но с CREATE INDEX CONCURRENTLY",
+  ]}
+  answer={1}
+  explanation="Каждый индекс обновляется при каждой вставке, так что 12 индексов — это 12 дополнительных записей на строку при 5000 строк в секунду, и всё ради индексов, которые не использует ни один запрос. Индексируйте под реально выполняемые запросы и проверяйте pg_stat_user_indexes на неиспользуемые индексы."
+/>
+
+<Exercise
+  language="sql"
+  title="Проиндексируйте службу поддержки"
+  starter={`-- 100 000 тикетов поддержки; открыты только 2%
+CREATE TABLE tickets AS
+SELECT g AS id,
+  g % 4000 + 1 AS customer_id,
+  CASE WHEN g % 50 = 0 THEN 'open' ELSE 'closed' END AS status,
+  'Customer' || g % 4000 || '@Mail.test' AS email,
+  timestamp '2025-01-01' + g * interval '5 minutes' AS created_at
+FROM generate_series(1, 100000) AS g;
+ANALYZE tickets;
+
+-- Ваши индексы здесь (не больше трёх)
+
+
+-- Запрос 1: 10 последних тикетов покупателя
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE customer_id = 42
+ORDER BY created_at DESC
+LIMIT 10;
+
+-- Запрос 2: очередь поддержки, сначала самый старый открытый тикет
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE status = 'open'
+ORDER BY created_at
+LIMIT 20;
+
+-- Запрос 3: поиск тикетов по email без учёта регистра букв
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE lower(email) = 'customer42@mail.test';
+`}
+  tests={[
+    { name: "Запрос 1 использует индекс, без Seq Scan и Sort", check: "await (async () => { const p = (await query(\"EXPLAIN (COSTS OFF) SELECT * FROM tickets WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 10\")).map(r => r['QUERY PLAN']).join('\\n'); return /Index/.test(p) && !/Seq Scan|Sort/.test(p); })()" },
+    { name: "Запрос 2 использует индекс, без Seq Scan и Sort", check: "await (async () => { const p = (await query(\"EXPLAIN (COSTS OFF) SELECT * FROM tickets WHERE status = 'open' ORDER BY created_at LIMIT 20\")).map(r => r['QUERY PLAN']).join('\\n'); return /Index/.test(p) && !/Seq Scan|Sort/.test(p); })()" },
+    { name: "Запрос 3 использует индекс, без Seq Scan", check: "await (async () => { const p = (await query(\"EXPLAIN (COSTS OFF) SELECT * FROM tickets WHERE lower(email) = 'customer42@mail.test'\")).map(r => r['QUERY PLAN']).join('\\n'); return /Index/.test(p) && !/Seq Scan/.test(p); })()" },
+    { name: "Индекс открытых тикетов — частичный (WHERE status = 'open')", check: "(await query(\"SELECT count(*) AS n FROM pg_indexes WHERE tablename = 'tickets' AND indexdef LIKE '%WHERE%open%'\"))[0].n === 1" },
+    { name: "На tickets не больше трёх индексов", check: "(await query(\"SELECT count(*) AS n FROM pg_indexes WHERE tablename = 'tickets'\"))[0].n <= 3" },
+    { name: "Очередь по-прежнему возвращает самые старые открытые тикеты", check: "(await query(\"SELECT id FROM tickets WHERE status = 'open' ORDER BY created_at LIMIT 3\")).map(r => r.id).join() === '50,100,150'" },
+  ]}
+>
+
+Приложение службы поддержки весь день выполняет три запроса внизу, и все три читают таблицу целиком. Добавьте **не больше трёх** индексов, чтобы:
+
+1. **Запрос 1** (последние тикеты покупателя) использовал индекс без Seq Scan и без Sort.
+2. **Запрос 2** (очередь открытых тикетов) использовал **частичный индекс**, содержащий только открытые тикеты, — тоже без Seq Scan и без Sort.
+3. **Запрос 3** (поиск по email без учёта регистра) использовал индекс вместо Seq Scan.
+
+Нажимайте «Запустить» после каждого добавленного индекса и смотрите, как меняются планы.
+
+<Hint>
+
+- Запрос 1 сравнивает `customer_id` через `=` и сортирует по `created_at`: составной индекс, где столбец с `=` идёт первым.
+- Запрос 2: индекс по `created_at` с `WHERE status = 'open'` в конце `CREATE INDEX`.
+- Запрос 3: индекс должен быть построен по тому же выражению, что и в запросе, — `lower(email)`, в собственных скобках: `ON tickets (lower(email))`.
+
+</Hint>
+
+<Solution>
+
+```sql
+-- 100 000 тикетов поддержки; открыты только 2%
+CREATE TABLE tickets AS
+SELECT g AS id,
+  g % 4000 + 1 AS customer_id,
+  CASE WHEN g % 50 = 0 THEN 'open' ELSE 'closed' END AS status,
+  'Customer' || g % 4000 || '@Mail.test' AS email,
+  timestamp '2025-01-01' + g * interval '5 minutes' AS created_at
+FROM generate_series(1, 100000) AS g;
+ANALYZE tickets;
+
+-- Сначала столбец с =, затем столбец сортировки
+CREATE INDEX tickets_customer_created_idx
+  ON tickets (customer_id, created_at);
+
+-- Только 2% открытых тикетов, отсортированных для очереди
+CREATE INDEX tickets_open_queue_idx
+  ON tickets (created_at)
+  WHERE status = 'open';
+
+-- То же выражение, что использует поиск
+CREATE INDEX tickets_lower_email_idx
+  ON tickets (lower(email));
+
+-- Запрос 1: 10 последних тикетов покупателя
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE customer_id = 42
+ORDER BY created_at DESC
+LIMIT 10;
+
+-- Запрос 2: очередь поддержки, сначала самый старый открытый тикет
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE status = 'open'
+ORDER BY created_at
+LIMIT 20;
+
+-- Запрос 3: поиск тикетов по email без учёта регистра букв
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE lower(email) = 'customer42@mail.test';
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- Индекс **B-tree** хранит значения **отсортированными** с несколькими уровнями указателей, поэтому поиск, диапазоны, `ORDER BY` и `LIKE` по префиксу работают быстро. Первичные ключи и ограничения `UNIQUE` создают такой индекс; **внешние ключи — нет**, так что индексируйте их сами.
+- **Составные** индексы подчиняются **правилу левого префикса**: сначала столбцы с `=`, затем столбец для диапазона или `ORDER BY`.
+- **Частичные** индексы (`WHERE …`) охватывают только «горячие» строки; **функциональные** индексы (`lower(email)`) обслуживают запросы с тем же выражением.
+- **Покрывающие** индексы (`INCLUDE`) дают **Index Only Scan** (`Heap Fetches: 0`), когда карта видимости актуальна.
+- **Уникальные** индексы обеспечивают правила вроде email без учёта регистра или «одна активная подписка на пользователя».
+- Индексы не помогают при неселективных условиях, на маленьких таблицах, при функциях над столбцом и при подстановочном символе в начале шаблона, а **каждый индекс замедляет запись** и занимает место. В продакшене используйте `CREATE INDEX CONCURRENTLY` и удаляйте неиспользуемые индексы.

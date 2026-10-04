@@ -1,0 +1,539 @@
+---
+title: Choosing the Right Indexes
+description: How B-tree indexes work, and when to use multicolumn, partial, expression, covering and unique indexes. Plus when indexes don't help and what they cost.
+duration: 24
+xp: 25
+---
+
+In [the last lesson](/learn/sql/explain-query-plans) one `CREATE INDEX` turned a full scan of 100,000 rows into a lookup of 40. Indexes are the biggest performance lever you have as a database developer, often a 100× or 1000× win for one line of SQL. 🚀
+
+But they aren't free, and the wrong index is worse than none: it slows down every write and still doesn't help your query. In this lesson you'll learn how indexes work inside, the different kinds PostgreSQL offers, and how to pick the right one for a query.
+
+## What a B-tree index is
+
+When you write `CREATE INDEX`, PostgreSQL builds a **B-tree** ("balanced tree") by default. Picture the values of the indexed column **sorted**, with a few levels of signposts on top:
+
+```text
+                        [ root: 1000 | 2000 ]
+                 /               |                \
+       [ 250 | 500 | 750 ]  [ 1250 | 1500 ]  [ 2250 | 2500 ]
+        /     |      \  ...
+  leaf pages: 1 2 3 ... 249 | 250 251 ... (each entry → a row's address)
+```
+
+To find `user_id = 42`, PostgreSQL starts at the root, follows one signpost per level, and lands on the leaf page that holds 42. Each leaf entry stores the value and the **address of the row** in the table (its `ctid`). Because every level splits the data hundreds of ways, even 100 million rows need only 4 or 5 page reads to find any value.
+
+Because a B-tree is **sorted**, it helps with much more than `=`:
+
+- **Comparisons and ranges**: `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN (…)`.
+- **Sorting**: `ORDER BY` the indexed column(s), forwards or backwards, especially with `LIMIT`.
+- **Prefix searches**: `LIKE 'abc%'` (on databases with the C collation, like this one; elsewhere create the index with `text_pattern_ops`).
+- **`IS NULL`** and **`min()`/`max()`**.
+
+You've been using B-trees all along without knowing it. A **primary key** and a **`UNIQUE`** constraint each create one automatically. Here are the sample database's indexes, read from the `pg_indexes` catalog view (in psql, `\di` lists them):
+
+<CodeExample output={`  tablename  |      indexname
+-------------+----------------------
+ customers   | customers_email_key
+ customers   | customers_pkey
+ departments | departments_name_key
+ departments | departments_pkey
+ employees   | employees_pkey
+ movies      | movies_pkey
+ order_items | order_items_pkey
+ orders      | orders_pkey
+ products    | products_pkey
+(9 rows)`}>
+
+```sql
+SELECT tablename, indexname
+FROM pg_indexes
+WHERE schemaname = 'public'
+ORDER BY tablename, indexname;
+```
+
+</CodeExample>
+
+Notice what's **missing**: `orders.customer_id`, `order_items.product_id` and `employees.manager_id` are foreign keys, and none of them has an index. PostgreSQL indexes the referenced side (a primary key) but **not** the referencing column. On a big database you almost always want one there: joins on it, "all orders of customer 7", and deleting a customer (which must check for orders) all need it.
+
+<Callout type="warning" title="Index your foreign keys">
+
+A missing index on a foreign key is one of the most common performance bugs in real apps. Deleting one row from `customers` makes PostgreSQL look for matching rows in `orders`; with no index on `orders.customer_id`, that's a full scan of `orders` for **every** deleted customer.
+
+</Callout>
+
+## Multicolumn indexes: order matters
+
+An index can cover several columns. Its entries are sorted by the first column, then by the second within equal values of the first, and so on, exactly like a phone book sorted by surname and then first name.
+
+That makes the **column order** crucial. A phone book helps you find "Smith, John" and every "Smith", but it's useless for finding everyone called "John". Let's see the same thing with a sales table and an index on `(customer_id, sold_on)`:
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+CREATE INDEX
+
+                    QUERY PLAN
+---------------------------------------------------
+ Bitmap Heap Scan on sales
+   Recheck Cond: (customer_id = 7)
+   ->  Bitmap Index Scan on sales_customer_day_idx
+         Index Cond: (customer_id = 7)
+(4 rows)
+
+                                 QUERY PLAN
+-----------------------------------------------------------------------------
+ Bitmap Heap Scan on sales
+   Recheck Cond: ((customer_id = 7) AND (sold_on >= '2025-01-01'::date))
+   ->  Bitmap Index Scan on sales_customer_day_idx
+         Index Cond: ((customer_id = 7) AND (sold_on >= '2025-01-01'::date))
+(4 rows)
+
+                QUERY PLAN
+------------------------------------------
+ Seq Scan on sales
+   Filter: (sold_on = '2025-03-01'::date)
+(2 rows)`}>
+
+```sql
+CREATE TABLE sales AS
+SELECT g AS id,
+  g % 2000 + 1 AS customer_id,
+  date '2024-01-01' + g % 730 AS sold_on,
+  (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+ANALYZE sales;
+
+CREATE INDEX sales_customer_day_idx ON sales (customer_id, sold_on);
+
+-- 1. The first column alone: uses the index
+EXPLAIN (COSTS OFF)
+SELECT * FROM sales WHERE customer_id = 7;
+
+-- 2. Both columns: uses the index for both conditions
+EXPLAIN (COSTS OFF)
+SELECT * FROM sales
+WHERE customer_id = 7 AND sold_on >= '2025-01-01';
+
+-- 3. Only the second column: can't use it
+EXPLAIN (COSTS OFF)
+SELECT * FROM sales WHERE sold_on = '2025-03-01';
+```
+
+</CodeExample>
+
+The third query wants one day across all 2,000 customers. In the index, that day's entries are scattered in 2,000 different places (one per customer), so PostgreSQL scans the table instead. This is the **leftmost prefix rule**: an index on `(a, b, c)` serves conditions on `a`, on `a` and `b`, or on `a`, `b` and `c`, but not on `b` or `c` alone.
+
+Rules of thumb for column order:
+
+1. Columns compared with **`=`** go **first**.
+2. Then the column used for a **range** (`>`, `BETWEEN`) **or** for **`ORDER BY`**. In the last lesson's exercise, `(user_id, viewed_at)` served `WHERE user_id = … ORDER BY viewed_at DESC LIMIT 5` with no Sort at all.
+3. An index on `(a, b)` also serves queries on `a` alone, so you rarely need a separate index on `a`.
+
+<Callout type="note" title="PostgreSQL 18's skip scan">
+
+Since version 18, PostgreSQL can sometimes use an index **without** its first column: when the first column has only a handful of distinct values (say `status` with 3 values), it "skips" through the index once per value. That's why an index on `(status, created_at)` can now help `WHERE created_at > …`. It's a nice bonus, but don't design for it: when the leading column has many distinct values, like `customer_id` above, the leftmost prefix rule still applies.
+
+</Callout>
+
+## Partial indexes: index only the rows you query
+
+Often an app queries a small, "hot" part of a big table again and again: the **open** tickets, the **unpaid** invoices, the jobs still **pending**. A **partial index** has a `WHERE` clause and contains only those rows:
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+CREATE INDEX
+
+                   QUERY PLAN
+------------------------------------------------
+ Limit
+   ->  Index Scan using tasks_open_idx on tasks
+(2 rows)
+
+ index_size
+------------
+ 64 kB
+(1 row)`}>
+
+```sql
+-- 100,000 tasks: 98% are done, 2% are still open
+CREATE TABLE tasks AS
+SELECT g AS id,
+  CASE WHEN g % 50 = 0 THEN 'open' ELSE 'done' END AS status,
+  timestamp '2025-01-01' + g * interval '5 minutes' AS created_at
+FROM generate_series(1, 100000) AS g;
+ANALYZE tasks;
+
+CREATE INDEX tasks_open_idx ON tasks (created_at)
+  WHERE status = 'open';
+
+-- The oldest open tasks, for the team's to-do screen
+EXPLAIN (COSTS OFF)
+SELECT * FROM tasks
+WHERE status = 'open'
+ORDER BY created_at
+LIMIT 10;
+
+SELECT pg_size_pretty(pg_relation_size('tasks_open_idx'))
+  AS index_size;
+```
+
+</CodeExample>
+
+The index holds only 2,000 entries, so it's tiny (64 kB instead of a couple of megabytes for all 100,000 rows), stays in memory, and writes to "done" rows don't touch it at all. Even the `Index Cond` disappeared from the plan: every entry in this index is an open task, already sorted by `created_at`.
+
+The catch: the planner only uses a partial index when it can **prove** the query's `WHERE` implies the index's `WHERE`. `WHERE status = 'open'` works; `WHERE status = $1` from an app, with the value unknown at planning time, might not.
+
+## Expression indexes
+
+An index on `email` stores the emails as they are. If your query searches `WHERE lower(email) = …`, that index doesn't help: it's sorted by `email`, not by `lower(email)`. The fix is to index the **expression** itself:
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+CREATE INDEX
+
+                      QUERY PLAN
+-------------------------------------------------------
+ Seq Scan on users
+   Filter: (lower(email) = 'user42@example.com'::text)
+(2 rows)
+
+CREATE INDEX
+
+                           QUERY PLAN
+-----------------------------------------------------------------
+ Bitmap Heap Scan on users
+   Recheck Cond: (lower(email) = 'user42@example.com'::text)
+   ->  Bitmap Index Scan on users_lower_email_idx
+         Index Cond: (lower(email) = 'user42@example.com'::text)
+(4 rows)`}>
+
+```sql
+CREATE TABLE users AS
+SELECT g AS id, 'User' || g || '@Example.com' AS email
+FROM generate_series(1, 100000) AS g;
+ANALYZE users;
+
+-- A plain index on email doesn't help lower(email)
+CREATE INDEX users_email_idx ON users (email);
+EXPLAIN (COSTS OFF)
+SELECT * FROM users WHERE lower(email) = 'user42@example.com';
+
+-- An index on the expression does
+CREATE INDEX users_lower_email_idx ON users (lower(email));
+EXPLAIN (COSTS OFF)
+SELECT * FROM users WHERE lower(email) = 'user42@example.com';
+```
+
+</CodeExample>
+
+The query must use **exactly the same expression** as the index. Expression indexes are common for case-insensitive lookups (`lower(email)`), parts of dates, and values inside JSON (`(data ->> 'country')`). The function must be **immutable** (always the same result for the same input), so `now()` can't go in an index.
+
+## Covering indexes and index-only scans
+
+Normally an index scan finds the row's address in the index and then fetches the row from the table. If **every column the query needs** is in the index, PostgreSQL can skip the table entirely: an **Index Only Scan**.
+
+`INCLUDE` adds extra columns to an index's leaf entries, just to be returned, not to be searched or sorted on. That makes a **covering index** for a specific query:
+
+<CodeExample output={`CREATE TABLE AS
+
+CREATE INDEX
+
+VACUUM
+
+                                     QUERY PLAN
+-------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Index Only Scan using sales_customer_idx on sales (actual rows=50.00 loops=1)
+         Index Cond: (customer_id = 7)
+         Heap Fetches: 0
+         Index Searches: 1
+(5 rows)`}>
+
+```sql
+CREATE TABLE sales AS
+SELECT g AS id,
+  g % 2000 + 1 AS customer_id,
+  (g * 37) % 500 + 0.99 AS amount
+FROM generate_series(1, 100000) AS g;
+
+CREATE INDEX sales_customer_idx ON sales (customer_id)
+  INCLUDE (amount);
+
+-- VACUUM marks pages all-visible; ANALYZE updates statistics
+VACUUM ANALYZE sales;
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT sum(amount) AS total
+FROM sales
+WHERE customer_id = 7;
+```
+
+</CodeExample>
+
+**`Heap Fetches: 0`** means not a single row was read from the table: the 50 amounts all came from the index. Two details matter in practice:
+
+- **Visibility**: because of how PostgreSQL handles concurrent transactions, an index entry alone doesn't say whether a row is visible to you. Index-only scans rely on the **visibility map**, which `VACUUM` keeps up to date (autovacuum does it in the background). On a table with lots of recent changes, you'll see many heap fetches.
+- **Don't overdo it**: every included column makes the index bigger. Use covering indexes for a few very frequent, very important queries.
+
+<Quiz
+  question="A table has an index on (country, city). Which query can NOT use it as a normal index search on its leading column?"
+  options={[
+    "WHERE country = 'UK'",
+    "WHERE country = 'UK' AND city = 'London'",
+    "WHERE city = 'London'",
+    "WHERE country = 'UK' ORDER BY city",
+  ]}
+  answer={2}
+  explanation="The index is sorted by country first, then city. Queries that fix the country can jump straight to it. 'All rows where city is London' are spread across every country, so by the leftmost prefix rule the index doesn't serve that query directly (at best PostgreSQL 18 can skip-scan it when there are few countries)."
+/>
+
+## Unique indexes
+
+A **unique index** refuses duplicate values. `UNIQUE` constraints are implemented with one, and you can create one directly, which lets you combine uniqueness with the tricks above. For example, emails that must be unique **ignoring case**:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE INDEX
+
+INSERT 0 1
+
+ERROR:  duplicate key value violates unique constraint "members_email_lower_idx"
+DETAIL:  Key (lower(email))=(mei@pandadev.test) already exists.`}>
+
+```sql
+CREATE TABLE members (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text NOT NULL
+);
+
+CREATE UNIQUE INDEX members_email_lower_idx
+  ON members (lower(email));
+
+INSERT INTO members (email) VALUES ('Mei@PandaDev.test');
+INSERT INTO members (email) VALUES ('mei@pandadev.test');
+```
+
+</CodeExample>
+
+A **partial unique index** enforces rules like "a user can have any number of old subscriptions, but only **one active** one":
+
+```sql
+CREATE UNIQUE INDEX one_active_subscription
+  ON subscriptions (user_id)
+  WHERE active;
+```
+
+Rules like these belong in the database: an app that checks "is there already one?" before inserting can be beaten by two requests arriving at the same moment. A unique index can't.
+
+## When indexes don't help
+
+Adding an index is not a magic "make fast" button. PostgreSQL ignores an index when:
+
+- **The condition matches a big share of the table.** If 98% of tasks are `done`, then `WHERE status = 'done'` reads almost every page anyway, and a Seq Scan is faster than jumping around through an index. Indexes shine for **selective** conditions.
+- **The table is small.** A few pages are read faster in one go.
+- **The column is wrapped in a function or calculation**: `WHERE lower(email) = …` with an index on `email`, or `WHERE extract(year FROM sold_on) = 2025`. You'll learn to rewrite these in [the tuning lesson](/learn/sql/query-tuning).
+- **The pattern starts with a wildcard**: `LIKE '%gmail.com'` can't use a B-tree, because the index is sorted by the **start** of the text. (Full-text search or the `pg_trgm` extension's GIN indexes handle these.)
+- **The leading column of a multicolumn index isn't in the query** (apart from PostgreSQL 18's skip scan).
+
+<CodeExample output={`CREATE TABLE AS
+
+ANALYZE
+
+CREATE INDEX
+
+            QUERY PLAN
+-----------------------------------
+ Seq Scan on tasks
+   Filter: (status = 'done'::text)
+(2 rows)
+
+                 QUERY PLAN
+--------------------------------------------
+ Index Scan using tasks_status_idx on tasks
+   Index Cond: (status = 'open'::text)
+(2 rows)`}>
+
+```sql
+CREATE TABLE tasks AS
+SELECT g AS id,
+  CASE WHEN g % 50 = 0 THEN 'open' ELSE 'done' END AS status
+FROM generate_series(1, 100000) AS g;
+ANALYZE tasks;
+
+CREATE INDEX tasks_status_idx ON tasks (status);
+
+-- 98% of the rows: the index isn't worth it
+EXPLAIN (COSTS OFF) SELECT * FROM tasks WHERE status = 'done';
+
+-- 2% of the rows: the index is used
+EXPLAIN (COSTS OFF) SELECT * FROM tasks WHERE status = 'open';
+```
+
+</CodeExample>
+
+Same index, same column, two different plans. The planner knows from the statistics how common each value is, and decides per query.
+
+## What indexes cost
+
+Every index is a second copy of some of your data, kept in sync on every change:
+
+- **Writes get slower.** An `INSERT` into a table with 6 indexes writes the row **and** 6 index entries. `UPDATE` and `DELETE` have to maintain them too. A write-heavy table (logs, events) with ten indexes can spend most of its time on index upkeep.
+- **Disk and memory.** Indexes take space and compete with your data for the cache. The two-column index on `sales` above is about 40% of the table's size.
+- **Planning.** More indexes mean more plans for the planner to consider.
+
+So index for the queries you actually run, and remove the ones nobody uses. On a real server, the statistics views tell you which ones those are:
+
+```sql
+-- Indexes that have never been used since statistics were reset
+SELECT relname AS table_name, indexrelname AS index_name,
+  pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+ORDER BY pg_relation_size(indexrelid) DESC;
+```
+
+<Callout type="danger" title="Creating indexes on a live database">
+
+A plain `CREATE INDEX` **blocks all writes** to the table until it finishes, which can take minutes on a big table: your app's inserts and updates just hang. In production, use `CREATE INDEX CONCURRENTLY`, which builds the index without blocking writes (it's slower, can't run inside a transaction, and leaves an `INVALID` index behind if it fails, which you drop and retry). The same goes for `DROP INDEX CONCURRENTLY`.
+
+</Callout>
+
+PostgreSQL also has other index types for other jobs: **GIN** for JSONB, arrays and full-text search, **GiST** for ranges and geometry, **BRIN** for huge tables whose rows are stored in a natural order (like append-only logs by time), and **hash** for equality only. B-tree is the right default for everything else.
+
+<Quiz
+  question="A table of 50 million log lines gets 5000 inserts a second and is queried only by created_at ranges. A teammate wants to add indexes on all 12 columns, just in case. What's the best advice?"
+  options={[
+    "Great idea, more indexes always make queries faster",
+    "Index only what the real queries use (here created_at), because each extra index slows down every insert and uses disk and memory",
+    "Never index a log table",
+    "Index all 12 columns but use CREATE INDEX CONCURRENTLY",
+  ]}
+  answer={1}
+  explanation="Each index has to be updated on every insert, so 12 indexes means 12 extra writes per row for 5000 rows a second, for indexes no query uses. Index for the queries you actually run, and check pg_stat_user_indexes for unused ones."
+/>
+
+<Exercise
+  language="sql"
+  title="Index the support desk"
+  starter={`-- 100,000 support tickets; only 2% are still open
+CREATE TABLE tickets AS
+SELECT g AS id,
+  g % 4000 + 1 AS customer_id,
+  CASE WHEN g % 50 = 0 THEN 'open' ELSE 'closed' END AS status,
+  'Customer' || g % 4000 || '@Mail.test' AS email,
+  timestamp '2025-01-01' + g * interval '5 minutes' AS created_at
+FROM generate_series(1, 100000) AS g;
+ANALYZE tickets;
+
+-- Your indexes here (three at most)
+
+
+-- Query 1: a customer's 10 latest tickets
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE customer_id = 42
+ORDER BY created_at DESC
+LIMIT 10;
+
+-- Query 2: the support team's queue, oldest open ticket first
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE status = 'open'
+ORDER BY created_at
+LIMIT 20;
+
+-- Query 3: find tickets by email, whatever its capitals
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE lower(email) = 'customer42@mail.test';
+`}
+  tests={[
+    { name: "Query 1 uses an index, with no Seq Scan or Sort", check: "await (async () => { const p = (await query(\"EXPLAIN (COSTS OFF) SELECT * FROM tickets WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 10\")).map(r => r['QUERY PLAN']).join('\\n'); return /Index/.test(p) && !/Seq Scan|Sort/.test(p); })()" },
+    { name: "Query 2 uses an index, with no Seq Scan or Sort", check: "await (async () => { const p = (await query(\"EXPLAIN (COSTS OFF) SELECT * FROM tickets WHERE status = 'open' ORDER BY created_at LIMIT 20\")).map(r => r['QUERY PLAN']).join('\\n'); return /Index/.test(p) && !/Seq Scan|Sort/.test(p); })()" },
+    { name: "Query 3 uses an index, with no Seq Scan", check: "await (async () => { const p = (await query(\"EXPLAIN (COSTS OFF) SELECT * FROM tickets WHERE lower(email) = 'customer42@mail.test'\")).map(r => r['QUERY PLAN']).join('\\n'); return /Index/.test(p) && !/Seq Scan/.test(p); })()" },
+    { name: "The open-ticket index is a partial index (WHERE status = 'open')", check: "(await query(\"SELECT count(*) AS n FROM pg_indexes WHERE tablename = 'tickets' AND indexdef LIKE '%WHERE%open%'\"))[0].n === 1" },
+    { name: "At most three indexes on tickets", check: "(await query(\"SELECT count(*) AS n FROM pg_indexes WHERE tablename = 'tickets'\"))[0].n <= 3" },
+    { name: "The queue still returns the oldest open tickets", check: "(await query(\"SELECT id FROM tickets WHERE status = 'open' ORDER BY created_at LIMIT 3\")).map(r => r.id).join() === '50,100,150'" },
+  ]}
+>
+
+The support desk app runs the three queries at the bottom all day, and all three read the whole table. Add **at most three** indexes so that:
+
+1. **Query 1** (a customer's latest tickets) uses an index with no Seq Scan and no Sort.
+2. **Query 2** (the open-ticket queue) uses a **partial index** that contains only open tickets, again with no Seq Scan and no Sort.
+3. **Query 3** (case-insensitive email search) uses an index instead of a Seq Scan.
+
+Run after each index you add and watch the plans change.
+
+<Hint>
+
+- Query 1 compares `customer_id` with `=` and sorts by `created_at`: a multicolumn index with the `=` column first.
+- Query 2: an index on `created_at` with `WHERE status = 'open'` at the end of `CREATE INDEX`.
+- Query 3: the index must be on the same expression as the query, `lower(email)`, in its own brackets: `ON tickets (lower(email))`.
+
+</Hint>
+
+<Solution>
+
+```sql
+-- 100,000 support tickets; only 2% are still open
+CREATE TABLE tickets AS
+SELECT g AS id,
+  g % 4000 + 1 AS customer_id,
+  CASE WHEN g % 50 = 0 THEN 'open' ELSE 'closed' END AS status,
+  'Customer' || g % 4000 || '@Mail.test' AS email,
+  timestamp '2025-01-01' + g * interval '5 minutes' AS created_at
+FROM generate_series(1, 100000) AS g;
+ANALYZE tickets;
+
+-- = column first, then the sort column
+CREATE INDEX tickets_customer_created_idx
+  ON tickets (customer_id, created_at);
+
+-- Only the 2% of open tickets, sorted for the queue
+CREATE INDEX tickets_open_queue_idx
+  ON tickets (created_at)
+  WHERE status = 'open';
+
+-- The same expression the search uses
+CREATE INDEX tickets_lower_email_idx
+  ON tickets (lower(email));
+
+-- Query 1: a customer's 10 latest tickets
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE customer_id = 42
+ORDER BY created_at DESC
+LIMIT 10;
+
+-- Query 2: the support team's queue, oldest open ticket first
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE status = 'open'
+ORDER BY created_at
+LIMIT 20;
+
+-- Query 3: find tickets by email, whatever its capitals
+EXPLAIN (COSTS OFF)
+SELECT * FROM tickets
+WHERE lower(email) = 'customer42@mail.test';
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **B-tree** index keeps values **sorted** with a few levels of signposts, so lookups, ranges, `ORDER BY` and prefix `LIKE` are fast. Primary keys and `UNIQUE` constraints create one; **foreign keys don't**, so index them yourself.
+- **Multicolumn** indexes follow the **leftmost prefix rule**: `=` columns first, then the range or `ORDER BY` column.
+- **Partial** indexes (`WHERE …`) cover only the hot rows; **expression** indexes (`lower(email)`) serve queries that use the same expression.
+- **Covering** indexes (`INCLUDE`) enable **Index Only Scans** (`Heap Fetches: 0`) when the visibility map is up to date.
+- **Unique** indexes enforce rules such as case-insensitive emails or "one active subscription per user".
+- Indexes don't help unselective conditions, small tables, functions on the column or leading wildcards, and **every index slows writes** and uses space. Use `CREATE INDEX CONCURRENTLY` in production and drop unused indexes.

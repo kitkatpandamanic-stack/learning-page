@@ -1,0 +1,458 @@
+---
+title: Triggers
+description: Run code automatically when rows change. Keep updated_at current, write an audit log, enforce rules that constraints can't, and know when a trigger is the wrong tool.
+duration: 24
+xp: 25
+---
+
+Some things must happen **every** time data changes, no matter who changes it: the web app, a background job, a teammate fixing data by hand at midnight. "Set `updated_at`." "Write who changed the price to the audit log." "Never let stock go below zero." If that logic lives only in your app, the one script that forgets it will eventually corrupt your data. 🛡️
+
+A **trigger** tells PostgreSQL to run a function automatically **before** or **after** an `INSERT`, `UPDATE` or `DELETE` on a table. In this lesson you'll build the three classic triggers (timestamps, audit logs and validation) and learn where triggers stop being a good idea.
+
+## Your first trigger: normalising data
+
+A trigger has two parts:
+
+1. A **trigger function**: a PL/pgSQL function that takes no arguments and `RETURNS trigger`.
+2. The **trigger** itself: `CREATE TRIGGER` connects the function to a table, an event and a timing.
+
+Here's a trigger that cleans up every email before it's stored:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE FUNCTION
+
+CREATE TRIGGER
+
+INSERT 0 2
+
+UPDATE 1
+
+ id |       email
+----+-------------------
+  1 | mei@pandadev.test
+  2 | sam@pandadev.test
+(2 rows)`}>
+
+```sql
+CREATE TABLE members (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text NOT NULL UNIQUE
+);
+
+CREATE FUNCTION normalise_email()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.email := lower(trim(NEW.email));
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER members_normalise_email
+BEFORE INSERT OR UPDATE ON members
+FOR EACH ROW
+EXECUTE FUNCTION normalise_email();
+
+INSERT INTO members (email)
+VALUES ('  Mei@PandaDev.test'), ('sam@pandadev.test');
+UPDATE members SET email = 'SAM@PANDADEV.TEST ' WHERE id = 2;
+
+SELECT id, email FROM members ORDER BY id;
+```
+
+</CodeExample>
+
+Reading `CREATE TRIGGER` aloud: "**before** each insert or update **on members**, **for each row**, run `normalise_email()`". Inside the function:
+
+- **`NEW`** is the row about to be written (for `INSERT` and `UPDATE`). A `BEFORE` trigger can **change** it, and what it returns is what gets stored.
+- **`OLD`** is the row as it was before (for `UPDATE` and `DELETE`).
+- **`RETURN NEW`** says "go ahead and write this row". Returning **`NULL`** from a `BEFORE ... FOR EACH ROW` trigger silently **skips** the row.
+
+Because the trigger runs before the `UNIQUE` check, `'SAM@PANDADEV.TEST '` and `'sam@pandadev.test'` are now recognised as duplicates, which a plain unique constraint alone wouldn't do.
+
+## BEFORE or AFTER, ROW or STATEMENT
+
+Triggers come in a few shapes:
+
+| | Runs | Typical use |
+| --- | --- | --- |
+| **`BEFORE … FOR EACH ROW`** | before each row is written; can change `NEW` or skip the row | defaults, normalising, validation |
+| **`AFTER … FOR EACH ROW`** | after each row is written; sees the final row | audit logs, updating other tables |
+| **`FOR EACH STATEMENT`** | once per statement, however many rows | summaries, notifications |
+| **`INSTEAD OF`** | instead of the change, on a **view** | making complex views writable |
+
+A few more options you'll use:
+
+- **`UPDATE OF price, stock`** fires only when those columns appear in the `UPDATE`'s `SET` list.
+- **`WHEN (…)`** adds a condition, checked before the function is even called, such as `WHEN (OLD.price IS DISTINCT FROM NEW.price)`. (`IS DISTINCT FROM` is a "not equal" that treats `NULL` as a normal value.)
+- In the function, **`TG_OP`** is `'INSERT'`, `'UPDATE'` or `'DELETE'`, and **`TG_TABLE_NAME`** is the table's name, so one function can serve many tables.
+
+## Keeping updated_at current
+
+The most common trigger in the world sets an `updated_at` column on every update, so you can always tell when a row last changed:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE FUNCTION
+
+CREATE TRIGGER
+
+INSERT 0 2
+
+UPDATE 1
+
+    title     | changed
+--------------+---------
+ Buy bamboo   | t
+ Water plants | f
+(2 rows)`}>
+
+```sql
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE FUNCTION set_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER notes_set_updated_at
+BEFORE UPDATE ON notes
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
+
+-- Two old notes from New Year's Day
+INSERT INTO notes (title, created_at, updated_at) VALUES
+  ('Buy bambo', '2025-01-01', '2025-01-01'),
+  ('Water plants', '2025-01-01', '2025-01-01');
+
+-- Fix a typo: the trigger stamps the change
+UPDATE notes SET title = 'Buy bamboo' WHERE id = 1;
+
+SELECT title, updated_at > created_at AS changed
+FROM notes
+ORDER BY id;
+```
+
+</CodeExample>
+
+Nobody has to remember to set `updated_at`, and nobody can forget to. `set_updated_at()` doesn't mention `notes` anywhere, so the same function can serve every table that has an `updated_at` column, each with its own `CREATE TRIGGER`.
+
+(We print `changed` rather than the timestamps, because `now()` is different every time you run this.)
+
+## An audit log
+
+Who changed the price of the Rice Cooker, when, and from what? An **audit log** answers that, and an `AFTER` trigger can fill it for every change, from every client. `to_jsonb(OLD)` turns a whole row into JSON, so one generic table can store changes to any table:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE FUNCTION
+
+INSERT 0 1
+
+CREATE TRIGGER
+
+UPDATE 1
+
+DELETE 1
+
+ id |   op   | row_id | old_price | new_price | changed_by
+----+--------+--------+-----------+-----------+------------
+  1 | UPDATE |     15 | 89.90     | 79.90     | postgres
+  2 | DELETE |     16 | 9.00      | NULL      | postgres
+(2 rows)`}>
+
+```sql
+CREATE TABLE audit_log (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  table_name text NOT NULL,
+  op text NOT NULL,
+  row_id integer,
+  old_data jsonb,
+  new_data jsonb,
+  changed_by text NOT NULL DEFAULT current_user,
+  changed_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE FUNCTION write_audit_log()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, row_id, old_data, new_data)
+  VALUES (
+    TG_TABLE_NAME,
+    TG_OP,
+    coalesce(NEW.id, OLD.id),
+    CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) END,
+    CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END
+  );
+  RETURN NULL;  -- the result of an AFTER trigger is ignored
+END;
+$$;
+
+INSERT INTO products (name, category, price, stock)
+VALUES ('Oolong', 'tea', 9.00, 5);
+
+CREATE TRIGGER products_audit
+AFTER INSERT OR UPDATE OR DELETE ON products
+FOR EACH ROW
+EXECUTE FUNCTION write_audit_log();
+
+UPDATE products SET price = 79.90 WHERE name = 'Rice Cooker';
+DELETE FROM products WHERE name = 'Oolong';
+
+SELECT id, op, row_id,
+  old_data ->> 'price' AS old_price,
+  new_data ->> 'price' AS new_price,
+  changed_by
+FROM audit_log
+ORDER BY id;
+```
+
+</CodeExample>
+
+In a `DELETE` there's no `NEW` row, which is why the function uses `coalesce(NEW.id, OLD.id)`, and in an `INSERT` there's no `OLD`. The deleted Oolong row is still fully recoverable from `old_data`.
+
+<Callout type="tip" title="Who made the change?">
+
+`current_user` is the **database** user, and many apps connect as one shared user for everybody. To record the real person, have the app set a value at the start of each transaction, such as `SELECT set_config('app.user_id', '42', true)`, and read it in the trigger with `current_setting('app.user_id', true)`. The `true` makes the setting last only for the current transaction.
+
+</Callout>
+
+<Quiz
+  question="A BEFORE UPDATE FOR EACH ROW trigger function ends with RETURN NULL instead of RETURN NEW. What happens when someone updates a row?"
+  options={[
+    "The row is updated normally",
+    "The update of that row is silently skipped",
+    "The row's columns are all set to NULL",
+    "PostgreSQL raises an error",
+  ]}
+  answer={1}
+  explanation="For BEFORE row triggers, the returned row is what gets written. Returning NULL tells PostgreSQL to skip the operation for that row, with no error, so the UPDATE reports fewer rows than expected. In AFTER triggers the return value is ignored."
+/>
+
+## Validation triggers
+
+Constraints (`CHECK`, `UNIQUE`, foreign keys) should be your first choice for rules: they're declarative, fast and impossible to bypass. But a `CHECK` constraint only sees **one row as it will be**. A rule that compares the **old** and **new** values, or looks at **other tables**, needs a trigger. For example, "a price may not jump by more than 50% in one go", to catch typos like 8990 instead of 89.90:
+
+<CodeExample output={`CREATE FUNCTION
+
+CREATE TRIGGER
+
+UPDATE 1
+
+ERROR:  price of Rice Cooker can't jump from 99.90 to 8990.00`}>
+
+```sql
+CREATE FUNCTION check_price_change()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.price > OLD.price * 1.5 THEN
+    RAISE EXCEPTION 'price of % can''t jump from % to %',
+      NEW.name, OLD.price, NEW.price;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER products_check_price
+BEFORE UPDATE OF price ON products
+FOR EACH ROW
+WHEN (NEW.price IS DISTINCT FROM OLD.price)
+EXECUTE FUNCTION check_price_change();
+
+UPDATE products SET price = 99.90 WHERE name = 'Rice Cooker';
+UPDATE products SET price = 8990 WHERE name = 'Rice Cooker';
+```
+
+</CodeExample>
+
+A modest rise from 89.90 to 99.90 passes; the typo is refused with a clear message, and because it's an error, the **whole statement** is rolled back: if it had been part of an `UPDATE` of 500 products, none of them would change.
+
+## Statement-level triggers
+
+A `FOR EACH STATEMENT` trigger runs once per statement, even if it changed a thousand rows (or none). With **transition tables** it can still see all the changed rows at once, as a table, which is far more efficient than a row trigger for bulk work:
+
+<CodeExample output={`CREATE FUNCTION
+
+CREATE TRIGGER
+
+NOTICE:  3 items added, 7 units in total
+INSERT 0 3`}>
+
+```sql
+CREATE FUNCTION report_new_items()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_items integer;
+  v_units integer;
+BEGIN
+  SELECT count(*), sum(quantity) INTO v_items, v_units
+  FROM added_items;
+  RAISE NOTICE '% items added, % units in total', v_items, v_units;
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER order_items_report
+AFTER INSERT ON order_items
+REFERENCING NEW TABLE AS added_items
+FOR EACH STATEMENT
+EXECUTE FUNCTION report_new_items();
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (1, 1, 2, 6.50), (1, 2, 1, 14.00), (1, 3, 4, 5.25);
+```
+
+</CodeExample>
+
+`REFERENCING NEW TABLE AS added_items` makes the inserted rows available as a table called `added_items` inside the function (`OLD TABLE` works for updates and deletes).
+
+## When not to use a trigger
+
+Triggers are powerful, and that's exactly the problem. Experienced teams use them sparingly:
+
+- **They're invisible.** Someone reading `UPDATE products SET price = …` in the app has no idea that it also writes an audit row, checks a rule and maybe updates three other tables. Name triggers clearly, keep them short, and document them.
+- **They run per row.** A row trigger on a table you bulk-load 10 million rows into runs 10 million times. Use statement-level triggers with transition tables, or disable triggers for a controlled bulk load (`ALTER TABLE … DISABLE TRIGGER …`, then `ENABLE` again).
+- **They chain.** A trigger that updates another table can fire that table's triggers, which can fire more. Debugging a cascade of triggers is miserable, and a trigger that updates its own table can loop.
+- **Order is alphabetical.** Several triggers for the same event on the same table fire in **name order**, which is easy to forget.
+- **Not everything fires them.** `TRUNCATE` doesn't fire `DELETE` triggers, for example.
+
+Use **constraints** first, **triggers** for the rules and bookkeeping that truly must happen on every change, and **app code** for business workflows (sending emails, calling other services). And never do slow things like network calls inside a trigger: the user's transaction waits for them.
+
+<Quiz
+  question="Which rule is a better fit for a CHECK constraint than for a trigger?"
+  options={[
+    "A product's price must be greater than 0",
+    "Every change to a salary must be written to an audit table",
+    "A price may not rise by more than 50% in one update",
+    "Stock must be decreased whenever an order item is inserted",
+  ]}
+  answer={0}
+  explanation="price > 0 only looks at the new row itself, which is exactly what CHECK constraints do, declaratively and efficiently. The others need the old value, another table or a side effect, which is trigger territory."
+/>
+
+<Exercise
+  language="sql"
+  title="Keep stock in sync"
+  starter={`-- Keep products.stock in sync with order_items
+CREATE FUNCTION sync_stock()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  -- Your code here
+  RETURN NEW;
+END;
+$$;
+
+-- Create the trigger(s) here
+
+
+-- Try it: add 2 kites (product 12) to order 3,
+-- then show the kite's name and stock
+`}
+  tests={[
+    { name: "There are triggers for INSERT and DELETE on order_items", check: "(await query(\"SELECT string_agg(DISTINCT event_manipulation, ',' ORDER BY event_manipulation) AS e FROM information_schema.triggers WHERE event_object_table = 'order_items'\"))[0].e === 'DELETE,INSERT'" },
+    { name: "Inserting an item lowers the product's stock", check: "await (async () => { await query('INSERT INTO order_items VALUES (3, 1, 5, 6.50)'); return (await query('SELECT stock FROM products WHERE id = 1'))[0].stock === 35; })()" },
+    { name: "Inserting several items at once lowers each stock", check: "await (async () => { await query('INSERT INTO order_items VALUES (3, 1, 2, 6.50), (3, 2, 3, 14.00)'); const r = await query('SELECT stock FROM products WHERE id IN (1, 2) ORDER BY id'); return r[0].stock === 38 && r[1].stock === 9; })()" },
+    { name: "Ordering more than the stock fails with 'not enough stock'", check: "await query('INSERT INTO order_items VALUES (3, 3, 1, 5.25)').then(() => false, e => /not enough stock/.test(e.message))" },
+    { name: "Selling the very last items is allowed (stock reaches 0)", check: "await (async () => { await query('INSERT INTO order_items VALUES (3, 8, 3, 29.00)'); return (await query('SELECT stock FROM products WHERE id = 8'))[0].stock === 0; })()" },
+    { name: "Deleting an item puts its stock back", check: "await (async () => { const q = (await query('SELECT quantity FROM order_items WHERE order_id = 1 AND product_id = 8'))[0].quantity; await query('DELETE FROM order_items WHERE order_id = 1 AND product_id = 8'); return (await query('SELECT stock FROM products WHERE id = 8'))[0].stock === 3 + q; })()" },
+    { name: "The last query shows the kite: name, stock 12", check: "columns.join() === 'name,stock' && rows.length === 1 && rows[0].name === 'Kite' && rows[0].stock === 12" },
+  ]}
+>
+
+Right now, selling a product doesn't change its `stock`. Write a trigger function **`sync_stock()`** for `order_items` that:
+
+1. on **`INSERT`**: refuses the item with an error containing `not enough stock` if the product's `stock` is smaller than the item's `quantity`; otherwise lowers the product's `stock` by the `quantity`;
+2. on **`DELETE`**: puts the item's `quantity` back into the product's `stock`.
+
+Create the trigger (or triggers) on `order_items`, then test it: insert **2 kites** (`product_id` 12, `unit_price` 15.00) into **order 3**, and finish with a query that shows the kite's `name` and `stock`.
+
+<Hint>
+
+- Use `IF TG_OP = 'INSERT' THEN … ELSIF TG_OP = 'DELETE' THEN … END IF;` in one function. For a delete, the row is in `OLD` (there's no `NEW`), and the function should `RETURN OLD`.
+- For the check, read the stock first: `SELECT stock INTO v_stock FROM products WHERE id = NEW.product_id FOR UPDATE;` (`FOR UPDATE` locks the product row, so two orders can't both take the last item). Then `IF v_stock < NEW.quantity THEN RAISE EXCEPTION 'not enough stock for product %', NEW.product_id; END IF;`
+- A `BEFORE INSERT OR DELETE ON order_items FOR EACH ROW` trigger covers both events.
+
+</Hint>
+
+<Solution>
+
+```sql
+-- Keep products.stock in sync with order_items
+CREATE FUNCTION sync_stock()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_stock integer;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    SELECT stock INTO v_stock
+    FROM products
+    WHERE id = NEW.product_id
+    FOR UPDATE;
+
+    IF v_stock < NEW.quantity THEN
+      RAISE EXCEPTION 'not enough stock for product % (% left)',
+        NEW.product_id, v_stock;
+    END IF;
+
+    UPDATE products
+    SET stock = stock - NEW.quantity
+    WHERE id = NEW.product_id;
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    UPDATE products
+    SET stock = stock + OLD.quantity
+    WHERE id = OLD.product_id;
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER order_items_sync_stock
+BEFORE INSERT OR DELETE ON order_items
+FOR EACH ROW
+EXECUTE FUNCTION sync_stock();
+
+-- Try it: add 2 kites (product 12) to order 3,
+-- then show the kite's name and stock
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (3, 12, 2, 15.00);
+
+SELECT name, stock
+FROM products
+WHERE id = 12;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- A **trigger** runs a **trigger function** (`RETURNS trigger`) automatically on `INSERT`, `UPDATE` or `DELETE`, **`BEFORE`** or **`AFTER`** the change, **`FOR EACH ROW`** or **`FOR EACH STATEMENT`**.
+- In row triggers, **`NEW`** is the new row and **`OLD`** the old one; a `BEFORE` trigger can change `NEW`, and returning `NULL` skips the row. `TG_OP` and `TG_TABLE_NAME` tell one function what happened where.
+- Classic uses: **normalising** data, **`updated_at`** timestamps, **audit logs** with `to_jsonb(OLD)`/`to_jsonb(NEW)`, and **validation** that needs old values or other tables.
+- `UPDATE OF columns` and `WHEN (…)` limit when a trigger fires; transition tables give statement-level triggers all changed rows at once.
+- Prefer **constraints** where they can express the rule; keep triggers few, short, clearly named and free of slow side effects.

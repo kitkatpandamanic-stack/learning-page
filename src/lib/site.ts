@@ -34,6 +34,7 @@ export const footerNav: { title: string; links: NavLink[] }[] = [
       { label: "javascript", href: "/languages/javascript" },
       { label: "python", href: "/languages/python" },
       { label: "typescript", href: "/languages/typescript" },
+      { label: "sql", href: "/languages/sql" },
       { label: "allLanguages", href: "/languages" },
     ],
   },

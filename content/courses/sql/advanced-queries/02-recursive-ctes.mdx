@@ -1,0 +1,411 @@
+---
+title: Recursive CTEs
+description: Walk org charts, generate series and find paths through networks with WITH RECURSIVE, and keep recursion safe from infinite loops with depth limits and the CYCLE clause.
+duration: 24
+xp: 25
+---
+
+Some questions have no fixed number of steps. "Who reports to Alan Turing, **directly or indirectly**?" could mean one level of managers or ten. "Which train journeys get from London to Rome?" might take two trains or six. A normal query joins a fixed number of times, so it can't answer these.
+
+A **recursive CTE** can. It runs a query, feeds the result back into the same query, and keeps going until no new rows appear. It's how SQL walks **trees** (org charts, categories, comment threads, folders) and **graphs** (networks, routes, dependencies). 🌳
+
+## The anatomy of WITH RECURSIVE
+
+Here's the smallest useful recursive CTE: counting from 1 to 5.
+
+<CodeExample output={` n
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)`}>
+
+```sql
+WITH RECURSIVE counter (n) AS (
+  SELECT 1                -- 1. the anchor: where to start
+  UNION ALL
+  SELECT n + 1            -- 2. the recursive part
+  FROM counter
+  WHERE n < 5             -- 3. when to stop
+)
+SELECT n FROM counter;
+```
+
+</CodeExample>
+
+A recursive CTE always has the same three parts:
+
+1. The **anchor** (non-recursive term): a normal query that produces the starting rows. Here, one row with `n = 1`.
+2. **`UNION ALL`** and the **recursive term**: a query that refers to the CTE itself (`FROM counter`).
+3. A **stopping condition**, usually a `WHERE` in the recursive term.
+
+PostgreSQL runs it like a loop. The anchor's rows go into a "working table". Then the recursive term runs **using only the rows from the previous step**, its new rows become the next working table, and so on. When a step returns no rows (here, when `n < 5` stops being true), the loop ends and all the rows from every step form the result:
+
+```text
+step 0 (anchor):   n = 1
+step 1:            n = 2      (from 1)
+step 2:            n = 3      (from 2)
+step 3:            n = 4      (from 3)
+step 4:            n = 5      (from 4)
+step 5:            no rows    (5 < 5 is false), done
+```
+
+## Loops with an unknown number of steps
+
+For plain number or date sequences, `generate_series` is simpler. Recursion shines when **each step depends on the previous one** and you don't know in advance how many steps it takes. Here's a loan of 1,000 with 10% interest a year, paid back at 300 a year: how many years until it's gone?
+
+<CodeExample output={` year | balance
+------+---------
+    0 | 1000.00
+    1 |  800.00
+    2 |  580.00
+    3 |  338.00
+    4 |   71.80
+    5 |    0.00
+(6 rows)`}>
+
+```sql
+WITH RECURSIVE loan (year, balance) AS (
+  SELECT 0, 1000.00
+  UNION ALL
+  SELECT year + 1,
+    round(balance * 1.10 - least(300, balance * 1.10), 2)
+  FROM loan
+  WHERE balance > 0
+)
+SELECT year, balance FROM loan;
+```
+
+</CodeExample>
+
+Each year's balance is calculated from the year before, and the loop stops on its own once the balance hits zero. (`least(300, ...)` makes the last payment just big enough.)
+
+## Walking down a tree: the org chart
+
+The `employees` table is a **tree**: every employee has a `manager_id` pointing at another employee, and the CEO has none. To draw the org chart, the anchor selects the root, and the recursive term finds the employees whose manager is a row from the previous step. To keep it short, this one follows Engineering and Design only:
+
+<CodeExample output={`           org_chart           |   job_title
+-------------------------------+----------------
+ Grace Hopper                  | CEO
+     Alan Turing               | CTO
+         Ada Lovelace          | Lead Engineer
+             Ken Thompson      | Engineer
+             Linus Park        | Engineer
+             Margaret Hamilton | Engineer
+         Barbara Liskov        | Architect
+     Don Norman                | Head of Design
+         Dieter Rams           | Designer
+         Susan Kare            | Designer
+(10 rows)`}>
+
+```sql
+WITH RECURSIVE org AS (
+  SELECT id, name, job_title, 0 AS depth, ARRAY[name] AS path
+  FROM employees
+  WHERE manager_id IS NULL
+  UNION ALL
+  SELECT e.id, e.name, e.job_title, org.depth + 1,
+    org.path || e.name
+  FROM employees AS e
+  JOIN org ON e.manager_id = org.id
+  WHERE e.department_id IN (1, 2)
+)
+SELECT repeat('    ', depth) || name AS org_chart, job_title
+FROM org
+ORDER BY path;
+```
+
+</CodeExample>
+
+Two extra columns do a lot of work:
+
+- **`depth`** starts at 0 and grows by 1 per level, so `repeat('    ', depth)` indents each name.
+- **`path`** is an **array** of the names from the top down to this person (`||` appends to an array). Sorting by it puts everyone directly under their manager, like a folder tree.
+
+The recursive term stops by itself: the engineers manage nobody, so the step after them finds no rows.
+
+## Walking up a tree: the chain of command
+
+Flip the join and you walk **upwards**. Start at one employee, and at each step find the manager of the previous row:
+
+<CodeExample output={` steps |     name
+-------+--------------
+     0 | Ken Thompson
+     1 | Ada Lovelace
+     2 | Alan Turing
+     3 | Grace Hopper
+(4 rows)`}>
+
+```sql
+WITH RECURSIVE chain AS (
+  SELECT id, name, manager_id, 0 AS steps
+  FROM employees
+  WHERE name = 'Ken Thompson'
+  UNION ALL
+  SELECT m.id, m.name, m.manager_id, chain.steps + 1
+  FROM employees AS m
+  JOIN chain ON m.id = chain.manager_id
+)
+SELECT steps, name
+FROM chain
+ORDER BY steps;
+```
+
+</CodeExample>
+
+The trick is the join condition. Going down: `e.manager_id = org.id` ("people whose manager is the previous row"). Going up: `m.id = chain.manager_id` ("the person who is the previous row's manager"). Getting it backwards is the most common recursive-CTE bug, so say it out loud when you write one.
+
+## Totals for every subtree
+
+"How many people work under each manager, and what do their teams cost?" needs every **(manager, someone below them)** pair. Start with every employee paired with themselves, and let the recursion add everyone below:
+
+<CodeExample output={`     name     | people_below | team_salary
+--------------+--------------+-------------
+ Grace Hopper |           19 |     1430500
+ Alan Turing  |            5 |      420000
+ Ada Lovelace |            3 |      217000
+ Mary Kay     |            3 |      147000
+ Don Norman   |            2 |      125000
+ Hana Sato    |            2 |       77500
+ Marie Curie  |            2 |      164000
+(7 rows)`}>
+
+```sql
+WITH RECURSIVE below AS (
+  SELECT id AS boss_id, id AS employee_id
+  FROM employees
+  UNION ALL
+  SELECT below.boss_id, e.id
+  FROM employees AS e
+  JOIN below ON e.manager_id = below.employee_id
+)
+SELECT boss.name,
+  count(*) - 1 AS people_below,
+  sum(e.salary) - boss.salary AS team_salary
+FROM below
+JOIN employees AS boss ON boss.id = below.boss_id
+JOIN employees AS e ON e.id = below.employee_id
+GROUP BY boss.id
+HAVING count(*) > 1
+ORDER BY people_below DESC, boss.name;
+```
+
+</CodeExample>
+
+The `- 1` and `- boss.salary` remove each manager's pair with themselves. Grace Hopper has all 19 other employees below her.
+
+<Quiz
+  question="In a recursive CTE, which rows does the recursive term see each time it runs?"
+  options={[
+    "Every row produced so far",
+    "Only the rows produced by the previous step",
+    "Only the anchor's rows",
+    "The whole table it joins with",
+  ]}
+  answer={1}
+  explanation="Each step works on the working table: the rows the previous step produced. That's why the loop ends as soon as a step produces no new rows. The final result is all the steps' rows together."
+/>
+
+## Paths through a graph
+
+A tree has one way down to each node. A **graph** can have many routes, and **cycles**: London → Paris → London → Paris… forever. Here's a small rail network, and every way to get from London to Rome:
+
+<CodeExample output={`CREATE TABLE
+
+INSERT 0 12
+
+                            route                            | hours
+-------------------------------------------------------------+-------
+ London → Paris → Milan → Rome                               |  12.5
+ London → Brussels → Paris → Milan → Rome                    |  13.5
+ London → Brussels → Cologne → Munich → Rome                 |  18.0
+ London → Brussels → Cologne → Munich → Milan → Rome         |  19.0
+ London → Paris → Brussels → Cologne → Munich → Rome         |  20.0
+ London → Paris → Brussels → Cologne → Munich → Milan → Rome |  21.0
+(6 rows)`}>
+
+```sql
+CREATE TABLE rail_links (
+  from_city text NOT NULL,
+  to_city text NOT NULL,
+  hours numeric NOT NULL
+);
+
+INSERT INTO rail_links VALUES
+  ('London', 'Paris', 2.5), ('Paris', 'London', 2.5),
+  ('London', 'Brussels', 2.0), ('Brussels', 'London', 2.0),
+  ('Paris', 'Brussels', 1.5), ('Brussels', 'Paris', 1.5),
+  ('Paris', 'Milan', 7.0), ('Brussels', 'Cologne', 2.0),
+  ('Cologne', 'Munich', 4.5), ('Munich', 'Milan', 7.5),
+  ('Munich', 'Rome', 9.5), ('Milan', 'Rome', 3.0);
+
+WITH RECURSIVE trips AS (
+  SELECT to_city AS city, ARRAY['London', to_city] AS route, hours
+  FROM rail_links
+  WHERE from_city = 'London'
+  UNION ALL
+  SELECT l.to_city, t.route || l.to_city, t.hours + l.hours
+  FROM trips AS t
+  JOIN rail_links AS l ON l.from_city = t.city
+  WHERE NOT l.to_city = ANY (t.route)
+)
+SELECT array_to_string(route, ' → ') AS route, hours
+FROM trips
+WHERE city = 'Rome'
+ORDER BY hours, route;
+```
+
+</CodeExample>
+
+The line that keeps this safe is **`WHERE NOT l.to_city = ANY (t.route)`**: never travel to a city that's already on this route. Without it, the trains between London, Paris and Brussels would go round in circles and the query would never finish. Notice too that the final `WHERE city = 'Rome'` is **outside** the CTE: the recursion explores every route, and the outer query picks the ones that end in Rome.
+
+<Callout type="warning" title="Recursive column types must match">
+
+If `hours` were `numeric(4, 1)`, this query would fail with "column 3 has type numeric(4,1) in non-recursive term but type numeric overall": `t.hours + l.hours` produces plain `numeric`, which doesn't match the anchor's type. The fix is a cast in the anchor (`hours::numeric`). The same goes for text: `ARRAY[name]` and `path || e.name` must agree on the type.
+
+</Callout>
+
+## Keeping recursion safe
+
+A recursive CTE that never stops runs until it fills the disk or someone cancels it. Data you trust today can grow a cycle tomorrow: one wrong `UPDATE`, and Grace Hopper reports to Linus Park, who reports (indirectly) to Grace Hopper. Your options, from simplest to strongest:
+
+- **A depth limit**: carry a `depth` column and add `WHERE depth < 20` to the recursive term. Crude but bulletproof.
+- **A visited list**: carry an array of the ids seen so far and stop with `NOT id = ANY (path)`, like the rail example.
+- **The `CYCLE` clause** (PostgreSQL 14+): it does the visited-list bookkeeping for you. Name the column(s) that identify a row, plus a flag column and a path column for PostgreSQL to fill in:
+
+<CodeExample output={`UPDATE 1
+
+     name     | is_cycle
+--------------+----------
+ Linus Park   | f
+ Ada Lovelace | f
+ Alan Turing  | f
+ Grace Hopper | f
+ Linus Park   | t
+(5 rows)`}>
+
+```sql
+UPDATE employees SET manager_id = 4 WHERE name = 'Grace Hopper';
+
+WITH RECURSIVE chain AS (
+  SELECT id, name, manager_id
+  FROM employees
+  WHERE name = 'Linus Park'
+  UNION ALL
+  SELECT m.id, m.name, m.manager_id
+  FROM employees AS m
+  JOIN chain ON m.id = chain.manager_id
+) CYCLE id SET is_cycle USING visited
+SELECT name, is_cycle
+FROM chain;
+```
+
+</CodeExample>
+
+When a step reaches an `id` that's already on its path, PostgreSQL emits that row with `is_cycle = true` and stops following it. Filter with `WHERE NOT is_cycle`, or alert on `WHERE is_cycle` to find broken data. A sibling clause, `SEARCH DEPTH FIRST BY id SET ordercol`, gives you a ready-made column to sort a tree by, much like our `path`.
+
+<Callout type="tip" title="UNION instead of UNION ALL">
+
+With `UNION`, PostgreSQL drops rows it has already produced, which also ends some cycles, but only if the repeated rows are **exactly** the same. As soon as a row carries a `depth` or a `path`, every row is different and `UNION` can't save you. In production, also set a `statement_timeout` for the app's database user, so a runaway query is cancelled after a few seconds instead of hurting everyone else.
+
+</Callout>
+
+Experiment with the whole company's org chart: remove the department filter, show salaries, start from a different person, or add `WHERE depth < 2`.
+
+<TryIt language="sql" code={`WITH RECURSIVE org AS (
+  SELECT id, name, job_title, 0 AS depth, ARRAY[name] AS path
+  FROM employees
+  WHERE manager_id IS NULL
+  UNION ALL
+  SELECT e.id, e.name, e.job_title, org.depth + 1,
+    org.path || e.name
+  FROM employees AS e
+  JOIN org ON e.manager_id = org.id
+)
+SELECT repeat('    ', depth) || name AS org_chart, job_title
+FROM org
+ORDER BY path;`} />
+
+<Quiz
+  question="A recursive CTE walks a graph that might contain cycles and carries a depth column. Which change reliably stops it looping forever?"
+  options={[
+    "Replace UNION ALL with UNION",
+    "Add ORDER BY to the final SELECT",
+    "Add a depth limit or a visited check (or the CYCLE clause) to the recursive term",
+    "Put LIMIT 100 inside the anchor",
+  ]}
+  answer={2}
+  explanation="Because depth changes on every step, no two rows are identical, so UNION never finds duplicates to drop. A depth limit, a NOT id = ANY (path) check, or CYCLE ... SET ... USING stop the recursion. ORDER BY and a LIMIT in the anchor don't stop the recursive term."
+/>
+
+<Exercise
+  language="sql"
+  title="Everyone under Alan Turing"
+  starter={`WITH RECURSIVE team AS (
+  -- Alan Turing's direct reports
+  SELECT e.id, e.name, e.manager_id, 1 AS depth
+  FROM employees AS e
+  JOIN employees AS boss ON boss.id = e.manager_id
+  WHERE boss.name = 'Alan Turing'
+  -- add the recursive part here
+)
+SELECT name, depth
+FROM team
+ORDER BY depth, name;`}
+  tests={[
+    { name: "Columns are name, manager, depth", check: "columns.join() === 'name,manager,depth'" },
+    { name: "Finds all 5 people below Alan Turing", check: "rows.length === 5 && rows.map(r => r.name).join() === 'Ada Lovelace,Barbara Liskov,Ken Thompson,Linus Park,Margaret Hamilton'" },
+    { name: "depth is 1 for direct reports, 2 for the next level", check: "rows.map(r => r.depth).join() === '1,1,2,2,2'" },
+    { name: "manager is the name of each person's manager", check: "rows.map(r => r.manager).join() === 'Alan Turing,Alan Turing,Ada Lovelace,Ada Lovelace,Ada Lovelace'" },
+    { name: "Doesn't include Alan Turing himself", check: "!rows.some(r => r.name === 'Alan Turing')" },
+    { name: "Follows any number of levels", check: "(await rerun(\"INSERT INTO employees (name, department_id, manager_id, job_title, salary, hired_on) VALUES ('Lee Chen', 1, 4, 'Intern', 30000, '2025-06-02'), ('Rui Costa', 2, 9, 'Intern', 30000, '2025-06-02')\")).map(r => r.name + ':' + r.manager + ':' + r.depth).join() === 'Ada Lovelace:Alan Turing:1,Barbara Liskov:Alan Turing:1,Ken Thompson:Ada Lovelace:2,Linus Park:Ada Lovelace:2,Margaret Hamilton:Ada Lovelace:2,Lee Chen:Linus Park:3'" },
+  ]}
+>
+
+The CTO, Alan Turing, wants a list of **everyone in his part of the company**: his direct reports, their reports, and so on, however deep it goes. Show:
+
+- `name`: the employee,
+- `manager`: the **name** of their direct manager,
+- `depth`: 1 for Alan's direct reports, 2 for the people below them, and so on,
+- sorted by depth, then name. Alan himself isn't in the list.
+
+The starter has the anchor. Add the recursive part, and the manager's name.
+
+<Hint>
+
+The recursive term joins `employees AS e` to `team` with `e.manager_id = team.id` and selects `team.depth + 1`. The simplest way to get the manager's name is to carry it in the CTE: select `boss.name AS manager` in the anchor and `team.name` in the recursive term (the previous row **is** the manager). Then `SELECT name, manager, depth FROM team`.
+
+</Hint>
+
+<Solution>
+
+```sql
+WITH RECURSIVE team AS (
+  SELECT e.id, e.name, boss.name AS manager, 1 AS depth
+  FROM employees AS e
+  JOIN employees AS boss ON boss.id = e.manager_id
+  WHERE boss.name = 'Alan Turing'
+  UNION ALL
+  SELECT e.id, e.name, team.name, team.depth + 1
+  FROM employees AS e
+  JOIN team ON e.manager_id = team.id
+)
+SELECT name, manager, depth
+FROM team
+ORDER BY depth, name;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **`WITH RECURSIVE`** = an **anchor** query, `UNION ALL`, and a **recursive term** that refers to the CTE. Each step sees only the previous step's rows; the loop ends when a step returns nothing.
+- Use it when each step depends on the last and you don't know how many steps there are; for plain sequences, `generate_series` is simpler.
+- **Down a tree**: `JOIN cte ON child.parent_id = cte.id`. **Up a tree**: `JOIN cte ON parent.id = cte.parent_id`. Carry `depth` and an array `path` for indenting and sorting.
+- Pair every node with itself in the anchor to get **subtree totals** with a normal `GROUP BY`.
+- **Graphs have cycles**: guard with a depth limit, `NOT id = ANY (path)`, or `CYCLE id SET is_cycle USING path`. `UNION` alone won't help once rows carry depth or path.
+- Column types must match between the anchor and the recursive term; cast in the anchor if needed.

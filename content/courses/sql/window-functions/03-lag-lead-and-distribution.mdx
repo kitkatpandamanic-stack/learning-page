@@ -1,0 +1,296 @@
+---
+title: LAG, LEAD, NTILE and Friends
+description: Compare each row with its neighbours using LAG and LEAD, measure growth period over period, split rows into buckets with NTILE, and pick values with FIRST_VALUE.
+duration: 22
+xp: 25
+---
+
+"Did revenue grow since last month?" "How many days pass between a customer's orders?" "Is this film in the top quarter of the catalogue?" All of these compare a row with **other specific rows**: the one before, the one after, the best one in the group.
+
+This lesson finishes the window-function toolbox with **offset functions** (`lag`, `lead`), **value functions** (`first_value`, `last_value`, `nth_value`) and **distribution functions** (`ntile`, `percent_rank`, `cume_dist`). They all use the same `OVER (PARTITION BY ... ORDER BY ...)` you already know. 🔍
+
+## LAG: look at the previous row
+
+**`lag(expression)`** returns the value of `expression` from the **previous row** in the window's order. The first row has no previous row, so it gets `NULL`. That's all you need for **period-over-period** reports:
+
+<CodeExample output={`  month  | revenue | prev_revenue | change  | change_pct
+---------+---------+--------------+---------+------------
+ 2025-01 |  518.30 |         NULL |    NULL |       NULL
+ 2025-02 |  331.69 |       518.30 | -186.61 |      -36.0
+ 2025-03 |  525.80 |       331.69 |  194.11 |       58.5
+ 2025-04 |  331.69 |       525.80 | -194.11 |      -36.9
+ 2025-05 |  467.80 |       331.69 |  136.11 |       41.0
+ 2025-06 |  270.54 |       467.80 | -197.26 |      -42.2
+(6 rows)`}>
+
+```sql
+WITH monthly AS (
+  SELECT to_char(o.ordered_at, 'YYYY-MM') AS month,
+    sum(oi.quantity * oi.unit_price) AS revenue
+  FROM orders AS o
+  JOIN order_items AS oi ON oi.order_id = o.id
+  WHERE o.status <> 'cancelled'
+  GROUP BY month
+),
+compared AS (
+  SELECT month, revenue,
+    lag(revenue) OVER (ORDER BY month) AS prev_revenue
+  FROM monthly
+)
+SELECT month, revenue, prev_revenue,
+  revenue - prev_revenue AS change,
+  round(100 * (revenue - prev_revenue)
+    / nullif(prev_revenue, 0), 1) AS change_pct
+FROM compared
+ORDER BY month;
+```
+
+</CodeExample>
+
+A few details worth copying into your own reports:
+
+- The second CTE gives `lag(...)` a name, so the final `SELECT` can use `prev_revenue` three times instead of repeating the window.
+- **`nullif(prev_revenue, 0)`** turns a zero into `NULL`, so a month after a month with no revenue gives `NULL` instead of a "division by zero" error.
+- The first month has no previous month, so its change is `NULL`. That's honest: "growth since nothing" isn't 0%.
+
+`lag` takes two optional arguments: **`lag(x, n, default)`** looks `n` rows back (default 1) and returns `default` instead of `NULL` when there's no such row. On monthly data, `lag(revenue, 12)` gives **year-over-year** comparisons.
+
+## LEAD: look at the next row
+
+**`lead()`** is the mirror image: the value from the **next** row. Combined with `PARTITION BY`, the pair of them describe a customer's rhythm: how long since their last order, and when (or whether) they came back:
+
+<CodeExample output={`    name    | order_id |    day     | days_since_prev | next_order
+------------+----------+------------+-----------------+------------
+ Mei Lin    |       17 | 2025-03-14 |            NULL | 2025-05-24
+ Mei Lin    |       34 | 2025-05-24 |              71 | NULL
+ Ravi Patel |        3 | 2025-01-15 |            NULL | 2025-03-27
+ Ravi Patel |       20 | 2025-03-27 |              71 | 2025-06-05
+ Ravi Patel |       37 | 2025-06-05 |              70 | NULL
+ Sam Ortiz  |        5 | 2025-01-24 |            NULL | 2025-04-04
+ Sam Ortiz  |       22 | 2025-04-04 |              70 | 2025-06-13
+ Sam Ortiz  |       39 | 2025-06-13 |              70 | NULL
+(8 rows)`}>
+
+```sql
+SELECT c.name, o.id AS order_id, o.ordered_at::date AS day,
+  o.ordered_at::date - lag(o.ordered_at::date) OVER w
+    AS days_since_prev,
+  lead(o.ordered_at::date) OVER w AS next_order
+FROM orders AS o
+JOIN customers AS c ON c.id = o.customer_id
+WHERE o.customer_id IN (1, 2, 5)
+WINDOW w AS (PARTITION BY o.customer_id ORDER BY o.ordered_at)
+ORDER BY c.name, o.ordered_at;
+```
+
+</CodeExample>
+
+Subtracting one `date` from another gives a whole number of days. A `NULL` in `next_order` means "no later order (yet)". In a real shop, "last order more than 90 days ago and no next order" is a classic definition of a customer who might be **churning**, and a good list for a "we miss you" email.
+
+<Callout type="warning" title="The previous row isn't always the previous month">
+
+`lag` looks at the previous **row**, not the previous month. If a month has no orders at all, it has no row, and `lag` happily compares May with March. When gaps are possible, build a **calendar** with `generate_series` first and `LEFT JOIN` the data onto it, so every month has a row (with 0 if nothing happened).
+
+</Callout>
+
+Here's that fix for Mei Lin, who only ordered in March and May:
+
+<CodeExample output={`  month  | orders | prev_month
+---------+--------+------------
+ 2025-01 |      0 |       NULL
+ 2025-02 |      0 |          0
+ 2025-03 |      1 |          0
+ 2025-04 |      0 |          1
+ 2025-05 |      1 |          0
+ 2025-06 |      0 |          1
+(6 rows)`}>
+
+```sql
+WITH months AS (
+  SELECT to_char(m, 'YYYY-MM') AS month
+  FROM generate_series(date '2025-01-01', date '2025-06-01',
+    interval '1 month') AS m
+),
+meis_orders AS (
+  SELECT to_char(ordered_at, 'YYYY-MM') AS month, count(*) AS orders
+  FROM orders
+  WHERE customer_id = 1
+  GROUP BY month
+)
+SELECT m.month, coalesce(mo.orders, 0) AS orders,
+  lag(coalesce(mo.orders, 0)) OVER (ORDER BY m.month) AS prev_month
+FROM months AS m
+LEFT JOIN meis_orders AS mo ON mo.month = m.month
+ORDER BY m.month;
+```
+
+</CodeExample>
+
+Without the calendar, the query would have two rows, and May's "previous month" would be March.
+
+<Quiz
+  question="On a table with one row per month, what does lag(revenue, 12, 0) OVER (ORDER BY month) return for the first 12 months?"
+  options={[
+    "NULL",
+    "0, the default, because there's no row 12 months earlier",
+    "The revenue of the same month",
+    "An error, because the offset is bigger than the table",
+  ]}
+  answer={1}
+  explanation="lag(x, n, default) looks n rows back. When that row doesn't exist, it returns the default you gave (0 here) instead of NULL. With one row per month and no gaps, 12 rows back is the same month last year."
+/>
+
+## FIRST_VALUE and LAST_VALUE
+
+**`first_value(x)`** and **`last_value(x)`** return `x` from the first or last row of the **frame**. Compare everyone with their department's top earner, and try to find the lowest earner too:
+
+<CodeExample output={` department_id |    name     | salary | top_earner | lowest_oops | lowest_earner
+---------------+-------------+--------+------------+-------------+---------------
+             3 | Mary Kay    |  90000 | Mary Kay   | Mary Kay    | Paul Allen
+             3 | Elena Gomez |  54000 | Mary Kay   | Elena Gomez | Paul Allen
+             3 | Carlos Ruiz |  52000 | Mary Kay   | Carlos Ruiz | Paul Allen
+             3 | Paul Allen  |  41000 | Mary Kay   | Paul Allen  | Paul Allen
+             4 | Hana Sato   |  70000 | Hana Sato  | Hana Sato   | Taro Yamada
+             4 | Aiko Suzuki |  39500 | Hana Sato  | Aiko Suzuki | Taro Yamada
+             4 | Taro Yamada |  38000 | Hana Sato  | Taro Yamada | Taro Yamada
+(7 rows)`}>
+
+```sql
+SELECT department_id, name, salary,
+  first_value(name) OVER by_salary AS top_earner,
+  last_value(name) OVER by_salary AS lowest_oops,
+  last_value(name) OVER (
+    PARTITION BY department_id
+    ORDER BY salary DESC
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) AS lowest_earner
+FROM employees
+WHERE department_id IN (3, 4)
+WINDOW by_salary AS (PARTITION BY department_id ORDER BY salary DESC)
+ORDER BY department_id, salary DESC;
+```
+
+</CodeExample>
+
+`first_value` works, but `lowest_oops` just repeats each person's own name. Remember the default frame from the [previous lesson](/learn/sql/running-totals-and-frames): with `ORDER BY` it ends at the **current row**, so the "last row of the frame" is the current row (or its last peer). To see the whole partition, spell out `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`, as `lowest_earner` does. (Or flip the order and use `first_value`, which is often simpler.)
+
+**`nth_value(x, n)`** returns the value from the n-th row of the frame: `nth_value(name, 2)` is the runner-up. It has the same frame catch as `last_value`.
+
+## NTILE, PERCENT_RANK and CUME_DIST
+
+The last family places each row **within the distribution** of all rows:
+
+- **`ntile(n)`** splits the ordered rows into `n` buckets as equal in size as possible and returns the bucket number: `ntile(4)` gives quartiles, `ntile(10)` deciles, `ntile(100)` percentiles.
+- **`percent_rank()`** is `(rank - 1) / (rows - 1)`: 0 for the first row, 1 for the last.
+- **`cume_dist()`** is "the fraction of rows that come before or tie with this one", between 0 and 1.
+
+<CodeExample output={`         title          | rating | quartile | pct_rank | cume_dist
+------------------------+--------+----------+----------+-----------
+ The Quiet Algorithm    |    8.4 |        1 |     1.00 |      1.00
+ Midnight in the Forest |    8.1 |        1 |     0.91 |      0.92
+ Mountain of Echoes     |    7.9 |        1 |     0.82 |      0.83
+ The Bamboo Heist       |    7.8 |        2 |     0.73 |      0.75
+ Snow Leopard Summer    |    7.6 |        2 |     0.64 |      0.67
+ The Last Dumpling      |    7.2 |        2 |     0.55 |      0.58
+ Bug in the Machine     |    7.1 |        3 |     0.45 |      0.50
+ Panda Express to Mars  |    6.9 |        3 |     0.36 |      0.42
+ Tea for Two Thousand   |    6.7 |        3 |     0.27 |      0.33
+ The Great Bamboo Race  |    6.5 |        4 |     0.18 |      0.25
+ Code Red               |    6.4 |        4 |     0.09 |      0.17
+ Ninja Pandas II        |    5.9 |        4 |     0.00 |      0.08
+(12 rows)`}>
+
+```sql
+SELECT title, rating,
+  ntile(4) OVER (ORDER BY rating DESC) AS quartile,
+  round(percent_rank() OVER (ORDER BY rating)::numeric, 2)
+    AS pct_rank,
+  round(cume_dist() OVER (ORDER BY rating)::numeric, 2)
+    AS cume_dist
+FROM movies
+ORDER BY rating DESC;
+```
+
+</CodeExample>
+
+Twelve films in four buckets gives three per quartile: the top three are "top 25%". `percent_rank` and `cume_dist` return `double precision`, so they're cast to `numeric` before `round(x, 2)` (rounding to decimal places only works on `numeric`). Read `cume_dist = 0.75` for The Bamboo Heist as "75% of the films are rated the same or lower".
+
+<Callout type="tip" title="ntile is about row counts, not values">
+
+`ntile(4)` makes buckets with the same **number of rows**, even if that splits equal values: two films with the same rating can land in different quartiles. If you need value bands ("the cheapest 25% of the price range"), or a proper median, use `percentile_cont(0.5) WITHIN GROUP (ORDER BY price)`, an ordered-set aggregate that interpolates values. Pick deliberately; they answer different questions.
+
+</Callout>
+
+Try it: change `ntile(4)` to `ntile(3)`, partition the films by `genre`, or use `lead` to show the next film each director made.
+
+<TryIt language="sql" code={`SELECT director, year, title, rating,
+  lead(title) OVER w AS next_film,
+  rating - first_value(rating) OVER w AS vs_first_film
+FROM movies
+WINDOW w AS (PARTITION BY director ORDER BY year)
+ORDER BY director, year;`} />
+
+<Quiz
+  question="Why does last_value(name) OVER (PARTITION BY department_id ORDER BY salary DESC) return each row's own name?"
+  options={[
+    "last_value only works without PARTITION BY",
+    "The default frame ends at the current row, so the last row of the frame is the current row",
+    "ORDER BY DESC reverses last_value into first_value",
+    "last_value needs a GROUP BY",
+  ]}
+  answer={1}
+  explanation="With ORDER BY and no explicit frame, the frame is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW. Add ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING to make last_value see the whole partition."
+/>
+
+<Exercise
+  language="sql"
+  title="Each director's career, film by film"
+  starter={`-- Compare each film with the director's previous film
+SELECT director, year, title, rating
+FROM movies
+ORDER BY director, year;`}
+  tests={[
+    { name: "Columns are director, year, title, rating, years_since_prev, rating_change", check: "columns.join() === 'director,year,title,rating,years_since_prev,rating_change'" },
+    { name: "All 12 films, sorted by director and year", check: "rows.length === 12 && rows.map(r => r.director + r.year).join() === 'Ada Brooks2015,Ada Brooks2020,Ada Brooks2025,Kenji Mori2016,Kenji Mori2022,Mei Lin2014,Mei Lin2019,Mei Lin2021,Ravi Patel2018,Ravi Patel2024,Sam Ortiz2017,Sam Ortiz2023'" },
+    { name: "A director's first film has NULLs", check: "rows.filter(r => r.years_since_prev === null).map(r => r.title).join() === 'Midnight in the Forest,Mountain of Echoes,The Great Bamboo Race,Code Red,Tea for Two Thousand'" },
+    { name: "Mei Lin's films compare with her previous film", check: "rows.filter(r => r.director === 'Mei Lin').map(r => r.years_since_prev + '/' + r.rating_change).join() === 'null/null,5/1.3,2/-0.6'" },
+    { name: "Works when a new film comes out", check: "(await rerun(\"INSERT INTO movies (title, year, director, genre, rating, minutes) VALUES ('Dumpling Returns', 2024, 'Mei Lin', 'comedy', 8.0, 99)\")).filter(r => r.director === 'Mei Lin').map(r => r.years_since_prev + '/' + r.rating_change).join() === 'null/null,5/1.3,2/-0.6,3/0.8'" },
+  ]}
+>
+
+The film club wants to see how each director's career went. For every film show:
+
+- `director`, `year`, `title` and `rating`,
+- `years_since_prev`: years since the **same director's** previous film,
+- `rating_change`: this film's rating minus the previous film's rating,
+- `NULL` in both for a director's first film,
+- sorted by director, then year.
+
+<Hint>
+
+Use `lag(year)` and `lag(rating)` over `PARTITION BY director ORDER BY year`, and subtract: `year - lag(year) OVER w AS years_since_prev`. A `WINDOW w AS (...)` clause saves typing the window twice. Subtracting from `NULL` gives `NULL`, so first films need no special handling.
+
+</Hint>
+
+<Solution>
+
+```sql
+SELECT director, year, title, rating,
+  year - lag(year) OVER w AS years_since_prev,
+  rating - lag(rating) OVER w AS rating_change
+FROM movies
+WINDOW w AS (PARTITION BY director ORDER BY year, id)
+ORDER BY director, year;
+```
+
+</Solution>
+
+</Exercise>
+
+## Recap
+
+- **`lag(x)`** / **`lead(x)`** read `x` from the previous / next row of the window's order; `lag(x, n, default)` looks further and replaces the missing `NULL`.
+- Period over period: `revenue - lag(revenue)`, and divide by `nullif(prev, 0)` for percentages. Fill gaps with a `generate_series` calendar first, because `lag` counts rows, not months.
+- **`first_value`**, **`last_value`** and **`nth_value`** pick values from the **frame**; for `last_value` and `nth_value`, widen it with `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`.
+- **`ntile(n)`** splits rows into n equal-sized buckets; **`percent_rank()`** and **`cume_dist()`** give each row's relative position from 0 to 1.
+- With ranking from the [first lesson](/learn/sql/window-functions-and-ranking) and frames from the second, you now have the whole window-function toolbox. Next up: advanced queries with `CASE`, recursion and JSON.

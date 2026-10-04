@@ -1,0 +1,458 @@
+---
+title: Триггеры
+description: Запускайте код автоматически при изменении строк. Обновляйте updated_at, ведите журнал аудита, проверяйте правила, которые не выразить ограничениями, и знайте, когда триггер — не тот инструмент.
+duration: 24
+xp: 25
+---
+
+Некоторые вещи должны происходить **каждый** раз, когда меняются данные, кто бы их ни менял: веб-приложение, фоновая задача или коллега, который в полночь вручную исправляет данные. «Заполнить `updated_at`». «Записать в журнал аудита, кто изменил цену». «Никогда не допускать отрицательного остатка». Если эта логика живёт только в приложении, рано или поздно найдётся скрипт, который о ней забудет и испортит данные. 🛡️
+
+**Триггер (trigger)** говорит PostgreSQL автоматически запускать функцию **до** или **после** `INSERT`, `UPDATE` или `DELETE` в таблице. В этом уроке вы соберёте три классических триггера (метки времени, журнал аудита и проверку данных) и узнаете, где триггеры перестают быть хорошей идеей.
+
+## Ваш первый триггер: нормализация данных
+
+Триггер состоит из двух частей:
+
+1. **Триггерная функция (trigger function)**: функция на PL/pgSQL, которая не принимает аргументов и `RETURNS trigger`.
+2. Сам **триггер**: `CREATE TRIGGER` связывает функцию с таблицей, событием (event) и моментом срабатывания.
+
+Вот триггер, который приводит в порядок каждый email перед сохранением:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE FUNCTION
+
+CREATE TRIGGER
+
+INSERT 0 2
+
+UPDATE 1
+
+ id |       email
+----+-------------------
+  1 | mei@pandadev.test
+  2 | sam@pandadev.test
+(2 rows)`}>
+
+```sql
+CREATE TABLE members (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text NOT NULL UNIQUE
+);
+
+CREATE FUNCTION normalise_email()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.email := lower(trim(NEW.email));
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER members_normalise_email
+BEFORE INSERT OR UPDATE ON members
+FOR EACH ROW
+EXECUTE FUNCTION normalise_email();
+
+INSERT INTO members (email)
+VALUES ('  Mei@PandaDev.test'), ('sam@pandadev.test');
+UPDATE members SET email = 'SAM@PANDADEV.TEST ' WHERE id = 2;
+
+SELECT id, email FROM members ORDER BY id;
+```
+
+</CodeExample>
+
+Прочитаем `CREATE TRIGGER` вслух: «**перед** каждой вставкой или обновлением **в members**, **для каждой строки**, запускать `normalise_email()`». Внутри функции:
+
+- **`NEW`** — строка, которая сейчас будет записана (для `INSERT` и `UPDATE`). Триггер `BEFORE` может её **изменить**, и сохранено будет то, что он вернёт.
+- **`OLD`** — строка в том виде, в каком она была раньше (для `UPDATE` и `DELETE`).
+- **`RETURN NEW`** означает «записывай эту строку». Если триггер `BEFORE ... FOR EACH ROW` вернёт **`NULL`**, строка молча **пропускается**.
+
+Поскольку триггер срабатывает до проверки `UNIQUE`, `'SAM@PANDADEV.TEST '` и `'sam@pandadev.test'` теперь распознаются как дубликаты, а одно только ограничение уникальности этого бы не сделало.
+
+## BEFORE или AFTER, ROW или STATEMENT
+
+Триггеры бывают нескольких видов:
+
+| | Когда срабатывает | Типичное применение |
+| --- | --- | --- |
+| **`BEFORE … FOR EACH ROW`** | перед записью каждой строки; может изменить `NEW` или пропустить строку | значения по умолчанию, нормализация, проверки |
+| **`AFTER … FOR EACH ROW`** | после записи каждой строки; видит итоговую строку | журналы аудита, обновление других таблиц |
+| **`FOR EACH STATEMENT`** | один раз на инструкцию, сколько бы ни было строк | сводки, уведомления |
+| **`INSTEAD OF`** | вместо изменения, на **представлении** | сделать сложные представления доступными для записи |
+
+Ещё несколько полезных параметров:
+
+- **`UPDATE OF price, stock`** срабатывает, только когда эти столбцы есть в списке `SET` у `UPDATE`.
+- **`WHEN (…)`** добавляет условие, которое проверяется ещё до вызова функции, например `WHEN (OLD.price IS DISTINCT FROM NEW.price)`. (`IS DISTINCT FROM` — это «не равно», которое считает `NULL` обычным значением.)
+- Внутри функции **`TG_OP`** равен `'INSERT'`, `'UPDATE'` или `'DELETE'`, а **`TG_TABLE_NAME`** — имени таблицы, так что одна функция может обслуживать много таблиц.
+
+## Поддерживаем updated_at в актуальном состоянии
+
+Самый распространённый триггер в мире заполняет столбец `updated_at` при каждом обновлении, чтобы всегда было видно, когда строка менялась в последний раз:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE FUNCTION
+
+CREATE TRIGGER
+
+INSERT 0 2
+
+UPDATE 1
+
+    title     | changed
+--------------+---------
+ Buy bamboo   | t
+ Water plants | f
+(2 rows)`}>
+
+```sql
+CREATE TABLE notes (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  title text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE FUNCTION set_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER notes_set_updated_at
+BEFORE UPDATE ON notes
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
+
+-- Две старые заметки от первого января
+INSERT INTO notes (title, created_at, updated_at) VALUES
+  ('Buy bambo', '2025-01-01', '2025-01-01'),
+  ('Water plants', '2025-01-01', '2025-01-01');
+
+-- Исправляем опечатку: триггер отмечает изменение
+UPDATE notes SET title = 'Buy bamboo' WHERE id = 1;
+
+SELECT title, updated_at > created_at AS changed
+FROM notes
+ORDER BY id;
+```
+
+</CodeExample>
+
+Никому не нужно помнить о заполнении `updated_at` — и никто не сможет об этом забыть. `set_updated_at()` нигде не упоминает `notes`, поэтому одна и та же функция может обслуживать все таблицы со столбцом `updated_at`, каждую со своим `CREATE TRIGGER`.
+
+(Мы выводим `changed`, а не сами метки времени, потому что `now()` при каждом запуске разное.)
+
+## Журнал аудита
+
+Кто изменил цену рисоварки (Rice Cooker), когда и какой она была раньше? Ответ даёт **журнал аудита (audit log)**, а заполнять его при каждом изменении, от любого клиента, может триггер `AFTER`. `to_jsonb(OLD)` превращает всю строку в JSON, так что одна универсальная таблица может хранить изменения любых таблиц:
+
+<CodeExample output={`CREATE TABLE
+
+CREATE FUNCTION
+
+INSERT 0 1
+
+CREATE TRIGGER
+
+UPDATE 1
+
+DELETE 1
+
+ id |   op   | row_id | old_price | new_price | changed_by
+----+--------+--------+-----------+-----------+------------
+  1 | UPDATE |     15 | 89.90     | 79.90     | postgres
+  2 | DELETE |     16 | 9.00      | NULL      | postgres
+(2 rows)`}>
+
+```sql
+CREATE TABLE audit_log (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  table_name text NOT NULL,
+  op text NOT NULL,
+  row_id integer,
+  old_data jsonb,
+  new_data jsonb,
+  changed_by text NOT NULL DEFAULT current_user,
+  changed_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE FUNCTION write_audit_log()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, row_id, old_data, new_data)
+  VALUES (
+    TG_TABLE_NAME,
+    TG_OP,
+    coalesce(NEW.id, OLD.id),
+    CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) END,
+    CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END
+  );
+  RETURN NULL;  -- результат триггера AFTER игнорируется
+END;
+$$;
+
+INSERT INTO products (name, category, price, stock)
+VALUES ('Oolong', 'tea', 9.00, 5);
+
+CREATE TRIGGER products_audit
+AFTER INSERT OR UPDATE OR DELETE ON products
+FOR EACH ROW
+EXECUTE FUNCTION write_audit_log();
+
+UPDATE products SET price = 79.90 WHERE name = 'Rice Cooker';
+DELETE FROM products WHERE name = 'Oolong';
+
+SELECT id, op, row_id,
+  old_data ->> 'price' AS old_price,
+  new_data ->> 'price' AS new_price,
+  changed_by
+FROM audit_log
+ORDER BY id;
+```
+
+</CodeExample>
+
+При `DELETE` строки `NEW` нет, поэтому функция использует `coalesce(NEW.id, OLD.id)`, а при `INSERT` нет `OLD`. Удалённую строку Oolong по-прежнему можно полностью восстановить из `old_data`.
+
+<Callout type="tip" title="Кто внёс изменение?">
+
+`current_user` — это пользователь **базы данных**, а многие приложения подключаются под одним общим пользователем для всех. Чтобы записать реального человека, пусть приложение в начале каждой транзакции устанавливает значение, например `SELECT set_config('app.user_id', '42', true)`, а триггер читает его через `current_setting('app.user_id', true)`. `true` означает, что настройка действует только в текущей транзакции.
+
+</Callout>
+
+<Quiz
+  question="Функция триггера BEFORE UPDATE FOR EACH ROW заканчивается RETURN NULL вместо RETURN NEW. Что произойдёт, когда кто-то обновит строку?"
+  options={[
+    "Строка обновится как обычно",
+    "Обновление этой строки будет молча пропущено",
+    "Всем столбцам строки будет присвоено NULL",
+    "PostgreSQL выбросит ошибку",
+  ]}
+  answer={1}
+  explanation="Для строчных триггеров BEFORE записывается именно та строка, которую вернула функция. Возврат NULL говорит PostgreSQL пропустить операцию для этой строки без всякой ошибки, так что UPDATE сообщит о меньшем числе строк, чем ожидалось. В триггерах AFTER возвращаемое значение игнорируется."
+/>
+
+## Триггеры для проверки данных
+
+Ограничения (constraints) — `CHECK`, `UNIQUE`, внешние ключи — должны быть вашим первым выбором для правил: они декларативные, быстрые, и их невозможно обойти. Но ограничение `CHECK` видит только **одну строку в её будущем виде**. Правилу, которое сравнивает **старое** и **новое** значения или заглядывает в **другие таблицы**, нужен триггер. Например, «цена не может вырасти больше чем на 50% за один раз» — чтобы ловить опечатки вроде 8990 вместо 89.90:
+
+<CodeExample output={`CREATE FUNCTION
+
+CREATE TRIGGER
+
+UPDATE 1
+
+ERROR:  price of Rice Cooker can't jump from 99.90 to 8990.00`}>
+
+```sql
+CREATE FUNCTION check_price_change()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.price > OLD.price * 1.5 THEN
+    RAISE EXCEPTION 'price of % can''t jump from % to %',
+      NEW.name, OLD.price, NEW.price;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER products_check_price
+BEFORE UPDATE OF price ON products
+FOR EACH ROW
+WHEN (NEW.price IS DISTINCT FROM OLD.price)
+EXECUTE FUNCTION check_price_change();
+
+UPDATE products SET price = 99.90 WHERE name = 'Rice Cooker';
+UPDATE products SET price = 8990 WHERE name = 'Rice Cooker';
+```
+
+</CodeExample>
+
+Скромное повышение с 89.90 до 99.90 проходит, а опечатка отклоняется с понятным сообщением. И поскольку это ошибка, откатывается **вся инструкция**: если бы это был `UPDATE` для 500 товаров, не изменился бы ни один.
+
+## Триггеры уровня инструкции
+
+Триггер `FOR EACH STATEMENT` срабатывает один раз на инструкцию, даже если она изменила тысячу строк (или ни одной). С **переходными таблицами (transition tables)** он всё равно видит сразу все изменённые строки в виде таблицы, а для массовой работы это гораздо эффективнее строчного триггера:
+
+<CodeExample output={`CREATE FUNCTION
+
+CREATE TRIGGER
+
+NOTICE:  3 items added, 7 units in total
+INSERT 0 3`}>
+
+```sql
+CREATE FUNCTION report_new_items()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_items integer;
+  v_units integer;
+BEGIN
+  SELECT count(*), sum(quantity) INTO v_items, v_units
+  FROM added_items;
+  RAISE NOTICE '% items added, % units in total', v_items, v_units;
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER order_items_report
+AFTER INSERT ON order_items
+REFERENCING NEW TABLE AS added_items
+FOR EACH STATEMENT
+EXECUTE FUNCTION report_new_items();
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (1, 1, 2, 6.50), (1, 2, 1, 14.00), (1, 3, 4, 5.25);
+```
+
+</CodeExample>
+
+`REFERENCING NEW TABLE AS added_items` делает вставленные строки доступными внутри функции как таблицу `added_items` (для обновлений и удалений есть `OLD TABLE`).
+
+## Когда триггер не нужен
+
+Триггеры — мощный инструмент, и в этом-то и проблема. Опытные команды используют их экономно:
+
+- **Они невидимы.** Тот, кто читает в приложении `UPDATE products SET price = …`, понятия не имеет, что эта инструкция ещё и пишет строку аудита, проверяет правило и, возможно, обновляет три другие таблицы. Давайте триггерам понятные имена, делайте их короткими и документируйте.
+- **Они срабатывают на каждую строку.** Строчный триггер на таблице, в которую вы массово загружаете 10 миллионов строк, выполнится 10 миллионов раз. Используйте триггеры уровня инструкции с переходными таблицами или отключайте триггеры на время контролируемой массовой загрузки (`ALTER TABLE … DISABLE TRIGGER …`, а потом снова `ENABLE`).
+- **Они выстраиваются в цепочки.** Триггер, обновляющий другую таблицу, может запустить триггеры той таблицы, а те — следующие. Отлаживать каскад триггеров — мучение, а триггер, который обновляет собственную таблицу, может зациклиться.
+- **Порядок — алфавитный.** Несколько триггеров на одно и то же событие одной таблицы срабатывают в **порядке имён**, а об этом легко забыть.
+- **Не всё их запускает.** Например, `TRUNCATE` не запускает триггеры `DELETE`.
+
+Сначала используйте **ограничения**, **триггеры** — для правил и учёта, которые действительно должны выполняться при каждом изменении, а **код приложения** — для бизнес-процессов (отправка писем, вызовы других сервисов). И никогда не делайте внутри триггера медленных вещей вроде сетевых запросов: транзакция пользователя будет их ждать.
+
+<Quiz
+  question="Какое правило лучше подходит для ограничения CHECK, чем для триггера?"
+  options={[
+    "Цена товара должна быть больше 0",
+    "Каждое изменение зарплаты должно записываться в таблицу аудита",
+    "Цена не может вырасти больше чем на 50% за одно обновление",
+    "Остаток должен уменьшаться при каждой вставке позиции заказа",
+  ]}
+  answer={0}
+  explanation="price > 0 смотрит только на саму новую строку — ровно это и делают ограничения CHECK, декларативно и эффективно. Остальным правилам нужны старое значение, другая таблица или побочный эффект, а это территория триггеров."
+/>
+
+<Exercise
+  language="sql"
+  title="Синхронизируйте остатки"
+  starter={`-- Синхронизируем products.stock с order_items
+CREATE FUNCTION sync_stock()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  -- Ваш код здесь
+  RETURN NEW;
+END;
+$$;
+
+-- Создайте триггер(ы) здесь
+
+
+-- Проверьте: добавьте 2 воздушных змея (товар 12) в заказ 3,
+-- затем покажите название и остаток змея
+`}
+  tests={[
+    { name: "На order_items есть триггеры для INSERT и DELETE", check: "(await query(\"SELECT string_agg(DISTINCT event_manipulation, ',' ORDER BY event_manipulation) AS e FROM information_schema.triggers WHERE event_object_table = 'order_items'\"))[0].e === 'DELETE,INSERT'" },
+    { name: "Вставка позиции уменьшает остаток товара", check: "await (async () => { await query('INSERT INTO order_items VALUES (3, 1, 5, 6.50)'); return (await query('SELECT stock FROM products WHERE id = 1'))[0].stock === 35; })()" },
+    { name: "Вставка нескольких позиций сразу уменьшает каждый остаток", check: "await (async () => { await query('INSERT INTO order_items VALUES (3, 1, 2, 6.50), (3, 2, 3, 14.00)'); const r = await query('SELECT stock FROM products WHERE id IN (1, 2) ORDER BY id'); return r[0].stock === 38 && r[1].stock === 9; })()" },
+    { name: "Заказ больше остатка завершается ошибкой 'not enough stock'", check: "await query('INSERT INTO order_items VALUES (3, 3, 1, 5.25)').then(() => false, e => /not enough stock/.test(e.message))" },
+    { name: "Продать самые последние штуки можно (остаток становится 0)", check: "await (async () => { await query('INSERT INTO order_items VALUES (3, 8, 3, 29.00)'); return (await query('SELECT stock FROM products WHERE id = 8'))[0].stock === 0; })()" },
+    { name: "Удаление позиции возвращает остаток", check: "await (async () => { const q = (await query('SELECT quantity FROM order_items WHERE order_id = 1 AND product_id = 8'))[0].quantity; await query('DELETE FROM order_items WHERE order_id = 1 AND product_id = 8'); return (await query('SELECT stock FROM products WHERE id = 8'))[0].stock === 3 + q; })()" },
+    { name: "Последний запрос показывает змея: name, stock 12", check: "columns.join() === 'name,stock' && rows.length === 1 && rows[0].name === 'Kite' && rows[0].stock === 12" },
+  ]}
+>
+
+Сейчас продажа товара никак не меняет его `stock`. Напишите для `order_items` триггерную функцию **`sync_stock()`**, которая:
+
+1. при **`INSERT`**: отклоняет позицию с ошибкой, содержащей `not enough stock`, если `stock` товара меньше `quantity` позиции; иначе уменьшает `stock` товара на `quantity`;
+2. при **`DELETE`**: возвращает `quantity` позиции обратно в `stock` товара.
+
+Создайте триггер (или триггеры) на `order_items` и проверьте его: вставьте **2 воздушных змея** (Kite, `product_id` 12, `unit_price` 15.00) в **заказ 3** и завершите запросом, который показывает `name` и `stock` змея.
+
+<Hint>
+
+- Используйте в одной функции `IF TG_OP = 'INSERT' THEN … ELSIF TG_OP = 'DELETE' THEN … END IF;`. При удалении строка находится в `OLD` (`NEW` нет), и функция должна выполнить `RETURN OLD`.
+- Для проверки сначала прочитайте остаток: `SELECT stock INTO v_stock FROM products WHERE id = NEW.product_id FOR UPDATE;` (`FOR UPDATE` блокирует строку товара, чтобы два заказа не могли одновременно забрать последнюю штуку). Затем `IF v_stock < NEW.quantity THEN RAISE EXCEPTION 'not enough stock for product %', NEW.product_id; END IF;`
+- Триггер `BEFORE INSERT OR DELETE ON order_items FOR EACH ROW` охватывает оба события.
+
+</Hint>
+
+<Solution>
+
+```sql
+-- Синхронизируем products.stock с order_items
+CREATE FUNCTION sync_stock()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_stock integer;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    SELECT stock INTO v_stock
+    FROM products
+    WHERE id = NEW.product_id
+    FOR UPDATE;
+
+    IF v_stock < NEW.quantity THEN
+      RAISE EXCEPTION 'not enough stock for product % (% left)',
+        NEW.product_id, v_stock;
+    END IF;
+
+    UPDATE products
+    SET stock = stock - NEW.quantity
+    WHERE id = NEW.product_id;
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    UPDATE products
+    SET stock = stock + OLD.quantity
+    WHERE id = OLD.product_id;
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER order_items_sync_stock
+BEFORE INSERT OR DELETE ON order_items
+FOR EACH ROW
+EXECUTE FUNCTION sync_stock();
+
+-- Проверьте: добавьте 2 воздушных змея (товар 12) в заказ 3,
+-- затем покажите название и остаток змея
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (3, 12, 2, 15.00);
+
+SELECT name, stock
+FROM products
+WHERE id = 12;
+```
+
+</Solution>
+
+</Exercise>
+
+## Итоги
+
+- **Триггер** автоматически запускает **триггерную функцию** (`RETURNS trigger`) при `INSERT`, `UPDATE` или `DELETE` — **`BEFORE`** или **`AFTER`** изменения, **`FOR EACH ROW`** или **`FOR EACH STATEMENT`**.
+- В строчных триггерах **`NEW`** — новая строка, а **`OLD`** — старая; триггер `BEFORE` может изменить `NEW`, а возврат `NULL` пропускает строку. `TG_OP` и `TG_TABLE_NAME` сообщают одной функции, что и где произошло.
+- Классические применения: **нормализация** данных, метки времени **`updated_at`**, **журналы аудита** с `to_jsonb(OLD)`/`to_jsonb(NEW)` и **проверки**, которым нужны старые значения или другие таблицы.
+- `UPDATE OF columns` и `WHEN (…)` ограничивают, когда срабатывает триггер; переходные таблицы дают триггерам уровня инструкции сразу все изменённые строки.
+- Там, где правило можно выразить **ограничением**, предпочитайте его; триггеров должно быть мало, они должны быть короткими, с понятными именами и без медленных побочных эффектов.

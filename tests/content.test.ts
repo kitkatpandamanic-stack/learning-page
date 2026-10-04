@@ -5,6 +5,7 @@
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { PGlite } from "@electric-sql/pglite";
 import { loadPyodide, type PyodideInterface } from "pyodide";
 import { describe, expect, it } from "vitest";
 
@@ -16,6 +17,8 @@ import {
 } from "@/lib/runner/execute";
 import { REACT_HTML } from "@/lib/runner/dom-harness";
 import { executePython } from "@/lib/runner/execute-python";
+import { createSqlSandbox, executeSql } from "@/lib/runner/execute-sql";
+import { SQL_SEED } from "@/lib/runner/sql-seed";
 import { typeErrorResult } from "@/lib/runner/typecheck";
 
 import { runDomInNode } from "./node-dom";
@@ -26,6 +29,7 @@ const PACKAGE_TIMEOUT_MS = 120_000;
 
 // Loaded on first use, so checking only other languages stays light.
 let pyodide: Promise<PyodideInterface> | undefined;
+let sqlSandbox: Promise<() => Promise<PGlite>> | undefined;
 
 /**
  * Runs lesson code the same way the browser does, in the right language.
@@ -35,6 +39,16 @@ async function run(code: string, language: RunLanguage, tests?: TestSpec[]) {
   if (language === "python") {
     pyodide ??= loadPyodide();
     return executePython(await pyodide, code, { tests });
+  }
+  if (language === "sql") {
+    // Like the browser: every run gets a fresh copy of the sample database.
+    sqlSandbox ??= createSqlSandbox((o) => PGlite.create(o), SQL_SEED);
+    const db = await (await sqlSandbox)();
+    try {
+      return await executeSql(db, code, { tests });
+    } finally {
+      await db.close();
+    }
   }
   if (language === "typescript") {
     const diagnostics = checkTypes(code);
@@ -145,7 +159,7 @@ function exercisesIn(file: string): Exercise[] {
     if (typeof attrs.starter !== "string") return [];
     const body = block.slice(0, block.indexOf("</Exercise>"));
     const solution =
-      /<Solution>\s*```(?:js|jsx|ts|tsx|python)[^\n]*\n([\s\S]*?)```/.exec(
+      /<Solution>\s*```(?:js|jsx|ts|tsx|python|sql)[^\n]*\n([\s\S]*?)```/.exec(
         body,
       )?.[1];
     return [
@@ -232,16 +246,19 @@ describe("Code + Output examples", () => {
   const examples = files.flatMap((file) => {
     const source = readFileSync(file, "utf8");
     const pattern =
-      /<CodeExample output=(?:"([^"]*)"|\{`([\s\S]*?)`\})>\s*```(js|ts|python)[^\n]*\n([\s\S]*?)```\s*<\/CodeExample>/g;
+      /<CodeExample output=(?:"([^"]*)"|\{`([\s\S]*?)`\})>\s*```(js|ts|python|sql)[^\n]*\n([\s\S]*?)```\s*<\/CodeExample>/g;
     return [...source.matchAll(pattern)].map((m, i) => ({
       name: `${file.slice(ROOT.length + 1)} #${i + 1}`,
       // Evaluate `…` the way the page does, so escapes like \n match.
       expected: (
         m[1] ?? (new Function(`return \`${m[2]}\`;`)() as string)
       ).trim(),
-      language: ({ js: "javascript", ts: "typescript", python: "python" }[
-        m[3]
-      ] ?? "javascript") as RunLanguage,
+      language: ({
+        js: "javascript",
+        ts: "typescript",
+        python: "python",
+        sql: "sql",
+      }[m[3]] ?? "javascript") as RunLanguage,
       code: m[4],
     }));
   });
