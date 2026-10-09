@@ -1,0 +1,125 @@
+---
+title: Checkout without overselling
+description: Turn a customer's basket into an order in one transaction, and make sure stock can never go below zero.
+difficulty: hard
+topic: changes
+lesson: /learn/sql/upserts-and-transactions
+---
+
+The panda shop is adding baskets 🛒. The starter code creates a `baskets` table holding two baskets: **Nina Novak's** (customer 20) and **Tom Baker's** (customer 19). Nina just pressed "Buy". Do her checkout:
+
+1. First add a guard to `products`: a **`CHECK` constraint named `stock_not_negative`** so that `stock` can **never go below 0**. If a checkout would oversell, the database refuses it and the whole transaction is rolled back.
+2. Then, **between `BEGIN` and `COMMIT`**:
+   - create **one order** for customer 20, `ordered_at` `'2025-07-01 10:00'`, status `'paid'`,
+   - copy every line of her basket into `order_items` at the product's **current price**,
+   - **lower each product's stock** by the quantity she bought,
+   - **empty her basket** (Tom's basket stays).
+3. Finish with a query listing her order's lines: **`product`** (name), **`quantity`**, **`unit_price`** and **`line_total`** (`quantity × unit_price`), sorted by product name.
+
+Don't type the new order's id: get it from the database (a data-modifying CTE with `RETURNING` is the neat way).
+
+```sql
+-- product       | quantity | unit_price | line_total
+-- Matcha Powder |        2 |      14.00 |      28.00
+-- …
+```
+
+<Exercise
+  language="sql"
+  title="Checkout without overselling"
+  starter={`CREATE TABLE baskets (
+  customer_id integer NOT NULL REFERENCES customers (id),
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL CHECK (quantity > 0),
+  PRIMARY KEY (customer_id, product_id)
+);
+
+INSERT INTO baskets (customer_id, product_id, quantity) VALUES
+  (20, 2, 2),   -- Nina: 2 × Matcha Powder
+  (20, 15, 1),  -- Nina: 1 × Rice Cooker
+  (20, 5, 3),   -- Nina: 3 × Panda Cookies
+  (19, 8, 5);   -- Tom: 5 × Algorithms in Pictures (only 3 in stock!)
+
+-- 1. The stock_not_negative guard on products.
+-- 2. BEGIN; order, order lines, stock, empty basket; COMMIT;
+-- 3. product, quantity, unit_price, line_total of Nina's order
+SELECT b.product_id, b.quantity, p.name, p.price, p.stock
+FROM baskets AS b
+JOIN products AS p ON p.id = b.product_id
+WHERE b.customer_id = 20;
+`}
+  tests={[
+    { name: "Lists Nina's 3 lines: product, quantity, unit_price, line_total", check: "columns.join() === 'product,quantity,unit_price,line_total' && rows.map(r => [r.product, r.quantity, r.unit_price, r.line_total].join('/')).join() === 'Matcha Powder/2/14/28,Panda Cookies/3/3.75/11.25,Rice Cooker/1/89.9/89.9'" },
+    { name: "Nina has one paid order on 2025-07-01 10:00, at the shop's prices", check: "(await query(\"SELECT o.status, o.ordered_at, count(oi.product_id) AS lines, sum(oi.quantity * oi.unit_price) AS total FROM orders AS o LEFT JOIN order_items AS oi ON oi.order_id = o.id WHERE o.customer_id = 20 GROUP BY o.id\")).map(r => [r.status, r.ordered_at, r.lines, r.total].join('/')).join() === 'paid/2025-07-01 10:00:00/3/129.15' && (await query(\"SELECT count(*) AS n FROM orders\"))[0].n === 41" },
+    { name: "Stock went down and Nina's basket is empty; Tom's is still there", check: "(await query(\"SELECT string_agg(name || ':' || stock, ',' ORDER BY name) AS s FROM products WHERE id IN (2, 5, 15)\"))[0].s === 'Matcha Powder:10,Panda Cookies:82,Rice Cooker:3' && (await query(\"SELECT sum(stock) AS s FROM products WHERE id NOT IN (2, 5, 15)\"))[0].s === 484 && (await query(\"SELECT string_agg(customer_id::text, ',') AS c FROM baskets\"))[0].c === '19'" },
+    { name: "stock_not_negative refuses Tom's checkout (only 3 in stock)", check: "(await query(\"SELECT count(*) AS n FROM pg_constraint WHERE conname = 'stock_not_negative' AND contype = 'c' AND conrelid = 'products'::regclass\"))[0].n === 1 && await query(\"UPDATE products AS p SET stock = p.stock - b.quantity FROM baskets AS b WHERE b.product_id = p.id AND b.customer_id = 19\").then(() => false, e => /stock_not_negative/.test(e.message))" },
+    { name: "The checkout runs between BEGIN and COMMIT", check: "(i => i >= 0 && results.slice(i).some(r => r.command.startsWith('INSERT')) && results.findIndex(r => r.command === 'COMMIT') > results.findLastIndex(r => r.command.startsWith('UPDATE')))(results.findIndex(r => r.command === 'BEGIN'))" },
+    { name: "line_total is worked out from the order lines", check: "(r => r.map(x => x.product + ':' + x.line_total).join() === 'Matcha Powder:28,Panda Cookies:15,Rice Cooker:89.9')(await rerun(\"UPDATE order_items SET quantity = 4 WHERE product_id = 5 AND order_id = (SELECT id FROM orders WHERE customer_id = 20)\"))" },
+  ]}
+>
+
+Add the guard, check out Nina's basket in one transaction, and list her order's lines.
+
+<Hint>
+
+The guard is `ALTER TABLE products ADD CONSTRAINT stock_not_negative CHECK (stock >= 0)`. For the order lines, `WITH new_order AS (INSERT INTO orders … RETURNING id) INSERT INTO order_items … SELECT new_order.id, b.product_id, b.quantity, p.price FROM new_order CROSS JOIN baskets AS b JOIN products AS p …` creates the order and its lines in one statement. Lower the stock with `UPDATE products AS p … FROM baskets AS b WHERE …`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE baskets (
+  customer_id integer NOT NULL REFERENCES customers (id),
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL CHECK (quantity > 0),
+  PRIMARY KEY (customer_id, product_id)
+);
+
+INSERT INTO baskets (customer_id, product_id, quantity) VALUES
+  (20, 2, 2),
+  (20, 15, 1),
+  (20, 5, 3),
+  (19, 8, 5);
+
+ALTER TABLE products
+  ADD CONSTRAINT stock_not_negative CHECK (stock >= 0);
+
+BEGIN;
+
+WITH new_order AS (
+  INSERT INTO orders (customer_id, ordered_at, status)
+  VALUES (20, '2025-07-01 10:00', 'paid')
+  RETURNING id
+)
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+SELECT new_order.id, b.product_id, b.quantity, p.price
+FROM new_order
+CROSS JOIN baskets AS b
+JOIN products AS p ON p.id = b.product_id
+WHERE b.customer_id = 20;
+
+UPDATE products AS p
+SET stock = p.stock - b.quantity
+FROM baskets AS b
+WHERE b.product_id = p.id
+  AND b.customer_id = 20;
+
+DELETE FROM baskets WHERE customer_id = 20;
+
+COMMIT;
+
+SELECT p.name AS product, oi.quantity, oi.unit_price,
+  oi.quantity * oi.unit_price AS line_total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+JOIN products AS p ON p.id = oi.product_id
+WHERE o.customer_id = 20
+ORDER BY product;
+```
+
+The guard lives in the table, not in your checkout code, so it protects every future statement too. Had Tom checked out instead, the `UPDATE` would fail on `stock_not_negative`, the transaction would be aborted, and his order and order lines would vanish with the `ROLLBACK`.
+
+</Solution>
+
+</Exercise>

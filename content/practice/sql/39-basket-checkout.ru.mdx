@@ -1,0 +1,125 @@
+---
+title: Оформление заказа без продажи сверх остатка
+description: Превратите корзину покупателя в заказ одной транзакцией и сделайте так, чтобы запас никогда не опускался ниже нуля.
+difficulty: hard
+topic: changes
+lesson: /learn/sql/upserts-and-transactions
+---
+
+В магазине панды появляются корзины 🛒. Заготовка создаёт таблицу `baskets` с двумя корзинами: корзиной **Nina Novak** (покупатель 20) и корзиной **Tom Baker** (покупатель 19). Nina только что нажала «Купить». Оформите её заказ:
+
+1. Сначала добавьте в `products` защиту: **ограничение `CHECK` с именем `stock_not_negative`**, чтобы `stock` **никогда не опускался ниже 0**. Если при оформлении заказа продаётся больше, чем есть на складе, база данных отклонит изменение, и вся транзакция откатится.
+2. Затем **между `BEGIN` и `COMMIT`**:
+   - создайте **один заказ** для покупателя 20 с `ordered_at` `'2025-07-01 10:00'` и статусом `'paid'`,
+   - скопируйте каждую позицию её корзины в `order_items` по **текущей цене** товара,
+   - **уменьшите запас каждого товара** на купленное количество,
+   - **очистите её корзину** (корзина Tom остаётся).
+3. Завершите решение запросом, который выводит позиции её заказа: **`product`** (название), **`quantity`**, **`unit_price`** и **`line_total`** (`quantity × unit_price`), отсортированные по названию товара.
+
+Не вписывайте id нового заказа вручную: получите его от базы данных (изящнее всего это сделать через CTE, изменяющее данные (data-modifying CTE), с `RETURNING`).
+
+```sql
+-- product       | quantity | unit_price | line_total
+-- Matcha Powder |        2 |      14.00 |      28.00
+-- …
+```
+
+<Exercise
+  language="sql"
+  title="Оформление заказа без продажи сверх остатка"
+  starter={`CREATE TABLE baskets (
+  customer_id integer NOT NULL REFERENCES customers (id),
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL CHECK (quantity > 0),
+  PRIMARY KEY (customer_id, product_id)
+);
+
+INSERT INTO baskets (customer_id, product_id, quantity) VALUES
+  (20, 2, 2),   -- Nina: 2 × Matcha Powder
+  (20, 15, 1),  -- Nina: 1 × Rice Cooker
+  (20, 5, 3),   -- Nina: 3 × Panda Cookies
+  (19, 8, 5);   -- Tom: 5 × Algorithms in Pictures (в наличии только 3!)
+
+-- 1. Защита stock_not_negative на products.
+-- 2. BEGIN; заказ, позиции заказа, запас, очистка корзины; COMMIT;
+-- 3. product, quantity, unit_price, line_total заказа Nina
+SELECT b.product_id, b.quantity, p.name, p.price, p.stock
+FROM baskets AS b
+JOIN products AS p ON p.id = b.product_id
+WHERE b.customer_id = 20;
+`}
+  tests={[
+    { name: "Выводит 3 позиции Nina: product, quantity, unit_price, line_total", check: "columns.join() === 'product,quantity,unit_price,line_total' && rows.map(r => [r.product, r.quantity, r.unit_price, r.line_total].join('/')).join() === 'Matcha Powder/2/14/28,Panda Cookies/3/3.75/11.25,Rice Cooker/1/89.9/89.9'" },
+    { name: "У Nina один оплаченный заказ от 2025-07-01 10:00 по ценам магазина", check: "(await query(\"SELECT o.status, o.ordered_at, count(oi.product_id) AS lines, sum(oi.quantity * oi.unit_price) AS total FROM orders AS o LEFT JOIN order_items AS oi ON oi.order_id = o.id WHERE o.customer_id = 20 GROUP BY o.id\")).map(r => [r.status, r.ordered_at, r.lines, r.total].join('/')).join() === 'paid/2025-07-01 10:00:00/3/129.15' && (await query(\"SELECT count(*) AS n FROM orders\"))[0].n === 41" },
+    { name: "Запас уменьшился, корзина Nina пуста, а корзина Tom на месте", check: "(await query(\"SELECT string_agg(name || ':' || stock, ',' ORDER BY name) AS s FROM products WHERE id IN (2, 5, 15)\"))[0].s === 'Matcha Powder:10,Panda Cookies:82,Rice Cooker:3' && (await query(\"SELECT sum(stock) AS s FROM products WHERE id NOT IN (2, 5, 15)\"))[0].s === 484 && (await query(\"SELECT string_agg(customer_id::text, ',') AS c FROM baskets\"))[0].c === '19'" },
+    { name: "stock_not_negative не даёт оформить заказ Tom (в наличии только 3)", check: "(await query(\"SELECT count(*) AS n FROM pg_constraint WHERE conname = 'stock_not_negative' AND contype = 'c' AND conrelid = 'products'::regclass\"))[0].n === 1 && await query(\"UPDATE products AS p SET stock = p.stock - b.quantity FROM baskets AS b WHERE b.product_id = p.id AND b.customer_id = 19\").then(() => false, e => /stock_not_negative/.test(e.message))" },
+    { name: "Оформление выполняется между BEGIN и COMMIT", check: "(i => i >= 0 && results.slice(i).some(r => r.command.startsWith('INSERT')) && results.findIndex(r => r.command === 'COMMIT') > results.findLastIndex(r => r.command.startsWith('UPDATE')))(results.findIndex(r => r.command === 'BEGIN'))" },
+    { name: "line_total вычисляется по позициям заказа", check: "(r => r.map(x => x.product + ':' + x.line_total).join() === 'Matcha Powder:28,Panda Cookies:15,Rice Cooker:89.9')(await rerun(\"UPDATE order_items SET quantity = 4 WHERE product_id = 5 AND order_id = (SELECT id FROM orders WHERE customer_id = 20)\"))" },
+  ]}
+>
+
+Добавьте защиту, оформите корзину Nina одной транзакцией и выведите позиции её заказа.
+
+<Hint>
+
+Защита — это `ALTER TABLE products ADD CONSTRAINT stock_not_negative CHECK (stock >= 0)`. Для позиций заказа `WITH new_order AS (INSERT INTO orders … RETURNING id) INSERT INTO order_items … SELECT new_order.id, b.product_id, b.quantity, p.price FROM new_order CROSS JOIN baskets AS b JOIN products AS p …` создаёт заказ и его позиции одной инструкцией. Уменьшите запас с помощью `UPDATE products AS p … FROM baskets AS b WHERE …`.
+
+</Hint>
+
+<Solution>
+
+```sql
+CREATE TABLE baskets (
+  customer_id integer NOT NULL REFERENCES customers (id),
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL CHECK (quantity > 0),
+  PRIMARY KEY (customer_id, product_id)
+);
+
+INSERT INTO baskets (customer_id, product_id, quantity) VALUES
+  (20, 2, 2),
+  (20, 15, 1),
+  (20, 5, 3),
+  (19, 8, 5);
+
+ALTER TABLE products
+  ADD CONSTRAINT stock_not_negative CHECK (stock >= 0);
+
+BEGIN;
+
+WITH new_order AS (
+  INSERT INTO orders (customer_id, ordered_at, status)
+  VALUES (20, '2025-07-01 10:00', 'paid')
+  RETURNING id
+)
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+SELECT new_order.id, b.product_id, b.quantity, p.price
+FROM new_order
+CROSS JOIN baskets AS b
+JOIN products AS p ON p.id = b.product_id
+WHERE b.customer_id = 20;
+
+UPDATE products AS p
+SET stock = p.stock - b.quantity
+FROM baskets AS b
+WHERE b.product_id = p.id
+  AND b.customer_id = 20;
+
+DELETE FROM baskets WHERE customer_id = 20;
+
+COMMIT;
+
+SELECT p.name AS product, oi.quantity, oi.unit_price,
+  oi.quantity * oi.unit_price AS line_total
+FROM orders AS o
+JOIN order_items AS oi ON oi.order_id = o.id
+JOIN products AS p ON p.id = oi.product_id
+WHERE o.customer_id = 20
+ORDER BY product;
+```
+
+Защита живёт в таблице, а не в вашем коде оформления заказа, поэтому она охраняет и все будущие инструкции. Если бы заказ оформлял Tom, `UPDATE` упал бы на `stock_not_negative`, транзакция была бы прервана, а его заказ и позиции заказа исчезли бы при `ROLLBACK`.
+
+</Solution>
+
+</Exercise>

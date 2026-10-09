@@ -29,5 +29,13 @@ export const practiceTopics = [
   "recursion",
   "algorithms",
   "text",
+  // SQL
+  "filtering",
+  "joins",
+  "grouping",
+  "subqueries",
+  "windows",
+  "changes",
+  "schema",
 ] as const;
 export type PracticeTopic = (typeof practiceTopics)[number];
