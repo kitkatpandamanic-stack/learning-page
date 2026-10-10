@@ -78,7 +78,7 @@ function variants(token: string) {
   return out;
 }
 
-type Prepared = {
+export type Prepared = {
   entry: SearchEntry;
   title: string;
   titleWords: string[];
