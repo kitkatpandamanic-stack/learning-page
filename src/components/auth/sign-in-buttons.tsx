@@ -1,13 +1,12 @@
 "use client";
 
 import * as React from "react";
-import { useLocale, useTranslations } from "next-intl";
+import { useTranslations } from "next-intl";
 import { Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import type { SocialProvider } from "@/lib/auth-providers";
 import { signIn } from "@/lib/auth-client";
-import { localizedPath } from "@/lib/i18n";
 
 function GitHubIcon() {
   return (
@@ -48,25 +47,53 @@ const providerInfo: Record<
   google: { name: "Google", icon: <GoogleIcon /> },
 };
 
+const LAST_PROVIDER_KEY = "pandadev:last-sign-in";
+
+const subscribeStorage = (onChange: () => void) => {
+  window.addEventListener("storage", onChange);
+  return () => window.removeEventListener("storage", onChange);
+};
+
+function readLastProvider() {
+  try {
+    return localStorage.getItem(LAST_PROVIDER_KEY);
+  } catch {
+    return null;
+  }
+}
+
 export function SignInButtons({
   providers,
   returnTo,
+  errorURL,
 }: {
   providers: SocialProvider[];
   returnTo: string;
+  /** Where a failed sign-in comes back to (keeps "next"), with ?error= added */
+  errorURL: string;
 }) {
   const t = useTranslations("auth.signIn");
-  const locale = useLocale();
   const [pending, setPending] = React.useState<SocialProvider | null>(null);
   const [error, setError] = React.useState(false);
+  // The provider picked last time in this browser (known only after hydration).
+  const lastUsed = React.useSyncExternalStore(
+    subscribeStorage,
+    readLastProvider,
+    () => null,
+  );
 
   async function handleSignIn(provider: SocialProvider) {
     setPending(provider);
     setError(false);
+    try {
+      localStorage.setItem(LAST_PROVIDER_KEY, provider);
+    } catch {
+      // Private mode: no "Last used" badge next time, that's all.
+    }
     const { error } = await signIn.social({
       provider,
       callbackURL: returnTo,
-      errorCallbackURL: localizedPath("/sign-in", locale),
+      errorCallbackURL: errorURL,
     });
     // On success the browser is redirected to the provider, so we only get here on failure.
     // The auth library's messages are English, so show our own translated one.
@@ -83,7 +110,7 @@ export function SignInButtons({
           key={provider}
           variant="glass"
           size="xl"
-          className="w-full justify-center [&_svg]:size-5"
+          className="relative w-full justify-center [&_svg]:size-5"
           disabled={pending !== null}
           onClick={() => handleSignIn(provider)}
         >
@@ -93,6 +120,11 @@ export function SignInButtons({
             providerInfo[provider].icon
           )}
           {t("continueWith", { provider: providerInfo[provider].name })}
+          {lastUsed === provider && providers.length > 1 && (
+            <span className="absolute -top-2 right-3 rounded-full bg-neon-violet px-2 py-0.5 text-[0.65rem] font-semibold text-white shadow-glow-violet">
+              {t("lastUsed")}
+            </span>
+          )}
         </Button>
       ))}
       {error && (
