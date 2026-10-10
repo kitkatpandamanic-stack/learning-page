@@ -59,3 +59,28 @@ export function getProblemContext(
     total: list.length,
   };
 }
+
+/**
+ * A language's problems in their fixed order (by file number), the list the
+ * problem of the day picks from, in `locale` where translated.
+ */
+export function getDailyCandidates(
+  language: string,
+  locale: Locale = defaultLocale,
+) {
+  return originals
+    .filter((p) => p.language === language)
+    .map((p) => translated(p, locale));
+}
+
+/** What the browser needs to show today's problem in a language. */
+export function dailySet(language: string, locale: Locale = defaultLocale) {
+  return {
+    language,
+    problems: getDailyCandidates(language, locale).map((p) => ({
+      permalink: p.permalink,
+      title: p.title,
+      difficulty: p.difficulty,
+    })),
+  };
+}

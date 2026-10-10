@@ -10,7 +10,8 @@ import { SectionHeading } from "@/components/ui/section-heading";
 import { Link } from "@/i18n/navigation";
 import { getLanguage } from "@/lib/content";
 import { alternates, localeParam } from "@/lib/i18n";
-import { getPracticeLanguages, getProblems } from "@/lib/practice";
+import { DailyProblems } from "@/components/daily/daily-problem";
+import { dailySet, getPracticeLanguages, getProblems } from "@/lib/practice";
 
 export async function generateMetadata({
   params,
@@ -59,6 +60,11 @@ export default async function PracticePage({
         description={t("description")}
       />
       <div className="mx-auto grid w-full max-w-3xl gap-6">
+        <DailyProblems
+          sets={getPracticeLanguages().map((language) =>
+            dailySet(language, locale),
+          )}
+        />
         {sets.map(({ language, total, easy, medium, hard }) => (
           <GlassCard key={language.slug} asChild interactive padding="lg">
             <Link

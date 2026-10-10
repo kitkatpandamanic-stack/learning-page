@@ -1,9 +1,16 @@
 "use server";
 
 import { getAllLessons } from "@/lib/content";
-import { getAllProblems } from "@/lib/practice";
+import { DAILY_BONUS_XP, dailyProblem } from "@/lib/daily";
+import { getAllProblems, getDailyCandidates } from "@/lib/practice";
 import { EXERCISE_XP, QUIZ_XP, type AchievementInfo } from "@/lib/gamification";
-import { awardXp, markLessonComplete, summarizeAward } from "@/lib/progress";
+import {
+  awardXp,
+  getTimeZone,
+  markLessonComplete,
+  summarizeAward,
+  todayIn,
+} from "@/lib/progress";
 import { createRateLimiter } from "@/lib/rate-limit";
 import { getSession } from "@/lib/session";
 
@@ -87,5 +94,20 @@ export async function recordActivity(
     `${permalink}#${kind}-${index}`,
     amount,
   );
-  return summarizeAward(userId, awarded ? amount : 0);
+  // Today's problem of the day also pays a bonus, once a day.
+  let bonus = 0;
+  if (problem) {
+    const today = todayIn(await getTimeZone());
+    const daily = dailyProblem(
+      today,
+      problem.language,
+      getDailyCandidates(problem.language),
+    );
+    if (
+      daily?.permalink === problem.permalink &&
+      (await awardXp(userId, "daily", `daily:${today}`, DAILY_BONUS_XP))
+    )
+      bonus = DAILY_BONUS_XP;
+  }
+  return summarizeAward(userId, (awarded ? amount : 0) + bonus);
 }

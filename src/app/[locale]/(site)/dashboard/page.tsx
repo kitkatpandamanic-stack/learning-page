@@ -10,6 +10,7 @@ import {
   Bookmark,
   BookOpen,
   Brain,
+  CalendarDays,
   Flame,
   History,
   PartyPopper,
@@ -20,6 +21,8 @@ import {
 import { cn } from "cn";
 
 import { ActivityChart } from "@/components/landing/activity-chart";
+import { LanguageMonogram } from "@/components/languages/language-card";
+import { DifficultyBadge } from "@/components/practice/difficulty-badge";
 import { UserAvatar } from "@/components/layout/user-menu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -30,7 +33,19 @@ import { ProgressBar } from "@/components/ui/progress-bar";
 import { StatCard } from "@/components/ui/stat-card";
 import { Link } from "@/i18n/navigation";
 import { alternates, localeParam } from "@/lib/i18n";
-import { getContinue, getReviewSummary, getSavedPages } from "@/lib/learning";
+import { languages } from "@/lib/languages";
+import {
+  addDays,
+  DAILY_BONUS_XP,
+  FREEZE_EVERY,
+  MAX_FREEZES,
+} from "@/lib/daily";
+import {
+  getContinue,
+  getDailySummary,
+  getReviewSummary,
+  getSavedPages,
+} from "@/lib/learning";
 import { getDashboard, getTimeZone, type RecentReason } from "@/lib/progress";
 import { REVIEW_XP } from "@/lib/review-schedule";
 import { requireSession } from "@/lib/session";
@@ -50,6 +65,8 @@ export async function generateMetadata({
 
 type AchievementId = keyof Messages["achievements"];
 
+const languageOf = (slug: string) => languages.find((l) => l.slug === slug);
+
 export default async function DashboardPage({
   params,
 }: PageProps<"/[locale]/dashboard">) {
@@ -57,12 +74,19 @@ export default async function DashboardPage({
   setRequestLocale(locale);
   const { user } = await requireSession("/dashboard");
   const timeZone = await getTimeZone();
-  const [d, place, review, saved] = await Promise.all([
+  const [d, place, review, saved, daily] = await Promise.all([
     getDashboard(user.id, timeZone, locale),
     getContinue(user.id, locale),
     getReviewSummary(user.id, timeZone, locale),
     getSavedPages(user.id, locale),
+    getDailySummary(user.id, timeZone, locale),
   ]);
+  const today = d.week.at(-1)!.date;
+  // A freeze covered yesterday or the day before: tell the learner.
+  const freezeSaved =
+    d.freezes.lastFrozen !== null && d.freezes.lastFrozen >= addDays(today, -2)
+      ? d.freezes.lastFrozen
+      : null;
   const continueWith = place.target;
   const t = await getTranslations("dashboard");
   const tAchievements = await getTranslations("achievements");
@@ -80,6 +104,7 @@ export default async function DashboardPage({
   function recentLabel(reason: RecentReason, title: string | null) {
     if (reason === "other") return t("recent.other");
     if (reason === "review") return t("recent.review");
+    if (reason === "daily") return t("recent.daily");
     return title
       ? t(`recent.${reason}`, { title })
       : t(`recent.${reason}Unknown`);
@@ -146,6 +171,19 @@ export default async function DashboardPage({
         </div>
       </GlassCard>
 
+      {freezeSaved && (
+        <GlassCard padding="sm" glow="cyan" className="text-sm text-white/85">
+          {t("freeze.saved", {
+            date: format.dateTime(new Date(`${freezeSaved}T12:00:00Z`), {
+              weekday: "long",
+              day: "numeric",
+              month: "long",
+              timeZone: "UTC",
+            }),
+          })}
+        </GlassCard>
+      )}
+
       {/* Headline stats */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatCard
@@ -167,7 +205,7 @@ export default async function DashboardPage({
         <StatCard
           label={t("stats.streak")}
           value={`${d.streak.current}${d.streak.current > 0 ? " 🔥" : ""}`}
-          delta={t("stats.bestStreak", { count: d.streak.longest })}
+          delta={`${t("stats.bestStreak", { count: d.streak.longest })} · ${t("freeze.held", { count: d.freezes.available })}`}
           icon={<Flame />}
           tone="pink"
         />
@@ -259,6 +297,75 @@ export default async function DashboardPage({
         </div>
 
         <div className="flex flex-col gap-6">
+          {/* Problem of the day */}
+          {daily.problem && (
+            <GlassCard
+              glow={daily.solvedToday ? "lime" : "amber"}
+              className="flex flex-col gap-3"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="flex items-center gap-2 font-semibold text-white">
+                  <CalendarDays className="size-5 text-amber-300" />{" "}
+                  {t("daily.title")}
+                </h2>
+                <span className="text-xs text-amber-300">
+                  {t("daily.bonus", { xp: DAILY_BONUS_XP })}
+                </span>
+              </div>
+              <Link
+                href={daily.problem.permalink}
+                className="flex items-center gap-3 rounded-xl bg-white/5 p-3 ring-1 ring-white/10 hover:bg-white/8"
+              >
+                {languageOf(daily.problem.language) && (
+                  <LanguageMonogram
+                    language={languageOf(daily.problem.language)!}
+                    className="size-10 shrink-0 text-xs"
+                  />
+                )}
+                <span className="min-w-0">
+                  <span className="block truncate font-semibold text-white">
+                    {daily.problem.title}
+                  </span>
+                  <DifficultyBadge difficulty={daily.problem.difficulty} />
+                </span>
+              </Link>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5 text-sm text-white/70">
+                  <Flame className="size-4 text-pink-300" />
+                  {t("daily.streak", { count: daily.streak })}
+                </span>
+                {daily.solvedToday ? (
+                  <span className="text-sm font-medium text-lime-300">
+                    {t("daily.solved")}
+                  </span>
+                ) : (
+                  <Button asChild variant="gradient" size="sm">
+                    <Link href={daily.problem.permalink}>
+                      {t("daily.solve")} <ArrowRight />
+                    </Link>
+                  </Button>
+                )}
+              </div>
+              {daily.others.length > 0 && (
+                <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-white/50">
+                  {t("daily.others")}:
+                  {daily.others.map((other) => (
+                    <Link
+                      key={other.permalink}
+                      href={other.permalink}
+                      className="text-cyan-300 hover:underline"
+                    >
+                      {languageOf(other.language)?.name ?? other.language}
+                    </Link>
+                  ))}
+                </p>
+              )}
+              <p className="text-xs text-white/40">
+                {t("freeze.hint", { every: FREEZE_EVERY, max: MAX_FREEZES })}
+              </p>
+            </GlassCard>
+          )}
+
           {/* Daily review */}
           <GlassCard
             glow={review.next > 0 ? "cyan" : "none"}

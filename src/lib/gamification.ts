@@ -5,7 +5,7 @@ export const EXERCISE_XP = 10;
 export const QUIZ_XP = 5;
 export const DAILY_GOAL_XP = 50;
 
-export type XpReason = "lesson" | "exercise" | "quiz" | "review";
+export type XpReason = "lesson" | "exercise" | "quiz" | "review" | "daily";
 
 // ---------------------------------------------------------------------------
 // Learner levels: level L needs 50·L·(L−1) XP → 0, 100, 300, 600, 1000, …
