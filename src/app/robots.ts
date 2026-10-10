@@ -2,21 +2,26 @@ import type { MetadataRoute } from "next";
 
 import { siteUrl } from "@/lib/site";
 
+const privatePages = [
+  "/design",
+  "/dashboard",
+  "/profile",
+  "/review",
+  "/saved",
+  "/sign-in",
+  "/welcome",
+];
+
 export default function robots(): MetadataRoute.Robots {
   return {
     rules: {
       userAgent: "*",
       allow: "/",
       disallow: [
-        "/design",
-        "/dashboard",
-        "/profile",
-        "/sign-in",
-        "/ru/design",
-        "/ru/dashboard",
-        "/ru/profile",
-        "/ru/sign-in",
+        // Signed-in pages and tools: nothing for search results there.
+        ...privatePages.flatMap((page) => [page, `/ru${page}`]),
         "/api/",
+        "/search/",
       ],
     },
     sitemap: `${siteUrl}/sitemap.xml`,

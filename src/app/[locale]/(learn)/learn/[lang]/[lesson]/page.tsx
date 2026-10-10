@@ -5,6 +5,7 @@ import { ChevronRight, Clock, Languages, Sparkles } from "lucide-react";
 import { cn } from "cn";
 
 import { BookmarkButton } from "@/components/learning/bookmark-button";
+import { ReportButton } from "@/components/learning/report-button";
 import { VisitTracker } from "@/components/learning/visit-tracker";
 import { LessonNav } from "@/components/lesson/lesson-nav";
 import { LessonSidebar } from "@/components/lesson/lesson-sidebar";
@@ -13,11 +14,18 @@ import { TableOfContents } from "@/components/lesson/table-of-contents";
 import { MDXContent } from "@/components/mdx/mdx-content";
 import { lessonProseClass } from "@/components/mdx/prose";
 import { CompleteLesson } from "@/components/progress/complete-lesson";
+import { JsonLd } from "@/components/seo/json-ld";
 import { Badge } from "@/components/ui/badge";
 import { Link } from "@/i18n/navigation";
 import { getAllLessons, getLanguage, getLessonContext } from "@/lib/content";
 import { loadLessonBody } from "@/lib/lesson-body";
-import { alternates, localeParam, localizedPath } from "@/lib/i18n";
+import { reportsConfigured } from "@/lib/reports";
+import { alternates, localeParam } from "@/lib/i18n";
+import {
+  breadcrumbJsonLd,
+  learningResourceJsonLd,
+  pageOpenGraph,
+} from "@/lib/seo";
 import { toneClasses } from "@/lib/tones";
 
 export const dynamicParams = false;
@@ -40,12 +48,11 @@ export async function generateMetadata({
     title,
     description: ctx.lesson.description,
     alternates: alternates(ctx.lesson.permalink, locale),
-    openGraph: {
+    openGraph: pageOpenGraph(locale, {
       title,
       description: ctx.lesson.description,
-      url: localizedPath(ctx.lesson.permalink, locale),
-      type: "article",
-    },
+      path: ctx.lesson.permalink,
+    }),
   };
 }
 
@@ -87,6 +94,24 @@ export default async function LessonPage({
       </aside>
 
       <article className="mx-auto w-full max-w-3xl min-w-0">
+        <JsonLd
+          data={[
+            learningResourceJsonLd(locale, {
+              name: lesson.title,
+              description: lesson.description,
+              path: lesson.permalink,
+              kind: "lesson",
+              language: language.name,
+              level: levelNames(`${level.level}.name`),
+              minutes: lesson.duration,
+            }),
+            breadcrumbJsonLd(locale, [
+              { name: tr("languages"), path: "/languages" },
+              { name: language.name, path: roadmapHref },
+              { name: lesson.title, path: lesson.permalink },
+            ]),
+          ]}
+        />
         {/* Breadcrumbs */}
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
           <nav
@@ -183,6 +208,7 @@ export default async function LessonPage({
             next={ctx.next}
             roadmapHref={roadmapHref}
           />
+          {reportsConfigured && <ReportButton permalink={lesson.permalink} />}
         </div>
       </article>
 

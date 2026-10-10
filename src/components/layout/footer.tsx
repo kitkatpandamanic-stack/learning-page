@@ -1,5 +1,6 @@
 import type { ComponentProps } from "react";
 import { useTranslations } from "next-intl";
+import { Send } from "lucide-react";
 
 import { Link } from "@/i18n/navigation";
 
@@ -54,14 +55,24 @@ export function Footer() {
               {t("stayInTheLoop")}
             </h2>
             <p className="text-sm text-muted-foreground">{t("followText")}</p>
-            <a
-              href={siteConfig.githubUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex w-fit items-center gap-2 rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/12 transition hover:bg-white/12"
-            >
-              <GitHubIcon className="size-4" /> {t("followOnGitHub")}
-            </a>
+            <div className="flex flex-wrap gap-2">
+              <a
+                href={siteConfig.telegramUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex w-fit items-center gap-2 rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/12 transition hover:bg-white/12"
+              >
+                <Send className="size-4 text-sky-300" /> {t("telegram")}
+              </a>
+              <a
+                href={siteConfig.githubUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex w-fit items-center gap-2 rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/12 transition hover:bg-white/12"
+              >
+                <GitHubIcon className="size-4" /> {t("followOnGitHub")}
+              </a>
+            </div>
           </div>
         </div>
 

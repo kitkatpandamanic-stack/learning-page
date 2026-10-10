@@ -12,17 +12,25 @@ import {
 } from "lucide-react";
 
 import { BookmarkButton } from "@/components/learning/bookmark-button";
+import { ReportButton } from "@/components/learning/report-button";
 import { VisitTracker } from "@/components/learning/visit-tracker";
 import { MDXContent } from "@/components/mdx/mdx-content";
 import { lessonProseClass } from "@/components/mdx/prose";
 import { DifficultyBadge } from "@/components/practice/difficulty-badge";
+import { JsonLd } from "@/components/seo/json-ld";
 import { Badge } from "@/components/ui/badge";
 import { Container } from "@/components/ui/container";
 import { GlassCard } from "@/components/ui/glass-card";
 import { Link } from "@/i18n/navigation";
 import { getLanguage, getLessonContext } from "@/lib/content";
-import { alternates, localeParam, localizedPath } from "@/lib/i18n";
+import { alternates, localeParam } from "@/lib/i18n";
+import {
+  breadcrumbJsonLd,
+  learningResourceJsonLd,
+  pageOpenGraph,
+} from "@/lib/seo";
 import { loadProblemBody } from "@/lib/lesson-body";
+import { reportsConfigured } from "@/lib/reports";
 import { DailyBadge } from "@/components/daily/daily-problem";
 import {
   getAllProblems,
@@ -49,12 +57,11 @@ export async function generateMetadata({
     title,
     description: ctx.problem.description,
     alternates: alternates(ctx.problem.permalink, locale),
-    openGraph: {
+    openGraph: pageOpenGraph(locale, {
       title,
       description: ctx.problem.description,
-      url: localizedPath(ctx.problem.permalink, locale),
-      type: "article",
-    },
+      path: ctx.problem.permalink,
+    }),
   };
 }
 
@@ -79,6 +86,23 @@ export default async function ProblemPage({
 
   return (
     <Container className="max-w-3xl py-8 sm:py-12">
+      <JsonLd
+        data={[
+          learningResourceJsonLd(locale, {
+            name: problem.title,
+            description: problem.description,
+            path: problem.permalink,
+            kind: "problem",
+            language: language.name,
+            level: t(`difficulty.${problem.difficulty}`),
+          }),
+          breadcrumbJsonLd(locale, [
+            { name: t("eyebrow"), path: "/practice" },
+            { name: language.name, path: listHref },
+            { name: problem.title, path: problem.permalink },
+          ]),
+        ]}
+      />
       <nav
         aria-label={t("breadcrumb")}
         className="mb-6 flex flex-wrap items-center gap-1 text-sm text-white/50"
@@ -177,6 +201,11 @@ export default async function ProblemPage({
           <span className="hidden sm:block" />
         )}
       </nav>
+      {reportsConfigured && (
+        <div className="mt-6">
+          <ReportButton permalink={problem.permalink} />
+        </div>
+      )}
     </Container>
   );
 }
