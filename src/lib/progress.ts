@@ -4,7 +4,13 @@ import { cookies } from "next/headers";
 import { and, count, desc, eq, or, sql, sum } from "drizzle-orm";
 
 import { db } from "@/db";
-import { account, lessonProgress, userAchievement, xpEvent } from "@/db/schema";
+import {
+  account,
+  lessonProgress,
+  streakFreeze,
+  userAchievement,
+  xpEvent,
+} from "@/db/schema";
 import { getAllLessons, getCourse } from "@/lib/content";
 import { getPracticeLanguages, getProblems } from "@/lib/practice";
 import { defaultLocale, type Locale } from "@/lib/i18n";
@@ -18,6 +24,7 @@ import {
   type AchievementStats,
   type XpReason,
 } from "@/lib/gamification";
+import { MAX_FREEZES, planFreezes } from "@/lib/daily";
 import { languages } from "@/lib/languages";
 import { getLearnerProfile } from "@/lib/learner-profile";
 import { isValidTimeZone } from "@/lib/time-zone";
@@ -80,6 +87,47 @@ export async function markLessonComplete(
 // Reads
 // ---------------------------------------------------------------------------
 
+/**
+ * Streak freezes, settled whenever the learner's data is loaded: covers days
+ * just missed (if freezes are left) and awards one for every 7 days in a row.
+ */
+async function settleFreezes(userId: string, xpDays: string[], today: string) {
+  const rows = await db
+    .select({ kind: streakFreeze.kind, day: streakFreeze.day })
+    .from(streakFreeze)
+    .where(eq(streakFreeze.userId, userId));
+  const used = rows.filter((r) => r.kind === "used").map((r) => r.day);
+  const earned = rows.length - used.length;
+  let available = Math.max(0, Math.min(MAX_FREEZES, earned - used.length));
+  const plan = planFreezes({
+    active: new Set([...xpDays, ...used]),
+    today,
+    available,
+  });
+  if (plan.fill.length > 0) {
+    await db
+      .insert(streakFreeze)
+      .values(plan.fill.map((day) => ({ userId, kind: "used" as const, day })))
+      .onConflictDoNothing();
+    available -= plan.fill.length;
+  }
+  if (plan.earn) {
+    const inserted = await db
+      .insert(streakFreeze)
+      .values({ userId, kind: "earned", day: today })
+      .onConflictDoNothing()
+      .returning({ day: streakFreeze.day });
+    if (inserted.length) available++;
+  }
+  const frozen = [...used, ...plan.fill];
+  return {
+    frozen,
+    available,
+    /** The latest day a freeze covered (for "a freeze saved your streak") */
+    lastFrozen: frozen.sort().at(-1) ?? null,
+  };
+}
+
 async function loadUserData(userId: string, tz: string) {
   const day = localDay(tz);
   const [completions, byReason, days, unlocked] = await Promise.all([
@@ -123,8 +171,13 @@ async function loadUserData(userId: string, tz: string) {
   );
   const totalXp = byReason.reduce((n, r) => n + Number(r.xp ?? 0), 0);
   const today = todayIn(tz);
-  const streak = computeStreaks(
+  const freezes = await settleFreezes(
+    userId,
     days.map((d) => d.day),
+    today,
+  );
+  const streak = computeStreaks(
+    [...days.map((d) => d.day), ...freezes.frozen],
     today,
   );
   const xpByDay = new Map(days.map((d) => [d.day, Number(d.xp ?? 0)]));
@@ -157,7 +210,16 @@ async function loadUserData(userId: string, tz: string) {
     levelsCompleted,
   };
 
-  return { completions, done, stats, streak, today, xpByDay, unlocked };
+  return {
+    completions,
+    done,
+    stats,
+    streak,
+    today,
+    xpByDay,
+    unlocked,
+    freezes: { available: freezes.available, lastFrozen: freezes.lastFrozen },
+  };
 }
 
 /** Unlocks any achievements the learner now qualifies for; returns the new ones. */
@@ -257,7 +319,8 @@ function lessonTitles(locale: Locale) {
   return titles;
 }
 
-export type RecentReason = "lesson" | "exercise" | "quiz" | "review" | "other";
+export type RecentReason =
+  "lesson" | "exercise" | "quiz" | "review" | "daily" | "other";
 
 /** What an XP event was for; the dashboard turns this into a sentence. */
 function describeEvent(
@@ -267,7 +330,7 @@ function describeEvent(
 ) {
   const [permalink] = (ref ?? "").split("#");
   return {
-    reason: (["lesson", "exercise", "quiz", "review"].includes(reason)
+    reason: (["lesson", "exercise", "quiz", "review", "daily"].includes(reason)
       ? reason
       : "other") as RecentReason,
     /** null when the lesson no longer exists */
@@ -338,6 +401,7 @@ export async function getDashboard(
     streak,
     todayXp: xpByDay.get(today) ?? 0,
     dailyGoal: profile?.dailyGoal ?? DAILY_GOAL_XP,
+    freezes: data.freezes,
     profile,
     week,
     courses: started.length > 0 ? started : courses.slice(0, 1),

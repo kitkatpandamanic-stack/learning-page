@@ -15,7 +15,13 @@ import { defaultLocale, type Locale } from "@/lib/i18n";
 import { getLearnerProfile } from "@/lib/learner-profile";
 import { languages } from "@/lib/languages";
 import type { Difficulty } from "@/lib/practice-meta";
-import { getPracticeLanguages, getProblems } from "@/lib/practice";
+import { dailyProblem } from "@/lib/daily";
+import { computeStreaks } from "@/lib/gamification";
+import {
+  getDailyCandidates,
+  getPracticeLanguages,
+  getProblems,
+} from "@/lib/practice";
 import { awardXp, todayIn } from "@/lib/progress";
 import {
   addDays,
@@ -439,4 +445,52 @@ export async function answerReview(
       ? REVIEW_XP
       : 0;
   return { correct, answer: found.quiz.answer, finished, xpAwarded };
+}
+
+// ---------------------------------------------------------------------------
+// Problem of the day
+// ---------------------------------------------------------------------------
+
+/** Today's problem in every practice language, the learner's own first. */
+export async function getDailySummary(
+  userId: string,
+  tz: string,
+  locale: Locale,
+) {
+  const today = todayIn(tz);
+  const [profile, rows] = await Promise.all([
+    getLearnerProfile(userId),
+    db
+      .select({ ref: xpEvent.ref })
+      .from(xpEvent)
+      .where(and(eq(xpEvent.userId, userId), eq(xpEvent.reason, "daily"))),
+  ]);
+  const problems = getPracticeLanguages().flatMap((language) => {
+    const problem = dailyProblem(
+      today,
+      language,
+      getDailyCandidates(language, locale),
+    );
+    return problem
+      ? [
+          {
+            language,
+            permalink: problem.permalink,
+            title: problem.title,
+            difficulty: problem.difficulty,
+          },
+        ]
+      : [];
+  });
+  const mine =
+    problems.find((p) => p.language === profile?.language) ?? problems[0];
+  const days = rows.flatMap((r) =>
+    r.ref ? [r.ref.slice("daily:".length)] : [],
+  );
+  return {
+    problem: mine ?? null,
+    others: problems.filter((p) => p !== mine),
+    solvedToday: days.includes(today),
+    streak: computeStreaks(days, today).current,
+  };
 }

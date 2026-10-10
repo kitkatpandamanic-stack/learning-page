@@ -7,7 +7,8 @@ import { Container } from "@/components/ui/container";
 import { SectionHeading } from "@/components/ui/section-heading";
 import { getLanguage } from "@/lib/content";
 import { alternates, localeParam, localizedPath } from "@/lib/i18n";
-import { getPracticeLanguages, getProblems } from "@/lib/practice";
+import { DailyProblems } from "@/components/daily/daily-problem";
+import { dailySet, getPracticeLanguages, getProblems } from "@/lib/practice";
 
 export const dynamicParams = false;
 
@@ -56,6 +57,7 @@ export default async function PracticeLanguagePage({
         title={t("languageHeading", { language: language.name })}
         description={t("languageIntro")}
       />
+      <DailyProblems sets={[dailySet(lang, locale)]} />
       <PracticeList
         language={lang}
         items={problems.map((p) => ({

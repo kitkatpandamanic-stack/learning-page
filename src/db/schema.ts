@@ -171,6 +171,24 @@ export const learnerProfile = pgTable("learner_profile", {
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
+/**
+ * Streak freezes: "earned" on the day a learner completed another 7 days in
+ * a row, "used" for each missed day a freeze covered.
+ */
+export const streakFreeze = pgTable(
+  "streak_freeze",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    kind: text("kind", { enum: ["earned", "used"] }).notNull(),
+    /** The learner's local day */
+    day: date("day", { mode: "string" }).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.kind, table.day] })],
+);
+
 export const lessonProgressRelations = relations(lessonProgress, ({ one }) => ({
   user: one(user, { fields: [lessonProgress.userId], references: [user.id] }),
 }));

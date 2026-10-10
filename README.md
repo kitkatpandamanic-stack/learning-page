@@ -184,6 +184,12 @@ a language, a starting level (0–2) and a daily goal (30, 50 or 100 XP), stored
 `learner_profile`. The dashboard uses the goal, "continue" starts them at that level's first
 lesson, and the profile page links back to change them.
 
+Every day has a **problem of the day** per language (`src/lib/daily.ts`: the same for
+everyone, cycling through all problems before repeating); solving it that day pays a 20 XP
+bonus once a day and builds a daily-problem streak. **Streak freezes** are earned for every 7
+days in a row (up to 2, in `streak_freeze`) and cover missed days automatically when the
+learner's data is next loaded.
+
 Search (⌘K / Ctrl+K, `/`, or the navbar button) finds lessons, their sections and practice
 problems by title, headings, description and the words in their `inline code`. The index is
 built at build time, one static file per locale (`/search/en.json`, from

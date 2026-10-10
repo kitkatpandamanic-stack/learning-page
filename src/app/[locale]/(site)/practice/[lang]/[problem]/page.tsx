@@ -23,7 +23,12 @@ import { Link } from "@/i18n/navigation";
 import { getLanguage, getLessonContext } from "@/lib/content";
 import { alternates, localeParam, localizedPath } from "@/lib/i18n";
 import { loadProblemBody } from "@/lib/lesson-body";
-import { getAllProblems, getProblemContext } from "@/lib/practice";
+import { DailyBadge } from "@/components/daily/daily-problem";
+import {
+  getAllProblems,
+  getDailyCandidates,
+  getProblemContext,
+} from "@/lib/practice";
 
 export const dynamicParams = false;
 
@@ -66,6 +71,7 @@ export default async function ProblemPage({
   const tl = await getTranslations("lesson");
   const { problem, prev, next } = ctx;
   const body = await loadProblemBody(problem);
+  const dailyOrder = getDailyCandidates(lang).map((p) => p.permalink);
   const listHref = `/practice/${lang}`;
   const lesson = problem.lesson
     ? getLessonContext(lang, problem.lesson.split("/").at(-1)!, locale)?.lesson
@@ -98,6 +104,11 @@ export default async function ProblemPage({
           <span className="font-mono text-xs text-white/50">
             {t("position", { position: ctx.position, total: ctx.total })}
           </span>
+          <DailyBadge
+            language={lang}
+            position={dailyOrder.indexOf(problem.permalink)}
+            count={dailyOrder.length}
+          />
           <BookmarkButton permalink={problem.permalink} className="ml-auto" />
         </div>
         <h1 className="text-4xl font-extrabold tracking-tight text-white sm:text-5xl">

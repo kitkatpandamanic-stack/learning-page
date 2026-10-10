@@ -51,21 +51,25 @@ const course = {
 vi.mock("@/lib/content", () => ({
   getCourse: (language: string) => (language === "python" ? course : undefined),
 }));
+const sqlProblems = () =>
+  ["a", "b", "c"].map((slug) => ({
+    slug,
+    permalink: `/practice/sql/${slug}`,
+    title: `Problem ${slug}`,
+    description: "",
+    difficulty: "easy",
+  }));
 vi.mock("@/lib/practice", () => ({
   getPracticeLanguages: () => ["sql"],
-  getProblems: () =>
-    ["a", "b", "c"].map((slug) => ({
-      slug,
-      permalink: `/practice/sql/${slug}`,
-      title: `Problem ${slug}`,
-      description: "",
-      difficulty: "easy",
-    })),
+  getProblems: sqlProblems,
+  getDailyCandidates: sqlProblems,
 }));
 
 const learning = await import("@/lib/learning");
 const savedCode = await import("@/lib/saved-code");
 const profiles = await import("@/lib/learner-profile");
+const { evaluateAchievements } = await import("@/lib/progress");
+const daily = await import("@/lib/daily");
 const { awardXp, markLessonComplete, todayIn } = await import("@/lib/progress");
 const { addDays, REVIEW_XP } = await import("@/lib/review-schedule");
 
@@ -353,6 +357,73 @@ describe("welcome steps", () => {
     expect((await learning.getContinue(userId, "en")).target).toMatchObject({
       permalink: "/learn/python/two",
       reason: "resume",
+    });
+  });
+});
+
+describe("streak freezes and the problem of the day", () => {
+  /** XP on a given local day (UTC here), as if earned that day at noon. */
+  const xpOn = (day: string, ref = `/learn/python/${day}`, reason = "lesson") =>
+    testDb.insert(schema.xpEvent).values({
+      userId,
+      reason,
+      ref,
+      amount: 10,
+      createdAt: new Date(`${day}T12:00:00Z`),
+    });
+  const streak = async () =>
+    (await evaluateAchievements(userId, tz)).stats.currentStreak;
+  const freezeRows = () =>
+    testDb.select().from(schema.streakFreeze).orderBy(schema.streakFreeze.day);
+
+  it("a missed day breaks the streak without a freeze", async () => {
+    for (const n of [4, 3, 2]) await xpOn(daily.addDays(today, -n));
+    expect(await streak()).toBe(0);
+    expect(await freezeRows()).toEqual([]);
+  });
+
+  it("a freeze covers yesterday and keeps the streak", async () => {
+    for (const n of [4, 3, 2]) await xpOn(daily.addDays(today, -n));
+    await testDb.insert(schema.streakFreeze).values({
+      userId,
+      kind: "earned",
+      day: daily.addDays(today, -5),
+    });
+    expect(await streak()).toBe(4);
+    const used = (await freezeRows()).filter((r) => r.kind === "used");
+    expect(used.map((r) => r.day)).toEqual([daily.addDays(today, -1)]);
+    // Settling again doesn't use a second freeze.
+    expect(await streak()).toBe(4);
+    expect((await freezeRows()).filter((r) => r.kind === "used")).toHaveLength(
+      1,
+    );
+  });
+
+  it("earns a freeze on the 7th day in a row", async () => {
+    for (let n = 6; n >= 0; n--) await xpOn(daily.addDays(today, -n));
+    expect(await streak()).toBe(7);
+    expect((await freezeRows()).map((r) => [r.kind, r.day])).toEqual([
+      ["earned", today],
+    ]);
+  });
+
+  it("summarises today's problem, whether it's solved and the daily streak", async () => {
+    const first = await learning.getDailySummary(userId, tz, "en");
+    expect(first.problem?.permalink).toMatch(/^\/practice\/sql\/[abc]$/);
+    expect(first.problem?.permalink).toBe(
+      daily.dailyProblem(today, "sql", sqlProblems())?.permalink,
+    );
+    expect(first).toMatchObject({ solvedToday: false, streak: 0 });
+
+    await xpOn(
+      daily.addDays(today, -1),
+      `daily:${daily.addDays(today, -1)}`,
+      "daily",
+    );
+    await xpOn(today, `daily:${today}`, "daily");
+    expect(await learning.getDailySummary(userId, tz, "en")).toMatchObject({
+      solvedToday: true,
+      streak: 2,
     });
   });
 });
