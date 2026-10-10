@@ -70,6 +70,12 @@ export function Navbar() {
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
+  // Signing in from a lesson brings you back to it (home and sign-in itself go to the dashboard).
+  const signInHref =
+    pathname === "/" || pathname.startsWith("/sign-in")
+      ? "/sign-in"
+      : { pathname: "/sign-in", query: { next: pathname } };
+
   const isActive = (href: string) =>
     !href.includes("#") &&
     (pathname === href || pathname.startsWith(`${href}/`));
@@ -147,7 +153,7 @@ export function Navbar() {
                 variant="ghost"
                 className="rounded-full px-4 text-white/80"
               >
-                <Link href="/sign-in">{t("signIn")}</Link>
+                <Link href={signInHref}>{t("signIn")}</Link>
               </Button>
               <Button asChild variant="gradient" size="lg" className="px-5">
                 <Link href="/languages">
@@ -263,7 +269,7 @@ export function Navbar() {
                   <>
                     <SheetClose asChild>
                       <Button asChild variant="glass" size="xl">
-                        <Link href="/sign-in">{t("signIn")}</Link>
+                        <Link href={signInHref}>{t("signIn")}</Link>
                       </Button>
                     </SheetClose>
                     <SheetClose asChild>

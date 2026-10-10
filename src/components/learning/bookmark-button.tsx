@@ -30,7 +30,10 @@ export function BookmarkButton({
         action: {
           label: t("signInAction"),
           onClick: () =>
-            router.push({ pathname: "/sign-in", query: { next: pathname } }),
+            router.push({
+              pathname: "/sign-in",
+              query: { next: pathname, reason: "save" },
+            }),
         },
       });
       return;
