@@ -31,6 +31,7 @@ import { getProblems } from "@/lib/practice";
 import { alternates, localeParam, localizedPath } from "@/lib/i18n";
 import { languages } from "@/lib/languages";
 import { levels } from "@/lib/levels";
+import { pageOpenGraph } from "@/lib/seo";
 import { siteConfig, siteUrl } from "@/lib/site";
 import { toneClasses } from "@/lib/tones";
 
@@ -63,7 +64,12 @@ export async function generateMetadata({
     title,
     description,
     alternates: alternates(path, locale),
-    openGraph: { title, description, url: localizedPath(path, locale) },
+    openGraph: pageOpenGraph(locale, {
+      title,
+      description,
+      path,
+      type: "website",
+    }),
   };
 }
 

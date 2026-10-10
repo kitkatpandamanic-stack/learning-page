@@ -24,6 +24,7 @@ import type search from "../../messages/en/search.json";
 import type saved from "../../messages/en/saved.json";
 import type review from "../../messages/en/review.json";
 import type welcome from "../../messages/en/welcome.json";
+import type report from "../../messages/en/report.json";
 import type notFound from "../../messages/en/notFound.json";
 
 type Messages = {
@@ -50,6 +51,7 @@ type Messages = {
   saved: typeof saved;
   review: typeof review;
   welcome: typeof welcome;
+  report: typeof report;
   notFound: typeof notFound;
 };
 

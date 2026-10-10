@@ -51,6 +51,15 @@ export async function generateMetadata({
       type: "website",
       locale: locale === "ru" ? "ru_RU" : "en_US",
     },
+    // Search Console / Yandex Webmaster / Bing ownership checks. The codes
+    // aren't secret: they're printed in every page's <head>.
+    verification: {
+      google: process.env.NEXT_PUBLIC_GOOGLE_SITE_VERIFICATION || undefined,
+      yandex: process.env.NEXT_PUBLIC_YANDEX_VERIFICATION || undefined,
+      other: process.env.NEXT_PUBLIC_BING_VERIFICATION
+        ? { "msvalidate.01": process.env.NEXT_PUBLIC_BING_VERIFICATION }
+        : undefined,
+    },
   };
 }
 

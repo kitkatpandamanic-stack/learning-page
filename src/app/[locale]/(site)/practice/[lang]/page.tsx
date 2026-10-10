@@ -6,7 +6,8 @@ import { PracticeList } from "@/components/practice/practice-list";
 import { Container } from "@/components/ui/container";
 import { SectionHeading } from "@/components/ui/section-heading";
 import { getLanguage } from "@/lib/content";
-import { alternates, localeParam, localizedPath } from "@/lib/i18n";
+import { alternates, localeParam } from "@/lib/i18n";
+import { pageOpenGraph } from "@/lib/seo";
 import { DailyProblems } from "@/components/daily/daily-problem";
 import { dailySet, getPracticeLanguages, getProblems } from "@/lib/practice";
 
@@ -34,7 +35,12 @@ export async function generateMetadata({
     title,
     description,
     alternates: alternates(path, locale),
-    openGraph: { title, description, url: localizedPath(path, locale) },
+    openGraph: pageOpenGraph(locale, {
+      title,
+      description,
+      path,
+      type: "website",
+    }),
   };
 }
 

@@ -10,6 +10,8 @@ export const siteConfig = {
   githubUrl: "https://github.com/kitkatpandamanic-stack/learning-page",
   /** Where people can reach us: GitHub Issues on the public repo */
   contactUrl: "https://github.com/kitkatpandamanic-stack/learning-page/issues",
+  /** The Telegram channel: daily problem and quiz */
+  telegramUrl: "https://t.me/Kitkatpandamanic",
 };
 
 /**
