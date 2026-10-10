@@ -4,6 +4,9 @@ import type * as React from "react";
 import {
   AppWindow,
   CircleCheckBig,
+  Cloud,
+  CloudAlert,
+  Loader2,
   Play,
   RotateCcw,
   Square,
@@ -15,8 +18,10 @@ import { cn } from "cn";
 import { Button } from "@/components/ui/button";
 import type { RunLanguage } from "@/lib/runner/execute";
 
+import type { CodeRunner } from "./code-runner";
+
 // The code runner's frame: toolbar, preview pane and output panel. The real
-// runner (code-runner.tsx) and its loading placeholder (lazy-code-runner.tsx)
+// runner (code-runner.tsx) and its loading placeholder (EditorPlaceholder below)
 // share them, so the placeholder wraps the same way on every screen width
 // and the page doesn't move when the editor arrives. Kept free of the
 // editor's heavy imports.
@@ -48,6 +53,7 @@ export function RunnerToolbar({
   onRun,
   onStop,
   onCheck,
+  saveStatus,
 }: {
   language: RunLanguage;
   canCheck: boolean;
@@ -56,9 +62,12 @@ export function RunnerToolbar({
   onRun?: () => void;
   onStop?: () => void;
   onCheck?: () => void;
+  /** Signed-in learners: saving the code to their account */
+  saveStatus?: "saving" | "saved" | "error" | null;
 }) {
   const t = useTranslations("runner");
   const inert = !onRun;
+  const saveLabel = saveStatus && t(`save.${saveStatus}`);
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-white/3 px-3 py-2">
       <div className="flex items-center gap-2">
@@ -70,6 +79,25 @@ export function RunnerToolbar({
         <span className="ml-1 font-mono text-xs text-white/50">
           {languageLabel[language]}
         </span>
+        {saveStatus && (
+          <span
+            role="status"
+            title={saveLabel ?? undefined}
+            className={cn(
+              "flex items-center gap-1 text-xs",
+              saveStatus === "error" ? "text-amber-300" : "text-white/40",
+            )}
+          >
+            {saveStatus === "saving" ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : saveStatus === "saved" ? (
+              <Cloud className="size-3.5" />
+            ) : (
+              <CloudAlert className="size-3.5" />
+            )}
+            <span className="sr-only sm:not-sr-only">{saveLabel}</span>
+          </span>
+        )}
       </div>
       <div className="flex items-center gap-1.5">
         <Button
@@ -166,4 +194,41 @@ export function OutputPanel({
  */
 export function EmptyOutput({ children }: { children: React.ReactNode }) {
   return <p className="min-h-[2lh] text-white/55">{children}</p>;
+}
+
+type PlaceholderProps = Pick<
+  React.ComponentProps<typeof CodeRunner>,
+  "starter" | "language" | "minHeight" | "html" | "tests" | "expectedOutput"
+>;
+
+/**
+ * Stands in for the runner while it loads: the same toolbar and output
+ * panel, and a box as tall as the editor will be, so nothing below moves
+ * when the editor replaces it.
+ */
+export function EditorPlaceholder(props: PlaceholderProps) {
+  const { starter, language = "javascript", minHeight, html } = props;
+  const t = useTranslations("runner");
+  return (
+    <div className={runnerFrameClass}>
+      <RunnerToolbar
+        language={language}
+        canCheck={Boolean(
+          props.tests?.length || props.expectedOutput !== undefined,
+        )}
+      />
+      <div
+        className="flex animate-pulse items-center justify-center bg-white/2 text-sm text-white/40"
+        style={{ height: editorHeight(starter, minHeight) }}
+      >
+        {t("loadingEditor")}
+      </div>
+      {(html !== undefined || language === "react" || language === "tsx") && (
+        <RunnerPreview />
+      )}
+      <OutputPanel>
+        <EmptyOutput>{t("pressRun")}</EmptyOutput>
+      </OutputPanel>
+    </div>
+  );
 }

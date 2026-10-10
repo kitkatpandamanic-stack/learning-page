@@ -7,7 +7,9 @@ import { useLocale, useTranslations } from "next-intl";
 import { cn } from "cn";
 
 import { CodeEditor } from "@/components/code/code-editor";
+import { useCodeSync, type SaveStatus } from "@/components/code/use-code-sync";
 import {
+  EditorPlaceholder,
   EmptyOutput,
   languageLabel,
   OutputPanel,
@@ -73,7 +75,44 @@ function writeSaved(key: string | null, value: string | null) {
   }
 }
 
-export function CodeRunner({
+type CodeRunnerProps = {
+  starter: string;
+  language?: RunLanguage;
+  tests?: TestSpec[];
+  /** Exact output the code should print (checked line by line) */
+  expectedOutput?: string;
+  /** Saves the learner's code under this id: in this browser and, signed in, their account */
+  storageId?: string;
+  minHeight?: string;
+  /** Lesson activity to reward with XP when solved */
+  activityId?: string;
+  /** Runs the code against this page and shows it in a live preview */
+  html?: string;
+  /** Preview only: run the code as soon as the editor appears (demos) */
+  autoRun?: boolean;
+};
+
+/**
+ * An editor with Run (and Check): opens with the learner's saved code once
+ * it's known (this browser and, signed in, their account).
+ */
+export function CodeRunner(props: CodeRunnerProps) {
+  const sync = useCodeSync({
+    storageId: props.storageId,
+    starter: props.starter,
+  });
+  if (!sync.ready) return <EditorPlaceholder {...props} />;
+  return (
+    <RunnerBody
+      {...props}
+      initialCode={sync.initialCode}
+      onCodeChange={sync.record}
+      saveStatus={sync.status}
+    />
+  );
+}
+
+function RunnerBody({
   starter,
   language = "javascript",
   tests,
@@ -83,21 +122,14 @@ export function CodeRunner({
   activityId,
   html: page,
   autoRun = false,
-}: {
-  starter: string;
-  language?: RunLanguage;
-  tests?: TestSpec[];
-  /** Exact output the code should print (checked line by line) */
-  expectedOutput?: string;
-  /** Saves the learner's code in this browser under this id */
-  storageId?: string;
-  minHeight?: string;
-  /** Lesson activity to reward with XP when solved */
-  activityId?: string;
-  /** Runs the code against this page and shows it in a live preview */
-  html?: string;
-  /** Preview only: run the code as soon as the editor appears (demos) */
-  autoRun?: boolean;
+  initialCode,
+  onCodeChange,
+  saveStatus,
+}: CodeRunnerProps & {
+  /** Saved code to open with; null for the starter */
+  initialCode: string | null;
+  onCodeChange: (code: string) => void;
+  saveStatus: SaveStatus | null;
 }) {
   // React code always runs in the preview, on an empty page by default.
   const react = language === "react" || language === "tsx";
@@ -114,13 +146,11 @@ export function CodeRunner({
   const t = useTranslations("runner");
   const award = useAward(languageFromPath(pathname));
   const [reward, setReward] = React.useState<string | null>(null);
-  // Each language keeps its own saved code (starters' comments differ).
+  // The preview page's saved data, next to the code saved by useCodeSync.
   const storageKey = storageId
     ? `pandadev:code:${pathname}:${storageId}${locale === "en" ? "" : `:${locale}`}`
     : null;
-  const [code, setCode] = React.useState(
-    () => readSaved(storageKey) ?? starter,
-  );
+  const [code, setCode] = React.useState(initialCode ?? starter);
   const [lines, setLines] = React.useState<OutputLine[]>([]);
   const [result, setResult] = React.useState<RunResult | null>(null);
   const [check, setCheck] = React.useState<Check | null>(null);
@@ -196,7 +226,7 @@ export function CodeRunner({
 
   function updateCode(value: string) {
     setCode(value);
-    writeSaved(storageKey, value === starter ? null : value);
+    onCodeChange(value);
   }
 
   async function run(withChecks: boolean) {
@@ -335,6 +365,7 @@ export function CodeRunner({
         onRun={() => run(false)}
         onStop={() => cancelRef.current?.()}
         onCheck={() => run(true)}
+        saveStatus={saveStatus}
       />
 
       <CodeEditor

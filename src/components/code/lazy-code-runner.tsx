@@ -1,51 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { useTranslations } from "next-intl";
 
 import type { CodeRunner as CodeRunnerType } from "./code-runner";
-import {
-  editorHeight,
-  EmptyOutput,
-  OutputPanel,
-  RunnerPreview,
-  RunnerToolbar,
-  runnerFrameClass,
-} from "./runner-frame";
+import { EditorPlaceholder } from "./runner-frame";
 
 type RunnerProps = React.ComponentProps<typeof CodeRunnerType>;
-
-/**
- * Stands in for the runner while it loads: the same toolbar and output
- * panel, and a box as tall as the editor will be, so nothing below moves
- * when the editor replaces it.
- */
-function EditorPlaceholder(props: RunnerProps) {
-  const { starter, language = "javascript", minHeight, html } = props;
-  const t = useTranslations("runner");
-  return (
-    <div className={runnerFrameClass}>
-      <RunnerToolbar
-        language={language}
-        canCheck={Boolean(
-          props.tests?.length || props.expectedOutput !== undefined,
-        )}
-      />
-      <div
-        className="flex animate-pulse items-center justify-center bg-white/2 text-sm text-white/40"
-        style={{ height: editorHeight(starter, minHeight) }}
-      >
-        {t("loadingEditor")}
-      </div>
-      {(html !== undefined || language === "react" || language === "tsx") && (
-        <RunnerPreview />
-      )}
-      <OutputPanel>
-        <EmptyOutput>{t("pressRun")}</EmptyOutput>
-      </OutputPanel>
-    </div>
-  );
-}
 
 const loadRunner = () => import("./code-runner");
 const CodeRunner = React.lazy(() =>

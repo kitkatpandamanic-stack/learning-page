@@ -63,6 +63,7 @@ vi.mock("@/lib/practice", () => ({
 }));
 
 const learning = await import("@/lib/learning");
+const savedCode = await import("@/lib/saved-code");
 const { awardXp, markLessonComplete, todayIn } = await import("@/lib/progress");
 const { addDays, REVIEW_XP } = await import("@/lib/review-schedule");
 
@@ -245,5 +246,67 @@ describe("daily review", () => {
     expect(
       await learning.answerReview(userId, tz, "/learn/python/one", 0),
     ).toBeNull();
+  });
+});
+
+describe("saved code", () => {
+  const key = savedCode.codeKey("en", "/learn/python/one", "exercise-1")!;
+  const load = () => savedCode.getSavedCode(userId, "en", "/learn/python/one");
+
+  it("only accepts real pages, locales and editors", () => {
+    expect(key).toBe("en:/learn/python/one#exercise-1");
+    expect(savedCode.codeKey("ru", "/playground", "playground-python")).toBe(
+      "ru:/playground#playground-python",
+    );
+    expect(
+      savedCode.codeKey("de", "/learn/python/one", "exercise-1"),
+    ).toBeNull();
+    expect(
+      savedCode.codeKey("en", "/learn/python/nope", "exercise-1"),
+    ).toBeNull();
+    expect(savedCode.codeKey("en", "/learn/python/one", "quiz-1")).toBeNull();
+  });
+
+  it("saves, updates and resets an editor's code for its page only", async () => {
+    expect(await savedCode.putSavedCode(userId, key, "print(1)", 1000)).toBe(
+      true,
+    );
+    await savedCode.putSavedCode(
+      userId,
+      savedCode.codeKey("en", "/learn/python/two", "exercise-1")!,
+      "other page",
+      1000,
+    );
+    expect(await load()).toEqual({
+      "exercise-1": { code: "print(1)", editedAt: 1000 },
+    });
+
+    await savedCode.putSavedCode(userId, key, "print(2)", 2000);
+    expect((await load())["exercise-1"].code).toBe("print(2)");
+
+    // A reset is kept (code null), so other devices learn about it.
+    await savedCode.putSavedCode(userId, key, null, 3000);
+    expect(await load()).toEqual({
+      "exercise-1": { code: null, editedAt: 3000 },
+    });
+  });
+
+  it("ignores an older edit arriving late from an offline device", async () => {
+    await savedCode.putSavedCode(userId, key, "newer", 5000);
+    await savedCode.putSavedCode(userId, key, "older", 4000);
+    expect((await load())["exercise-1"]).toEqual({
+      code: "newer",
+      editedAt: 5000,
+    });
+  });
+
+  it("refuses code that is too long, and clamps edits from the future", async () => {
+    expect(
+      await savedCode.putSavedCode(userId, key, "x".repeat(100_001), 1000),
+    ).toBe(false);
+    await savedCode.putSavedCode(userId, key, "soon", Date.now() + 86_400_000);
+    expect((await load())["exercise-1"].editedAt).toBeLessThanOrEqual(
+      Date.now(),
+    );
   });
 });
