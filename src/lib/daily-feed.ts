@@ -19,6 +19,41 @@ const fitsPoll = (quiz: { question: string; options: string[] }) =>
 const link = (path: string, locale: Locale) =>
   `${siteUrl}${localizedPath(path, locale)}`;
 
+type Quiz = {
+  question: string;
+  options: string[];
+  answer: number;
+  explanation?: string;
+};
+type PollQuiz = { permalink: string; en: Quiz; ru: Quiz };
+let pollQuizzes: PollQuiz[] | undefined;
+
+/** Every lesson quiz that fits in a Telegram poll in both languages. */
+export function getPollQuizzes() {
+  if (pollQuizzes) return pollQuizzes;
+  const en = getCatalog("en");
+  const ru = getCatalog("ru");
+  pollQuizzes = [...en.quizzes].flatMap(([permalink, list]) =>
+    list.flatMap((quiz, i) => {
+      const translated = ru.quizzes.get(permalink)?.[i] ?? quiz;
+      return fitsPoll(quiz) && fitsPoll(translated)
+        ? [{ permalink, en: quiz, ru: translated }]
+        : [];
+    }),
+  );
+  return pollQuizzes;
+}
+
+/** A poll's explanation: whole sentences when they fit, else whole words. */
+export function clipExplanation(text?: string) {
+  if (!text || text.length <= POLL.explanation) return text;
+  const cut = text.slice(0, POLL.explanation);
+  const sentence = cut.lastIndexOf(". ");
+  return sentence > 60
+    ? cut.slice(0, sentence + 1)
+    : `${cut.slice(0, cut.lastIndexOf(" "))}…`;
+}
+
 /**
  * One day's problems and quiz question in English and Russian, for posts
  * outside the site (the Telegram channel). Same picks as the site itself.
@@ -39,27 +74,10 @@ export function getDailyFeed(day: string) {
     ];
   });
 
-  // Every lesson quiz that fits in a Telegram poll in both languages.
   const en = getCatalog("en");
   const ru = getCatalog("ru");
-  const quizzes = [...en.quizzes].flatMap(([permalink, list]) =>
-    list.flatMap((quiz, i) => {
-      const translated = ru.quizzes.get(permalink)?.[i] ?? quiz;
-      return fitsPoll(quiz) && fitsPoll(translated)
-        ? [{ permalink, en: quiz, ru: translated }]
-        : [];
-    }),
-  );
+  const quizzes = getPollQuizzes();
   const pick = quizzes[dailyIndex(day, "quiz", quizzes.length)];
-  const clip = (text?: string) => {
-    if (!text || text.length <= POLL.explanation) return text;
-    // Whole sentences when they fit, otherwise whole words and an ellipsis.
-    const cut = text.slice(0, POLL.explanation);
-    const sentence = cut.lastIndexOf(". ");
-    return sentence > 60
-      ? cut.slice(0, sentence + 1)
-      : `${cut.slice(0, cut.lastIndexOf(" "))}…`;
-  };
   const quiz = pick && {
     lesson: {
       en: {
@@ -71,8 +89,8 @@ export function getDailyFeed(day: string) {
         url: link(pick.permalink, "ru"),
       },
     },
-    en: { ...pick.en, explanation: clip(pick.en.explanation) },
-    ru: { ...pick.ru, explanation: clip(pick.ru.explanation) },
+    en: { ...pick.en, explanation: clipExplanation(pick.en.explanation) },
+    ru: { ...pick.ru, explanation: clipExplanation(pick.ru.explanation) },
   };
 
   return { date: day, problems, quiz: quiz ?? null, quizCount: quizzes.length };

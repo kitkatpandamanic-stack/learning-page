@@ -11,6 +11,7 @@ import {
   SignOutButton,
 } from "@/components/auth/account-actions";
 import { UserAvatar } from "@/components/layout/user-menu";
+import { TelegramCard } from "@/components/profile/telegram-card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Container } from "@/components/ui/container";
@@ -21,6 +22,8 @@ import { alternates, localeParam } from "@/lib/i18n";
 import { getLearnerProfile } from "@/lib/learner-profile";
 import { getLinkedProviders, getTimeZone } from "@/lib/progress";
 import { requireSession } from "@/lib/session";
+import { BOT_USERNAME, telegramConfigured } from "@/lib/telegram/api";
+import { getLinkForUser } from "@/lib/telegram/links";
 
 export async function generateMetadata({
   params,
@@ -45,10 +48,11 @@ export default async function ProfilePage({
   const locale = await localeParam(params);
   setRequestLocale(locale);
   const { user } = await requireSession("/profile");
-  const [providers, timeZone, learner] = await Promise.all([
+  const [providers, timeZone, learner, telegramLink] = await Promise.all([
     getLinkedProviders(user.id),
     getTimeZone(),
     getLearnerProfile(user.id),
+    telegramConfigured ? getLinkForUser(user.id) : null,
   ]);
   const tWelcome = await getTranslations("welcome");
   const tLevels = await getTranslations("levels");
@@ -120,6 +124,10 @@ export default async function ProfilePage({
           ))}
         </div>
       </GlassCard>
+
+      {telegramConfigured && (
+        <TelegramCard link={telegramLink} locale={locale} bot={BOT_USERNAME} />
+      )}
 
       <GlassCard className="flex flex-col gap-4">
         <h2 className="text-lg font-semibold text-white">{t("account")}</h2>

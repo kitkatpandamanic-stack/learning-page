@@ -418,6 +418,22 @@ export async function getDashboard(
 }
 
 export type Dashboard = Awaited<ReturnType<typeof getDashboard>>;
+
+/** Streak, XP and today's goal: what the Telegram bot shows and reminds about. */
+export async function getStreakStatus(userId: string, tz: string) {
+  const [data, profile] = await Promise.all([
+    loadUserData(userId, tz),
+    getLearnerProfile(userId),
+  ]);
+  return {
+    streak: data.streak,
+    totalXp: data.stats.totalXp,
+    level: levelFromXp(data.stats.totalXp).level,
+    todayXp: data.xpByDay.get(data.today) ?? 0,
+    dailyGoal: profile?.dailyGoal ?? DAILY_GOAL_XP,
+    freezes: data.freezes.available,
+  };
+}
 export type { AchievementInfo };
 
 export async function getLinkedProviders(userId: string) {

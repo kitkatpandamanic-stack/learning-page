@@ -1,5 +1,7 @@
 import { relations } from "drizzle-orm";
 import {
+  bigint,
+  boolean,
   date,
   index,
   integer,
@@ -188,6 +190,39 @@ export const streakFreeze = pgTable(
   },
   (table) => [primaryKey({ columns: [table.userId, table.kind, table.day] })],
 );
+
+/**
+ * A learner's Telegram account, linked from the profile page through the bot
+ * (t.me/<bot>?start=<token>). Reminders and the weekly leaderboard are opt-in.
+ */
+export const telegramLink = pgTable("telegram_link", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => user.id, { onDelete: "cascade" }),
+  /** Telegram's user id, which is also the private chat with the bot */
+  telegramId: bigint("telegram_id", { mode: "number" }).notNull().unique(),
+  username: text("username"),
+  /** Site locale the bot writes in, "en" or "ru" */
+  locale: text("locale").notNull(),
+  /** The learner's time zone, for "today" and the evening reminder */
+  timeZone: text("time_zone").notNull(),
+  reminders: boolean("reminders").default(false).notNull(),
+  leaderboard: boolean("leaderboard").default(false).notNull(),
+  /** The learner's local day of the last reminder (one a day at most) */
+  lastReminded: date("last_reminded", { mode: "string" }),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+/** One-time codes behind the "Connect Telegram" button; valid for minutes. */
+export const telegramLinkToken = pgTable("telegram_link_token", {
+  token: text("token").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  locale: text("locale").notNull(),
+  timeZone: text("time_zone").notNull(),
+  expiresAt: timestamp("expires_at").notNull(),
+});
 
 export const lessonProgressRelations = relations(lessonProgress, ({ one }) => ({
   user: one(user, { fields: [lessonProgress.userId], references: [user.id] }),
