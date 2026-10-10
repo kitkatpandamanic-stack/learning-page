@@ -4,6 +4,7 @@
 //   node scripts/telegram/setup-channel.mjs            apply
 //   node scripts/telegram/setup-channel.mjs --preview  print what would change
 //   node scripts/telegram/setup-channel.mjs --welcome  only update the pinned welcome post
+//   node scripts/telegram/setup-channel.mjs --about    only update the description
 import { readFileSync } from "node:fs";
 
 import { CHAT, loadEnv, SITE, telegram } from "./lib.mjs";
@@ -13,10 +14,13 @@ const preview = process.argv.includes("--preview");
 
 export const title = "PandaDev · Learn to code";
 
+export const BOT = "@panda_learning_bot";
+
 export const description = [
-  "Учитесь программировать бесплатно: Python, JavaScript, TypeScript и SQL прямо в браузере. Каждый день — задача и вопрос дня 🐼",
+  "Учитесь программировать бесплатно: Python, JavaScript, TypeScript и SQL в браузере. Каждый день задача и квиз 🐼",
+  `🤖 Бот ${BOT}: задачи, ваша серия, напоминания`,
   "",
-  "Learn to code for free, with a daily problem and quiz.",
+  `Learn to code for free. Bot: ${BOT}`,
   `${SITE.replace(/^https:\/\//, "")}`,
 ].join("\n");
 
@@ -27,6 +31,12 @@ export const welcome = [
   "Каждый день в 11:00 (Ташкент):",
   "🧩 задача дня (+20 XP на сайте)",
   "❓ вопрос дня в виде квиза",
+  "",
+  `🤖 <b>Бот ${BOT}</b>`,
+  "/today: задача дня · /quiz: квиз · /random: случайная задача",
+  "/streak: ваша серия и XP · /next: где вы остановились",
+  "🔔 Вечернее напоминание, если серия под угрозой, и 🏆 рейтинг недели по понедельникам. Подключите Telegram в профиле на сайте.",
+  "",
   `👉 <a href="${SITE}/ru">Начать бесплатно</a>`,
   "",
   "———",
@@ -37,6 +47,12 @@ export const welcome = [
   "Every day at 11:00 (Tashkent time):",
   "🧩 problem of the day (+20 XP on the site)",
   "❓ quiz question of the day",
+  "",
+  `🤖 <b>The ${BOT} bot</b>`,
+  "/today: problem of the day · /quiz: a quiz · /random: a random problem",
+  "/streak: your streak and XP · /next: where you left off",
+  "🔔 An evening reminder when your streak is at risk, and 🏆 a weekly leaderboard on Mondays. Connect Telegram on your profile on the site.",
+  "",
   `👉 <a href="${SITE}">Start for free</a>`,
 ].join("\n");
 
@@ -44,6 +60,12 @@ if (preview) {
   console.log(`title (${title.length}/128):\n${title}\n`);
   console.log(`description (${description.length}/255):\n${description}\n`);
   console.log(`welcome post (pinned):\n${welcome}`);
+  process.exit(0);
+}
+
+if (process.argv.includes("--about")) {
+  await telegram("setChatDescription", { chat_id: CHAT, description });
+  console.log("✓ description");
   process.exit(0);
 }
 
