@@ -21,6 +21,8 @@ import type runner from "../../messages/en/runner.json";
 import type playground from "../../messages/en/playground.json";
 import type practice from "../../messages/en/practice.json";
 import type search from "../../messages/en/search.json";
+import type saved from "../../messages/en/saved.json";
+import type review from "../../messages/en/review.json";
 import type notFound from "../../messages/en/notFound.json";
 
 type Messages = {
@@ -44,6 +46,8 @@ type Messages = {
   playground: typeof playground;
   practice: typeof practice;
   search: typeof search;
+  saved: typeof saved;
+  review: typeof review;
   notFound: typeof notFound;
 };
 

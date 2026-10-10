@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { LogoMark } from "@/components/brand/logo";
+import { ReviewDemo } from "@/components/learning/review-demo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Chip } from "@/components/ui/chip";
@@ -270,6 +271,12 @@ export default function DesignPage() {
               More opaque, for text over busy backgrounds.
             </p>
           </GlassCard>
+        </div>
+      </Section>
+
+      <Section title="Daily review">
+        <div className="max-w-2xl">
+          <ReviewDemo />
         </div>
       </Section>
     </Container>

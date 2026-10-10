@@ -5,6 +5,8 @@ import { useLocale, useTranslations } from "next-intl";
 import { cn } from "cn";
 import {
   ArrowRight,
+  Bookmark,
+  Brain,
   LayoutDashboard,
   LogOut,
   Menu,
@@ -13,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { Logo } from "@/components/brand/logo";
+import { useContinue } from "@/components/learning/use-learning";
 import { LanguageSwitcher } from "@/components/layout/language-switcher";
 import {
   UserAvatar,
@@ -54,6 +57,9 @@ export function Navbar() {
   const prefetchSearch = () => void loadSearchIndex(locale).catch(() => {});
   const { data: session, isPending } = useSession();
   const user = session?.user;
+  const tMenu = useTranslations("auth.menu");
+  const { data: place } = useContinue(Boolean(user));
+  const continueTarget = place?.target;
   const handleSignOut = useSignOut();
   const [scrolled, setScrolled] = React.useState(false);
 
@@ -128,7 +134,7 @@ export function Navbar() {
           ) : user ? (
             <>
               <Button asChild variant="gradient" size="lg" className="px-5">
-                <Link href="/dashboard">
+                <Link href={continueTarget?.permalink ?? "/dashboard"}>
                   {t("continueLearning")} <ArrowRight />
                 </Link>
               </Button>
@@ -217,6 +223,25 @@ export function Navbar() {
                       </SheetClose>
                       <SheetClose asChild>
                         <Button asChild variant="glass" size="xl">
+                          <Link href="/review">
+                            <Brain /> {tMenu("review")}
+                          </Link>
+                        </Button>
+                      </SheetClose>
+                      <SheetClose asChild>
+                        <Button asChild variant="glass" size="xl">
+                          <Link href="/saved">
+                            <Bookmark /> {tMenu("saved")}
+                          </Link>
+                        </Button>
+                      </SheetClose>
+                      <SheetClose asChild>
+                        <Button
+                          asChild
+                          variant="glass"
+                          size="xl"
+                          className="col-span-2"
+                        >
                           <Link href="/profile">
                             <UserRound /> {t("profile")}
                           </Link>

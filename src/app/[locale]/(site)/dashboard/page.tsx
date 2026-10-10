@@ -7,8 +7,11 @@ import {
 } from "next-intl/server";
 import {
   ArrowRight,
+  Bookmark,
   BookOpen,
+  Brain,
   Flame,
+  History,
   PartyPopper,
   Sparkles,
   Target,
@@ -27,7 +30,9 @@ import { ProgressBar } from "@/components/ui/progress-bar";
 import { StatCard } from "@/components/ui/stat-card";
 import { Link } from "@/i18n/navigation";
 import { alternates, localeParam } from "@/lib/i18n";
+import { getContinue, getReviewSummary, getSavedPages } from "@/lib/learning";
 import { getDashboard, getTimeZone, type RecentReason } from "@/lib/progress";
+import { REVIEW_XP } from "@/lib/review-schedule";
 import { requireSession } from "@/lib/session";
 import { toneClasses, TONES } from "@/lib/tones";
 
@@ -52,7 +57,13 @@ export default async function DashboardPage({
   setRequestLocale(locale);
   const { user } = await requireSession("/dashboard");
   const timeZone = await getTimeZone();
-  const d = await getDashboard(user.id, timeZone, locale);
+  const [d, place, review, saved] = await Promise.all([
+    getDashboard(user.id, timeZone, locale),
+    getContinue(user.id, locale),
+    getReviewSummary(user.id, timeZone, locale),
+    getSavedPages(user.id, locale),
+  ]);
+  const continueWith = place.target;
   const t = await getTranslations("dashboard");
   const tAchievements = await getTranslations("achievements");
   const format = await getFormatter();
@@ -67,6 +78,7 @@ export default async function DashboardPage({
 
   function recentLabel(reason: RecentReason, title: string | null) {
     if (reason === "other") return t("recent.other");
+    if (reason === "review") return t("recent.review");
     return title
       ? t(`recent.${reason}`, { title })
       : t(`recent.${reason}Unknown`);
@@ -172,29 +184,55 @@ export default async function DashboardPage({
       <div className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
         <div className="flex flex-col gap-6">
           {/* Continue learning */}
-          {d.continueWith ? (
-            <GlassCard
-              glow="violet"
-              className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between"
-            >
-              <div>
-                <p className="text-sm text-violet-300">
-                  {d.stats.lessonsCompleted
-                    ? t("continue.continueLabel")
-                    : t("continue.startLabel")}
-                </p>
-                <p className="text-xl font-bold text-white">
-                  {d.continueWith.title}
-                </p>
+          {continueWith ? (
+            <GlassCard glow="violet" className="flex flex-col gap-4">
+              <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
+                  <p className="text-sm text-violet-300">
+                    {continueWith.reason === "resume"
+                      ? t("continue.resumeLabel")
+                      : continueWith.reason === "next"
+                        ? t("continue.nextLabel")
+                        : t("continue.startLabel")}
+                  </p>
+                  <p className="text-xl font-bold text-white">
+                    {continueWith.title}
+                  </p>
+                </div>
+                <Button
+                  asChild
+                  variant="gradient"
+                  size="xl"
+                  className="shrink-0"
+                >
+                  <Link href={continueWith.permalink}>
+                    {continueWith.reason === "start"
+                      ? t("continue.start")
+                      : t("continue.continue")}{" "}
+                    <ArrowRight />
+                  </Link>
+                </Button>
               </div>
-              <Button asChild variant="gradient" size="xl" className="shrink-0">
-                <Link href={d.continueWith.href}>
-                  {d.stats.lessonsCompleted
-                    ? t("continue.continue")
-                    : t("continue.start")}{" "}
-                  <ArrowRight />
-                </Link>
-              </Button>
+              {place.recent.length > 1 && (
+                <div className="flex flex-col gap-2 border-t border-white/10 pt-3">
+                  <p className="text-xs font-medium tracking-wide text-white/45 uppercase">
+                    {t("continue.recent")}
+                  </p>
+                  <ul className="flex flex-wrap gap-2">
+                    {place.recent.slice(0, 4).map((page) => (
+                      <li key={page.permalink}>
+                        <Link
+                          href={page.permalink}
+                          className="inline-flex max-w-64 items-center gap-1.5 rounded-full bg-white/6 px-3 py-1 text-sm text-white/75 ring-1 ring-white/10 hover:bg-white/12 hover:text-white"
+                        >
+                          <History className="size-3.5 shrink-0 text-white/40" />
+                          <span className="truncate">{page.title}</span>
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </GlassCard>
           ) : (
             <GlassCard glow="lime" className="flex items-center gap-3">
@@ -220,6 +258,44 @@ export default async function DashboardPage({
         </div>
 
         <div className="flex flex-col gap-6">
+          {/* Daily review */}
+          <GlassCard
+            glow={review.next > 0 ? "cyan" : "none"}
+            className="flex flex-col gap-3"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="flex items-center gap-2 font-semibold text-white">
+                <Brain className="size-5 text-cyan-300" /> {t("review.title")}
+              </h2>
+              <span className="text-xs text-amber-300">
+                {t("review.xp", { xp: REVIEW_XP })}
+              </span>
+            </div>
+            {review.next > 0 ? (
+              <>
+                <p className="text-sm text-white/75">
+                  {t("review.waiting", { count: review.waiting })}
+                </p>
+                <Button asChild variant="gradient" size="lg">
+                  <Link href="/review">
+                    {t("review.start")} <ArrowRight />
+                  </Link>
+                </Button>
+              </>
+            ) : review.deckSize === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {t("review.empty")}
+              </p>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                <span className="font-medium text-lime-300">
+                  {t("review.done")}
+                </span>{" "}
+                {t("review.doneBody")}
+              </p>
+            )}
+          </GlassCard>
+
           {/* Daily goal */}
           <GlassCard className="flex flex-col gap-3">
             <h2 className="flex items-center gap-2 font-semibold text-white">
@@ -237,6 +313,39 @@ export default async function DashboardPage({
                 ? t("goal.reached")
                 : t("goal.remaining", { xp: d.dailyGoal - d.todayXp })}
             </p>
+          </GlassCard>
+
+          {/* Saved for later */}
+          <GlassCard className="flex flex-col gap-3">
+            <h2 className="flex items-center gap-2 font-semibold text-white">
+              <Bookmark className="size-5 text-amber-300" /> {t("saved.title")}
+            </h2>
+            {saved.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {t("saved.empty")}
+              </p>
+            ) : (
+              <>
+                <ul className="flex flex-col gap-1">
+                  {saved.slice(0, 3).map((page) => (
+                    <li key={page.permalink}>
+                      <Link
+                        href={page.permalink}
+                        className="block truncate rounded-lg px-2 py-1.5 text-sm text-white/80 hover:bg-white/6 hover:text-white"
+                      >
+                        {page.title}
+                      </Link>
+                    </li>
+                  ))}
+                </ul>
+                <Link
+                  href="/saved"
+                  className="text-sm text-cyan-300 hover:underline"
+                >
+                  {t("saved.all")}
+                </Link>
+              </>
+            )}
           </GlassCard>
 
           {/* Courses */}

@@ -132,6 +132,64 @@ function countTags(raw: string, tag: string) {
   return raw.match(new RegExp(`^<${tag}\\b`, "gm"))?.length ?? 0;
 }
 
+/** A multiple-choice question from a lesson's <Quiz>, for daily review. */
+type QuizData = {
+  question: string;
+  options: string[];
+  answer: number;
+  explanation?: string;
+};
+
+/**
+ * Reads every <Quiz … /> in document order (the same order as their
+ * "quiz-N" activity ids). Attributes are "strings" or {JavaScript literals}.
+ */
+function extractQuizzes(raw: string): QuizData[] {
+  const quizzes: QuizData[] = [];
+  for (const start of raw.matchAll(/^<Quiz\b/gm)) {
+    const attrs: Record<string, unknown> = {};
+    let i = start.index + "<Quiz".length;
+    while (i < raw.length && !raw.startsWith("/>", i)) {
+      const name = /^\s*([A-Za-z]+)=/.exec(raw.slice(i, i + 40));
+      if (!name) {
+        i++;
+        continue;
+      }
+      i += name[0].length;
+      if (raw[i] === '"') {
+        const end = raw.indexOf('"', i + 1);
+        attrs[name[1]] = raw.slice(i + 1, end);
+        i = end + 1;
+      } else if (raw[i] === "{") {
+        // The matching brace, skipping over strings.
+        let depth = 0;
+        let j = i;
+        let quote = "";
+        for (; j < raw.length; j++) {
+          const ch = raw[j];
+          if (quote) {
+            if (ch === "\\") j++;
+            else if (ch === quote) quote = "";
+          } else if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+          else if (ch === "{") depth++;
+          else if (ch === "}" && --depth === 0) break;
+        }
+        attrs[name[1]] = new Function(`return (${raw.slice(i + 1, j)});`)();
+        i = j + 1;
+      }
+    }
+    quizzes.push({
+      question: String(attrs.question ?? ""),
+      options: Array.isArray(attrs.options) ? attrs.options.map(String) : [],
+      answer: Number(attrs.answer),
+      ...(typeof attrs.explanation === "string"
+        ? { explanation: attrs.explanation }
+        : {}),
+    });
+  }
+  return quizzes;
+}
+
 type TocEntry = { title: string; url: string; items: TocEntry[] };
 
 /**
@@ -288,6 +346,7 @@ const lessons = defineCollection({
         terms: searchTerms(raw),
         exerciseCount: countTags(raw, "Exercise"),
         quizCount: countTags(raw, "Quiz"),
+        quizzes: extractQuizzes(raw),
       };
     }),
 });
@@ -409,6 +468,19 @@ export default defineConfig({
         problems.push(`${where}: no course.yml for "${lesson.language}"`);
         continue;
       }
+      lesson.quizzes.forEach((quiz, i) => {
+        if (
+          !quiz.question ||
+          quiz.options.length < 2 ||
+          !Number.isInteger(quiz.answer) ||
+          quiz.answer < 0 ||
+          quiz.answer >= quiz.options.length
+        ) {
+          problems.push(
+            `${where}: quiz ${i + 1} needs a question, two or more options and an answer that is one of them`,
+          );
+        }
+      });
       if (
         !course.levels.some(
           (l) =>

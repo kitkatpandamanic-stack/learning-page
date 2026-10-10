@@ -1,5 +1,6 @@
 import { relations } from "drizzle-orm";
 import {
+  date,
   index,
   integer,
   pgTable,
@@ -77,6 +78,62 @@ export const userAchievement = pgTable(
     unlockedAt: timestamp("unlocked_at").defaultNow().notNull(),
   },
   (table) => [primaryKey({ columns: [table.userId, table.achievementId] })],
+);
+
+/** Lessons and practice problems a learner saved for later. */
+export const bookmark = pgTable(
+  "bookmark",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    /** e.g. "/learn/python/loops" or "/practice/sql/films-per-genre" */
+    permalink: text("permalink").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.permalink] })],
+);
+
+/** The last time a learner opened each lesson or problem ("continue where you left off"). */
+export const pageVisit = pgTable(
+  "page_visit",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    permalink: text("permalink").notNull(),
+    visitedAt: timestamp("visited_at").defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.permalink] }),
+    index("page_visit_user_visited_idx").on(table.userId, table.visitedAt),
+  ],
+);
+
+/**
+ * Daily review: one row per quiz question a learner has reviewed, with its
+ * spaced-repetition box and the day it comes back.
+ */
+export const reviewCard = pgTable(
+  "review_card",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    /** The quiz, e.g. "/learn/python/loops#quiz-2" */
+    ref: text("ref").notNull(),
+    /** 0 after a wrong answer, up to the last interval after right ones */
+    box: integer("box").notNull().default(0),
+    /** The learner's local day it's due again */
+    dueOn: date("due_on", { mode: "string" }).notNull(),
+    /** The learner's local day it was first reviewed (limits new cards per day) */
+    firstReviewedOn: date("first_reviewed_on", { mode: "string" }).notNull(),
+    reviewedAt: timestamp("reviewed_at").defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.ref] }),
+    index("review_card_user_due_idx").on(table.userId, table.dueOn),
+  ],
 );
 
 export const lessonProgressRelations = relations(lessonProgress, ({ one }) => ({

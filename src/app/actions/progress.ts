@@ -2,18 +2,8 @@
 
 import { getAllLessons } from "@/lib/content";
 import { getAllProblems } from "@/lib/practice";
-import {
-  EXERCISE_XP,
-  levelFromXp,
-  QUIZ_XP,
-  type AchievementInfo,
-} from "@/lib/gamification";
-import {
-  awardXp,
-  evaluateAchievements,
-  getTimeZone,
-  markLessonComplete,
-} from "@/lib/progress";
+import { EXERCISE_XP, QUIZ_XP, type AchievementInfo } from "@/lib/gamification";
+import { awardXp, markLessonComplete, summarizeAward } from "@/lib/progress";
 import { createRateLimiter } from "@/lib/rate-limit";
 import { getSession } from "@/lib/session";
 
@@ -31,23 +21,6 @@ export type AwardResult =
       newAchievements: AchievementInfo[];
     }
   | { ok: false; reason: "signed-out" | "invalid" | "rate-limited" };
-
-async function finish(userId: string, xpAwarded: number): Promise<AwardResult> {
-  const { stats, newAchievements } = await evaluateAchievements(
-    userId,
-    await getTimeZone(),
-  );
-  const level = levelFromXp(stats.totalXp).level;
-  return {
-    ok: true,
-    xpAwarded,
-    totalXp: stats.totalXp,
-    level,
-    leveledUp:
-      xpAwarded > 0 && levelFromXp(stats.totalXp - xpAwarded).level < level,
-    newAchievements,
-  };
-}
 
 /** Marks a lesson complete and awards its XP (once). */
 export async function completeLesson(
@@ -68,7 +41,7 @@ export async function completeLesson(
   const userId = session.user.id;
   const awarded = await awardXp(userId, "lesson", lesson.permalink, lesson.xp);
   await markLessonComplete(userId, language, slug);
-  return finish(userId, awarded ? lesson.xp : 0);
+  return summarizeAward(userId, awarded ? lesson.xp : 0);
 }
 
 /** Rewards a solved exercise or a quiz answered right on the first try (once each). */
@@ -114,5 +87,5 @@ export async function recordActivity(
     `${permalink}#${kind}-${index}`,
     amount,
   );
-  return finish(userId, awarded ? amount : 0);
+  return summarizeAward(userId, awarded ? amount : 0);
 }

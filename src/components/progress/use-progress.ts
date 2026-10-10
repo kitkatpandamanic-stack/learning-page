@@ -30,11 +30,12 @@ export function useProgress(language: string) {
   });
 }
 
-type ProgressT = ReturnType<typeof useTranslations<"progress">>;
-type AchievementsT = ReturnType<typeof useTranslations<"achievements">>;
+export type ProgressT = ReturnType<typeof useTranslations<"progress">>;
+export type AchievementsT = ReturnType<typeof useTranslations<"achievements">>;
 type AchievementId = keyof Messages["achievements"];
 
-function celebrate(
+/** Toasts for XP, a new level and new achievements. */
+export function celebrate(
   result: AwardResult,
   label: string,
   t: ProgressT,
