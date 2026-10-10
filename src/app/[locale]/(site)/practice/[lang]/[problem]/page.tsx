@@ -11,6 +11,8 @@ import {
   Sparkles,
 } from "lucide-react";
 
+import { BookmarkButton } from "@/components/learning/bookmark-button";
+import { VisitTracker } from "@/components/learning/visit-tracker";
 import { MDXContent } from "@/components/mdx/mdx-content";
 import { lessonProseClass } from "@/components/mdx/prose";
 import { DifficultyBadge } from "@/components/practice/difficulty-badge";
@@ -96,6 +98,7 @@ export default async function ProblemPage({
           <span className="font-mono text-xs text-white/50">
             {t("position", { position: ctx.position, total: ctx.total })}
           </span>
+          <BookmarkButton permalink={problem.permalink} className="ml-auto" />
         </div>
         <h1 className="text-4xl font-extrabold tracking-tight text-white sm:text-5xl">
           {problem.title}
@@ -116,6 +119,7 @@ export default async function ProblemPage({
           </Link>
         )}
       </header>
+      <VisitTracker permalink={problem.permalink} title={problem.title} />
 
       <div className={lessonProseClass}>
         <MDXContent code={body} />

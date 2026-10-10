@@ -166,6 +166,14 @@ hard: 10, 20 or 30 XP), `topic` (see `src/lib/practice-meta.ts`) and optionally 
 `lesson`, then the statement and exactly one `<Exercise>`. Translations sit next to them as
 `NN-slug.ru.mdx`, like lessons.
 
+Signed-in learners can **save** lessons and problems for later (the bookmark in the page
+header, listed at `/saved`), **continue where they left off** (lesson and problem pages
+record visits in `page_visit`; the navbar, dashboard and home page link to the last page
+opened, or the one after it once it's finished; signed-out visitors get the same from
+`localStorage`), and do a **daily review** at `/review`: quiz questions from finished lessons
+come back on a spaced-repetition schedule (`src/lib/review-schedule.ts`, cards in
+`review_card`), with XP once a day. Velite extracts each lesson's quizzes for it.
+
 Search (⌘K / Ctrl+K, `/`, or the navbar button) finds lessons, their sections and practice
 problems by title, headings, description and the words in their `inline code`. The index is
 built at build time, one static file per locale (`/search/en.json`, from

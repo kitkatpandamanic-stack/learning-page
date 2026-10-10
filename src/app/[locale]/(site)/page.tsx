@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { getTranslations, setRequestLocale } from "next-intl/server";
 
 import { CtaSection } from "@/components/landing/cta-section";
+import { ContinueBanner } from "@/components/learning/continue-banner";
 import { DashboardPreview } from "@/components/landing/dashboard-preview";
 import { Hero } from "@/components/landing/hero";
 import { LanguagesSection } from "@/components/landing/languages-section";
@@ -33,6 +34,7 @@ export default async function Home({ params }: PageProps<"/[locale]">) {
       <DashboardPreview />
       <AudienceSection />
       <CtaSection />
+      <ContinueBanner />
     </>
   );
 }

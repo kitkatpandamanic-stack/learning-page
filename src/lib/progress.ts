@@ -31,7 +31,7 @@ export async function getTimeZone() {
   return tz && isValidTimeZone(tz) ? tz : "UTC";
 }
 
-function todayIn(tz: string) {
+export function todayIn(tz: string) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date());
 }
 
@@ -180,6 +180,24 @@ export async function evaluateAchievements(userId: string, tz: string) {
   };
 }
 
+/** After XP was (maybe) awarded: the new total, level and fresh achievements, for toasts. */
+export async function summarizeAward(userId: string, xpAwarded: number) {
+  const { stats, newAchievements } = await evaluateAchievements(
+    userId,
+    await getTimeZone(),
+  );
+  const level = levelFromXp(stats.totalXp).level;
+  return {
+    ok: true as const,
+    xpAwarded,
+    totalXp: stats.totalXp,
+    level,
+    leveledUp:
+      xpAwarded > 0 && levelFromXp(stats.totalXp - xpAwarded).level < level,
+    newAchievements,
+  };
+}
+
 /**
  * Completed lessons and rewarded activities (lesson exercises and quizzes,
  * practice problems) for one language (for the browser).
@@ -238,7 +256,7 @@ function lessonTitles(locale: Locale) {
   return titles;
 }
 
-export type RecentReason = "lesson" | "exercise" | "quiz" | "other";
+export type RecentReason = "lesson" | "exercise" | "quiz" | "review" | "other";
 
 /** What an XP event was for; the dashboard turns this into a sentence. */
 function describeEvent(
@@ -248,7 +266,7 @@ function describeEvent(
 ) {
   const [permalink] = (ref ?? "").split("#");
   return {
-    reason: (reason === "lesson" || reason === "exercise" || reason === "quiz"
+    reason: (["lesson", "exercise", "quiz", "review"].includes(reason)
       ? reason
       : "other") as RecentReason,
     /** null when the lesson no longer exists */
@@ -285,7 +303,7 @@ export async function getDashboard(
     return { date: d, xp: xpByDay.get(d) ?? 0 };
   });
 
-  // Per-language progress and the next lesson to continue with.
+  // Per-language progress.
   const courses = languages
     .map((language) => {
       const course = getCourse(language.slug, locale);
@@ -296,22 +314,16 @@ export async function getDashboard(
       const completed = ordered.filter((l) =>
         done.has(`${language.slug}/${l.slug}`),
       ).length;
-      const next = ordered.find((l) => !done.has(`${language.slug}/${l.slug}`));
       return {
         slug: language.slug,
         name: language.name,
         completed,
         total: ordered.length,
-        next: next ? { title: next.title, href: next.permalink } : null,
       };
     })
     .filter((c) => c !== null);
 
   const started = courses.filter((c) => c.completed > 0);
-  const continueWith =
-    started.find((c) => c.next)?.next ??
-    courses.find((c) => c.next)?.next ??
-    null;
 
   const unlockedAt = new Map(data.unlocked.map((u) => [u.id, u.unlockedAt]));
   const titles = lessonTitles(locale);
@@ -324,7 +336,6 @@ export async function getDashboard(
     dailyGoal: DAILY_GOAL_XP,
     week,
     courses: started.length > 0 ? started : courses.slice(0, 1),
-    continueWith,
     achievements: achievements.map((a) => ({
       ...toInfo(a),
       unlockedAt: unlockedAt.get(a.id) ?? null,

@@ -4,6 +4,8 @@ import { getTranslations, setRequestLocale } from "next-intl/server";
 import { ChevronRight, Clock, Languages, Sparkles } from "lucide-react";
 import { cn } from "cn";
 
+import { BookmarkButton } from "@/components/learning/bookmark-button";
+import { VisitTracker } from "@/components/learning/visit-tracker";
 import { LessonNav } from "@/components/lesson/lesson-nav";
 import { LessonSidebar } from "@/components/lesson/lesson-sidebar";
 import { MobileContents } from "@/components/lesson/mobile-contents";
@@ -149,6 +151,7 @@ export default async function LessonPage({
                 total: ctx.total,
               })}
             </span>
+            <BookmarkButton permalink={lesson.permalink} className="ml-auto" />
           </div>
           {lesson.locale !== locale && (
             <p className="flex items-center gap-2 rounded-xl bg-white/6 px-3 py-2 text-sm text-white/70 ring-1 ring-white/10">
@@ -157,6 +160,7 @@ export default async function LessonPage({
             </p>
           )}
         </header>
+        <VisitTracker permalink={lesson.permalink} title={lesson.title} />
 
         <div className={lessonProseClass}>
           <MDXContent code={body} />

@@ -23,5 +23,7 @@ export const namespaces = [
   "playground",
   "practice",
   "search",
+  "saved",
+  "review",
   "notFound",
 ] as const;

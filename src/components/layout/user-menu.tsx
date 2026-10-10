@@ -3,7 +3,13 @@
 import { useTranslations } from "next-intl";
 
 import { Link, useRouter } from "@/i18n/navigation";
-import { LayoutDashboard, LogOut, UserRound } from "lucide-react";
+import {
+  Bookmark,
+  Brain,
+  LayoutDashboard,
+  LogOut,
+  UserRound,
+} from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
@@ -86,6 +92,16 @@ export function UserMenu({ user }: { user: MenuUser }) {
         <DropdownMenuItem asChild className="rounded-lg">
           <Link href="/dashboard">
             <LayoutDashboard /> {t("dashboard")}
+          </Link>
+        </DropdownMenuItem>
+        <DropdownMenuItem asChild className="rounded-lg">
+          <Link href="/review">
+            <Brain /> {t("review")}
+          </Link>
+        </DropdownMenuItem>
+        <DropdownMenuItem asChild className="rounded-lg">
+          <Link href="/saved">
+            <Bookmark /> {t("saved")}
           </Link>
         </DropdownMenuItem>
         <DropdownMenuItem asChild className="rounded-lg">
