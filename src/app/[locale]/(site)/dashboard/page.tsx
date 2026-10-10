@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { cn } from "cn";
 
-import { ActivityChart } from "@/components/landing/activity-chart";
+import { ActivityCalendar } from "@/components/dashboard/activity-calendar";
 import { LanguageMonogram } from "@/components/languages/language-card";
 import { DifficultyBadge } from "@/components/practice/difficulty-badge";
 import { UserAvatar } from "@/components/layout/user-menu";
@@ -110,13 +110,6 @@ export default async function DashboardPage({
       : t(`recent.${reason}Unknown`);
   }
 
-  const week = d.week.map((w) => ({
-    day: format.dateTime(new Date(`${w.date}T12:00:00Z`), {
-      weekday: "short",
-      timeZone: "UTC",
-    }),
-    xp: w.xp,
-  }));
   const firstName = user.name.split(" ")[0] || user.name;
   const unlockedCount = d.achievements.filter((a) => a.unlockedAt).length;
   const goalReached = d.todayXp >= d.dailyGoal;
@@ -280,19 +273,17 @@ export default async function DashboardPage({
             </GlassCard>
           )}
 
-          {/* Weekly activity */}
-          <GlassCard className="flex flex-col gap-3">
+          {/* Activity calendar */}
+          <GlassCard className="flex flex-col gap-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="font-semibold text-white">
                 {t("activity.title")}
               </h2>
               <span className="rounded-md bg-white/6 px-2 py-0.5 text-xs text-white/60">
-                {t("activity.lastWeek")}
+                {t("activity.range")}
               </span>
             </div>
-            <div className="h-56">
-              <ActivityChart data={week} />
-            </div>
+            <ActivityCalendar calendar={d.calendar} today={today} />
           </GlassCard>
         </div>
 

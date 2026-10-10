@@ -25,6 +25,8 @@ import { GradientText } from "@/components/ui/gradient-text";
 import { ProgressBar } from "@/components/ui/progress-bar";
 import { SectionHeading } from "@/components/ui/section-heading";
 import { StatCard } from "@/components/ui/stat-card";
+import { ActivityCalendar } from "@/components/dashboard/activity-calendar";
+import { buildCalendar } from "@/lib/activity";
 
 export const metadata: Metadata = {
   title: "Design system",
@@ -50,6 +52,26 @@ const languages = [
   { name: "C++", className: "bg-lang-cpp" },
   { name: "SQL", className: "bg-lang-sql" },
 ];
+
+/** Made-up but steady activity for the calendar sample: busier lately. */
+function sampleCalendar() {
+  const today = new Date().toISOString().slice(0, 10);
+  const xpByDay = new Map<string, number>();
+  const frozen: string[] = [];
+  for (let i = 0; i < 182; i++) {
+    const day = new Date(Date.now() - i * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+    const roll = (i * 7919 + 13) % 100;
+    if (roll < 15 + i / 4) continue;
+    if (roll % 17 === 0) frozen.push(day);
+    else xpByDay.set(day, [10, 25, 40, 55, 70, 120][roll % 6]);
+  }
+  return {
+    today,
+    calendar: buildCalendar({ xpByDay, frozen, today, goal: 50 }),
+  };
+}
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -228,6 +250,12 @@ export default function DesignPage() {
             tone="lime"
           />
         </div>
+      </Section>
+
+      <Section title="Activity calendar">
+        <GlassCard className="max-w-2xl">
+          <ActivityCalendar {...sampleCalendar()} />
+        </GlassCard>
       </Section>
 
       <Section title="Progress bars">
