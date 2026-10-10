@@ -66,11 +66,14 @@ export function SignInButtons({
   providers,
   returnTo,
   errorURL,
+  newUserURL,
 }: {
   providers: SocialProvider[];
   returnTo: string;
   /** Where a failed sign-in comes back to (keeps "next"), with ?error= added */
   errorURL: string;
+  /** Where a brand-new account goes first (the welcome steps) */
+  newUserURL: string;
 }) {
   const t = useTranslations("auth.signIn");
   const [pending, setPending] = React.useState<SocialProvider | null>(null);
@@ -94,6 +97,7 @@ export function SignInButtons({
       provider,
       callbackURL: returnTo,
       errorCallbackURL: errorURL,
+      newUserCallbackURL: newUserURL,
     });
     // On success the browser is redirected to the provider, so we only get here on failure.
     // The auth library's messages are English, so show our own translated one.

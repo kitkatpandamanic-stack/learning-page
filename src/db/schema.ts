@@ -156,6 +156,21 @@ export const savedCode = pgTable(
   (table) => [primaryKey({ columns: [table.userId, table.key] })],
 );
 
+/** What a learner chose in the welcome steps: language, starting level, daily goal. */
+export const learnerProfile = pgTable("learner_profile", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => user.id, { onDelete: "cascade" }),
+  /** Language slug, e.g. "python" */
+  language: text("language").notNull(),
+  /** Starting level, 0 (new to coding) to 2 */
+  level: integer("level").notNull(),
+  /** Daily XP goal */
+  dailyGoal: integer("daily_goal").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
 export const lessonProgressRelations = relations(lessonProgress, ({ one }) => ({
   user: one(user, { fields: [lessonProgress.userId], references: [user.id] }),
 }));

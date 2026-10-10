@@ -4,7 +4,7 @@ import {
   getTranslations,
   setRequestLocale,
 } from "next-intl/server";
-import { CalendarDays, Link2, Mail } from "lucide-react";
+import { CalendarDays, Link2, Mail, Target } from "lucide-react";
 
 import {
   DeleteAccountButton,
@@ -12,9 +12,13 @@ import {
 } from "@/components/auth/account-actions";
 import { UserAvatar } from "@/components/layout/user-menu";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Container } from "@/components/ui/container";
 import { GlassCard } from "@/components/ui/glass-card";
+import { Link } from "@/i18n/navigation";
+import { getLanguage } from "@/lib/content";
 import { alternates, localeParam } from "@/lib/i18n";
+import { getLearnerProfile } from "@/lib/learner-profile";
 import { getLinkedProviders, getTimeZone } from "@/lib/progress";
 import { requireSession } from "@/lib/session";
 
@@ -41,10 +45,13 @@ export default async function ProfilePage({
   const locale = await localeParam(params);
   setRequestLocale(locale);
   const { user } = await requireSession("/profile");
-  const [providers, timeZone] = await Promise.all([
+  const [providers, timeZone, learner] = await Promise.all([
     getLinkedProviders(user.id),
     getTimeZone(),
+    getLearnerProfile(user.id),
   ]);
+  const tWelcome = await getTranslations("welcome");
+  const tLevels = await getTranslations("levels");
   const t = await getTranslations("profile");
   const format = await getFormatter();
 
@@ -74,6 +81,30 @@ export default async function ProfilePage({
               }),
             })}
           </p>
+        </div>
+      </GlassCard>
+
+      <GlassCard className="flex flex-col gap-4">
+        <h2 className="flex items-center gap-2 text-lg font-semibold text-white">
+          <Target className="size-5 text-pink-300" />{" "}
+          {tWelcome("settings.title")}
+        </h2>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-white/75">
+            {learner
+              ? tWelcome("settings.summary", {
+                  language:
+                    getLanguage(learner.language)?.name ?? learner.language,
+                  level: tLevels(`${learner.level as 0 | 1 | 2}.name`),
+                  xp: learner.dailyGoal,
+                })
+              : tWelcome("settings.none")}
+          </p>
+          <Button asChild variant="glass" size="lg">
+            <Link href="/welcome">
+              {learner ? tWelcome("settings.change") : tWelcome("settings.set")}
+            </Link>
+          </Button>
         </div>
       </GlassCard>
 

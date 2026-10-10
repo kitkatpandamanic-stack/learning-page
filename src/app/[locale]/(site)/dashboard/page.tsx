@@ -66,6 +66,7 @@ export default async function DashboardPage({
   const continueWith = place.target;
   const t = await getTranslations("dashboard");
   const tAchievements = await getTranslations("achievements");
+  const tWelcome = await getTranslations("welcome");
   const format = await getFormatter();
   const now = new Date();
 
@@ -313,6 +314,14 @@ export default async function DashboardPage({
                 ? t("goal.reached")
                 : t("goal.remaining", { xp: d.dailyGoal - d.todayXp })}
             </p>
+            {!d.profile && (
+              <Link
+                href="/welcome"
+                className="text-sm text-cyan-300 hover:underline"
+              >
+                {tWelcome("settings.set")} →
+              </Link>
+            )}
           </GlassCard>
 
           {/* Saved for later */}
