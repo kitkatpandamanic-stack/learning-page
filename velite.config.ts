@@ -184,6 +184,28 @@ function buildToc(raw: string): TocEntry[] {
   return toc;
 }
 
+/**
+ * Words from the prose's `inline code` (e.g. `LEFT JOIN`, `useState`,
+ * `dict.get`), lower-cased and de-duplicated, for site search. Code blocks
+ * and component attributes (starter code, checks) are skipped.
+ */
+function searchTerms(raw: string, max = 80): string[] {
+  const prose = raw
+    .replace(/^\s*(`{3,}|~{3,})[\s\S]*?^\s*\1[`~]*\s*$/gm, "")
+    .replace(/\{`[\s\S]*?`\}/g, "")
+    .replace(/\w+=\{[^}]*\}/g, "");
+  const terms = new Set<string>();
+  for (const [, code] of prose.matchAll(/(?<!`)`([^`\n]+)`(?!`)/g)) {
+    for (const word of code.toLowerCase().split(/[^\p{L}\p{N}_$.]+/u)) {
+      const term = word.replace(/^\.+|\.+$/g, "");
+      if (term.length >= 2 && term.length <= 40 && /\p{L}/u.test(term))
+        terms.add(term);
+      if (terms.size >= max) return [...terms];
+    }
+  }
+  return [...terms];
+}
+
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 const courses = defineCollection({
@@ -263,6 +285,7 @@ const lessons = defineCollection({
         slug: match ? match[2] : file,
         permalink: `/learn/${language}/${match ? match[2] : file}`,
         toc: buildToc(raw),
+        terms: searchTerms(raw),
         exerciseCount: countTags(raw, "Exercise"),
         quizCount: countTags(raw, "Quiz"),
       };
@@ -302,6 +325,7 @@ const problems = defineCollection({
         slug,
         permalink: `/practice/${language}/${slug}`,
         xp: PRACTICE_XP[data.difficulty],
+        terms: searchTerms(raw),
         exerciseCount: countTags(raw, "Exercise"),
       };
     }),
