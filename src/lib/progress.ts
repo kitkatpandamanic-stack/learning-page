@@ -15,6 +15,7 @@ import { getAllLessons, getCourse } from "@/lib/content";
 import { getPracticeLanguages, getProblems } from "@/lib/practice";
 import { defaultLocale, type Locale } from "@/lib/i18n";
 import {
+  achievementProgress,
   achievements,
   computeStreaks,
   DAILY_GOAL_XP,
@@ -418,6 +419,7 @@ export async function getDashboard(
     achievements: achievements.map((a) => ({
       ...toInfo(a),
       unlockedAt: unlockedAt.get(a.id) ?? null,
+      progress: achievementProgress(a, stats),
     })),
     recent: recent.map((e) => ({
       ...describeEvent(e.reason, e.ref, titles),

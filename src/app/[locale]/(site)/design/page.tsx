@@ -27,6 +27,9 @@ import { SectionHeading } from "@/components/ui/section-heading";
 import { StatCard } from "@/components/ui/stat-card";
 import { ActivityCalendar } from "@/components/dashboard/activity-calendar";
 import { buildCalendar } from "@/lib/activity";
+import { PracticeProgress } from "@/components/dashboard/practice-progress";
+import { getPracticeLanguages, getProblems } from "@/lib/practice";
+import { summarizePractice } from "@/lib/practice-progress";
 
 export const metadata: Metadata = {
   title: "Design system",
@@ -71,6 +74,19 @@ function sampleCalendar() {
     today,
     calendar: buildCalendar({ xpByDay, frozen, today, goal: 50 }),
   };
+}
+
+/** Made-up practice: some Python solved, a little JavaScript, nothing else. */
+function samplePractice() {
+  return getPracticeLanguages().map((language, l) => {
+    const problems = getProblems(language);
+    const solved = new Set(
+      problems
+        .filter((_, i) => (l === 0 ? i % 3 !== 2 && i < 24 : l === 1 && i < 4))
+        .map((p) => p.permalink),
+    );
+    return { language, ...summarizePractice(problems, solved) };
+  });
 }
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
@@ -255,6 +271,15 @@ export default function DesignPage() {
       <Section title="Activity calendar">
         <GlassCard className="max-w-2xl">
           <ActivityCalendar {...sampleCalendar()} />
+        </GlassCard>
+      </Section>
+
+      <Section title="Practice progress">
+        <GlassCard className="max-w-2xl">
+          <PracticeProgress
+            items={samplePractice()}
+            initial={getPracticeLanguages()[0]}
+          />
         </GlassCard>
       </Section>
 
