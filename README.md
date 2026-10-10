@@ -179,6 +179,11 @@ signed-in learners also in `saved_code` (saved a moment after typing stops), so 
 them to other devices. Each copy carries the time of its last edit, and an editor opens with
 whichever is newer (`src/lib/code-sync.ts`); a reset is saved too.
 
+New accounts land on `/welcome` after their first sign-in (Better Auth's `newUserCallbackURL`):
+a language, a starting level (0–2) and a daily goal (30, 50 or 100 XP), stored in
+`learner_profile`. The dashboard uses the goal, "continue" starts them at that level's first
+lesson, and the profile page links back to change them.
+
 Search (⌘K / Ctrl+K, `/`, or the navbar button) finds lessons, their sections and practice
 problems by title, headings, description and the words in their `inline code`. The index is
 built at build time, one static file per locale (`/search/en.json`, from

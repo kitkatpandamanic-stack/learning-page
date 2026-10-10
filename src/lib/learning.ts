@@ -12,6 +12,7 @@ import {
 } from "@/db/schema";
 import { getCourse } from "@/lib/content";
 import { defaultLocale, type Locale } from "@/lib/i18n";
+import { getLearnerProfile } from "@/lib/learner-profile";
 import { languages } from "@/lib/languages";
 import type { Difficulty } from "@/lib/practice-meta";
 import { getPracticeLanguages, getProblems } from "@/lib/practice";
@@ -198,6 +199,13 @@ async function finishedPages(userId: string) {
   };
 }
 
+/** The first lesson of a level in a language's course, in `locale`. */
+export function startLesson(language: string, level: number, locale: Locale) {
+  const first = getCourse(language, locale)?.levels[level]?.modules[0]
+    ?.lessons[0];
+  return first ? getCatalog(locale).pages.get(first.permalink) : undefined;
+}
+
 export type ContinueTarget = {
   permalink: string;
   kind: "lesson" | "problem";
@@ -251,6 +259,13 @@ export async function getContinue(
       .map((p) => pages.get(p)!)
       .find((page) => !finished(page));
     if (after) result = target(after, "next");
+  }
+  if (!result && done.lessons.length === 0) {
+    // Nothing opened or finished yet: where the welcome steps said to start.
+    const profile = await getLearnerProfile(userId);
+    const start =
+      profile && startLesson(profile.language, profile.level, locale);
+    if (start) result = target(start, "start");
   }
   if (!result) {
     // The next lesson in the course of the lesson finished last, or the first course.

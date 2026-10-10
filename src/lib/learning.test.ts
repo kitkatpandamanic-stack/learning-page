@@ -45,6 +45,7 @@ const course = {
         },
       ],
     },
+    { modules: [{ title: "Next steps", lessons: [lesson("four", [])] }] },
   ],
 };
 vi.mock("@/lib/content", () => ({
@@ -64,6 +65,7 @@ vi.mock("@/lib/practice", () => ({
 
 const learning = await import("@/lib/learning");
 const savedCode = await import("@/lib/saved-code");
+const profiles = await import("@/lib/learner-profile");
 const { awardXp, markLessonComplete, todayIn } = await import("@/lib/progress");
 const { addDays, REVIEW_XP } = await import("@/lib/review-schedule");
 
@@ -308,5 +310,49 @@ describe("saved code", () => {
     expect((await load())["exercise-1"].editedAt).toBeLessThanOrEqual(
       Date.now(),
     );
+  });
+});
+
+describe("welcome steps", () => {
+  it("saves and changes a learner's choices, refusing ones not offered", async () => {
+    expect(await profiles.getLearnerProfile(userId)).toBeNull();
+    const choice = { language: "python", level: 1, dailyGoal: 50 };
+    expect(await profiles.saveLearnerProfile(userId, choice)).toBe(true);
+    expect(await profiles.getLearnerProfile(userId)).toEqual(choice);
+
+    await profiles.saveLearnerProfile(userId, { ...choice, dailyGoal: 100 });
+    expect((await profiles.getLearnerProfile(userId))?.dailyGoal).toBe(100);
+
+    for (const bad of [
+      { ...choice, language: "cobol" },
+      { ...choice, level: 3 },
+      { ...choice, dailyGoal: 45 },
+    ]) {
+      expect(await profiles.saveLearnerProfile(userId, bad)).toBe(false);
+    }
+  });
+
+  it("starts a new learner at the first lesson of the level they picked", async () => {
+    expect(learning.startLesson("python", 1, "en")?.permalink).toBe(
+      "/learn/python/four",
+    );
+    expect(learning.startLesson("python", 2, "en")).toBeUndefined();
+
+    await profiles.saveLearnerProfile(userId, {
+      language: "python",
+      level: 1,
+      dailyGoal: 30,
+    });
+    expect((await learning.getContinue(userId, "en")).target).toMatchObject({
+      permalink: "/learn/python/four",
+      reason: "start",
+    });
+
+    // Once they've opened something, "continue" follows them instead.
+    await learning.recordVisit(userId, "/learn/python/two");
+    expect((await learning.getContinue(userId, "en")).target).toMatchObject({
+      permalink: "/learn/python/two",
+      reason: "resume",
+    });
   });
 });

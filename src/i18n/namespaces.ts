@@ -25,5 +25,6 @@ export const namespaces = [
   "search",
   "saved",
   "review",
+  "welcome",
   "notFound",
 ] as const;

@@ -19,6 +19,7 @@ import {
   type XpReason,
 } from "@/lib/gamification";
 import { languages } from "@/lib/languages";
+import { getLearnerProfile } from "@/lib/learner-profile";
 import { isValidTimeZone } from "@/lib/time-zone";
 
 // ---------------------------------------------------------------------------
@@ -283,7 +284,10 @@ export async function getDashboard(
   tz: string,
   locale: Locale = defaultLocale,
 ) {
-  const data = await loadUserData(userId, tz);
+  const [data, profile] = await Promise.all([
+    loadUserData(userId, tz),
+    getLearnerProfile(userId),
+  ]);
   const { stats, streak, today, xpByDay, done } = data;
 
   const recent = await db
@@ -333,7 +337,8 @@ export async function getDashboard(
     level: levelFromXp(stats.totalXp),
     streak,
     todayXp: xpByDay.get(today) ?? 0,
-    dailyGoal: DAILY_GOAL_XP,
+    dailyGoal: profile?.dailyGoal ?? DAILY_GOAL_XP,
+    profile,
     week,
     courses: started.length > 0 ? started : courses.slice(0, 1),
     achievements: achievements.map((a) => ({

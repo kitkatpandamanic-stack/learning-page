@@ -58,6 +58,10 @@ export default async function SignInPage({
   // A failed attempt comes back here with the same destination and reason.
   const retry = new URLSearchParams({ next: returnTo });
   if (typeof reason === "string") retry.set("reason", reason);
+  // A brand-new account answers the welcome steps first, then goes on to `next`.
+  const welcomeURL =
+    localizedPath("/welcome", locale) +
+    (next ? `?${new URLSearchParams({ next: returnTo })}` : "");
 
   return (
     <Container className="grid flex-1 items-center gap-12 py-16 lg:max-w-5xl lg:grid-cols-2">
@@ -108,6 +112,7 @@ export default async function SignInPage({
                 providers={enabledProviders}
                 returnTo={localizedPath(returnTo, locale)}
                 errorURL={`${localizedPath("/sign-in", locale)}?${retry}`}
+                newUserURL={welcomeURL}
               />
               <p className="mt-4 flex items-start justify-center gap-2 text-xs text-white/55">
                 <ShieldCheck className="size-4 shrink-0 text-lime-300/80" />

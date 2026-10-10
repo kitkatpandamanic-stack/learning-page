@@ -1,7 +1,16 @@
 "use server";
 
 import type { AwardResult } from "@/app/actions/progress";
-import { answerReview, isPage, recordVisit, setBookmark } from "@/lib/learning";
+import { isLocale } from "@/lib/i18n";
+import { saveLearnerProfile } from "@/lib/learner-profile";
+import {
+  answerReview,
+  isPage,
+  recordVisit,
+  setBookmark,
+  startLesson,
+} from "@/lib/learning";
+import { safeReturnPath } from "@/lib/return-path";
 import { getTimeZone, summarizeAward } from "@/lib/progress";
 import { codeKey, putSavedCode } from "@/lib/saved-code";
 import { createRateLimiter } from "@/lib/rate-limit";
@@ -91,4 +100,37 @@ export async function saveCode(
     return { ok: false, reason: "invalid" };
   const saved = await putSavedCode(user.userId, key, code, editedAt);
   return saved ? { ok: true } : { ok: false, reason: "invalid" };
+}
+
+/**
+ * Saves the welcome steps and says where to go next: back to the lesson the
+ * learner signed in from, or the first lesson of the level they picked.
+ */
+export async function finishWelcome(
+  choice: { language: string; level: number; dailyGoal: number },
+  next: string,
+  locale: string,
+): Promise<{ ok: true; href: string } | Refused> {
+  const user = await signedIn();
+  if ("ok" in user) return user;
+  if (
+    !isLocale(locale) ||
+    typeof choice?.language !== "string" ||
+    !Number.isInteger(choice.level) ||
+    !Number.isInteger(choice.dailyGoal)
+  )
+    return { ok: false, reason: "invalid" };
+  const saved = await saveLearnerProfile(user.userId, {
+    language: choice.language,
+    level: choice.level,
+    dailyGoal: choice.dailyGoal,
+  });
+  if (!saved) return { ok: false, reason: "invalid" };
+  const back = safeReturnPath(next, "");
+  const href =
+    back && isPage(back.split(/[?#]/)[0])
+      ? back
+      : (startLesson(choice.language, choice.level, locale)?.permalink ??
+        "/dashboard");
+  return { ok: true, href };
 }
