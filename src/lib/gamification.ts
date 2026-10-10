@@ -50,17 +50,19 @@ export type Achievement = {
   description: string;
   emoji: string;
   tone: Tone;
+  /** Unlocked when this stat reaches the target */
+  goal: { stat: keyof AchievementStats; target: number };
   unlocked: (s: AchievementStats) => boolean;
 };
 
-export const achievements: Achievement[] = [
+const definitions: Omit<Achievement, "unlocked">[] = [
   {
     id: "first-lesson",
     title: "First Steps",
     description: "Complete your first lesson",
     emoji: "🐣",
     tone: "lime",
-    unlocked: (s) => s.lessonsCompleted >= 1,
+    goal: { stat: "lessonsCompleted", target: 1 },
   },
   {
     id: "five-lessons",
@@ -68,7 +70,7 @@ export const achievements: Achievement[] = [
     description: "Complete 5 lessons",
     emoji: "🖐️",
     tone: "cyan",
-    unlocked: (s) => s.lessonsCompleted >= 5,
+    goal: { stat: "lessonsCompleted", target: 5 },
   },
   {
     id: "first-exercise",
@@ -76,7 +78,7 @@ export const achievements: Achievement[] = [
     description: "Solve your first coding exercise",
     emoji: "💻",
     tone: "violet",
-    unlocked: (s) => s.exercisesSolved >= 1,
+    goal: { stat: "exercisesSolved", target: 1 },
   },
   {
     id: "ten-exercises",
@@ -84,7 +86,7 @@ export const achievements: Achievement[] = [
     description: "Solve 10 coding exercises",
     emoji: "🧩",
     tone: "pink",
-    unlocked: (s) => s.exercisesSolved >= 10,
+    goal: { stat: "exercisesSolved", target: 10 },
   },
   {
     id: "quiz-whiz",
@@ -92,7 +94,7 @@ export const achievements: Achievement[] = [
     description: "Answer 5 quizzes right on the first try",
     emoji: "🧠",
     tone: "amber",
-    unlocked: (s) => s.quizzesAced >= 5,
+    goal: { stat: "quizzesAced", target: 5 },
   },
   {
     id: "module-complete",
@@ -100,7 +102,7 @@ export const achievements: Achievement[] = [
     description: "Finish every lesson in a module",
     emoji: "📦",
     tone: "cyan",
-    unlocked: (s) => s.modulesCompleted >= 1,
+    goal: { stat: "modulesCompleted", target: 1 },
   },
   {
     id: "level-complete",
@@ -108,7 +110,7 @@ export const achievements: Achievement[] = [
     description: "Finish every lesson in a course level",
     emoji: "🎓",
     tone: "violet",
-    unlocked: (s) => s.levelsCompleted >= 1,
+    goal: { stat: "levelsCompleted", target: 1 },
   },
   {
     id: "streak-3",
@@ -116,7 +118,7 @@ export const achievements: Achievement[] = [
     description: "Learn 3 days in a row",
     emoji: "🔥",
     tone: "pink",
-    unlocked: (s) => s.currentStreak >= 3,
+    goal: { stat: "currentStreak", target: 3 },
   },
   {
     id: "streak-7",
@@ -124,7 +126,7 @@ export const achievements: Achievement[] = [
     description: "Learn 7 days in a row",
     emoji: "⚡",
     tone: "amber",
-    unlocked: (s) => s.currentStreak >= 7,
+    goal: { stat: "currentStreak", target: 7 },
   },
   {
     id: "xp-100",
@@ -132,7 +134,7 @@ export const achievements: Achievement[] = [
     description: "Earn 100 XP",
     emoji: "💯",
     tone: "lime",
-    unlocked: (s) => s.totalXp >= 100,
+    goal: { stat: "totalXp", target: 100 },
   },
   {
     id: "xp-500",
@@ -140,14 +142,27 @@ export const achievements: Achievement[] = [
     description: "Earn 500 XP",
     emoji: "💎",
     tone: "violet",
-    unlocked: (s) => s.totalXp >= 500,
+    goal: { stat: "totalXp", target: 500 },
   },
 ];
+
+export const achievements: Achievement[] = definitions.map((a) => ({
+  ...a,
+  unlocked: (s) => s[a.goal.stat] >= a.goal.target,
+}));
+
+/** How far along a learner is: "3 of 5 lessons". */
+export function achievementProgress(a: Achievement, s: AchievementStats) {
+  return {
+    current: Math.min(s[a.goal.stat], a.goal.target),
+    target: a.goal.target,
+  };
+}
 
 export const achievementById = new Map(achievements.map((a) => [a.id, a]));
 
 /** Public shape sent to the browser (no functions). */
-export type AchievementInfo = Omit<Achievement, "unlocked">;
+export type AchievementInfo = Omit<Achievement, "unlocked" | "goal">;
 
 export function toInfo(achievement: Achievement): AchievementInfo {
   const { id, title, description, emoji, tone } = achievement;
