@@ -12,6 +12,14 @@ export const siteConfig = {
   contactUrl: "https://github.com/kitkatpandamanic-stack/learning-page/issues",
   /** The Telegram channel: daily problem and quiz */
   telegramUrl: "https://t.me/Kitkatpandamanic",
+  /**
+   * Search engine ownership checks (Google Search Console, Yandex Webmaster):
+   * public codes printed in every page's <head>. Env vars can override them.
+   */
+  verification: {
+    google: "dvB-I7SQ8LWxqBCXnH1-eRB2XlEeWAElCI1oXUtByjY",
+    yandex: "2d182856cc262c37",
+  },
 };
 
 /**
