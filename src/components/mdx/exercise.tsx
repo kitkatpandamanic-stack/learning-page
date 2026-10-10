@@ -1,8 +1,9 @@
 import { Children, isValidElement, type ReactNode } from "react";
-import { ChevronRight, Dumbbell, Eye, Lightbulb } from "lucide-react";
+import { ChevronRight, Dumbbell, Eye } from "lucide-react";
 import { useTranslations } from "next-intl";
 
 import { LazyCodeRunner } from "@/components/code/lazy-code-runner";
+import { HintSteps } from "@/components/mdx/hint-steps";
 import type { RunLanguage, TestSpec } from "@/lib/runner/execute";
 
 /**
@@ -32,12 +33,22 @@ export function Exercise({
   children: ReactNode;
 }) {
   const t = useTranslations("lesson");
-  // Show the task first, then the editor, then the hint/solution reveals.
+  // Show the task first, then the editor, then the hints (one step at a
+  // time) and the solution.
   const items = Children.toArray(children);
-  const isReveal = (node: ReactNode) =>
-    isValidElement(node) && (node.type === Hint || node.type === Solution);
-  const task = items.filter((node) => !isReveal(node));
-  const reveals = items.filter(isReveal);
+  const isHint = (node: ReactNode) =>
+    isValidElement(node) && node.type === Hint;
+  const isSolution = (node: ReactNode) =>
+    isValidElement(node) && node.type === Solution;
+  const task = items.filter((node) => !isHint(node) && !isSolution(node));
+  const hints = items
+    .filter(isHint)
+    .map((node) =>
+      isValidElement<{ children: ReactNode }>(node)
+        ? node.props.children
+        : null,
+    );
+  const solutions = items.filter(isSolution);
 
   return (
     <section className="not-prose my-8 rounded-2xl bg-gradient-to-r from-neon-violet/60 via-neon-pink/40 to-neon-cyan/60 p-px">
@@ -61,7 +72,8 @@ export function Exercise({
               activityId={activityId}
             />
           )}
-          {reveals}
+          <HintSteps hints={hints} />
+          {solutions}
         </div>
       </div>
     </section>
@@ -89,16 +101,9 @@ function Reveal({
   );
 }
 
+/** One step of help inside an <Exercise>; its hints open one at a time. */
 export function Hint({ children }: { children: ReactNode }) {
-  const t = useTranslations("lesson");
-  return (
-    <Reveal
-      icon={<Lightbulb className="size-4 text-amber-300" />}
-      label={t("hint")}
-    >
-      {children}
-    </Reveal>
-  );
+  return <HintSteps hints={[children]} />;
 }
 
 export function Solution({ children }: { children: ReactNode }) {

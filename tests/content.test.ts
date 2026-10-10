@@ -238,6 +238,28 @@ describe("interactive exercises", () => {
   );
 });
 
+describe("practice hints", () => {
+  const practice = files.filter((file) =>
+    file.slice(ROOT.length + 1).startsWith("practice/"),
+  );
+
+  // Hints open one at a time: a nudge, the plan, then a code skeleton.
+  it.each(practice.map((file) => [file.slice(ROOT.length + 1), file]))(
+    "%s has three hints",
+    (_name, file) => {
+      const source = readFileSync(file, "utf8");
+      const hints = [...source.matchAll(/<Hint>([\s\S]*?)<\/Hint>/g)].map(
+        (m) => m[1],
+      );
+      expect(hints).toHaveLength(3);
+      expect(hints[0], "the first hint is a nudge, without code").not.toContain(
+        "```",
+      );
+      expect(hints[2], "the last hint shows a code skeleton").toContain("```");
+    },
+  );
+});
+
 /** pytest says how long tests took ("3 passed in 0.02s"), which varies. */
 const steadyTimes = (text: string) =>
   text.replace(/ in \d+\.\d+s\b/g, " in 0.01s");
