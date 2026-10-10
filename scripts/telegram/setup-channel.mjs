@@ -3,6 +3,7 @@
 //
 //   node scripts/telegram/setup-channel.mjs            apply
 //   node scripts/telegram/setup-channel.mjs --preview  print what would change
+//   node scripts/telegram/setup-channel.mjs --welcome  only update the pinned welcome post
 import { readFileSync } from "node:fs";
 
 import { CHAT, loadEnv, SITE, telegram } from "./lib.mjs";
@@ -23,9 +24,9 @@ export const welcome = [
   "🐼 <b>PandaDev — программирование с нуля до Senior</b>",
   "Бесплатные уроки Python, JavaScript, TypeScript и SQL прямо в браузере: код запускается сразу, а задачи проверяются автоматически.",
   "",
-  "Каждый день здесь:",
-  "🧩 11:00 — задача дня (+20 XP на сайте)",
-  "❓ 16:00 — вопрос дня в виде квиза",
+  "Каждый день в 11:00 (Ташкент):",
+  "🧩 задача дня (+20 XP на сайте)",
+  "❓ вопрос дня в виде квиза",
   `👉 <a href="${SITE}/ru">Начать бесплатно</a>`,
   "",
   "———",
@@ -33,9 +34,9 @@ export const welcome = [
   "🐼 <b>PandaDev — learn to code from zero to senior</b>",
   "Free Python, JavaScript, TypeScript and SQL lessons in your browser: code runs instantly and exercises check themselves.",
   "",
-  "Every day here (Tashkent time):",
-  "🧩 11:00 — problem of the day (+20 XP on the site)",
-  "❓ 16:00 — quiz question of the day",
+  "Every day at 11:00 (Tashkent time):",
+  "🧩 problem of the day (+20 XP on the site)",
+  "❓ quiz question of the day",
   `👉 <a href="${SITE}">Start for free</a>`,
 ].join("\n");
 
@@ -43,6 +44,21 @@ if (preview) {
   console.log(`title (${title.length}/128):\n${title}\n`);
   console.log(`description (${description.length}/255):\n${description}\n`);
   console.log(`welcome post (pinned):\n${welcome}`);
+  process.exit(0);
+}
+
+if (process.argv.includes("--welcome")) {
+  // Edit the pinned welcome post in place (no new message, no notification).
+  const chat = await telegram("getChat", { chat_id: CHAT });
+  if (!chat.pinned_message) throw new Error("No pinned welcome post to update");
+  await telegram("editMessageText", {
+    chat_id: CHAT,
+    message_id: chat.pinned_message.message_id,
+    text: welcome,
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+  });
+  console.log("✓ welcome post updated");
   process.exit(0);
 }
 

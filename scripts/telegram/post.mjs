@@ -1,7 +1,9 @@
 // Daily posts for the PandaDev Telegram channel, in Russian and English:
 //
-//   node scripts/telegram/post.mjs morning   problem of the day (11:00 Tashkent)
-//   node scripts/telegram/post.mjs quiz      quiz question as polls (16:00)
+//   node scripts/telegram/post.mjs daily     the day's post (11:00 Tashkent):
+//                                            problem of the day, then the quiz polls
+//   node scripts/telegram/post.mjs morning   just the problem of the day
+//   node scripts/telegram/post.mjs quiz      just the quiz question
 //   add --preview to print the posts instead of sending them,
 //   and --date=2026-10-11 to post another day's picks.
 //
@@ -43,7 +45,7 @@ async function feed() {
 
 const order = ["python", "javascript", "typescript", "sql"];
 
-function morningPost(data) {
+function morningPost(data, withQuiz = false) {
   const problems = [...data.problems].sort(
     (a, b) => order.indexOf(a.language) - order.indexOf(b.language),
   );
@@ -70,6 +72,15 @@ function morningPost(data) {
       "Problem of the day",
       "Solve one today for a <b>+20 XP</b> bonus on the site.",
     ),
+    ...(withQuiz && data.quiz
+      ? [
+          "",
+          "———",
+          "",
+          `❓ Вопрос дня ниже — из урока <a href="${data.quiz.lesson.ru.url}">«${escapeHtml(data.quiz.lesson.ru.title)}»</a>`,
+          `❓ Question of the day below — from <a href="${data.quiz.lesson.en.url}">“${escapeHtml(data.quiz.lesson.en.title)}”</a>`,
+        ]
+      : []),
     "",
     "#задачадня #problemoftheday",
   ].join("\n");
@@ -104,18 +115,28 @@ const message = (text) => ({
 
 const data = await feed();
 const sends =
-  mode === "morning"
-    ? [["sendMessage", message(morningPost(data))]]
-    : mode === "quiz" && data.quiz
-      ? [
-          ["sendMessage", message(quizIntro(data))],
-          ["sendPoll", poll(data.quiz.ru, "🇷🇺")],
-          ["sendPoll", poll(data.quiz.en, "🇬🇧")],
-        ]
-      : null;
+  mode === "daily"
+    ? [
+        ["sendMessage", message(morningPost(data, true))],
+        ...(data.quiz
+          ? [
+              ["sendPoll", poll(data.quiz.ru, "🇷🇺")],
+              ["sendPoll", poll(data.quiz.en, "🇬🇧")],
+            ]
+          : []),
+      ]
+    : mode === "morning"
+      ? [["sendMessage", message(morningPost(data))]]
+      : mode === "quiz" && data.quiz
+        ? [
+            ["sendMessage", message(quizIntro(data))],
+            ["sendPoll", poll(data.quiz.ru, "🇷🇺")],
+            ["sendPoll", poll(data.quiz.en, "🇬🇧")],
+          ]
+        : null;
 if (!sends) {
   console.error(
-    "Usage: node scripts/telegram/post.mjs morning|quiz [--preview] [--date=YYYY-MM-DD]",
+    "Usage: node scripts/telegram/post.mjs daily|morning|quiz [--preview] [--date=YYYY-MM-DD]",
   );
   process.exit(1);
 }
