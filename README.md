@@ -174,6 +174,11 @@ opened, or the one after it once it's finished; signed-out visitors get the same
 come back on a spaced-repetition schedule (`src/lib/review-schedule.ts`, cards in
 `review_card`), with XP once a day. Velite extracts each lesson's quizzes for it.
 
+Code typed in exercise editors and the playground is kept in `localStorage`, and for
+signed-in learners also in `saved_code` (saved a moment after typing stops), so it follows
+them to other devices. Each copy carries the time of its last edit, and an editor opens with
+whichever is newer (`src/lib/code-sync.ts`); a reset is saved too.
+
 Search (⌘K / Ctrl+K, `/`, or the navbar button) finds lessons, their sections and practice
 problems by title, headings, description and the words in their `inline code`. The index is
 built at build time, one static file per locale (`/search/en.json`, from

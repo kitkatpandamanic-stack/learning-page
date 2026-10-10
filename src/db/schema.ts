@@ -136,6 +136,26 @@ export const reviewCard = pgTable(
   ],
 );
 
+/**
+ * Code a learner wrote in an exercise editor or the playground, so it
+ * follows them to other devices. A null `code` records a reset.
+ */
+export const savedCode = pgTable(
+  "saved_code",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    /** locale:path#editor, e.g. "en:/learn/python/loops#exercise-1" */
+    key: text("key").notNull(),
+    code: text("code"),
+    /** When the learner made this edit, by their device's clock (newest wins) */
+    editedAt: timestamp("edited_at").notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.userId, table.key] })],
+);
+
 export const lessonProgressRelations = relations(lessonProgress, ({ one }) => ({
   user: one(user, { fields: [lessonProgress.userId], references: [user.id] }),
 }));
