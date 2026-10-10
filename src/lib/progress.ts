@@ -24,6 +24,7 @@ import {
   type AchievementStats,
   type XpReason,
 } from "@/lib/gamification";
+import { buildCalendar } from "@/lib/activity";
 import { MAX_FREEZES, planFreezes } from "@/lib/daily";
 import { languages } from "@/lib/languages";
 import { getLearnerProfile } from "@/lib/learner-profile";
@@ -219,6 +220,7 @@ async function loadUserData(userId: string, tz: string) {
     xpByDay,
     unlocked,
     freezes: { available: freezes.available, lastFrozen: freezes.lastFrozen },
+    frozenDays: freezes.frozen,
   };
 }
 
@@ -395,15 +397,23 @@ export async function getDashboard(
   const unlockedAt = new Map(data.unlocked.map((u) => [u.id, u.unlockedAt]));
   const titles = lessonTitles(locale);
 
+  const dailyGoal = profile?.dailyGoal ?? DAILY_GOAL_XP;
+
   return {
     stats,
     level: levelFromXp(stats.totalXp),
     streak,
     todayXp: xpByDay.get(today) ?? 0,
-    dailyGoal: profile?.dailyGoal ?? DAILY_GOAL_XP,
+    dailyGoal,
     freezes: data.freezes,
     profile,
     week,
+    calendar: buildCalendar({
+      xpByDay,
+      frozen: data.frozenDays,
+      today,
+      goal: dailyGoal,
+    }),
     courses: started.length > 0 ? started : courses.slice(0, 1),
     achievements: achievements.map((a) => ({
       ...toInfo(a),
