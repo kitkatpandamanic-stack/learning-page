@@ -12,7 +12,7 @@ import { MotionProvider } from "@/components/motion/motion-provider";
 import { Providers } from "@/components/progress/providers";
 import { routing } from "@/i18n/routing";
 import { localeParam } from "@/lib/i18n";
-import { siteUrl } from "@/lib/site";
+import { siteConfig, siteUrl } from "@/lib/site";
 import "../globals.css";
 
 const jakarta = Plus_Jakarta_Sans({
@@ -54,8 +54,12 @@ export async function generateMetadata({
     // Search Console / Yandex Webmaster / Bing ownership checks. The codes
     // aren't secret: they're printed in every page's <head>.
     verification: {
-      google: process.env.NEXT_PUBLIC_GOOGLE_SITE_VERIFICATION || undefined,
-      yandex: process.env.NEXT_PUBLIC_YANDEX_VERIFICATION || undefined,
+      google:
+        process.env.NEXT_PUBLIC_GOOGLE_SITE_VERIFICATION ||
+        siteConfig.verification.google,
+      yandex:
+        process.env.NEXT_PUBLIC_YANDEX_VERIFICATION ||
+        siteConfig.verification.yandex,
       other: process.env.NEXT_PUBLIC_BING_VERIFICATION
         ? { "msvalidate.01": process.env.NEXT_PUBLIC_BING_VERIFICATION }
         : undefined,
