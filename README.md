@@ -166,6 +166,11 @@ hard: 10, 20 or 30 XP), `topic` (see `src/lib/practice-meta.ts`) and optionally 
 `lesson`, then the statement and exactly one `<Exercise>`. Translations sit next to them as
 `NN-slug.ru.mdx`, like lessons.
 
+Search (⌘K / Ctrl+K, `/`, or the navbar button) finds lessons, their sections and practice
+problems by title, headings, description and the words in their `inline code`. The index is
+built at build time, one static file per locale (`/search/en.json`, from
+`src/app/search/[file]/route.ts`), and searched in the browser by `src/lib/search.ts`.
+
 Each level ends with a capstone project. In `course.yml` a level's `capstone` is either a
 title, or `{ slug, title, description }` with its lessons ("parts") in
 `content/courses/<language>/<slug>/`, listed after the level's modules.

@@ -22,5 +22,6 @@ export const namespaces = [
   "runner",
   "playground",
   "practice",
+  "search",
   "notFound",
 ] as const;
