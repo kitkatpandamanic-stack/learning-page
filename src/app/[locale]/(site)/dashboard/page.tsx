@@ -11,16 +11,20 @@ import {
   BookOpen,
   Brain,
   CalendarDays,
+  Dumbbell,
   Flame,
   History,
   PartyPopper,
+  Send,
   Sparkles,
   Target,
   Trophy,
 } from "lucide-react";
 import { cn } from "cn";
 
+import { connectTelegram } from "@/app/actions/telegram";
 import { ActivityCalendar } from "@/components/dashboard/activity-calendar";
+import { PracticeProgress } from "@/components/dashboard/practice-progress";
 import { LanguageMonogram } from "@/components/languages/language-card";
 import { DifficultyBadge } from "@/components/practice/difficulty-badge";
 import { UserAvatar } from "@/components/layout/user-menu";
@@ -43,12 +47,15 @@ import {
 import {
   getContinue,
   getDailySummary,
+  getPracticeProgress,
   getReviewSummary,
   getSavedPages,
 } from "@/lib/learning";
 import { getDashboard, getTimeZone, type RecentReason } from "@/lib/progress";
 import { REVIEW_XP } from "@/lib/review-schedule";
 import { requireSession } from "@/lib/session";
+import { telegramConfigured } from "@/lib/telegram/api";
+import { getLinkForUser } from "@/lib/telegram/links";
 import { toneClasses, TONES } from "@/lib/tones";
 
 export async function generateMetadata({
@@ -74,13 +81,16 @@ export default async function DashboardPage({
   setRequestLocale(locale);
   const { user } = await requireSession("/dashboard");
   const timeZone = await getTimeZone();
-  const [d, place, review, saved, daily] = await Promise.all([
-    getDashboard(user.id, timeZone, locale),
-    getContinue(user.id, locale),
-    getReviewSummary(user.id, timeZone, locale),
-    getSavedPages(user.id, locale),
-    getDailySummary(user.id, timeZone, locale),
-  ]);
+  const [d, place, review, saved, daily, practice, telegramLink] =
+    await Promise.all([
+      getDashboard(user.id, timeZone, locale),
+      getContinue(user.id, locale),
+      getReviewSummary(user.id, timeZone, locale),
+      getSavedPages(user.id, locale),
+      getDailySummary(user.id, timeZone, locale),
+      getPracticeProgress(user.id, locale),
+      telegramConfigured ? getLinkForUser(user.id) : null,
+    ]);
   const today = d.week.at(-1)!.date;
   // A freeze covered yesterday or the day before: tell the learner.
   const freezeSaved =
@@ -112,6 +122,37 @@ export default async function DashboardPage({
 
   const firstName = user.name.split(" ")[0] || user.name;
   const unlockedCount = d.achievements.filter((a) => a.unlockedAt).length;
+  // The locked achievements the learner is closest to.
+  const nextAchievements = d.achievements
+    .filter((a) => !a.unlockedAt)
+    .sort(
+      (a, b) =>
+        b.progress.current / b.progress.target -
+        a.progress.current / a.progress.target,
+    )
+    .slice(0, 3);
+  const achievementTitle = (a: (typeof d.achievements)[number]) => {
+    const id = a.id as AchievementId;
+    return tAchievements.has(`${id}.title`)
+      ? tAchievements(`${id}.title`)
+      : a.title;
+  };
+  const achievementDescription = (a: (typeof d.achievements)[number]) => {
+    const id = a.id as AchievementId;
+    return tAchievements.has(`${id}.description`)
+      ? tAchievements(`${id}.description`)
+      : a.description;
+  };
+  // Practice opens on the language practised most, else the chosen one.
+  const mostPractised = practice.reduce<(typeof practice)[number] | null>(
+    (best, p) => (p.solved > (best?.solved ?? 0) ? p : best),
+    null,
+  );
+  const practiceStart =
+    mostPractised?.language ??
+    practice.find((p) => p.language === d.profile?.language)?.language ??
+    practice[0]?.language ??
+    "python";
   const goalReached = d.todayXp >= d.dailyGoal;
 
   return (
@@ -213,81 +254,91 @@ export default async function DashboardPage({
         />
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
-        <div className="flex flex-col gap-6">
-          {/* Continue learning */}
-          {continueWith ? (
-            <GlassCard glow="violet" className="flex flex-col gap-4">
-              <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between">
-                <div className="min-w-0">
-                  <p className="text-sm text-violet-300">
-                    {continueWith.reason === "resume"
-                      ? t("continue.resumeLabel")
-                      : continueWith.reason === "next"
-                        ? t("continue.nextLabel")
-                        : t("continue.startLabel")}
-                  </p>
-                  <p className="text-xl font-bold text-white">
-                    {continueWith.title}
-                  </p>
-                </div>
-                <Button
-                  asChild
-                  variant="gradient"
-                  size="xl"
-                  className="shrink-0"
-                >
-                  <Link href={continueWith.permalink}>
-                    {continueWith.reason === "start"
-                      ? t("continue.start")
-                      : t("continue.continue")}{" "}
-                    <ArrowRight />
-                  </Link>
-                </Button>
-              </div>
-              {place.recent.length > 1 && (
-                <div className="flex flex-col gap-2 border-t border-white/10 pt-3">
-                  <p className="text-xs font-medium tracking-wide text-white/45 uppercase">
-                    {t("continue.recent")}
-                  </p>
-                  <ul className="flex flex-wrap gap-2">
-                    {place.recent.slice(0, 4).map((page) => (
-                      <li key={page.permalink}>
-                        <Link
-                          href={page.permalink}
-                          className="inline-flex max-w-64 items-center gap-1.5 rounded-full bg-white/6 px-3 py-1 text-sm text-white/75 ring-1 ring-white/10 hover:bg-white/12 hover:text-white"
-                        >
-                          <History className="size-3.5 shrink-0 text-white/40" />
-                          <span className="truncate">{page.title}</span>
-                        </Link>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </GlassCard>
-          ) : (
-            <GlassCard glow="lime" className="flex items-center gap-3">
-              <PartyPopper className="size-6 text-lime-300" />
-              <p className="text-white">{t("continue.allDone")}</p>
-            </GlassCard>
-          )}
-
-          {/* Activity calendar */}
-          <GlassCard className="flex flex-col gap-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="font-semibold text-white">
-                {t("activity.title")}
-              </h2>
-              <span className="rounded-md bg-white/6 px-2 py-0.5 text-xs text-white/60">
-                {t("activity.range")}
-              </span>
+      {/* Continue learning */}
+      {continueWith ? (
+        <GlassCard glow="violet" className="flex flex-col gap-4">
+          <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-sm text-violet-300">
+                {continueWith.reason === "resume"
+                  ? t("continue.resumeLabel")
+                  : continueWith.reason === "next"
+                    ? t("continue.nextLabel")
+                    : t("continue.startLabel")}
+              </p>
+              <p className="text-xl font-bold text-white">
+                {continueWith.title}
+              </p>
             </div>
-            <ActivityCalendar calendar={d.calendar} today={today} />
-          </GlassCard>
-        </div>
+            <Button asChild variant="gradient" size="xl" className="shrink-0">
+              <Link href={continueWith.permalink}>
+                {continueWith.reason === "start"
+                  ? t("continue.start")
+                  : t("continue.continue")}{" "}
+                <ArrowRight />
+              </Link>
+            </Button>
+          </div>
+          {place.recent.length > 1 && (
+            <div className="flex flex-col gap-2 border-t border-white/10 pt-3">
+              <p className="text-xs font-medium tracking-wide text-white/45 uppercase">
+                {t("continue.recent")}
+              </p>
+              <ul className="flex flex-wrap gap-2">
+                {place.recent.slice(0, 4).map((page) => (
+                  <li key={page.permalink}>
+                    <Link
+                      href={page.permalink}
+                      className="inline-flex max-w-64 items-center gap-1.5 rounded-full bg-white/6 px-3 py-1 text-sm text-white/75 ring-1 ring-white/10 hover:bg-white/12 hover:text-white"
+                    >
+                      <History className="size-3.5 shrink-0 text-white/40" />
+                      <span className="truncate">{page.title}</span>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </GlassCard>
+      ) : (
+        <GlassCard glow="lime" className="flex items-center gap-3">
+          <PartyPopper className="size-6 text-lime-300" />
+          <p className="text-white">{t("continue.allDone")}</p>
+        </GlassCard>
+      )}
 
-        <div className="flex flex-col gap-6">
+      <div className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
+        {/* Today: first on phones, the right-hand column on wide screens */}
+        <div className="flex flex-col gap-6 lg:order-2">
+          <h2 className="text-xs font-semibold tracking-wider text-white/45 uppercase">
+            {t("columns.today")}
+          </h2>
+          {/* Daily goal */}
+          <GlassCard className="flex flex-col gap-3">
+            <h2 className="flex items-center gap-2 font-semibold text-white">
+              <Target className="size-5 text-pink-300" /> {t("goal.title")}
+            </h2>
+            <ProgressBar
+              value={Math.min(d.todayXp, d.dailyGoal)}
+              max={d.dailyGoal}
+              tone={goalReached ? "lime" : "pink"}
+              size="lg"
+              label={t("goal.progress", { xp: d.todayXp, goal: d.dailyGoal })}
+            />
+            <p className="text-sm text-muted-foreground">
+              {goalReached
+                ? t("goal.reached")
+                : t("goal.remaining", { xp: d.dailyGoal - d.todayXp })}
+            </p>
+            {!d.profile && (
+              <Link
+                href="/welcome"
+                className="text-sm text-cyan-300 hover:underline"
+              >
+                {tWelcome("settings.set")} →
+              </Link>
+            )}
+          </GlassCard>
           {/* Problem of the day */}
           {daily.problem && (
             <GlassCard
@@ -356,7 +407,6 @@ export default async function DashboardPage({
               </p>
             </GlassCard>
           )}
-
           {/* Daily review */}
           <GlassCard
             glow={review.next > 0 ? "cyan" : "none"}
@@ -395,33 +445,62 @@ export default async function DashboardPage({
             )}
           </GlassCard>
 
-          {/* Daily goal */}
-          <GlassCard className="flex flex-col gap-3">
-            <h2 className="flex items-center gap-2 font-semibold text-white">
-              <Target className="size-5 text-pink-300" /> {t("goal.title")}
-            </h2>
-            <ProgressBar
-              value={Math.min(d.todayXp, d.dailyGoal)}
-              max={d.dailyGoal}
-              tone={goalReached ? "lime" : "pink"}
-              size="lg"
-              label={t("goal.progress", { xp: d.todayXp, goal: d.dailyGoal })}
-            />
-            <p className="text-sm text-muted-foreground">
-              {goalReached
-                ? t("goal.reached")
-                : t("goal.remaining", { xp: d.dailyGoal - d.todayXp })}
-            </p>
-            {!d.profile && (
-              <Link
-                href="/welcome"
-                className="text-sm text-cyan-300 hover:underline"
-              >
-                {tWelcome("settings.set")} →
-              </Link>
-            )}
-          </GlassCard>
+          {/* Achievements within reach */}
+          {nextAchievements.length > 0 && (
+            <GlassCard className="flex flex-col gap-4">
+              <h2 className="flex items-center gap-2 font-semibold text-white">
+                <Trophy className="size-5 text-amber-300" /> {t("next.title")}
+              </h2>
+              <ul className="flex flex-col gap-3">
+                {nextAchievements.map((a) => (
+                  <li key={a.id} className="flex items-center gap-3">
+                    <span
+                      aria-hidden
+                      className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-white/6 text-xl"
+                    >
+                      {a.emoji}
+                    </span>
+                    <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                      <span className="flex items-center justify-between gap-2 text-sm">
+                        <span className="truncate font-medium text-white">
+                          {achievementTitle(a)}
+                        </span>
+                        <span className="shrink-0 font-mono text-xs text-white/50">
+                          {a.progress.current}/{a.progress.target}
+                        </span>
+                      </span>
+                      <ProgressBar
+                        value={a.progress.current}
+                        max={a.progress.target}
+                        tone={a.tone}
+                        size="sm"
+                        aria-label={`${achievementTitle(a)}: ${a.progress.current}/${a.progress.target}`}
+                      />
+                      <span className="truncate text-xs text-white/50">
+                        {achievementDescription(a)}
+                      </span>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </GlassCard>
+          )}
 
+          {/* Telegram, for learners who haven't connected it */}
+          {telegramConfigured && !telegramLink && (
+            <GlassCard glow="cyan" className="flex flex-col gap-3">
+              <h2 className="flex items-center gap-2 font-semibold text-white">
+                <Send className="size-5 text-sky-300" /> {t("telegram.title")}
+              </h2>
+              <p className="text-sm text-white/70">{t("telegram.body")}</p>
+              <form action={connectTelegram}>
+                <input type="hidden" name="locale" value={locale} />
+                <Button type="submit" variant="glass" size="sm">
+                  <Send /> {t("telegram.connect")}
+                </Button>
+              </form>
+            </GlassCard>
+          )}
           {/* Saved for later */}
           <GlassCard className="flex flex-col gap-3">
             <h2 className="flex items-center gap-2 font-semibold text-white">
@@ -454,6 +533,44 @@ export default async function DashboardPage({
               </>
             )}
           </GlassCard>
+        </div>
+
+        {/* Progress */}
+        <div className="flex flex-col gap-6 lg:order-1">
+          <h2 className="text-xs font-semibold tracking-wider text-white/45 uppercase">
+            {t("columns.progress")}
+          </h2>
+          {/* Activity calendar */}
+          <GlassCard className="flex flex-col gap-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="font-semibold text-white">
+                {t("activity.title")}
+              </h2>
+              <span className="rounded-md bg-white/6 px-2 py-0.5 text-xs text-white/60">
+                {t("activity.range")}
+              </span>
+            </div>
+            <ActivityCalendar calendar={d.calendar} today={today} />
+          </GlassCard>
+
+          {/* Practice */}
+          {practice.length > 0 && (
+            <GlassCard className="flex flex-col gap-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h2 className="flex items-center gap-2 font-semibold text-white">
+                  <Dumbbell className="size-5 text-violet-300" />{" "}
+                  {t("practice.title")}
+                </h2>
+                <Link
+                  href="/practice"
+                  className="text-sm text-cyan-300 hover:underline"
+                >
+                  {t("practice.all")}
+                </Link>
+              </div>
+              <PracticeProgress items={practice} initial={practiceStart} />
+            </GlassCard>
+          )}
 
           {/* Courses */}
           <GlassCard className="flex flex-col gap-4">
@@ -502,8 +619,6 @@ export default async function DashboardPage({
           {d.achievements.map((a) => {
             const tone = toneClasses[a.tone];
             const unlocked = Boolean(a.unlockedAt);
-            const id = a.id as AchievementId;
-            const known = tAchievements.has(`${id}.title`);
             return (
               <li key={a.id}>
                 <GlassCard
@@ -525,12 +640,10 @@ export default async function DashboardPage({
                   </span>
                   <div className="min-w-0">
                     <p className="font-semibold text-white">
-                      {known ? tAchievements(`${id}.title`) : a.title}
+                      {achievementTitle(a)}
                     </p>
                     <p className="text-xs text-muted-foreground">
-                      {known
-                        ? tAchievements(`${id}.description`)
-                        : a.description}
+                      {achievementDescription(a)}
                     </p>
                     <p
                       className={cn(
@@ -542,7 +655,10 @@ export default async function DashboardPage({
                         ? t("achievements.unlocked", {
                             time: timeAgo(a.unlockedAt),
                           })
-                        : t("achievements.locked")}
+                        : t("achievements.progress", {
+                            current: a.progress.current,
+                            target: a.progress.target,
+                          })}
                     </p>
                   </div>
                 </GlassCard>

@@ -22,6 +22,7 @@ import {
   getPracticeLanguages,
   getProblems,
 } from "@/lib/practice";
+import { summarizePractice } from "@/lib/practice-progress";
 import { awardXp, todayIn } from "@/lib/progress";
 import {
   addDays,
@@ -203,6 +204,18 @@ async function finishedPages(userId: string) {
     lessons: lessons.map((l) => `/learn/${l.language}/${l.slug}`),
     problems: new Set(problems.map((p) => p.ref!.split("#")[0])),
   };
+}
+
+/** Practice in every language: solved by difficulty and topic, what to try next. */
+export async function getPracticeProgress(userId: string, locale: Locale) {
+  const { problems: solved } = await finishedPages(userId);
+  const order = (slug: string) => languages.findIndex((l) => l.slug === slug);
+  return getPracticeLanguages()
+    .toSorted((a, b) => order(a) - order(b))
+    .map((language) => ({
+      language,
+      ...summarizePractice(getProblems(language, locale), solved),
+    }));
 }
 
 /** The first lesson of a level in a language's course, in `locale`. */
