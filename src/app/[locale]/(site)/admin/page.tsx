@@ -13,6 +13,7 @@ import {
   Database,
   ExternalLink,
   Flag,
+  HeartPulse,
   Send,
   Sparkles,
   Users,
@@ -24,6 +25,7 @@ import { DailyBars } from "@/components/admin/daily-bars";
 import { Badge } from "@/components/ui/badge";
 import { Container } from "@/components/ui/container";
 import { GlassCard } from "@/components/ui/glass-card";
+import { Button } from "@/components/ui/button";
 import { ProgressBar } from "@/components/ui/progress-bar";
 import { StatCard } from "@/components/ui/stat-card";
 import { getAdminOverview, getDatabaseInfo, isAdmin } from "@/lib/admin";
@@ -33,8 +35,10 @@ import {
   getReports,
   type JobRun,
 } from "@/lib/admin-external";
+import { Link } from "@/i18n/navigation";
 import { languages } from "@/lib/languages";
 import { localeParam } from "@/lib/i18n";
+import { recordSecurityEvent } from "@/lib/security-events";
 import { getSession } from "@/lib/session";
 import { siteConfig } from "@/lib/site";
 
@@ -53,7 +57,11 @@ export default async function AdminPage({
   setRequestLocale(locale);
   // Everyone else gets "page not found", as if there were no admin panel.
   const session = await getSession();
-  if (!session || !isAdmin(session.user.email)) notFound();
+  if (!session || !isAdmin(session.user.email)) {
+    if (session)
+      recordSecurityEvent("admin-denied", "/admin", `u:${session.user.id}`);
+    notFound();
+  }
 
   const [
     overview,
@@ -94,7 +102,14 @@ export default async function AdminPage({
   return (
     <Container className="flex flex-col gap-8 py-10 sm:py-14">
       <header className="flex flex-col gap-1">
-        <h1 className="text-3xl font-bold text-white">{t("title")}</h1>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h1 className="text-3xl font-bold text-white">{t("title")}</h1>
+          <Button asChild variant="glass" size="sm">
+            <Link href="/admin/health">
+              <HeartPulse /> {t("health")}
+            </Link>
+          </Button>
+        </div>
         <p className="text-muted-foreground">{t("subtitle")}</p>
         {commit && (
           <p className="text-xs text-white/40">

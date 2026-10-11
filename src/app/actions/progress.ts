@@ -12,6 +12,7 @@ import {
   todayIn,
 } from "@/lib/progress";
 import { createRateLimiter } from "@/lib/rate-limit";
+import { recordSecurityEvent } from "@/lib/security-events";
 import { getSession } from "@/lib/session";
 
 /** A learner finishes a few things a minute; a script trying thousands doesn't get far. */
@@ -36,8 +37,10 @@ export async function completeLesson(
 ): Promise<AwardResult> {
   const session = await getSession();
   if (!session) return { ok: false, reason: "signed-out" };
-  if (!allowAward(session.user.id))
+  if (!allowAward(session.user.id)) {
+    recordSecurityEvent("rate-limited", "progress", `u:${session.user.id}`);
     return { ok: false, reason: "rate-limited" };
+  }
 
   // XP comes from the content, never from the browser.
   const lesson = getAllLessons().find(
@@ -58,8 +61,10 @@ export async function recordActivity(
 ): Promise<AwardResult> {
   const session = await getSession();
   if (!session) return { ok: false, reason: "signed-out" };
-  if (!allowAward(session.user.id))
+  if (!allowAward(session.user.id)) {
+    recordSecurityEvent("rate-limited", "progress", `u:${session.user.id}`);
     return { ok: false, reason: "rate-limited" };
+  }
 
   // A lesson's exercises and quizzes, or a practice problem's one exercise.
   const lesson = getAllLessons().find((l) => l.permalink === permalink);

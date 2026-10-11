@@ -1,4 +1,5 @@
 import { handleUpdate, type Update } from "@/lib/telegram/bot";
+import { recordSecurityEvent, requester } from "@/lib/security-events";
 import { secretMatches } from "@/lib/telegram/secret";
 
 /**
@@ -12,6 +13,7 @@ export async function POST(request: Request) {
       process.env.TELEGRAM_WEBHOOK_SECRET,
     )
   ) {
+    recordSecurityEvent("bad-secret", "telegram-webhook", await requester());
     return new Response("Forbidden", { status: 403 });
   }
   try {
