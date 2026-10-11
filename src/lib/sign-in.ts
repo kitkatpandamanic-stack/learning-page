@@ -6,19 +6,23 @@
 
 export type SignInReason =
   | { key: "save" | "page"; title: string }
-  | { key: "review" | "saved" | "dashboard" | "practice" };
+  | { key: "review" | "saved" | "dashboard" | "practice" | "library" };
 
 /** Pages that only make sense signed in: guests go somewhere useful instead. */
 const accountPages = ["/dashboard", "/profile", "/review", "/saved"];
 
 const pathOf = (returnTo: string) => returnTo.split(/[?#]/)[0];
 
-/** Why they're here: "save" comes from the bookmark button, the rest from the page. */
+/**
+ * Why they're here: "save" comes from the bookmark button, "library" from a
+ * library book on a course page, the rest from the page.
+ */
 export function signInReason(
   returnTo: string,
   reason: string | undefined,
   titleOf: (path: string) => string | undefined,
 ): SignInReason | null {
+  if (reason === "library") return { key: "library" };
   const path = pathOf(returnTo);
   const title = titleOf(path);
   if (title) return { key: reason === "save" ? "save" : "page", title };
