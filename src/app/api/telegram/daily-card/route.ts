@@ -21,6 +21,12 @@ const levels = {
   ru: { easy: "лёгкая", medium: "средняя", hard: "сложная" },
 } as Record<string, Record<string, string>>;
 
+const DAY = 86_400_000;
+function nearToday(date: string, now = Date.now()) {
+  const offset = (Date.parse(`${date}T00:00:00Z`) - now) / DAY;
+  return offset >= -8 && offset <= 3;
+}
+
 /**
  * The daily post's picture: GET /api/telegram/daily-card?date=2026-10-12
  * &lang=both|en|ru. Telegram downloads it when the post goes out.
@@ -30,6 +36,10 @@ export async function GET(request: NextRequest) {
   const date = params.get("date") ?? "";
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || isNaN(Date.parse(date)))
     return new Response("Bad date", { status: 400 });
+  // Drawing a picture is the most expensive thing the site does: only for
+  // days around today (previews of the next posts, last week's posts).
+  if (!nearToday(date))
+    return new Response("Date out of range", { status: 400 });
   const lang =
     params.get("lang") === "en"
       ? "en"

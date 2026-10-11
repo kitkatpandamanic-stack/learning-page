@@ -1,0 +1,91 @@
+name: Backup
+
+# A nightly backup of the database, around 2–4 am Tashkent time
+# (scripts/backup/backup.sh): dumped with a read-only role, restored into an
+# empty PostgreSQL and checked table by table, then encrypted with your
+# public key and kept here for 30 days as a workflow artifact. Only your
+# private key (on your computer) can open it: see scripts/backup/README.md.
+# Set up with: node scripts/backup/setup.mjs (secret BACKUP_DATABASE_URL,
+# variable BACKUP_PUBLIC_KEY).
+#
+# GitHub's scheduler is best effort, so there's a second try that only runs
+# when the first didn't succeed.
+on:
+  schedule:
+    - cron: "23 21 * * *"
+    - cron: "53 22 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: backup
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      done: ${{ steps.runs.outputs.done }}
+    steps:
+      - name: Backed up today already?
+        id: runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          done=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow backup.yml \
+            --status success --created ">=$(date -u +%F)" --json databaseId -q length)
+          echo "done=$done" >> "$GITHUB_OUTPUT"
+
+  backup:
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.done == '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      # The empty database the backup is restored into, to prove it works.
+      # Same major version as Neon (18).
+      restore:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: restore-check
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/backup
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install PostgreSQL 18 tools
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" |
+            sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+      - name: Dump, restore-check and encrypt
+        env:
+          BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+          BACKUP_PUBLIC_KEY: ${{ vars.BACKUP_PUBLIC_KEY }}
+          RESTORE_URL: postgresql://postgres:restore-check@localhost:5432/postgres
+        run: bash scripts/backup/backup.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pandadev-db-backup
+          path: backup/*.enc
+          retention-days: 30
+          if-no-files-found: error
+          # Encrypted data doesn't compress.
+          compression-level: 0

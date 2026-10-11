@@ -170,7 +170,28 @@ const github = collect(
     )
       .then((alerts) => alerts.length)
       .catch(() => null);
-    return { dependabot, dependabotStatus, codeScanning };
+    // The nightly backup (.github/workflows/backup.yml): the newest backup
+    // file (a run that found today's backup done keeps none) and the last
+    // run's result. null until the workflow exists.
+    const backup = await Promise.all([
+      getJson(`${repo}/actions/workflows/backup.yml/runs?per_page=1`, headers),
+      getJson(
+        `${repo}/actions/artifacts?name=pandadev-db-backup&per_page=1`,
+        headers,
+      ),
+    ])
+      .then(([runs, artifacts]) => {
+        const last = runs.workflow_runs[0];
+        const file = artifacts.artifacts.find((a) => !a.expired);
+        return {
+          lastRunAt: last?.created_at ?? null,
+          lastConclusion: last ? (last.conclusion ?? last.status) : null,
+          lastSuccessAt: file?.created_at ?? null,
+          sizeBytes: file?.size_in_bytes ?? null,
+        };
+      })
+      .catch(() => null);
+    return { dependabot, dependabotStatus, codeScanning, backup };
   },
 );
 

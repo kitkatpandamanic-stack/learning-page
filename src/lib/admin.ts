@@ -23,9 +23,16 @@ export function adminEmails() {
     .filter(Boolean);
 }
 
-export function isAdmin(email?: string | null) {
-  if (!email) return false;
-  return adminEmails().includes(email.toLowerCase());
+/**
+ * Admins are the accounts in ADMIN_EMAILS whose email the sign-in provider
+ * verified. Google and GitHub accounts with the same email are linked into
+ * one account, so an unverified address must never be enough.
+ */
+export function isAdmin(
+  user?: { email?: string | null; emailVerified?: boolean | null } | null,
+) {
+  if (!user?.email || !user.emailVerified) return false;
+  return adminEmails().includes(user.email.toLowerCase());
 }
 
 const DAY = 86_400_000;
