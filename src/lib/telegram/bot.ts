@@ -14,6 +14,7 @@ import { prepareIndex, search, type Prepared } from "@/lib/search";
 import { buildSearchIndex } from "@/lib/search-index";
 import { siteUrl } from "@/lib/site";
 import { BOT_USERNAME, sendMessage, telegram } from "@/lib/telegram/api";
+import { dailyHint, dailyPost } from "@/lib/telegram/daily-post";
 import {
   getLinkByTelegramId,
   redeemLinkToken,
@@ -26,6 +27,8 @@ import {
   dayIn,
   escapeHtml,
   helpText,
+  hintPopup,
+  hintSpoiler,
   languageEmoji,
   languageFromArg,
   linkedText,
@@ -33,6 +36,7 @@ import {
   nextText,
   notLinkedText,
   parseCommand,
+  parseHintButton,
   randomText,
   settingsKeyboard,
   settingsText,
@@ -95,6 +99,11 @@ async function onMessage(
 
   switch (parsed?.command) {
     case "start":
+      // t.me/<bot>?start=streak, from the "My streak" button under posts.
+      if (parsed.arg === "streak") {
+        if (!link) return reply(notLinkedText(locale, profile));
+        return reply(await streak(link));
+      }
       if (parsed.arg) {
         const result = await redeemLinkToken(parsed.arg, from);
         if (result.ok) return reply(linkedText(result.locale, result.name));
@@ -107,8 +116,25 @@ async function onMessage(
       return reply(
         helpText(locale, { linked: Boolean(link), siteUrl, bot: BOT_USERNAME }),
       );
-    case "today":
-      return reply(today(locale, link));
+    case "today": {
+      const post = dailyPost(
+        dayIn(link?.timeZone ?? DEFAULT_TIME_ZONE),
+        locale,
+      );
+      try {
+        return await telegram("sendPhoto", {
+          chat_id: chat.id,
+          photo: post.photo,
+          caption: post.caption,
+          parse_mode: "HTML",
+          reply_markup: post.reply_markup,
+        });
+      } catch (error) {
+        // No picture (say, the image didn't load in time): the text still helps.
+        console.error(error);
+        return reply(today(locale, link));
+      }
+    }
     case "quiz":
       return sendQuiz(chat.id, locale);
     case "random":
@@ -184,13 +210,16 @@ function randomProblem(locale: BotLocale, arg: string) {
       : all[Math.floor(Math.random() * all.length)];
   const problems = getProblems(language, locale);
   const problem = problems[Math.floor(Math.random() * problems.length)];
-  return randomText(locale, {
+  const text = randomText(locale, {
     language,
     name: getLanguage(language)?.name ?? language,
     difficulty: problem.difficulty,
     title: problem.title,
     url: url(problem.permalink, locale),
   });
+  return problem.hint
+    ? `${text}\n\n${hintSpoiler(locale, problem.hint)}`
+    : text;
 }
 
 async function streak(link: TelegramLink) {
@@ -208,6 +237,23 @@ async function streak(link: TelegramLink) {
 
 async function onButton(query: NonNullable<Update["callback_query"]>) {
   const link = await getLinkByTelegramId(query.from.id);
+  // 💡 under a daily post (in the channel or a chat): the hint, privately.
+  const hintButton = parseHintButton(query.data);
+  if (hintButton) {
+    const locale = link
+      ? (link.locale as BotLocale)
+      : botLocale(query.from.language_code);
+    const hint = dailyHint(hintButton.language, hintButton.date, locale);
+    return telegram("answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: hint
+        ? hintPopup(hint)
+        : locale === "ru"
+          ? "Для этой задачи пока нет подсказки."
+          : "There's no hint for this one yet.",
+      show_alert: true,
+    });
+  }
   const message = query.message;
   if (!link || !message) {
     return telegram("answerCallbackQuery", { callback_query_id: query.id });
