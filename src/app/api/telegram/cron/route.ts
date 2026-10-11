@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 
+import { recordSecurityEvent, requester } from "@/lib/security-events";
 import { postLeaderboard, sendReminders } from "@/lib/telegram/jobs";
 import { secretMatches } from "@/lib/telegram/secret";
 
@@ -17,6 +18,7 @@ export async function GET(request: NextRequest) {
       process.env.CRON_SECRET,
     )
   ) {
+    recordSecurityEvent("bad-secret", "telegram-cron", await requester());
     return new Response("Forbidden", { status: 403 });
   }
   const job = request.nextUrl.searchParams.get("job");

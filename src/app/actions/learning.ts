@@ -14,6 +14,7 @@ import { safeReturnPath } from "@/lib/return-path";
 import { getTimeZone, summarizeAward } from "@/lib/progress";
 import { codeKey, putSavedCode } from "@/lib/saved-code";
 import { createRateLimiter } from "@/lib/rate-limit";
+import { recordSecurityEvent } from "@/lib/security-events";
 import { getSession } from "@/lib/session";
 
 /** Saving, visiting and reviewing are cheap, but not free: keep scripts at bay. */
@@ -26,7 +27,10 @@ type Refused = { ok: false; reason: "signed-out" | "invalid" | "rate-limited" };
 async function signedIn(limit = allow): Promise<{ userId: string } | Refused> {
   const session = await getSession();
   if (!session) return { ok: false, reason: "signed-out" };
-  if (!limit(session.user.id)) return { ok: false, reason: "rate-limited" };
+  if (!limit(session.user.id)) {
+    recordSecurityEvent("rate-limited", "learning", `u:${session.user.id}`);
+    return { ok: false, reason: "rate-limited" };
+  }
   return { userId: session.user.id };
 }
 

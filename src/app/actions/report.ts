@@ -5,6 +5,7 @@ import { headers } from "next/headers";
 import { isLocale, localizedPath } from "@/lib/i18n";
 import { getCatalog } from "@/lib/learning";
 import { createRateLimiter } from "@/lib/rate-limit";
+import { recordSecurityEvent, requester } from "@/lib/security-events";
 import {
   isReportCategory,
   MESSAGE_MAX,
@@ -41,7 +42,10 @@ export async function reportProblem(input: {
   )
     return { ok: false, reason: "invalid" };
   // Bots get a cheerful "thanks" and nothing happens.
-  if (input.website) return { ok: true };
+  if (input.website) {
+    recordSecurityEvent("spam-trap", "report", await requester());
+    return { ok: true };
+  }
   const page = getCatalog(input.locale).pages.get(input.permalink);
   if (!page) return { ok: false, reason: "invalid" };
 
@@ -51,8 +55,14 @@ export async function reportProblem(input: {
     session?.user.id ??
     requestHeaders.get("x-forwarded-for")?.split(",")[0].trim() ??
     "unknown";
-  if (!allowPerson(who) || !allowSite("site"))
+  if (!allowPerson(who) || !allowSite("site")) {
+    recordSecurityEvent(
+      "rate-limited",
+      "report",
+      await requester(session?.user.id),
+    );
     return { ok: false, reason: "rate-limited" };
+  }
 
   try {
     await fileReport({

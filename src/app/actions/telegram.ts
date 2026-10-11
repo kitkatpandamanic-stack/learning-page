@@ -6,6 +6,7 @@ import { revalidatePath } from "next/cache";
 import { isLocale, localizedPath } from "@/lib/i18n";
 import { getTimeZone } from "@/lib/progress";
 import { createRateLimiter } from "@/lib/rate-limit";
+import { recordSecurityEvent } from "@/lib/security-events";
 import { getSession } from "@/lib/session";
 import { BOT_USERNAME } from "@/lib/telegram/api";
 import {
@@ -19,7 +20,11 @@ const allow = createRateLimiter(20, 60_000);
 
 async function signedInUser() {
   const session = await getSession();
-  if (!session || !allow(session.user.id)) return null;
+  if (!session) return null;
+  if (!allow(session.user.id)) {
+    recordSecurityEvent("rate-limited", "telegram", `u:${session.user.id}`);
+    return null;
+  }
   return session.user.id;
 }
 

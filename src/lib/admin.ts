@@ -10,18 +10,22 @@ import {
   user,
   xpEvent,
 } from "@/db/schema";
+import { FREE_LIMITS } from "@/lib/health";
 
 /**
  * The site owner's admin panel: who may open it (ADMIN_EMAILS, comma
  * separated) and the numbers it shows. Everything here is read-only.
  */
-export function isAdmin(email?: string | null) {
-  if (!email) return false;
-  const admins = (process.env.ADMIN_EMAILS ?? "")
+export function adminEmails() {
+  return (process.env.ADMIN_EMAILS ?? "")
     .split(",")
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean);
-  return admins.includes(email.toLowerCase());
+}
+
+export function isAdmin(email?: string | null) {
+  if (!email) return false;
+  return adminEmails().includes(email.toLowerCase());
 }
 
 const DAY = 86_400_000;
@@ -224,7 +228,7 @@ export async function getAdminOverview(days = 30) {
 
 export type AdminOverview = Awaited<ReturnType<typeof getAdminOverview>>;
 
-/** The database's size and its biggest tables, against Neon's free 0.5 GB. */
+/** The database's size and its biggest tables, against Neon's free plan. */
 export async function getDatabaseInfo() {
   const [size] = (
     await db.execute(
@@ -240,7 +244,7 @@ export async function getDatabaseInfo() {
   ).rows as { name: string; rows: string | number }[];
   return {
     bytes: Number(size?.bytes ?? 0),
-    limitBytes: 512 * 1024 * 1024,
+    limitBytes: FREE_LIMITS.neonStorageBytes,
     tables: tables.map((t) => ({ name: t.name, rows: Number(t.rows) })),
   };
 }

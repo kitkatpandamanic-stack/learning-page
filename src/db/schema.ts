@@ -5,8 +5,10 @@ import {
   date,
   index,
   integer,
+  jsonb,
   pgTable,
   primaryKey,
+  serial,
   text,
   timestamp,
   uniqueIndex,
@@ -223,6 +225,38 @@ export const telegramLinkToken = pgTable("telegram_link_token", {
   timeZone: text("time_zone").notNull(),
   expiresAt: timestamp("expires_at").notNull(),
 });
+
+/**
+ * What the health collector (.github/workflows/health.yml) found outside the
+ * site: Vercel deployments, Neon usage, Sentry errors, GitHub security
+ * alerts. One row per run, kept for 90 days; /admin/health reads the latest.
+ */
+export const healthSnapshot = pgTable(
+  "health_snapshot",
+  {
+    id: serial("id").primaryKey(),
+    data: jsonb("data").notNull(),
+    collectedAt: timestamp("collected_at").defaultNow().notNull(),
+  },
+  (table) => [index("health_snapshot_collected_at_idx").on(table.collectedAt)],
+);
+
+/**
+ * Things worth a look on /admin/health: refused rate limits, the report
+ * form's spam trap, wrong secrets on the bot and cron endpoints, signed-in
+ * people opening /admin. Kept for 30 days; `who` is a user id or a hashed IP.
+ */
+export const securityEvent = pgTable(
+  "security_event",
+  {
+    id: serial("id").primaryKey(),
+    kind: text("kind").notNull(),
+    detail: text("detail"),
+    who: text("who"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [index("security_event_created_at_idx").on(table.createdAt)],
+);
 
 export const lessonProgressRelations = relations(lessonProgress, ({ one }) => ({
   user: one(user, { fields: [lessonProgress.userId], references: [user.id] }),
