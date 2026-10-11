@@ -603,9 +603,13 @@ export default async function HealthPage({
               <p className="text-sm text-white/80">
                 {!github?.ok
                   ? t("security.alertsUnknown")
-                  : !github.dependabot
-                    ? t("security.alertsOff")
-                    : t("security.alertCounts", github.dependabot)}
+                  : github.dependabot
+                    ? t("security.alertCounts", github.dependabot)
+                    : github.dependabotStatus === "off"
+                      ? t("security.alertsOff")
+                      : github.dependabotStatus === "no-access"
+                        ? t("security.alertsNoAccess")
+                        : t("security.alertsUnknown")}
               </p>
               <a
                 href={`${siteConfig.githubUrl}/security`}

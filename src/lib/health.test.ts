@@ -87,6 +87,21 @@ describe("readSnapshot", () => {
     expect(readSnapshot([])).toBeNull();
   });
 
+  it("reads why Dependabot counts are missing, also from older snapshots", () => {
+    const read = (github: object) => {
+      const part = readSnapshot({
+        version: 1,
+        github: { ok: true, ...github },
+      })?.github;
+      return part?.ok ? part.dependabotStatus : null;
+    };
+    expect(read({ dependabot: null, dependabotStatus: "no-access" })).toBe(
+      "no-access",
+    );
+    expect(read({ dependabot: null })).toBe("failed");
+    expect(read({ dependabot: { high: 1 } })).toBe("ok");
+  });
+
   it("keeps failed parts as failures with a short message", () => {
     const snapshot = readSnapshot({
       version: 1,
@@ -262,15 +277,25 @@ describe("securityArea", () => {
     const serious = securityArea([], quiet, {
       ok: true,
       dependabot: { critical: 0, high: 1, medium: 2, low: 0 },
+      dependabotStatus: "ok",
       codeScanning: null,
     });
     expect(serious.status).toBe("bad");
     const off = securityArea([], quiet, {
       ok: true,
       dependabot: null,
+      dependabotStatus: "off",
       codeScanning: null,
     });
     expect(off.findings.map((f) => f.code)).toEqual(["alertsOff"]);
+    // Alerts on, but no key that may read them: not the site's problem
+    const noAccess = securityArea([], quiet, {
+      ok: true,
+      dependabot: null,
+      dependabotStatus: "no-access",
+      codeScanning: null,
+    });
+    expect(noAccess.status).toBe("ok");
   });
 
   it("warns about wrong secrets and people poking at admin", () => {

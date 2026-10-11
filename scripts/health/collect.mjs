@@ -133,20 +133,36 @@ const github = collect(
       "X-GitHub-Api-Version": "2022-11-28",
     };
     const repo = `https://api.github.com/repos/${env.GITHUB_REPOSITORY}`;
-    const dependabot = await getJson(
+    // GitHub's workflow token can't read Dependabot alerts: that takes a
+    // fine-grained token with only "Dependabot alerts: read" (HEALTH_GITHUB_TOKEN).
+    const res = await fetch(
       `${repo}/dependabot/alerts?state=open&per_page=100`,
-      headers,
-    )
-      .then((alerts) => {
-        const counts = { critical: 0, high: 0, medium: 0, low: 0 };
-        for (const a of alerts) {
-          const severity =
-            a.security_vulnerability?.severity ?? a.security_advisory?.severity;
-          if (severity in counts) counts[severity] += 1;
-        }
-        return counts;
-      })
-      .catch(() => null);
+      {
+        headers: {
+          ...headers,
+          Authorization: `Bearer ${env.HEALTH_GITHUB_TOKEN || env.GITHUB_TOKEN}`,
+        },
+        signal: AbortSignal.timeout(20_000),
+      },
+    ).catch(() => null);
+    let dependabot = null;
+    let dependabotStatus = "failed";
+    if (res?.ok) {
+      dependabot = { critical: 0, high: 0, medium: 0, low: 0 };
+      for (const a of await res.json()) {
+        const severity =
+          a.security_vulnerability?.severity ?? a.security_advisory?.severity;
+        if (severity in dependabot) dependabot[severity] += 1;
+      }
+      dependabotStatus = "ok";
+    } else if (res) {
+      const { message = "" } = await res.json().catch(() => ({}));
+      dependabotStatus = /disabled/i.test(message)
+        ? "off"
+        : [401, 403, 404].includes(res.status)
+          ? "no-access"
+          : "failed";
+    }
     // 404 until code scanning (CodeQL) is set up.
     const codeScanning = await getJson(
       `${repo}/code-scanning/alerts?state=open&per_page=100`,
@@ -154,7 +170,7 @@ const github = collect(
     )
       .then((alerts) => alerts.length)
       .catch(() => null);
-    return { dependabot, codeScanning };
+    return { dependabot, dependabotStatus, codeScanning };
   },
 );
 

@@ -130,6 +130,8 @@ export type Snapshot = {
   }>;
   github?: Part<{
     dependabot: Record<"critical" | "high" | "medium" | "low", number> | null;
+    /** Why there are no counts: alerts turned off, or no key that may read them */
+    dependabotStatus: "ok" | "off" | "no-access" | "failed";
     codeScanning: number | null;
   }>;
 };
@@ -210,6 +212,10 @@ export function readSnapshot(data: unknown): Snapshot | null {
             low: num(o.dependabot.low),
           }
         : null,
+      dependabotStatus:
+        (["ok", "off", "no-access"] as const).find(
+          (v) => v === o.dependabotStatus,
+        ) ?? (isObject(o.dependabot) ? "ok" : "failed"),
       codeScanning: typeof o.codeScanning === "number" ? o.codeScanning : null,
     })),
   };
@@ -491,7 +497,7 @@ export function securityArea(
         values: { count: medium + low },
       });
   }
-  if (github?.ok && !github.dependabot)
+  if (github?.ok && github.dependabotStatus === "off")
     findings.push({ status: "warn", code: "alertsOff" });
   if (github?.ok && github.codeScanning)
     findings.push({
