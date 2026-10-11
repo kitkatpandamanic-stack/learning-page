@@ -120,3 +120,148 @@ export async function renderOgImage({
     await loadFonts(),
   );
 }
+
+export type DailyCardRow = {
+  /** Short badge text, e.g. "Py" */
+  monogram: string;
+  /** Badge colour */
+  color: string;
+  title: string;
+  difficulty: string;
+};
+
+/** The Telegram channel's daily picture: the date and the day's problems. */
+export async function renderDailyCard({
+  label,
+  date,
+  rows,
+  footer,
+}: {
+  label: string;
+  date: string;
+  rows: DailyCardRow[];
+  footer: string;
+}) {
+  const clip = (text: string, max = 46) =>
+    text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+  return new ImageResponse(
+    <div
+      style={{
+        width: "100%",
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "space-between",
+        padding: "52px 64px",
+        backgroundColor: "#070814",
+        backgroundImage:
+          "radial-gradient(circle at 12% 0%, #8b5cf6aa 0%, transparent 45%), radial-gradient(circle at 100% 100%, #22d3ee66 0%, transparent 45%), radial-gradient(circle at 88% 8%, #f472b655 0%, transparent 35%)",
+        color: "white",
+        fontFamily: "Onest, Onest Cyrillic",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={pandaDataUri} width={56} height={56} alt="" />
+          <div style={{ display: "flex", fontSize: 34, fontWeight: 700 }}>
+            Panda<span style={{ color: "#c4b5fd" }}>Dev</span>
+          </div>
+        </div>
+        <div
+          style={{
+            display: "flex",
+            padding: "8px 20px",
+            borderRadius: 999,
+            border: "2px solid rgba(255,255,255,0.25)",
+            background: "rgba(255,255,255,0.08)",
+            fontSize: 24,
+            color: "#a5f3fc",
+          }}
+        >
+          {label}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <div
+          style={{
+            display: "flex",
+            fontSize: 52,
+            fontWeight: 800,
+            letterSpacing: -1.5,
+            marginBottom: 6,
+          }}
+        >
+          {date}
+        </div>
+        {rows.map((row) => (
+          <div
+            key={row.monogram}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 20,
+              padding: "12px 18px",
+              borderRadius: 18,
+              background: "rgba(255,255,255,0.06)",
+              border: "1px solid rgba(255,255,255,0.12)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 58,
+                height: 44,
+                borderRadius: 12,
+                background: `${row.color}33`,
+                color: row.color,
+                fontSize: 22,
+                fontWeight: 700,
+              }}
+            >
+              {row.monogram}
+            </div>
+            <div style={{ display: "flex", flex: 1, fontSize: 30 }}>
+              {clip(row.title)}
+            </div>
+            <div
+              style={{
+                display: "flex",
+                fontSize: 22,
+                color: "rgba(226,232,255,0.7)",
+              }}
+            >
+              {row.difficulty}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <div style={{ display: "flex", fontSize: 24, color: "#fcd34d" }}>
+          {footer}
+        </div>
+        <div
+          style={{
+            display: "flex",
+            height: 8,
+            width: "100%",
+            borderRadius: 999,
+            backgroundImage:
+              "linear-gradient(90deg, #8b5cf6, #f472b6, #22d3ee)",
+          }}
+        />
+      </div>
+    </div>,
+    await loadFonts(),
+  );
+}

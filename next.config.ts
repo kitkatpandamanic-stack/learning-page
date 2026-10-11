@@ -84,6 +84,10 @@ const nextConfig: NextConfig = {
   outputFileTracingIncludes: {
     "/[locale]/learn/[lang]/[lesson]": ["./.velite/bodies/**/*"],
     "/[locale]/practice/[lang]/[problem]": ["./.velite/bodies/practice/**/*"],
+    // The daily picture is drawn on request, with the share images' font.
+    "/api/telegram/daily-card": [
+      "./node_modules/@fontsource/onest/files/onest-*-normal.woff",
+    ],
   },
 };
 

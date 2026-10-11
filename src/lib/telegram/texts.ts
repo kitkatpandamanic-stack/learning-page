@@ -361,3 +361,145 @@ export function leaderboardText(
     "#рейтинг #leaderboard",
   ].join("\n\n");
 }
+
+// ---------------------------------------------------------------------------
+// The daily post (channel and /today): a picture card, a caption, buttons
+// ---------------------------------------------------------------------------
+
+/** Who reads a post: the channel gets both languages, a chat gets one. */
+export type Audience = BotLocale | "both";
+
+export type DailyProblem = {
+  language: string;
+  name: string;
+  difficulty: string;
+  en: { title: string; url: string };
+  ru: { title: string; url: string };
+};
+
+const dailyOrder = ["python", "javascript", "typescript", "sql"];
+export const sortDaily = <T extends { language: string }>(problems: T[]) =>
+  problems.toSorted(
+    (a, b) => dailyOrder.indexOf(a.language) - dailyOrder.indexOf(b.language),
+  );
+
+const shortName: Record<string, string> = {
+  python: "Python",
+  javascript: "JS",
+  typescript: "TS",
+  sql: "SQL",
+};
+
+const dayLabel = (locale: BotLocale, date: string) =>
+  new Intl.DateTimeFormat(locale, {
+    day: "numeric",
+    month: "long",
+    timeZone: "UTC",
+  }).format(new Date(`${date}T12:00:00Z`));
+
+/**
+ * The caption under the daily picture (Telegram allows 1024 characters):
+ * each problem links to the site, and a pointer to the hint buttons.
+ */
+export function dailyCaption(
+  audience: Audience,
+  date: string,
+  problems: DailyProblem[],
+  quizBelow: boolean,
+) {
+  const both = audience === "both";
+  const head =
+    audience === "en"
+      ? `🧩 <b>Problem of the day</b> · ${dayLabel("en", date)}\nSolve one today for a <b>+20 XP</b> bonus on the site.`
+      : `🧩 <b>Задача дня</b>${both ? " · Problem of the day" : ""} · ${dayLabel("ru", date)}\nРешите сегодня и получите <b>+20 XP</b> на сайте.${both ? "\nSolve one today for +20 XP on the site." : ""}`;
+  const lines = sortDaily(problems).map((p) => {
+    const level =
+      audience === "en"
+        ? difficulty.en[p.difficulty as Difficulty]
+        : `${difficulty.ru[p.difficulty as Difficulty]}${both ? ` · ${difficulty.en[p.difficulty as Difficulty]}` : ""}`;
+    const main = audience === "en" ? p.en : p.ru;
+    const extra = both ? ` · ${a(p.en.url, "EN")}` : "";
+    return `${languageEmoji[p.language] ?? "•"} <b>${escapeHtml(p.name)}</b> · ${level}\n${a(main.url, main.title)}${extra}`;
+  });
+  const hints =
+    audience === "en"
+      ? "💡 Stuck? Tap a hint button below."
+      : `💡 Застряли? Нажмите кнопку с подсказкой ниже.${both ? "\n💡 Stuck? Tap a hint button below." : ""}`;
+  const quiz = quizBelow
+    ? audience === "en"
+      ? "\n❓ Question of the day below."
+      : `\n❓ Вопрос дня ниже.${both ? " · Question of the day below." : ""}`
+    : "";
+  const tags = both ? "\n\n#задачадня #problemoftheday" : "";
+  return `${head}\n\n${lines.join("\n")}\n\n${hints}${quiz}${tags}`;
+}
+
+/** Buttons under the daily post: solve on the site, a hint per language. */
+export function dailyKeyboard(
+  audience: Audience,
+  date: string,
+  problems: DailyProblem[],
+  { siteUrl, bot }: { siteUrl: string; bot: string },
+) {
+  const solve =
+    audience === "both"
+      ? [
+          { text: "🇷🇺 Решить на сайте", url: `${siteUrl}/ru/practice` },
+          { text: "🇬🇧 Solve on the site", url: `${siteUrl}/practice` },
+        ]
+      : [
+          {
+            text:
+              audience === "ru" ? "🧩 Решить на сайте" : "🧩 Solve on the site",
+            url: `${siteUrl}${audience === "ru" ? "/ru" : ""}/practice`,
+          },
+        ];
+  const hints = sortDaily(problems).map((p) => ({
+    text: `💡 ${shortName[p.language] ?? p.name}`,
+    callback_data: `hint:${p.language}:${date}`,
+  }));
+  const rows: object[][] = [solve, hints];
+  if (audience === "both")
+    rows.push([
+      {
+        text: "🔥 Моя серия · My streak",
+        url: `https://t.me/${bot}?start=streak`,
+      },
+    ]);
+  return { inline_keyboard: rows };
+}
+
+/** "hint:python:2026-10-12" → the language and day of a hint button. */
+export function parseHintButton(data?: string) {
+  const match = /^hint:([a-z]+):(\d{4}-\d{2}-\d{2})$/.exec(data ?? "");
+  return match ? { language: match[1], date: match[2] } : null;
+}
+
+/** A hint's markdown as Telegram HTML: `code` and **bold**, the rest escaped. */
+export function hintHtml(markdown: string) {
+  return escapeHtml(markdown)
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+}
+
+/**
+ * A hint as plain text for a pop-up (Telegram shows up to 200 characters):
+ * whole sentences when they fit, else whole words and an ellipsis.
+ */
+export function hintPopup(markdown: string, max = 200) {
+  const text = markdown
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const sentence = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("? "));
+  return sentence > max / 3
+    ? cut.slice(0, sentence + 1)
+    : `${cut.slice(0, cut.lastIndexOf(" "))}…`;
+}
+
+export function hintSpoiler(locale: BotLocale, markdown: string) {
+  return `💡 ${locale === "ru" ? "Подсказка" : "Hint"}: <tg-spoiler>${hintHtml(markdown)}</tg-spoiler>`;
+}

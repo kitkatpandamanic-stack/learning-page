@@ -2,11 +2,17 @@ import { describe, expect, it } from "vitest";
 
 import {
   botLocale,
+  dailyCaption,
+  dailyKeyboard,
   displayName,
+  hintHtml,
+  hintPopup,
+  hintSpoiler,
   languageFromArg,
   leaderboardText,
   localHour,
   parseCommand,
+  parseHintButton,
   reminderText,
   streakText,
 } from "@/lib/telegram/texts";
@@ -93,6 +99,83 @@ describe("writing messages", () => {
     );
     expect(reminderText("en", { streak: 4, freezes: 2, url })).toContain(
       "2 freezes",
+    );
+  });
+});
+
+describe("the daily post", () => {
+  const long = "A problem title that is about as long as titles get here!!";
+  const problems = ["sql", "python", "typescript", "javascript"].map(
+    (language) => ({
+      language,
+      name: language,
+      difficulty: "medium",
+      en: { title: long, url: `https://pandadev.test/practice/${language}/x` },
+      ru: {
+        title: long,
+        url: `https://pandadev.test/ru/practice/${language}/x`,
+      },
+    }),
+  );
+  const visible = (html: string) => html.replace(/<[^>]+>/g, "");
+
+  it("fits Telegram's 1024-character caption, Python first", () => {
+    const caption = dailyCaption("both", "2026-10-12", problems, true);
+    expect(visible(caption).length).toBeLessThanOrEqual(1024);
+    expect(caption.indexOf("python")).toBeLessThan(caption.indexOf("sql"));
+    expect(caption).toContain("12 октября");
+    expect(caption).toContain("#problemoftheday");
+    const en = dailyCaption("en", "2026-10-12", problems, false);
+    expect(en).not.toMatch(/[а-я]/i);
+  });
+
+  it("has solve links, a hint button per language and the streak link", () => {
+    const { inline_keyboard: rows } = dailyKeyboard(
+      "both",
+      "2026-10-12",
+      problems,
+      {
+        siteUrl: "https://pandadev.test",
+        bot: "panda_bot",
+      },
+    ) as {
+      inline_keyboard: {
+        text: string;
+        url?: string;
+        callback_data?: string;
+      }[][];
+    };
+    expect(rows[0].map((b) => b.url)).toEqual([
+      "https://pandadev.test/ru/practice",
+      "https://pandadev.test/practice",
+    ]);
+    expect(rows[1].map((b) => b.callback_data)).toEqual([
+      "hint:python:2026-10-12",
+      "hint:javascript:2026-10-12",
+      "hint:typescript:2026-10-12",
+      "hint:sql:2026-10-12",
+    ]);
+    expect(rows[2][0].url).toBe("https://t.me/panda_bot?start=streak");
+    expect(parseHintButton("hint:sql:2026-10-12")).toEqual({
+      language: "sql",
+      date: "2026-10-12",
+    });
+    expect(parseHintButton("toggle:reminders")).toBeNull();
+  });
+
+  it("formats hints for messages and pop-ups", () => {
+    expect(hintHtml("Use `a < b` and **think**")).toBe(
+      "Use <code>a &lt; b</code> and <b>think</b>",
+    );
+    expect(hintPopup("Use `len()`. Then **loop**.")).toBe(
+      "Use len(). Then loop.",
+    );
+    const long = `${"First sentence is here. ".repeat(10)}And then more words follow`;
+    const popup = hintPopup(long);
+    expect(popup.length).toBeLessThanOrEqual(200);
+    expect(popup.endsWith(".")).toBe(true);
+    expect(hintSpoiler("ru", "x")).toBe(
+      "💡 Подсказка: <tg-spoiler>x</tg-spoiler>",
     );
   });
 });

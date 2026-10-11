@@ -190,6 +190,15 @@ function extractQuizzes(raw: string): QuizData[] {
   return quizzes;
 }
 
+/**
+ * A practice problem's first hint, the nudge, as plain markdown: the
+ * Telegram bot shows it as a spoiler or a pop-up without the full page.
+ */
+function firstHint(raw: string) {
+  const match = /<Hint>\s*([\s\S]*?)\s*<\/Hint>/.exec(raw);
+  return match ? match[1].trim() : undefined;
+}
+
 type TocEntry = { title: string; url: string; items: TocEntry[] };
 
 /**
@@ -386,6 +395,7 @@ const problems = defineCollection({
         xp: PRACTICE_XP[data.difficulty],
         terms: searchTerms(raw),
         exerciseCount: countTags(raw, "Exercise"),
+        hint: firstHint(raw),
       };
     }),
 });
