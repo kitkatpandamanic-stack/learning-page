@@ -78,14 +78,18 @@ beforeAll(async () => {
 });
 
 describe("admin access", () => {
-  it("is for the emails in ADMIN_EMAILS only", () => {
+  it("is for the verified emails in ADMIN_EMAILS only", () => {
     vi.stubEnv("ADMIN_EMAILS", "owner@x.test, Other@X.test");
-    expect(isAdmin("owner@x.test")).toBe(true);
-    expect(isAdmin("other@x.test")).toBe(true);
-    expect(isAdmin("someone@x.test")).toBe(false);
+    const verified = (email: string) => ({ email, emailVerified: true });
+    expect(isAdmin(verified("owner@x.test"))).toBe(true);
+    expect(isAdmin(verified("other@x.test"))).toBe(true);
+    expect(isAdmin(verified("someone@x.test"))).toBe(false);
+    expect(isAdmin({ email: "owner@x.test", emailVerified: false })).toBe(
+      false,
+    );
     expect(isAdmin(null)).toBe(false);
     vi.stubEnv("ADMIN_EMAILS", "");
-    expect(isAdmin("owner@x.test")).toBe(false);
+    expect(isAdmin(verified("owner@x.test"))).toBe(false);
     vi.unstubAllEnvs();
   });
 });

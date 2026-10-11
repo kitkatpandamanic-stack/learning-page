@@ -11,7 +11,7 @@ import { getSession } from "@/lib/session";
 export async function signOutOtherDevices(formData: FormData) {
   const session = await getSession();
   const locale = formData.get("locale");
-  if (!session || !isAdmin(session.user.email) || !isLocale(locale)) return;
+  if (!session || !isAdmin(session.user) || !isLocale(locale)) return;
   const { auth } = await import("@/lib/auth");
   await auth.api.revokeOtherSessions({ headers: await headers() });
   revalidatePath(localizedPath("/admin/health", locale));

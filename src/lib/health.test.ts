@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  backupsArea,
   checkSecrets,
   collectorArea,
   compareToNormal,
@@ -279,6 +280,7 @@ describe("securityArea", () => {
       dependabot: { critical: 0, high: 1, medium: 2, low: 0 },
       dependabotStatus: "ok",
       codeScanning: null,
+      backup: null,
     });
     expect(serious.status).toBe("bad");
     const off = securityArea([], quiet, {
@@ -286,6 +288,7 @@ describe("securityArea", () => {
       dependabot: null,
       dependabotStatus: "off",
       codeScanning: null,
+      backup: null,
     });
     expect(off.findings.map((f) => f.code)).toEqual(["alertsOff"]);
     // Alerts on, but no key that may read them: not the site's problem
@@ -294,6 +297,7 @@ describe("securityArea", () => {
       dependabot: null,
       dependabotStatus: "no-access",
       codeScanning: null,
+      backup: null,
     });
     expect(noAccess.status).toBe("ok");
   });
@@ -334,5 +338,72 @@ describe("describeDevice and maskIp", () => {
   it("hides the end of an IP address", () => {
     expect(maskIp("203.0.113.42")).toBe("203.0.113.x");
     expect(maskIp("2001:db8:85a3:0:0:8a2e:370:7334")).toBe("2001:db8:85a3:…");
+  });
+});
+
+describe("backupsArea", () => {
+  const now = new Date("2026-10-12T12:00:00Z");
+  const github = (backup: object | null) =>
+    readSnapshot({ version: 1, github: { ok: true, dependabot: null, backup } })
+      ?.github;
+
+  it("is unknown until the backup workflow exists", () => {
+    expect(backupsArea(github(null), now).status).toBe("unknown");
+    expect(backupsArea(undefined, now).status).toBe("unknown");
+  });
+
+  it("is fine with last night's backup", () => {
+    const area = backupsArea(
+      github({
+        lastRunAt: "2026-10-11T21:23:00Z",
+        lastConclusion: "success",
+        lastSuccessAt: "2026-10-11T21:25:00Z",
+        sizeBytes: 2_000_000,
+      }),
+      now,
+    );
+    expect(area).toEqual({ status: "ok", findings: [] });
+  });
+
+  it("turns red when the last run failed or backups stopped", () => {
+    expect(
+      backupsArea(
+        github({
+          lastRunAt: "2026-10-11T21:23:00Z",
+          lastConclusion: "failure",
+          lastSuccessAt: "2026-10-11T02:00:00Z",
+          sizeBytes: 2_000_000,
+        }),
+        now,
+      ).findings.map((f) => f.code),
+    ).toEqual(["backupFailed"]);
+    expect(
+      backupsArea(
+        github({
+          lastRunAt: "2026-10-09T21:23:00Z",
+          lastConclusion: "success",
+          lastSuccessAt: "2026-10-09T21:25:00Z",
+          sizeBytes: 2_000_000,
+        }),
+        now,
+      ),
+    ).toEqual({
+      status: "bad",
+      findings: [{ status: "bad", code: "backupStale", values: { hours: 62 } }],
+    });
+  });
+
+  it("asks for a first backup when none succeeded yet", () => {
+    expect(
+      backupsArea(
+        github({
+          lastRunAt: null,
+          lastConclusion: null,
+          lastSuccessAt: null,
+          sizeBytes: null,
+        }),
+        now,
+      ).findings.map((f) => f.code),
+    ).toEqual(["backupNever"]);
   });
 });

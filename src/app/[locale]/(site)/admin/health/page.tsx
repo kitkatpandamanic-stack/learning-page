@@ -10,6 +10,7 @@ import {
   ArrowLeft,
   Bug,
   CheckCircle2,
+  DatabaseBackup,
   CircleDashed,
   ExternalLink,
   Gauge,
@@ -34,6 +35,7 @@ import { Link } from "@/i18n/navigation";
 import { adminEmails, getDatabaseInfo, isAdmin } from "@/lib/admin";
 import {
   area,
+  backupsArea,
   checkSecrets,
   collectorArea,
   compareToNormal,
@@ -113,7 +115,7 @@ export default async function HealthPage({
   const locale = await localeParam(params);
   setRequestLocale(locale);
   const session = await getSession();
-  if (!session || !isAdmin(session.user.email)) {
+  if (!session || !isAdmin(session.user)) {
     if (session)
       recordSecurityEvent(
         "admin-denied",
@@ -145,7 +147,7 @@ export default async function HealthPage({
   const size = (bytes: number) =>
     bytes >= 1024 ** 3
       ? `${format.number(bytes / 1024 ** 3, { maximumFractionDigits: 1 })} GB`
-      : `${format.number(bytes / 1024 ** 2, { maximumFractionDigits: 0 })} MB`;
+      : `${format.number(bytes / 1024 ** 2, { maximumFractionDigits: bytes < 10 * 1024 ** 2 ? 1 : 0 })} MB`;
   const hours = (h: number) =>
     t("limits.hours", {
       value: format.number(h, { maximumFractionDigits: 1 }),
@@ -162,11 +164,12 @@ export default async function HealthPage({
     ...compareToNormal(s.last24h, s.dailyAverage),
   }));
   const areas: Record<
-    "errors" | "limits" | "security" | "learners" | "collector",
+    "errors" | "limits" | "backups" | "security" | "learners" | "collector",
     Area
   > = {
     errors: errorsArea(snapshot?.sentry),
     limits: limitsArea(allMeters, snapshot),
+    backups: backupsArea(snapshot?.github, now),
     security: securityArea(secrets, events.last24h, snapshot?.github),
     learners: area(
       signalResults
@@ -245,7 +248,7 @@ export default async function HealthPage({
           </div>
         </div>
 
-        <nav className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+        <nav className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
           {(Object.keys(areas) as (keyof typeof areas)[]).map((key) => (
             <a
               key={key}
@@ -511,6 +514,64 @@ export default async function HealthPage({
             </div>
           ))}
         </div>
+      </GlassCard>
+
+      {/* Backups */}
+      <GlassCard id="backups" className="flex scroll-mt-24 flex-col gap-3">
+        <SectionTitle
+          icon={<DatabaseBackup className="size-5 text-lime-300" />}
+          title={t("backups.title")}
+          hint={t("backups.hint")}
+          status={areas.backups.status}
+          statusLabel={t(`status.${areas.backups.status}`)}
+        />
+        {!github?.ok || !github.backup ? (
+          <p className="text-sm text-muted-foreground">
+            {t("backups.notSetUp")}
+          </p>
+        ) : (
+          <dl className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <div className="rounded-xl bg-white/5 p-3">
+              <dt className="text-xs text-white/50">{t("backups.last")}</dt>
+              <dd className="text-sm text-white">
+                {github.backup.lastSuccessAt
+                  ? ago(github.backup.lastSuccessAt)
+                  : t("backups.never")}
+              </dd>
+            </div>
+            <div className="rounded-xl bg-white/5 p-3">
+              <dt className="text-xs text-white/50">{t("backups.size")}</dt>
+              <dd className="text-sm text-white">
+                {github.backup.sizeBytes !== null
+                  ? size(github.backup.sizeBytes)
+                  : "—"}
+              </dd>
+            </div>
+            <div className="rounded-xl bg-white/5 p-3">
+              <dt className="text-xs text-white/50">{t("backups.lastRun")}</dt>
+              <dd
+                className={cn(
+                  "text-sm",
+                  github.backup.lastConclusion === "failure"
+                    ? "text-pink-300"
+                    : "text-white",
+                )}
+              >
+                {github.backup.lastRunAt
+                  ? `${github.backup.lastConclusion ?? ""} · ${ago(github.backup.lastRunAt)}`
+                  : "—"}
+              </dd>
+            </div>
+          </dl>
+        )}
+        <a
+          href={`${siteConfig.githubUrl}/actions/workflows/backup.yml`}
+          target="_blank"
+          rel="noreferrer"
+          className="flex w-fit items-center gap-1.5 text-sm text-cyan-300 hover:underline"
+        >
+          {t("backups.open")} <ExternalLink className="size-3.5" />
+        </a>
       </GlassCard>
 
       {/* Security */}

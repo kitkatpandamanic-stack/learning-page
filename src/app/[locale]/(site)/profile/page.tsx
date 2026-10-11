@@ -133,7 +133,7 @@ export default async function ProfilePage({
       <GlassCard className="flex flex-col gap-4">
         <h2 className="text-lg font-semibold text-white">{t("account")}</h2>
         <div className="flex flex-col items-start gap-4">
-          {isAdmin(user.email) && (
+          {isAdmin(user) && (
             <Button asChild variant="glass">
               <Link href="/admin">{t("adminPanel")}</Link>
             </Button>

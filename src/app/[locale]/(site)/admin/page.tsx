@@ -57,7 +57,7 @@ export default async function AdminPage({
   setRequestLocale(locale);
   // Everyone else gets "page not found", as if there were no admin panel.
   const session = await getSession();
-  if (!session || !isAdmin(session.user.email)) {
+  if (!session || !isAdmin(session.user)) {
     if (session)
       recordSecurityEvent("admin-denied", "/admin", `u:${session.user.id}`);
     notFound();

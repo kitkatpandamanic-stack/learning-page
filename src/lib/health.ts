@@ -133,6 +133,13 @@ export type Snapshot = {
     /** Why there are no counts: alerts turned off, or no key that may read them */
     dependabotStatus: "ok" | "off" | "no-access" | "failed";
     codeScanning: number | null;
+    /** The nightly backup; null until the backup workflow exists */
+    backup: {
+      lastRunAt: string | null;
+      lastConclusion: string | null;
+      lastSuccessAt: string | null;
+      sizeBytes: number | null;
+    } | null;
   }>;
 };
 
@@ -217,6 +224,20 @@ export function readSnapshot(data: unknown): Snapshot | null {
           (v) => v === o.dependabotStatus,
         ) ?? (isObject(o.dependabot) ? "ok" : "failed"),
       codeScanning: typeof o.codeScanning === "number" ? o.codeScanning : null,
+      backup: isObject(o.backup)
+        ? {
+            lastRunAt: date(o.backup.lastRunAt),
+            lastConclusion:
+              typeof o.backup.lastConclusion === "string"
+                ? str(o.backup.lastConclusion, 20)
+                : null,
+            lastSuccessAt: date(o.backup.lastSuccessAt),
+            sizeBytes:
+              typeof o.backup.sizeBytes === "number"
+                ? o.backup.sizeBytes
+                : null,
+          }
+        : null,
     })),
   };
 }
@@ -242,6 +263,32 @@ export function collectorArea(
       { status: "warn", code: "collectorStale", values: { hours } },
     ]);
   return area([]);
+}
+
+/**
+ * Nightly backups: red when the last one failed or none succeeded for a day
+ * and a half, unknown until the backup workflow is set up.
+ */
+export function backupsArea(
+  github: Snapshot["github"],
+  now = new Date(),
+): Area {
+  if (!github?.ok || !github.backup) return area([], false);
+  const { lastSuccessAt, lastConclusion } = github.backup;
+  const findings: Finding[] = [];
+  if (lastConclusion === "failure")
+    findings.push({ status: "bad", code: "backupFailed" });
+  if (!lastSuccessAt) {
+    if (lastConclusion !== "failure")
+      findings.push({ status: "warn", code: "backupNever" });
+  } else {
+    const hours = Math.floor(
+      (now.getTime() - Date.parse(lastSuccessAt)) / HOUR,
+    );
+    if (hours >= 36)
+      findings.push({ status: "bad", code: "backupStale", values: { hours } });
+  }
+  return area(findings);
 }
 
 export function errorsArea(sentry: Snapshot["sentry"]): Area {
