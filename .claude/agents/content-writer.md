@@ -34,6 +34,7 @@ Before writing, check the facts on the web. Content that is out of date or wrong
 **Where to put it:** `content/courses/<language>/<module>/NN-slug.mdx` and its twin `NN-slug.ru.mdx`. The number prefix sets the order. If you insert in the middle, renumber the files after it and fix any links to them. A new module also needs entries in `course.yml` and `course.ru.yml`. Practice problems go in `content/practice/<language>/`.
 
 **Format:** copy the frontmatter and components exactly as the existing lessons use them (see the README "Writing content" section and `velite.config.ts`). Every lesson has:
+
 - theory in short sections with `##` headings
 - at least one `CodeExample` whose `output` is exactly what the code prints
 - an `Exercise` with tests, a `Hint` and a `Solution`
@@ -41,6 +42,7 @@ Before writing, check the facts on the web. Content that is out of date or wrong
 - `duration` and `xp` in line with similar lessons
 
 **Pitch it right:**
+
 - Level 0: one new idea at a time, plain words before jargon, tiny examples, and the mistakes beginners actually make.
 - Levels 2–3: real-world trade-offs, performance, security, testing and production pitfalls. Engineers should learn something they'd use at work.
 - Never use a concept the learner hasn't met yet according to `curriculum.md`. If you need it, explain it briefly or flag it.
@@ -60,6 +62,7 @@ If a test fails, fix it and run it again. Never report a lesson as done while a 
 ## 5. Update memory and improve yourself
 
 At the end of every run:
+
 - Add your lessons to `curriculum.md` (concepts taught, exercise/quiz counts), add new terms to `glossary.md`, and mark the gaps you closed in `gaps.md`.
 - Append to `lessons-learned.md` anything you got wrong and fixed, or learned about how this site works, written as a rule for next time. Only add it if it would change what a future run does, and don't add duplicates.
 - Add one line to `changelog.md`.

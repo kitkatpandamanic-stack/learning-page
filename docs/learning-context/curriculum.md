@@ -5,13 +5,13 @@ Last refreshed: 2026-10-11 (repo HEAD `947f15b`). Generated from `course.yml`, l
 
 ## Totals
 
-| Course | Levels | Modules (+ capstones) | Lessons | Exercises | Quizzes | Practice (easy/med/hard) |
-| --- | --- | --- | --- | --- | --- | --- |
-| JavaScript | 4 | 20 + 4 | 72 (L0 15 · L1 16 · L2 22 · L3 19) | 71 | 116 | 40 (12/18/10) |
-| Python | 4 | 25 + 4 | 94 (L0 16 · L1 23 · L2 33 · L3 22) | 93 | 162 | 40 (12/18/10) |
-| SQL | 4 | 16 + 4 | 60 (15 per level) | 60 | 113 | 40 (12/18/10) |
-| TypeScript | 4 | 17 + 4 | 62 (L0 15 · L1 15 · L2 15 · L3 17) | 62 | 100 | 40 (12/18/10) |
-| **All** | | **78 + 16** | **288** (+288 RU) | 286 | 491 | **160** (+160 RU) |
+| Course     | Levels | Modules (+ capstones) | Lessons                            | Exercises | Quizzes | Practice (easy/med/hard) |
+| ---------- | ------ | --------------------- | ---------------------------------- | --------- | ------- | ------------------------ |
+| JavaScript | 4      | 20 + 4                | 72 (L0 15 · L1 16 · L2 22 · L3 19) | 71        | 116     | 40 (12/18/10)            |
+| Python     | 4      | 25 + 4                | 94 (L0 16 · L1 23 · L2 33 · L3 22) | 93        | 162     | 40 (12/18/10)            |
+| SQL        | 4      | 16 + 4                | 60 (15 per level)                  | 60        | 113     | 40 (12/18/10)            |
+| TypeScript | 4      | 17 + 4                | 62 (L0 15 · L1 15 · L2 15 · L3 17) | 62        | 100     | 40 (12/18/10)            |
+| **All**    |        | **78 + 16**           | **288** (+288 RU)                  | 286       | 491     | **160** (+160 RU)        |
 
 Lesson counts include capstone parts (3 per capstone). Module mini-projects present: JS 10/20, Python 14/25, SQL 2/16, TS 9/17 (35 of 78; 43 modules have none). Quiz counts updated 2026-10-11 after the basics mini-projects (JS 116, Python 162).
 
@@ -34,60 +34,60 @@ Prerequisite rule: a lesson may use anything from lessons above it in the same c
 
 ## Cross-language map (same idea, lesson slug in each course)
 
-| Concept | JavaScript | Python | TypeScript | SQL |
-| --- | --- | --- | --- | --- |
-| First program | hello-world | hello-world | hello-typescript | what-is-a-database |
-| Variables & types | variables, data-types | variables, data-types | basic-types, special-types | number-functions (types, `::`) |
-| Strings | working-with-strings | working-with-strings | basic-types | text-functions |
-| Arithmetic | arithmetic | arithmetic | (basic-types) | number-functions |
-| Comparisons & logic | comparisons-and-logic | comparisons-and-logic | conditions-and-narrowing | filtering-with-where |
-| Branching | if-else (incl. switch, ternary) | if-elif-else (incl. match) | conditions-and-narrowing, literal-types-and-switch | case-and-pivots (L2) |
-| Loops | for-loops, while-loops, for-of | for-loops, while-loops, looping-over-lists | loops | recursive-ctes (L2) |
-| Functions | writing-functions, arrow-functions-and-scope | writing-functions, defaults-and-scope | typed-functions, optional-default-and-rest, arrow-functions-and-callbacks | functions-and-procedures (L2) |
-| Missing values | data-types (null/undefined), spread-rest-and-optional-chaining | data-types (None) | special-types | null-values |
-| Reading errors / debugging | reading-errors (L1) | reading-errors-and-debugging (L0) | (hello-typescript: compiler errors) | what-is-a-database ("When something goes wrong") |
-| Lists / arrays | arrays | looping-over-lists, lists-in-depth | arrays-and-tuples | jsonb-and-arrays (L2) |
-| Transform collections | array-methods | comprehensions | typed-data | aggregation, group-by |
-| Key-value data | objects, map-set-and-generators (Map) | dictionaries | object-types-and-interfaces, utility-types (Record) | jsonb-and-arrays |
-| Sets / tuples | map-set-and-generators (Set) | tuples-and-sets | arrays-and-tuples (tuples) | union-intersect-except |
-| JSON / files | working-with-data (JSON), saving-with-localstorage | reading-and-writing-files, csv-and-json | type-guards-and-unknown (JSON) | jsonb-and-arrays |
-| Exceptions | try-catch | exceptions | type-guards-and-unknown, validation-and-errors | upserts-and-transactions (ROLLBACK), functions-and-procedures (RAISE) |
-| Classes | classes, inheritance | classes-and-objects, inheritance, special-methods | classes-and-access-modifiers, inheritance-interfaces-and-abstract-classes, structural-typing-and-class-design | — |
-| Enums / tagged states | — | enums-and-pattern-matching | literal-types-and-switch, discriminated-unions | advanced-constraints (enum types) |
-| Modules & packages | modules, npm-and-git | modules-and-imports, pip-and-virtual-environments | modules-and-declaration-files, tsconfig-and-the-compiler | — |
-| Git | npm-and-git | — | — | — |
-| Browser DOM | the-dom, events, building-pages | — | typing-the-dom | — |
-| Regex / dates | — | regular-expressions, dates-and-times | — | text-functions, date-functions |
-| Recursion & algorithms | — | recursion, big-o, searching-and-sorting, stacks-queues-and-hash-maps | — | recursive-ctes |
-| Closures / decorators | closures-and-higher-order-functions | decorators | arrow-functions-and-callbacks (function types) | — |
-| Generators / iterators | map-set-and-generators | generators-and-context-managers | (typed-sdk/the-client: async iterator) | — |
-| Static types | — | type-hints | whole course | creating-tables (types) |
-| Async | callbacks-and-the-event-loop, promises, async-await | async-await, concurrent-tasks, timeouts-and-cancellation | typing-promises-and-async | — |
-| HTTP clients | fetch-basics, sending-data-and-handling-errors | http-requests, robust-api-clients | typed-fetch, runtime-validation | — |
-| Testing | first-tests, mocks-and-async-tests, test-driven-development | first-tests, fixtures-and-parametrize, mocks-and-coverage | testing-typed-code, dependency-injection-and-fakes, testing-types | — |
-| Web servers / APIs | node-and-express-basics, middleware-and-validation, notes-api | first-api, request-validation, todo-api | typed-express-apis, validation-and-errors, sharing-types-between-client-and-server | — |
-| UI framework | react (4 lessons) | — | react (3 lessons) | — |
-| Databases | — | sql-basics, sqlalchemy-orm, relationships-and-migrations | — | whole course |
-| Transactions | — | sql-basics | — | upserts-and-transactions, acid-and-isolation-levels, row-locks-and-job-queues |
-| Data / ML | — | data-analysis, statistics, machine-learning, deep-learning | — | analytics-dashboard, window-functions |
-| Internals | how-engines-run-code, the-event-loop-in-depth, memory-and-garbage-collection | how-python-runs-code, memory-and-the-gil | how-the-compiler-works | mvcc-and-vacuum, explain-query-plans |
-| Metaprogramming | proxies-reflect-and-symbols | descriptors-and-metaclasses | advanced-types, type-level-programming | — |
-| Design patterns | solid-and-classic-patterns | design-patterns | branded-types-and-type-safe-apis | modeling-patterns |
-| Clean architecture / DI | clean-architecture, dependency-injection-and-domain-modelling | clean-architecture, dependency-injection-and-ddd | designing-types-for-large-codebases, dependency-injection-and-fakes (L2) | — |
-| Performance | measuring-performance, fast-code-in-the-browser, bundling-and-caching | profiling, caching-and-optimisation, threads-and-processes | faster-type-checking | explain-query-plans, choosing-indexes, query-tuning |
-| Security | xss-and-injection, authentication-and-sessions, csrf-cors-and-secrets | secure-coding, auth-for-apis | — | roles-and-privileges, sql-injection, row-level-security |
-| Deployment / CI | realtime-chat/the-client-and-shipping-it | containers-and-deployment | building-and-publishing-packages, typed-sdk/shipping-it | backups-and-replication |
-| System design | designing-systems, real-time-and-resilience | designing-systems, resilience-patterns | monorepos-and-project-references | table-partitioning, choosing-a-database |
-| Code review & mentoring | code-review-and-leadership | code-review-and-leadership | reviewing-typescript-code, leading-typescript-adoption | — |
+| Concept                    | JavaScript                                                                   | Python                                                               | TypeScript                                                                                                    | SQL                                                                           |
+| -------------------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| First program              | hello-world                                                                  | hello-world                                                          | hello-typescript                                                                                              | what-is-a-database                                                            |
+| Variables & types          | variables, data-types                                                        | variables, data-types                                                | basic-types, special-types                                                                                    | number-functions (types, `::`)                                                |
+| Strings                    | working-with-strings                                                         | working-with-strings                                                 | basic-types                                                                                                   | text-functions                                                                |
+| Arithmetic                 | arithmetic                                                                   | arithmetic                                                           | (basic-types)                                                                                                 | number-functions                                                              |
+| Comparisons & logic        | comparisons-and-logic                                                        | comparisons-and-logic                                                | conditions-and-narrowing                                                                                      | filtering-with-where                                                          |
+| Branching                  | if-else (incl. switch, ternary)                                              | if-elif-else (incl. match)                                           | conditions-and-narrowing, literal-types-and-switch                                                            | case-and-pivots (L2)                                                          |
+| Loops                      | for-loops, while-loops, for-of                                               | for-loops, while-loops, looping-over-lists                           | loops                                                                                                         | recursive-ctes (L2)                                                           |
+| Functions                  | writing-functions, arrow-functions-and-scope                                 | writing-functions, defaults-and-scope                                | typed-functions, optional-default-and-rest, arrow-functions-and-callbacks                                     | functions-and-procedures (L2)                                                 |
+| Missing values             | data-types (null/undefined), spread-rest-and-optional-chaining               | data-types (None)                                                    | special-types                                                                                                 | null-values                                                                   |
+| Reading errors / debugging | reading-errors (L1)                                                          | reading-errors-and-debugging (L0)                                    | (hello-typescript: compiler errors)                                                                           | what-is-a-database ("When something goes wrong")                              |
+| Lists / arrays             | arrays                                                                       | looping-over-lists, lists-in-depth                                   | arrays-and-tuples                                                                                             | jsonb-and-arrays (L2)                                                         |
+| Transform collections      | array-methods                                                                | comprehensions                                                       | typed-data                                                                                                    | aggregation, group-by                                                         |
+| Key-value data             | objects, map-set-and-generators (Map)                                        | dictionaries                                                         | object-types-and-interfaces, utility-types (Record)                                                           | jsonb-and-arrays                                                              |
+| Sets / tuples              | map-set-and-generators (Set)                                                 | tuples-and-sets                                                      | arrays-and-tuples (tuples)                                                                                    | union-intersect-except                                                        |
+| JSON / files               | working-with-data (JSON), saving-with-localstorage                           | reading-and-writing-files, csv-and-json                              | type-guards-and-unknown (JSON)                                                                                | jsonb-and-arrays                                                              |
+| Exceptions                 | try-catch                                                                    | exceptions                                                           | type-guards-and-unknown, validation-and-errors                                                                | upserts-and-transactions (ROLLBACK), functions-and-procedures (RAISE)         |
+| Classes                    | classes, inheritance                                                         | classes-and-objects, inheritance, special-methods                    | classes-and-access-modifiers, inheritance-interfaces-and-abstract-classes, structural-typing-and-class-design | —                                                                             |
+| Enums / tagged states      | —                                                                            | enums-and-pattern-matching                                           | literal-types-and-switch, discriminated-unions                                                                | advanced-constraints (enum types)                                             |
+| Modules & packages         | modules, npm-and-git                                                         | modules-and-imports, pip-and-virtual-environments                    | modules-and-declaration-files, tsconfig-and-the-compiler                                                      | —                                                                             |
+| Git                        | npm-and-git                                                                  | —                                                                    | —                                                                                                             | —                                                                             |
+| Browser DOM                | the-dom, events, building-pages                                              | —                                                                    | typing-the-dom                                                                                                | —                                                                             |
+| Regex / dates              | —                                                                            | regular-expressions, dates-and-times                                 | —                                                                                                             | text-functions, date-functions                                                |
+| Recursion & algorithms     | —                                                                            | recursion, big-o, searching-and-sorting, stacks-queues-and-hash-maps | —                                                                                                             | recursive-ctes                                                                |
+| Closures / decorators      | closures-and-higher-order-functions                                          | decorators                                                           | arrow-functions-and-callbacks (function types)                                                                | —                                                                             |
+| Generators / iterators     | map-set-and-generators                                                       | generators-and-context-managers                                      | (typed-sdk/the-client: async iterator)                                                                        | —                                                                             |
+| Static types               | —                                                                            | type-hints                                                           | whole course                                                                                                  | creating-tables (types)                                                       |
+| Async                      | callbacks-and-the-event-loop, promises, async-await                          | async-await, concurrent-tasks, timeouts-and-cancellation             | typing-promises-and-async                                                                                     | —                                                                             |
+| HTTP clients               | fetch-basics, sending-data-and-handling-errors                               | http-requests, robust-api-clients                                    | typed-fetch, runtime-validation                                                                               | —                                                                             |
+| Testing                    | first-tests, mocks-and-async-tests, test-driven-development                  | first-tests, fixtures-and-parametrize, mocks-and-coverage            | testing-typed-code, dependency-injection-and-fakes, testing-types                                             | —                                                                             |
+| Web servers / APIs         | node-and-express-basics, middleware-and-validation, notes-api                | first-api, request-validation, todo-api                              | typed-express-apis, validation-and-errors, sharing-types-between-client-and-server                            | —                                                                             |
+| UI framework               | react (4 lessons)                                                            | —                                                                    | react (3 lessons)                                                                                             | —                                                                             |
+| Databases                  | —                                                                            | sql-basics, sqlalchemy-orm, relationships-and-migrations             | —                                                                                                             | whole course                                                                  |
+| Transactions               | —                                                                            | sql-basics                                                           | —                                                                                                             | upserts-and-transactions, acid-and-isolation-levels, row-locks-and-job-queues |
+| Data / ML                  | —                                                                            | data-analysis, statistics, machine-learning, deep-learning           | —                                                                                                             | analytics-dashboard, window-functions                                         |
+| Internals                  | how-engines-run-code, the-event-loop-in-depth, memory-and-garbage-collection | how-python-runs-code, memory-and-the-gil                             | how-the-compiler-works                                                                                        | mvcc-and-vacuum, explain-query-plans                                          |
+| Metaprogramming            | proxies-reflect-and-symbols                                                  | descriptors-and-metaclasses                                          | advanced-types, type-level-programming                                                                        | —                                                                             |
+| Design patterns            | solid-and-classic-patterns                                                   | design-patterns                                                      | branded-types-and-type-safe-apis                                                                              | modeling-patterns                                                             |
+| Clean architecture / DI    | clean-architecture, dependency-injection-and-domain-modelling                | clean-architecture, dependency-injection-and-ddd                     | designing-types-for-large-codebases, dependency-injection-and-fakes (L2)                                      | —                                                                             |
+| Performance                | measuring-performance, fast-code-in-the-browser, bundling-and-caching        | profiling, caching-and-optimisation, threads-and-processes           | faster-type-checking                                                                                          | explain-query-plans, choosing-indexes, query-tuning                           |
+| Security                   | xss-and-injection, authentication-and-sessions, csrf-cors-and-secrets        | secure-coding, auth-for-apis                                         | —                                                                                                             | roles-and-privileges, sql-injection, row-level-security                       |
+| Deployment / CI            | realtime-chat/the-client-and-shipping-it                                     | containers-and-deployment                                            | building-and-publishing-packages, typed-sdk/shipping-it                                                       | backups-and-replication                                                       |
+| System design              | designing-systems, real-time-and-resilience                                  | designing-systems, resilience-patterns                               | monorepos-and-project-references                                                                              | table-partitioning, choosing-a-database                                       |
+| Code review & mentoring    | code-review-and-leadership                                                   | code-review-and-leadership                                           | reviewing-typescript-code, leading-typescript-adoption                                                        | —                                                                             |
 
 ## Capstones
 
-| Course | L0 | L1 | L2 | L3 |
-| --- | --- | --- | --- | --- |
-| JavaScript | number-guessing-game | todo-app | weather-dashboard | realtime-chat |
-| Python | text-adventure | expense-tracker | rest-api | production-service |
-| SQL | movie-night | shop-analytics | analytics-dashboard | multi-tenant-saas |
-| TypeScript | quiz-game | habit-tracker | fullstack-todos | typed-sdk |
+| Course     | L0                   | L1              | L2                  | L3                 |
+| ---------- | -------------------- | --------------- | ------------------- | ------------------ |
+| JavaScript | number-guessing-game | todo-app        | weather-dashboard   | realtime-chat      |
+| Python     | text-adventure       | expense-tracker | rest-api            | production-service |
+| SQL        | movie-night          | shop-analytics  | analytics-dashboard | multi-tenant-saas  |
+| TypeScript | quiz-game            | habit-tracker   | fullstack-todos     | typed-sdk          |
 
 All 16 capstones exist with 3 parts each.
 
@@ -300,13 +300,13 @@ All 16 capstones exist with 3 parts each.
 **Module `classes`: Classes & OOP** · yml project: Library management system · mini-project exercise: Library management system (in `special-methods`)
 
 - `01-classes-and-objects` Classes and Objects (15m, 25xp, ex 1, quiz 2): Your first class; Methods: functions that belong to a class; Objects remember their state; Class attributes vs instance attributes; Properties: attributes with validation; Alternative constructors with @classmethod
-- `02-inheritance` Inheritance (15m, 25xp, ex 1, quiz 2): Creating a subclass; super().__init__: extending the setup; Overriding methods; isinstance and issubclass; Custom exceptions; Composition vs inheritance; @dataclass: a shortcut for data classes
+- `02-inheritance` Inheritance (15m, 25xp, ex 1, quiz 2): Creating a subclass; super().**init**: extending the setup; Overriding methods; isinstance and issubclass; Custom exceptions; Composition vs inheritance; @dataclass: a shortcut for data classes
 - `03-enums-and-pattern-matching` Enums & Pattern Matching (18m, 20xp, ex 1, quiz 2): Magic strings and why they hurt; Your first enum; auto(), looping and looking up; Comparing members; match with enum members; Sequence patterns: matching lists; Mapping patterns: matching dictionaries; Class patterns: matching objects; When to use match (and when not)
-- `04-special-methods` Special (Dunder) Methods (15m, 25xp, ex 1, quiz 2): __str__ and __repr__: printing objects; __eq__: when are two objects equal?; __lt__: sorting your objects; __len__, __contains__ and __iter__: acting like a collection
+- `04-special-methods` Special (Dunder) Methods (15m, 25xp, ex 1, quiz 2): **str** and **repr**: printing objects; **eq**: when are two objects equal?; **lt**: sorting your objects; **len**, **contains** and **iter**: acting like a collection
 
 **Module `modules-and-packages`: Modules, pip & Virtual Environments** · yml project: — · mini-project exercise: NONE
 
-- `01-modules-and-imports` Modules and Imports (15m, 20xp, ex 1, quiz 1): import; from … import and as; A tour of the standard library; Writing your own module; Running vs importing: if __name__ == "__main__":; Exploring with dir() and help()
+- `01-modules-and-imports` Modules and Imports (15m, 20xp, ex 1, quiz 1): import; from … import and as; A tour of the standard library; Writing your own module; Running vs importing: if **name** == "**main**":; Exploring with dir() and help()
 - `02-pip-and-virtual-environments` pip and Virtual Environments (12m, 20xp, ex 0, quiz 2) **[NO EXERCISE; no CodeExample]**: Packages and PyPI; Why virtual environments?; Creating a virtual environment; Activating it; Installing packages with pip; requirements.txt and pip freeze; Keep .venv out of Git; The whole workflow
 
 **Module `text-and-automation`: Text, Dates & Automation** · yml project: Log file analyser · mini-project exercise: Log file analyser (in `automating-files`)
@@ -324,7 +324,7 @@ All 16 capstones exist with 3 parts each.
 
 **Capstone `expense-tracker`: Command-line expense tracker that saves to files**
 
-- `01-modelling-expenses` Part 1: Modelling expenses (20m, 30xp, ex 1, quiz 1): A word about money and floats; The Expense dataclass; Checking a date; Validating with __post_init__; The ExpenseTracker class; Totals per category
+- `01-modelling-expenses` Part 1: Modelling expenses (20m, 30xp, ex 1, quiz 1): A word about money and floats; The Expense dataclass; Checking a date; Validating with **post_init**; The ExpenseTracker class; Totals per category
 - `02-saving-to-files` Part 2: Saving to files (25m, 30xp, ex 1, quiz 1): From an expense to a dict; Writing a CSV file; Reading it back: everything is text; When the file doesn't exist yet; Surviving a broken row; Saving and loading JSON; Picking the format from the file name; Round-trip tests
 - `03-the-command-line` Part 3: The command line (25m, 30xp, ex 1, quiz 1): Splitting a command into words; Friendly errors for bad input; Lining up columns; Grouping by month; The command loop; Running it on your computer
 
@@ -397,9 +397,9 @@ All 16 capstones exist with 3 parts each.
 
 **Module `internals`: Python Internals** · yml project: — · mini-project exercise: NONE
 
-- `01-how-python-runs-code` How Python Runs Your Code (22m, 25xp, ex 1, quiz 2): CPython: the Python you're running; From source to bytecode; Reading bytecode with dis; .pyc files and __pycache__; Everything is an object; Names bind to objects; Aliasing bugs you'll meet in real code; Interning: a curiosity, not a feature; Frames and the call stack
-- `02-memory-and-the-gil` Memory Management and the GIL (24m, 25xp, ex 1, quiz 2): Reference counting; Cycles and the garbage collector; Weak references for caches; __slots__ and object size; Finding a leak with tracemalloc; The GIL: what it actually is; Threads for I/O, processes for CPU; Free-threaded Python and sub-interpreters
-- `03-descriptors-and-metaclasses` Descriptors and Metaclasses (25m, 30xp, ex 1, quiz 2): How Python finds an attribute; __getattr__ vs __getattribute__; Descriptors: objects that control attribute access; A reusable validated field; __init_subclass__: hooks for subclasses; Class decorators; Metaclasses: the class of a class
+- `01-how-python-runs-code` How Python Runs Your Code (22m, 25xp, ex 1, quiz 2): CPython: the Python you're running; From source to bytecode; Reading bytecode with dis; .pyc files and **pycache**; Everything is an object; Names bind to objects; Aliasing bugs you'll meet in real code; Interning: a curiosity, not a feature; Frames and the call stack
+- `02-memory-and-the-gil` Memory Management and the GIL (24m, 25xp, ex 1, quiz 2): Reference counting; Cycles and the garbage collector; Weak references for caches; **slots** and object size; Finding a leak with tracemalloc; The GIL: what it actually is; Threads for I/O, processes for CPU; Free-threaded Python and sub-interpreters
+- `03-descriptors-and-metaclasses` Descriptors and Metaclasses (25m, 30xp, ex 1, quiz 2): How Python finds an attribute; **getattr** vs **getattribute**; Descriptors: objects that control attribute access; A reusable validated field; **init_subclass**: hooks for subclasses; Class decorators; Metaclasses: the class of a class
 
 **Module `performance`: Performance & Concurrency** · yml project: — · mini-project exercise: NONE
 
@@ -709,180 +709,180 @@ All 160 EN problems link to an existing lesson (0 broken links) and have a RU tw
 
 ### JavaScript practice (40 problems)
 
-| # | Slug | Title | Diff | Topic | Linked lesson (where) |
-|---|---|---|---|---|---|
-| 01 | count-vowels | Count the vowels | easy | strings | working-with-strings (javascript L0 basics) |
-| 02 | munch-nap-roll | Munch, Nap, Roll | easy | numbers | for-loops (javascript L0 loops) |
-| 03 | digit-chain | The digit chain | easy | numbers | while-loops (javascript L0 loops) |
-| 04 | title-case | Book title case | easy | strings | working-with-strings (javascript L0 basics) |
-| 05 | make-a-range | Make a range | easy | arrays | for-loops (javascript L0 loops) |
-| 06 | clean-tags | Tidy up the tags | easy | arrays | map-set-and-generators (javascript L2 modern-javascript) |
-| 07 | best-bamboo-stretch | The best bamboo stretch | easy | arrays | arrays (javascript L1 arrays-and-objects) |
-| 08 | letter-tally | Letter tally | easy | objects | objects (javascript L1 arrays-and-objects) |
-| 09 | mirror-words | Mirror words | easy | strings | working-with-strings (javascript L0 basics) |
-| 10 | ticket-numbers | Ticket number machine | easy | functions | closures-and-higher-order-functions (javascript L2 modern-javascript) |
-| 11 | repeat-a-function | Do it n times | easy | functions | closures-and-higher-order-functions (javascript L2 modern-javascript) |
-| 12 | dig-into-an-object | Dig into an object | easy | objects | spread-rest-and-optional-chaining (javascript L2 modern-javascript) |
-| 13 | zip-the-columns | Zip the columns | medium | arrays | arrays (javascript L1 arrays-and-objects) |
-| 14 | stock-changes | What changed in the stock? | medium | objects | objects (javascript L1 arrays-and-objects) |
-| 15 | flatten-to-a-depth | Flatten to a depth | medium | arrays | spread-rest-and-optional-chaining (javascript L2 modern-javascript) |
-| 16 | pipe-and-compose | Pipe and compose | medium | functions | closures-and-higher-order-functions (javascript L2 modern-javascript) |
-| 17 | memoize-any-arguments | Remember every answer | medium | functions | closures-and-higher-order-functions (javascript L2 modern-javascript) |
-| 18 | wrap-text | Wrap the text | medium | strings | working-with-strings (javascript L0 basics) |
-| 19 | merge-settings | Merge the settings | medium | objects | spread-rest-and-optional-chaining (javascript L2 modern-javascript) |
-| 20 | share-out-fairly | Share it out fairly | medium | numbers | arithmetic (javascript L0 operators-and-conditions) |
-| 21 | panda-thermostat | The panda-house thermostat | medium | classes | classes (javascript L1 classes) |
-| 22 | format-duration | How long did the panda nap? | medium | strings | working-with-strings (javascript L0 basics) |
-| 23 | rotate-sprite | Spin the pixel panda | medium | arrays | arrays (javascript L1 arrays-and-objects) |
-| 24 | parse-query-string | Read the search bar | medium | text | working-with-strings (javascript L0 basics) |
-| 25 | merge-bookings | Squash the visiting slots | medium | algorithms | array-methods (javascript L1 arrays-and-objects) |
-| 26 | first-tall-enough | The first tall-enough bamboo | medium | algorithms | measuring-performance (javascript L3 performance) |
-| 27 | event-emitter | The bamboo-feed newsroom | medium | classes | closures-and-higher-order-functions (javascript L2 modern-javascript) |
-| 28 | deep-equal | Are these two pandas the same? | medium | recursion | objects (javascript L1 arrays-and-objects) |
-| 29 | flatten-to-dotted-keys | Flatten the settings file | medium | objects | objects (javascript L1 arrays-and-objects) |
-| 30 | retry-with-backoff | Try, try again (with a nap in between) | medium | async | async-await (javascript L2 async) |
-| 31 | panda-parade | Who can see whom at the panda parade? | hard | arrays | arrays (javascript L1 arrays-and-objects) |
-| 32 | expiring-cache | The bamboo cache that goes stale | hard | objects | map-set-and-generators (javascript L2 modern-javascript) |
-| 33 | deep-clone | Clone the whole panda family tree | hard | recursion | spread-rest-and-optional-chaining (javascript L2 modern-javascript) |
-| 34 | build-order | Which job comes first? | hard | algorithms | map-set-and-generators (javascript L2 modern-javascript) |
-| 35 | promise-pool | Only three trucks at a time | hard | async | promises (javascript L2 async) |
-| 36 | debounce-async | Wait until the typing stops | hard | async | closures-and-higher-order-functions (javascript L2 modern-javascript) |
-| 37 | spelling-suggestions | Did you mean "bamboo"? | hard | algorithms | measuring-performance (javascript L3 performance) |
-| 38 | tokenizer | Chop code into tokens | hard | text | working-with-strings (javascript L0 basics) |
-| 39 | grid-route | The panda's way out of the maze | hard | algorithms | arrays (javascript L1 arrays-and-objects) |
-| 40 | mini-templates | A tiny template engine | hard | text | objects (javascript L1 arrays-and-objects) |
+| #   | Slug                   | Title                                  | Diff   | Topic      | Linked lesson (where)                                                 |
+| --- | ---------------------- | -------------------------------------- | ------ | ---------- | --------------------------------------------------------------------- |
+| 01  | count-vowels           | Count the vowels                       | easy   | strings    | working-with-strings (javascript L0 basics)                           |
+| 02  | munch-nap-roll         | Munch, Nap, Roll                       | easy   | numbers    | for-loops (javascript L0 loops)                                       |
+| 03  | digit-chain            | The digit chain                        | easy   | numbers    | while-loops (javascript L0 loops)                                     |
+| 04  | title-case             | Book title case                        | easy   | strings    | working-with-strings (javascript L0 basics)                           |
+| 05  | make-a-range           | Make a range                           | easy   | arrays     | for-loops (javascript L0 loops)                                       |
+| 06  | clean-tags             | Tidy up the tags                       | easy   | arrays     | map-set-and-generators (javascript L2 modern-javascript)              |
+| 07  | best-bamboo-stretch    | The best bamboo stretch                | easy   | arrays     | arrays (javascript L1 arrays-and-objects)                             |
+| 08  | letter-tally           | Letter tally                           | easy   | objects    | objects (javascript L1 arrays-and-objects)                            |
+| 09  | mirror-words           | Mirror words                           | easy   | strings    | working-with-strings (javascript L0 basics)                           |
+| 10  | ticket-numbers         | Ticket number machine                  | easy   | functions  | closures-and-higher-order-functions (javascript L2 modern-javascript) |
+| 11  | repeat-a-function      | Do it n times                          | easy   | functions  | closures-and-higher-order-functions (javascript L2 modern-javascript) |
+| 12  | dig-into-an-object     | Dig into an object                     | easy   | objects    | spread-rest-and-optional-chaining (javascript L2 modern-javascript)   |
+| 13  | zip-the-columns        | Zip the columns                        | medium | arrays     | arrays (javascript L1 arrays-and-objects)                             |
+| 14  | stock-changes          | What changed in the stock?             | medium | objects    | objects (javascript L1 arrays-and-objects)                            |
+| 15  | flatten-to-a-depth     | Flatten to a depth                     | medium | arrays     | spread-rest-and-optional-chaining (javascript L2 modern-javascript)   |
+| 16  | pipe-and-compose       | Pipe and compose                       | medium | functions  | closures-and-higher-order-functions (javascript L2 modern-javascript) |
+| 17  | memoize-any-arguments  | Remember every answer                  | medium | functions  | closures-and-higher-order-functions (javascript L2 modern-javascript) |
+| 18  | wrap-text              | Wrap the text                          | medium | strings    | working-with-strings (javascript L0 basics)                           |
+| 19  | merge-settings         | Merge the settings                     | medium | objects    | spread-rest-and-optional-chaining (javascript L2 modern-javascript)   |
+| 20  | share-out-fairly       | Share it out fairly                    | medium | numbers    | arithmetic (javascript L0 operators-and-conditions)                   |
+| 21  | panda-thermostat       | The panda-house thermostat             | medium | classes    | classes (javascript L1 classes)                                       |
+| 22  | format-duration        | How long did the panda nap?            | medium | strings    | working-with-strings (javascript L0 basics)                           |
+| 23  | rotate-sprite          | Spin the pixel panda                   | medium | arrays     | arrays (javascript L1 arrays-and-objects)                             |
+| 24  | parse-query-string     | Read the search bar                    | medium | text       | working-with-strings (javascript L0 basics)                           |
+| 25  | merge-bookings         | Squash the visiting slots              | medium | algorithms | array-methods (javascript L1 arrays-and-objects)                      |
+| 26  | first-tall-enough      | The first tall-enough bamboo           | medium | algorithms | measuring-performance (javascript L3 performance)                     |
+| 27  | event-emitter          | The bamboo-feed newsroom               | medium | classes    | closures-and-higher-order-functions (javascript L2 modern-javascript) |
+| 28  | deep-equal             | Are these two pandas the same?         | medium | recursion  | objects (javascript L1 arrays-and-objects)                            |
+| 29  | flatten-to-dotted-keys | Flatten the settings file              | medium | objects    | objects (javascript L1 arrays-and-objects)                            |
+| 30  | retry-with-backoff     | Try, try again (with a nap in between) | medium | async      | async-await (javascript L2 async)                                     |
+| 31  | panda-parade           | Who can see whom at the panda parade?  | hard   | arrays     | arrays (javascript L1 arrays-and-objects)                             |
+| 32  | expiring-cache         | The bamboo cache that goes stale       | hard   | objects    | map-set-and-generators (javascript L2 modern-javascript)              |
+| 33  | deep-clone             | Clone the whole panda family tree      | hard   | recursion  | spread-rest-and-optional-chaining (javascript L2 modern-javascript)   |
+| 34  | build-order            | Which job comes first?                 | hard   | algorithms | map-set-and-generators (javascript L2 modern-javascript)              |
+| 35  | promise-pool           | Only three trucks at a time            | hard   | async      | promises (javascript L2 async)                                        |
+| 36  | debounce-async         | Wait until the typing stops            | hard   | async      | closures-and-higher-order-functions (javascript L2 modern-javascript) |
+| 37  | spelling-suggestions   | Did you mean "bamboo"?                 | hard   | algorithms | measuring-performance (javascript L3 performance)                     |
+| 38  | tokenizer              | Chop code into tokens                  | hard   | text       | working-with-strings (javascript L0 basics)                           |
+| 39  | grid-route             | The panda's way out of the maze        | hard   | algorithms | arrays (javascript L1 arrays-and-objects)                             |
+| 40  | mini-templates         | A tiny template engine                 | hard   | text       | objects (javascript L1 arrays-and-objects)                            |
 
 ### Python practice (40 problems)
 
-| # | Slug | Title | Diff | Topic | Linked lesson (where) |
-|---|---|---|---|---|---|
-| 01 | count-vowels | Count the vowels | easy | strings | working-with-strings (python L0 basics) |
-| 02 | bamboo-buzz | Bamboo, Panda, BambooPanda | easy | numbers | for-loops (python L0 loops) |
-| 03 | digit-sum | Add up the digits | easy | numbers | arithmetic (python L0 conditions) |
-| 04 | running-totals | Running totals | easy | lists | looping-over-lists (python L0 loops) |
-| 05 | convert-temperature | Celsius or Fahrenheit? | easy | functions | defaults-and-scope (python L0 functions) |
-| 06 | palindrome-phrase | Palindrome phrases | easy | strings | working-with-strings (python L0 basics) |
-| 07 | find-duplicates | Spot the duplicates | easy | lists | dictionaries (python L1 collections) |
-| 08 | is-prime | Is it prime? | easy | numbers | while-loops (python L0 loops) |
-| 09 | word-counts | Word frequencies | easy | dictionaries | dictionaries (python L1 collections) |
-| 10 | price-tag | Price tags | easy | functions | defaults-and-scope (python L0 functions) |
-| 11 | second-largest | The runner-up | easy | lists | lists-in-depth (python L1 collections) |
-| 12 | group-by-letter | Group by first letter | easy | dictionaries | dictionaries (python L1 collections) |
-| 13 | password-check | Password checker | medium | strings | working-with-strings (python L0 basics) |
-| 14 | caesar-cipher | Caesar cipher | medium | strings | working-with-strings (python L0 basics) |
-| 15 | compress-letters | Squash repeated letters | medium | strings | while-loops (python L0 loops) |
-| 16 | rotate-list | Rotate a list | medium | lists | lists-in-depth (python L1 collections) |
-| 17 | merge-counts | Merge stock counts | medium | dictionaries | dictionaries (python L1 collections) |
-| 18 | top-n | Top of the leaderboard | medium | functions | defaults-and-scope (python L0 functions) |
-| 19 | anagram-groups | Anagram groups | medium | dictionaries | dictionaries (python L1 collections) |
-| 20 | pipeline | Build a pipeline | medium | functions | defaults-and-scope (python L0 functions) |
-| 21 | bamboo-bank-account | The bamboo bank account | medium | classes | classes-and-objects (python L1 classes) |
-| 22 | flatten-nested-lists | Unpack the nesting dolls | medium | recursion | recursion (python L1 algorithms) |
-| 23 | roman-numerals | Roman numerals, there and back | medium | algorithms | dictionaries (python L1 collections) |
-| 24 | snack-pair | Two snacks, exact budget | medium | dictionaries | stacks-queues-and-hash-maps (python L1 algorithms) |
-| 25 | first-bad-bracket | Find the broken bracket | medium | algorithms | stacks-queues-and-hash-maps (python L1 algorithms) |
-| 26 | parse-log-lines | Read the server's diary | medium | text | regular-expressions (python L1 text-and-automation) |
-| 27 | count-workdays | How many working days? | medium | text | dates-and-times (python L1 text-and-automation) |
-| 28 | top-k-words | The k most popular words | medium | dictionaries | searching-and-sorting (python L1 algorithms) |
-| 29 | spiral-matrix | Walk the bamboo spiral | medium | lists | lists-in-depth (python L1 collections) |
-| 30 | sudoku-conflicts | Sudoku referee | medium | algorithms | tuples-and-sets (python L1 collections) |
-| 31 | cut-bamboo | Cut the bamboo fairly | hard | algorithms | searching-and-sorting (python L1 algorithms) |
-| 32 | unflatten-dotted-keys | Dotted settings, folded and unfolded | hard | dictionaries | dictionaries (python L1 collections) |
-| 33 | undo-redo-editor | Undo, redo, repeat | hard | classes | stacks-queues-and-hash-maps (python L1 algorithms) |
-| 34 | free-time-slots | When is the panda free? | hard | lists | searching-and-sorting (python L1 algorithms) |
-| 35 | decode-nested-repeats | Unzip the panda message | hard | recursion | recursion (python L1 algorithms) |
-| 36 | lru-cache | The forgetful bamboo cache | hard | classes | caching-and-optimisation (python L3 performance) |
-| 37 | unique-arrangements | Shuffle the letter tiles | hard | recursion | recursion (python L1 algorithms) |
-| 38 | meeting-dates | Every last Friday | hard | text | dates-and-times (python L1 text-and-automation) |
-| 39 | break-one-wall | Smash one wall | hard | algorithms | stacks-queues-and-hash-maps (python L1 algorithms) |
-| 40 | power-calculator | Build a pocket calculator | hard | algorithms | recursion (python L1 algorithms) |
+| #   | Slug                  | Title                                | Diff   | Topic        | Linked lesson (where)                               |
+| --- | --------------------- | ------------------------------------ | ------ | ------------ | --------------------------------------------------- |
+| 01  | count-vowels          | Count the vowels                     | easy   | strings      | working-with-strings (python L0 basics)             |
+| 02  | bamboo-buzz           | Bamboo, Panda, BambooPanda           | easy   | numbers      | for-loops (python L0 loops)                         |
+| 03  | digit-sum             | Add up the digits                    | easy   | numbers      | arithmetic (python L0 conditions)                   |
+| 04  | running-totals        | Running totals                       | easy   | lists        | looping-over-lists (python L0 loops)                |
+| 05  | convert-temperature   | Celsius or Fahrenheit?               | easy   | functions    | defaults-and-scope (python L0 functions)            |
+| 06  | palindrome-phrase     | Palindrome phrases                   | easy   | strings      | working-with-strings (python L0 basics)             |
+| 07  | find-duplicates       | Spot the duplicates                  | easy   | lists        | dictionaries (python L1 collections)                |
+| 08  | is-prime              | Is it prime?                         | easy   | numbers      | while-loops (python L0 loops)                       |
+| 09  | word-counts           | Word frequencies                     | easy   | dictionaries | dictionaries (python L1 collections)                |
+| 10  | price-tag             | Price tags                           | easy   | functions    | defaults-and-scope (python L0 functions)            |
+| 11  | second-largest        | The runner-up                        | easy   | lists        | lists-in-depth (python L1 collections)              |
+| 12  | group-by-letter       | Group by first letter                | easy   | dictionaries | dictionaries (python L1 collections)                |
+| 13  | password-check        | Password checker                     | medium | strings      | working-with-strings (python L0 basics)             |
+| 14  | caesar-cipher         | Caesar cipher                        | medium | strings      | working-with-strings (python L0 basics)             |
+| 15  | compress-letters      | Squash repeated letters              | medium | strings      | while-loops (python L0 loops)                       |
+| 16  | rotate-list           | Rotate a list                        | medium | lists        | lists-in-depth (python L1 collections)              |
+| 17  | merge-counts          | Merge stock counts                   | medium | dictionaries | dictionaries (python L1 collections)                |
+| 18  | top-n                 | Top of the leaderboard               | medium | functions    | defaults-and-scope (python L0 functions)            |
+| 19  | anagram-groups        | Anagram groups                       | medium | dictionaries | dictionaries (python L1 collections)                |
+| 20  | pipeline              | Build a pipeline                     | medium | functions    | defaults-and-scope (python L0 functions)            |
+| 21  | bamboo-bank-account   | The bamboo bank account              | medium | classes      | classes-and-objects (python L1 classes)             |
+| 22  | flatten-nested-lists  | Unpack the nesting dolls             | medium | recursion    | recursion (python L1 algorithms)                    |
+| 23  | roman-numerals        | Roman numerals, there and back       | medium | algorithms   | dictionaries (python L1 collections)                |
+| 24  | snack-pair            | Two snacks, exact budget             | medium | dictionaries | stacks-queues-and-hash-maps (python L1 algorithms)  |
+| 25  | first-bad-bracket     | Find the broken bracket              | medium | algorithms   | stacks-queues-and-hash-maps (python L1 algorithms)  |
+| 26  | parse-log-lines       | Read the server's diary              | medium | text         | regular-expressions (python L1 text-and-automation) |
+| 27  | count-workdays        | How many working days?               | medium | text         | dates-and-times (python L1 text-and-automation)     |
+| 28  | top-k-words           | The k most popular words             | medium | dictionaries | searching-and-sorting (python L1 algorithms)        |
+| 29  | spiral-matrix         | Walk the bamboo spiral               | medium | lists        | lists-in-depth (python L1 collections)              |
+| 30  | sudoku-conflicts      | Sudoku referee                       | medium | algorithms   | tuples-and-sets (python L1 collections)             |
+| 31  | cut-bamboo            | Cut the bamboo fairly                | hard   | algorithms   | searching-and-sorting (python L1 algorithms)        |
+| 32  | unflatten-dotted-keys | Dotted settings, folded and unfolded | hard   | dictionaries | dictionaries (python L1 collections)                |
+| 33  | undo-redo-editor      | Undo, redo, repeat                   | hard   | classes      | stacks-queues-and-hash-maps (python L1 algorithms)  |
+| 34  | free-time-slots       | When is the panda free?              | hard   | lists        | searching-and-sorting (python L1 algorithms)        |
+| 35  | decode-nested-repeats | Unzip the panda message              | hard   | recursion    | recursion (python L1 algorithms)                    |
+| 36  | lru-cache             | The forgetful bamboo cache           | hard   | classes      | caching-and-optimisation (python L3 performance)    |
+| 37  | unique-arrangements   | Shuffle the letter tiles             | hard   | recursion    | recursion (python L1 algorithms)                    |
+| 38  | meeting-dates         | Every last Friday                    | hard   | text         | dates-and-times (python L1 text-and-automation)     |
+| 39  | break-one-wall        | Smash one wall                       | hard   | algorithms   | stacks-queues-and-hash-maps (python L1 algorithms)  |
+| 40  | power-calculator      | Build a pocket calculator            | hard   | algorithms   | recursion (python L1 algorithms)                    |
 
 ### SQL practice (40 problems)
 
-| # | Slug | Title | Diff | Topic | Linked lesson (where) |
-|---|---|---|---|---|---|
-| 01 | bargains-in-stock | Bargains in stock | easy | filtering | filtering-with-where (sql L0 first-queries) |
-| 02 | long-films-for-a-rainy-sunday | Long films for a rainy Sunday | easy | filtering | filtering-with-where (sql L0 first-queries) |
-| 03 | customers-without-a-city | Customers without a city | easy | filtering | null-values (sql L0 sorting-and-limiting) |
-| 04 | film-chart-page-two | Film chart, page two | easy | filtering | limit-and-offset (sql L0 sorting-and-limiting) |
-| 05 | conference-name-badges | Conference name badges | easy | text | text-functions (sql L0 functions) |
-| 06 | charm-price-tags | Charm price tags | easy | numbers | number-functions (sql L0 functions) |
-| 07 | spring-work-anniversaries | Spring work anniversaries | easy | text | date-functions (sql L0 functions) |
-| 08 | panda-gift-box | Panda gift box | medium | filtering | filtering-with-where (sql L0 first-queries) |
-| 09 | salary-bands | Salary bands | medium | filtering | case-and-pivots (sql L2 advanced-queries) |
-| 10 | payroll-shares | Payroll shares | medium | numbers | number-functions (sql L0 functions) |
-| 11 | parcels-on-the-way | Parcels on the way | easy | joins | inner-join (sql L1 joins) |
-| 12 | films-per-genre | Films per genre | easy | grouping | group-by (sql L0 aggregation) |
-| 13 | shop-at-a-glance | The shop at a glance | easy | grouping | aggregate-functions (sql L0 aggregation) |
-| 14 | still-waiting-for-a-first-order | Still waiting for a first order | medium | joins | outer-joins (sql L1 joins) |
-| 15 | how-far-from-the-boss | How far from the boss? | medium | joins | self-joins (sql L1 joins) |
-| 16 | the-regulars | The regulars | medium | grouping | having (sql L0 aggregation) |
-| 17 | revenue-by-category | Revenue by category | medium | grouping | group-by (sql L0 aggregation) |
-| 18 | who-got-which-book | Who got which book? | medium | joins | inner-join (sql L1 joins) |
-| 19 | monthly-order-board | The monthly order board | hard | grouping | case-and-pivots (sql L2 advanced-queries) |
-| 20 | the-complete-kitchen-set | The complete kitchen set | hard | joins | having (sql L0 aggregation) |
-| 21 | overstocked-shelves | Overstocked shelves | easy | subqueries | queries-inside-queries (sql L1 subqueries) |
-| 22 | tea-drinkers | Tea drinkers | medium | subqueries | queries-inside-queries (sql L1 subqueries) |
-| 23 | big-spenders | Big spenders, step by step | medium | subqueries | common-table-expressions (sql L1 subqueries) |
-| 24 | where-to-open-next | Where to open the next office | medium | subqueries | union-intersect-except (sql L1 subqueries) |
-| 25 | pay-ladder | The pay ladder | medium | windows | window-functions-and-ranking (sql L2 window-functions) |
-| 26 | road-to-a-thousand | The road to 1,000 | medium | windows | running-totals-and-frames (sql L2 window-functions) |
-| 27 | panda-weigh-ins | Panda weigh-ins | medium | windows | lag-lead-and-distribution (sql L2 window-functions) |
-| 28 | best-of-the-decade | Best of the decade | hard | windows | window-functions-and-ranking (sql L2 window-functions) |
-| 29 | study-streaks | Longest study streaks | hard | windows | window-functions-and-ranking (sql L2 window-functions) |
-| 30 | revenue-league-table | The customer league table | hard | subqueries | common-table-expressions (sql L1 subqueries) |
-| 31 | fresh-releases | Fresh releases for film night | easy | changes | insert-rows (sql L1 changing-data) |
-| 32 | london-pay-rise | A pay rise for London | medium | changes | update-and-delete (sql L1 changing-data) |
-| 33 | sold-out-lines | Take sold-out products out of open orders | medium | changes | update-and-delete (sql L1 changing-data) |
-| 34 | stock-delivery | The stock delivery | medium | changes | upserts-and-transactions (sql L1 changing-data) |
-| 35 | product-reviews | A table for product reviews | medium | schema | constraints-and-keys (sql L1 designing-tables) |
-| 36 | delivery-addresses | Delivery addresses with house rules | hard | schema | modeling-patterns (sql L3 data-modeling) |
-| 37 | branch-of-the-tree | Which branch of the tree? | hard | recursion | recursive-ctes (sql L2 advanced-queries) |
-| 38 | tea-dry-spells | Dry spells at the tea counter | hard | recursion | recursive-ctes (sql L2 advanced-queries) |
-| 39 | basket-checkout | Checkout without overselling | hard | changes | upserts-and-transactions (sql L1 changing-data) |
-| 40 | new-or-returning | New money or returning money? | hard | grouping | dashboard-retention-and-funnels (sql L2 analytics-dashboard) |
+| #   | Slug                            | Title                                     | Diff   | Topic      | Linked lesson (where)                                        |
+| --- | ------------------------------- | ----------------------------------------- | ------ | ---------- | ------------------------------------------------------------ |
+| 01  | bargains-in-stock               | Bargains in stock                         | easy   | filtering  | filtering-with-where (sql L0 first-queries)                  |
+| 02  | long-films-for-a-rainy-sunday   | Long films for a rainy Sunday             | easy   | filtering  | filtering-with-where (sql L0 first-queries)                  |
+| 03  | customers-without-a-city        | Customers without a city                  | easy   | filtering  | null-values (sql L0 sorting-and-limiting)                    |
+| 04  | film-chart-page-two             | Film chart, page two                      | easy   | filtering  | limit-and-offset (sql L0 sorting-and-limiting)               |
+| 05  | conference-name-badges          | Conference name badges                    | easy   | text       | text-functions (sql L0 functions)                            |
+| 06  | charm-price-tags                | Charm price tags                          | easy   | numbers    | number-functions (sql L0 functions)                          |
+| 07  | spring-work-anniversaries       | Spring work anniversaries                 | easy   | text       | date-functions (sql L0 functions)                            |
+| 08  | panda-gift-box                  | Panda gift box                            | medium | filtering  | filtering-with-where (sql L0 first-queries)                  |
+| 09  | salary-bands                    | Salary bands                              | medium | filtering  | case-and-pivots (sql L2 advanced-queries)                    |
+| 10  | payroll-shares                  | Payroll shares                            | medium | numbers    | number-functions (sql L0 functions)                          |
+| 11  | parcels-on-the-way              | Parcels on the way                        | easy   | joins      | inner-join (sql L1 joins)                                    |
+| 12  | films-per-genre                 | Films per genre                           | easy   | grouping   | group-by (sql L0 aggregation)                                |
+| 13  | shop-at-a-glance                | The shop at a glance                      | easy   | grouping   | aggregate-functions (sql L0 aggregation)                     |
+| 14  | still-waiting-for-a-first-order | Still waiting for a first order           | medium | joins      | outer-joins (sql L1 joins)                                   |
+| 15  | how-far-from-the-boss           | How far from the boss?                    | medium | joins      | self-joins (sql L1 joins)                                    |
+| 16  | the-regulars                    | The regulars                              | medium | grouping   | having (sql L0 aggregation)                                  |
+| 17  | revenue-by-category             | Revenue by category                       | medium | grouping   | group-by (sql L0 aggregation)                                |
+| 18  | who-got-which-book              | Who got which book?                       | medium | joins      | inner-join (sql L1 joins)                                    |
+| 19  | monthly-order-board             | The monthly order board                   | hard   | grouping   | case-and-pivots (sql L2 advanced-queries)                    |
+| 20  | the-complete-kitchen-set        | The complete kitchen set                  | hard   | joins      | having (sql L0 aggregation)                                  |
+| 21  | overstocked-shelves             | Overstocked shelves                       | easy   | subqueries | queries-inside-queries (sql L1 subqueries)                   |
+| 22  | tea-drinkers                    | Tea drinkers                              | medium | subqueries | queries-inside-queries (sql L1 subqueries)                   |
+| 23  | big-spenders                    | Big spenders, step by step                | medium | subqueries | common-table-expressions (sql L1 subqueries)                 |
+| 24  | where-to-open-next              | Where to open the next office             | medium | subqueries | union-intersect-except (sql L1 subqueries)                   |
+| 25  | pay-ladder                      | The pay ladder                            | medium | windows    | window-functions-and-ranking (sql L2 window-functions)       |
+| 26  | road-to-a-thousand              | The road to 1,000                         | medium | windows    | running-totals-and-frames (sql L2 window-functions)          |
+| 27  | panda-weigh-ins                 | Panda weigh-ins                           | medium | windows    | lag-lead-and-distribution (sql L2 window-functions)          |
+| 28  | best-of-the-decade              | Best of the decade                        | hard   | windows    | window-functions-and-ranking (sql L2 window-functions)       |
+| 29  | study-streaks                   | Longest study streaks                     | hard   | windows    | window-functions-and-ranking (sql L2 window-functions)       |
+| 30  | revenue-league-table            | The customer league table                 | hard   | subqueries | common-table-expressions (sql L1 subqueries)                 |
+| 31  | fresh-releases                  | Fresh releases for film night             | easy   | changes    | insert-rows (sql L1 changing-data)                           |
+| 32  | london-pay-rise                 | A pay rise for London                     | medium | changes    | update-and-delete (sql L1 changing-data)                     |
+| 33  | sold-out-lines                  | Take sold-out products out of open orders | medium | changes    | update-and-delete (sql L1 changing-data)                     |
+| 34  | stock-delivery                  | The stock delivery                        | medium | changes    | upserts-and-transactions (sql L1 changing-data)              |
+| 35  | product-reviews                 | A table for product reviews               | medium | schema     | constraints-and-keys (sql L1 designing-tables)               |
+| 36  | delivery-addresses              | Delivery addresses with house rules       | hard   | schema     | modeling-patterns (sql L3 data-modeling)                     |
+| 37  | branch-of-the-tree              | Which branch of the tree?                 | hard   | recursion  | recursive-ctes (sql L2 advanced-queries)                     |
+| 38  | tea-dry-spells                  | Dry spells at the tea counter             | hard   | recursion  | recursive-ctes (sql L2 advanced-queries)                     |
+| 39  | basket-checkout                 | Checkout without overselling              | hard   | changes    | upserts-and-transactions (sql L1 changing-data)              |
+| 40  | new-or-returning                | New money or returning money?             | hard   | grouping   | dashboard-retention-and-funnels (sql L2 analytics-dashboard) |
 
 ### TypeScript practice (40 problems)
 
-| # | Slug | Title | Diff | Topic | Linked lesson (where) |
-|---|---|---|---|---|---|
-| 01 | order-total | Order total | easy | types | object-types-and-interfaces (typescript L0 arrays-and-objects) |
-| 02 | first-and-last | First and last | easy | types | generic-functions (typescript L1 generics) |
-| 03 | letter-count | Letter count | easy | strings | union-types (typescript L1 unions-and-narrowing) |
-| 04 | vote-tally | Vote tally | easy | objects | typed-data (typescript L0 arrays-and-objects) |
-| 05 | sorted-copy | Sorted copy | easy | arrays | arrays-and-tuples (typescript L0 arrays-and-objects) |
-| 06 | traffic-lights | Traffic lights | easy | types | literal-types-and-switch (typescript L0 control-flow) |
-| 07 | lowest-and-highest | Lowest and highest | easy | arrays | arrays-and-tuples (typescript L0 arrays-and-objects) |
-| 08 | delivery-city | Delivery city | easy | objects | special-types (typescript L0 basics) |
-| 09 | price-tags | Price tags | easy | strings | utility-types (typescript L1 generics) |
-| 10 | pluck | Pluck a property | easy | functions | generic-functions (typescript L1 generics) |
-| 11 | profile-update | Profile update | easy | objects | typed-data (typescript L0 arrays-and-objects) |
-| 12 | is-it-a-user | Is it a user? | easy | types | type-guards-and-unknown (typescript L1 unions-and-narrowing) |
-| 13 | group-by | Typed groupBy | medium | functions | generic-functions (typescript L1 generics) |
-| 14 | shape-areas | Shape areas | medium | types | discriminated-unions (typescript L1 unions-and-narrowing) |
-| 15 | result-type | Results, not exceptions | medium | types | generic-types-and-classes (typescript L1 generics) |
-| 16 | typed-omit | A typed omit | medium | objects | utility-types (typescript L1 generics) |
-| 17 | parse-duration | Parse a duration | medium | strings | union-types (typescript L1 unions-and-narrowing) |
-| 18 | zip-and-unzip | Zip and unzip | medium | arrays | arrays-and-tuples (typescript L0 arrays-and-objects) |
-| 19 | map-values | Map an object's values | medium | functions | generic-functions (typescript L1 generics) |
-| 20 | multi-sort | Sort by several keys | medium | arrays | typed-data (typescript L0 arrays-and-objects) |
-| 21 | plate-stack | A stack of any plates | medium | classes | generic-types-and-classes (typescript L1 generics) |
-| 22 | order-lifecycle | An order that can't be wrong | medium | types | discriminated-unions (typescript L1 unions-and-narrowing) |
-| 23 | typed-emitter | An event emitter that knows its events | medium | classes | generic-types-and-classes (typescript L1 generics) |
-| 24 | retry-with-backoff | Try, wait, try again | medium | async | typing-promises-and-async (typescript L2 async-and-apis) |
-| 25 | typed-memoize | Remember every answer | medium | functions | generic-functions (typescript L1 generics) |
-| 26 | guard-the-events | Guard the event log | medium | types | type-guards-and-unknown (typescript L1 unions-and-narrowing) |
-| 27 | branded-ids | Don't mix up the IDs | medium | types | branded-types-and-type-safe-apis (typescript L3 type-level-programming) |
-| 28 | ttl-cache | A cache that forgets on time | medium | classes | classes-and-access-modifiers (typescript L1 classes) |
-| 29 | load-everything | Load everything at once | medium | async | typing-promises-and-async (typescript L2 async-and-apis) |
-| 30 | sort-by-keys | Sort by this, then by that | medium | algorithms | generic-functions (typescript L1 generics) |
-| 31 | update-at-a-path | Change one leaf, keep the tree | hard | types | template-literal-types (typescript L3 advanced-types) |
-| 32 | schema-with-all-errors | A schema that reports every mistake | hard | types | runtime-validation (typescript L2 async-and-apis) |
-| 33 | request-builder | A builder that won't build too early | hard | types | branded-types-and-type-safe-apis (typescript L3 type-level-programming) |
-| 34 | typed-router | A router that reads its own patterns | hard | types | template-literal-types (typescript L3 advanced-types) |
-| 35 | build-order | What to build first | hard | algorithms | variance-and-inference (typescript L3 type-level-programming) |
-| 36 | batching-loader | One trip for many requests | hard | async | typing-promises-and-async (typescript L2 async-and-apis) |
-| 37 | deep-patches | Patches all the way down | hard | types | building-utility-types (typescript L3 type-level-programming) |
-| 38 | cheapest-route | The cheapest way through the forest | hard | algorithms | variance-and-inference (typescript L3 type-level-programming) |
-| 39 | typed-cli-args | Command-line flags with types | hard | text | mapped-types (typescript L3 advanced-types) |
-| 40 | typed-query | A query builder that knows your rows | hard | classes | branded-types-and-type-safe-apis (typescript L3 type-level-programming) |
+| #   | Slug                   | Title                                  | Diff   | Topic      | Linked lesson (where)                                                   |
+| --- | ---------------------- | -------------------------------------- | ------ | ---------- | ----------------------------------------------------------------------- |
+| 01  | order-total            | Order total                            | easy   | types      | object-types-and-interfaces (typescript L0 arrays-and-objects)          |
+| 02  | first-and-last         | First and last                         | easy   | types      | generic-functions (typescript L1 generics)                              |
+| 03  | letter-count           | Letter count                           | easy   | strings    | union-types (typescript L1 unions-and-narrowing)                        |
+| 04  | vote-tally             | Vote tally                             | easy   | objects    | typed-data (typescript L0 arrays-and-objects)                           |
+| 05  | sorted-copy            | Sorted copy                            | easy   | arrays     | arrays-and-tuples (typescript L0 arrays-and-objects)                    |
+| 06  | traffic-lights         | Traffic lights                         | easy   | types      | literal-types-and-switch (typescript L0 control-flow)                   |
+| 07  | lowest-and-highest     | Lowest and highest                     | easy   | arrays     | arrays-and-tuples (typescript L0 arrays-and-objects)                    |
+| 08  | delivery-city          | Delivery city                          | easy   | objects    | special-types (typescript L0 basics)                                    |
+| 09  | price-tags             | Price tags                             | easy   | strings    | utility-types (typescript L1 generics)                                  |
+| 10  | pluck                  | Pluck a property                       | easy   | functions  | generic-functions (typescript L1 generics)                              |
+| 11  | profile-update         | Profile update                         | easy   | objects    | typed-data (typescript L0 arrays-and-objects)                           |
+| 12  | is-it-a-user           | Is it a user?                          | easy   | types      | type-guards-and-unknown (typescript L1 unions-and-narrowing)            |
+| 13  | group-by               | Typed groupBy                          | medium | functions  | generic-functions (typescript L1 generics)                              |
+| 14  | shape-areas            | Shape areas                            | medium | types      | discriminated-unions (typescript L1 unions-and-narrowing)               |
+| 15  | result-type            | Results, not exceptions                | medium | types      | generic-types-and-classes (typescript L1 generics)                      |
+| 16  | typed-omit             | A typed omit                           | medium | objects    | utility-types (typescript L1 generics)                                  |
+| 17  | parse-duration         | Parse a duration                       | medium | strings    | union-types (typescript L1 unions-and-narrowing)                        |
+| 18  | zip-and-unzip          | Zip and unzip                          | medium | arrays     | arrays-and-tuples (typescript L0 arrays-and-objects)                    |
+| 19  | map-values             | Map an object's values                 | medium | functions  | generic-functions (typescript L1 generics)                              |
+| 20  | multi-sort             | Sort by several keys                   | medium | arrays     | typed-data (typescript L0 arrays-and-objects)                           |
+| 21  | plate-stack            | A stack of any plates                  | medium | classes    | generic-types-and-classes (typescript L1 generics)                      |
+| 22  | order-lifecycle        | An order that can't be wrong           | medium | types      | discriminated-unions (typescript L1 unions-and-narrowing)               |
+| 23  | typed-emitter          | An event emitter that knows its events | medium | classes    | generic-types-and-classes (typescript L1 generics)                      |
+| 24  | retry-with-backoff     | Try, wait, try again                   | medium | async      | typing-promises-and-async (typescript L2 async-and-apis)                |
+| 25  | typed-memoize          | Remember every answer                  | medium | functions  | generic-functions (typescript L1 generics)                              |
+| 26  | guard-the-events       | Guard the event log                    | medium | types      | type-guards-and-unknown (typescript L1 unions-and-narrowing)            |
+| 27  | branded-ids            | Don't mix up the IDs                   | medium | types      | branded-types-and-type-safe-apis (typescript L3 type-level-programming) |
+| 28  | ttl-cache              | A cache that forgets on time           | medium | classes    | classes-and-access-modifiers (typescript L1 classes)                    |
+| 29  | load-everything        | Load everything at once                | medium | async      | typing-promises-and-async (typescript L2 async-and-apis)                |
+| 30  | sort-by-keys           | Sort by this, then by that             | medium | algorithms | generic-functions (typescript L1 generics)                              |
+| 31  | update-at-a-path       | Change one leaf, keep the tree         | hard   | types      | template-literal-types (typescript L3 advanced-types)                   |
+| 32  | schema-with-all-errors | A schema that reports every mistake    | hard   | types      | runtime-validation (typescript L2 async-and-apis)                       |
+| 33  | request-builder        | A builder that won't build too early   | hard   | types      | branded-types-and-type-safe-apis (typescript L3 type-level-programming) |
+| 34  | typed-router           | A router that reads its own patterns   | hard   | types      | template-literal-types (typescript L3 advanced-types)                   |
+| 35  | build-order            | What to build first                    | hard   | algorithms | variance-and-inference (typescript L3 type-level-programming)           |
+| 36  | batching-loader        | One trip for many requests             | hard   | async      | typing-promises-and-async (typescript L2 async-and-apis)                |
+| 37  | deep-patches           | Patches all the way down               | hard   | types      | building-utility-types (typescript L3 type-level-programming)           |
+| 38  | cheapest-route         | The cheapest way through the forest    | hard   | algorithms | variance-and-inference (typescript L3 type-level-programming)           |
+| 39  | typed-cli-args         | Command-line flags with types          | hard   | text       | mapped-types (typescript L3 advanced-types)                             |
+| 40  | typed-query            | A query builder that knows your rows   | hard   | classes    | branded-types-and-type-safe-apis (typescript L3 type-level-programming) |

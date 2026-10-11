@@ -26,12 +26,12 @@ and a read of ~15 full lessons across all levels.
 
 ## The 4-level ladder (source of truth: ROADMAP.md §4, mirrored in `messages/en/levels.json`)
 
-| Level | ROADMAP focus | levels.json topics |
-| --- | --- | --- |
-| 0 Beginner | Syntax, variables, types, conditions, loops, functions | Variables & types · Conditions & loops · Functions · First mini-games |
-| 1 Junior | Data structures, OOP/modules, errors, tooling, small projects | Data structures · OOP & modules · Errors & debugging · Git & tooling |
-| 2 Middle | Async, testing, design patterns, frameworks, databases, APIs | Async & APIs · Testing · Design patterns · Databases |
-| 3 Senior | Architecture, performance, security, system design, code review, mentoring (CI/CD) | System design · Performance · Security · Code review & mentoring |
+| Level      | ROADMAP focus                                                                      | levels.json topics                                                    |
+| ---------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| 0 Beginner | Syntax, variables, types, conditions, loops, functions                             | Variables & types · Conditions & loops · Functions · First mini-games |
+| 1 Junior   | Data structures, OOP/modules, errors, tooling, small projects                      | Data structures · OOP & modules · Errors & debugging · Git & tooling  |
+| 2 Middle   | Async, testing, design patterns, frameworks, databases, APIs                       | Async & APIs · Testing · Design patterns · Databases                  |
+| 3 Senior   | Architecture, performance, security, system design, code review, mentoring (CI/CD) | System design · Performance · Security · Code review & mentoring      |
 
 Hierarchy: Language → Level → Module → Lesson. Every lesson: theory, code examples, an interactive exercise
 with checks, a quiz. Every module ends with a mini-project; every level ends with a capstone.
@@ -45,7 +45,7 @@ Deviation in practice (all four courses): design patterns / architecture sit in 
 - Small, warm examples: "Panda", "Mei", bamboo, pandas napping, a film club, a shop. Practice problems are
   panda-themed stories ("The bamboo cache that goes stale").
 - One emoji now and then in intros (🪟 🧠 🗺️ 🐧), never in headings except the final "Congratulations! 🎉🐼".
-- Explains *why* as well as *how*; Level 2–3 lessons add "In real projects", trade-offs, "When not to…",
+- Explains _why_ as well as _how_; Level 2–3 lessons add "In real projects", trade-offs, "When not to…",
   "Common mistakes", pitfalls and production notes.
 - Error messages from real tools stay in English, also in RU lessons. Code identifiers stay in English;
   comments, prose and printed text are translated.
@@ -57,10 +57,10 @@ Frontmatter (schema in `velite.config.ts`, collection `lessons`):
 
 ```yaml
 ---
-title: "…"          # max 80 chars
-description: "…"    # max 200 chars
-duration: 12        # minutes, positive int
-xp: 20              # positive int, default 10
+title: "…" # max 80 chars
+description: "…" # max 200 chars
+duration: 12 # minutes, positive int
+xp: 20 # positive int, default 10
 ---
 ```
 
@@ -115,16 +115,16 @@ recursion, algorithms, text, filtering, joins, grouping, subqueries, windows, ch
 
 ## Decision log
 
-| Date | Decision | Source |
-| --- | --- | --- |
-| 2026-10-01 | Same 4-level ladder for every language; module → mini-project, level → capstone | ROADMAP §4 |
-| 2026-10-01 | Full Russian version of the site; translations share slug, XP and progress | commit "Add a full Russian version of the site" |
-| 2026-10-01 | Capstones are modules of "Part N" lessons listed after the level's modules | README, velite schema |
-| 2026-10-04 | SQL added as a full course (PGlite in browser), although ROADMAP still lists SQL under "Later" | commit #12, `languages.ts` |
-| 2026-10-10 | Practice: 40 problems per language, 12 easy / 18 medium / 10 hard, with step-by-step hints | commits #13, #23 |
-| (observed) | Design patterns & architecture are taught at Level 3 in all courses, not Level 2 as ROADMAP lists | course.yml files |
-| (observed) | Level 0 DOM is used via provided "glue code" in the JS L0 capstone, explained in L1 | `number-guessing-game/03-playing-in-the-browser` |
-| 2026-10-11 | Learning-context files created in `docs/learning-context/` | this run |
+| Date       | Decision                                                                                          | Source                                           |
+| ---------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| 2026-10-01 | Same 4-level ladder for every language; module → mini-project, level → capstone                   | ROADMAP §4                                       |
+| 2026-10-01 | Full Russian version of the site; translations share slug, XP and progress                        | commit "Add a full Russian version of the site"  |
+| 2026-10-01 | Capstones are modules of "Part N" lessons listed after the level's modules                        | README, velite schema                            |
+| 2026-10-04 | SQL added as a full course (PGlite in browser), although ROADMAP still lists SQL under "Later"    | commit #12, `languages.ts`                       |
+| 2026-10-10 | Practice: 40 problems per language, 12 easy / 18 medium / 10 hard, with step-by-step hints        | commits #13, #23                                 |
+| (observed) | Design patterns & architecture are taught at Level 3 in all courses, not Level 2 as ROADMAP lists | course.yml files                                 |
+| (observed) | Level 0 DOM is used via provided "glue code" in the JS L0 capstone, explained in L1               | `number-guessing-game/03-playing-in-the-browser` |
+| 2026-10-11 | Learning-context files created in `docs/learning-context/`                                        | this run                                         |
 
 ## Open questions for the site owner
 
