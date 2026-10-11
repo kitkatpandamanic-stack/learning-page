@@ -10,11 +10,13 @@ export function botLocale(languageCode?: string): BotLocale {
   return languageCode?.toLowerCase().startsWith("ru") ? "ru" : "en";
 }
 
+/** For Telegram's HTML: text and attribute values (quotes too, for href="…"). */
 export function escapeHtml(text: string) {
   return text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 const a = (url: string, text: string) =>

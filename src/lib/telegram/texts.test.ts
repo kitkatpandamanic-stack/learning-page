@@ -5,6 +5,7 @@ import {
   dailyCaption,
   dailyKeyboard,
   displayName,
+  escapeHtml,
   hintHtml,
   hintPopup,
   hintSpoiler,
@@ -16,6 +17,14 @@ import {
   reminderText,
   streakText,
 } from "@/lib/telegram/texts";
+
+describe("escapeHtml", () => {
+  it("is safe in text and inside attribute quotes", () => {
+    expect(escapeHtml(`<a href="x">Tom & "Jerry"</a>`)).toBe(
+      "&lt;a href=&quot;x&quot;&gt;Tom &amp; &quot;Jerry&quot;&lt;/a&gt;",
+    );
+  });
+});
 
 describe("reading messages", () => {
   it("parses commands, also with the bot's name and an argument", () => {
