@@ -124,9 +124,9 @@ describe("linking Telegram", () => {
   });
 });
 
-/** A UTC±N zone where it's 8 pm right now, so the reminder is due. */
-function eveningZone(now = new Date()) {
-  let offset = (20 - now.getUTCHours() + 24) % 24;
+/** A UTC±N zone where it's `hour` o'clock right now (8 pm by default). */
+function eveningZone(now = new Date(), hour = 20) {
+  let offset = (hour - now.getUTCHours() + 24) % 24;
   if (offset > 14) offset -= 24;
   // Etc/GMT signs are reversed: Etc/GMT-5 is UTC+5.
   return offset === 0
@@ -183,6 +183,28 @@ describe("evening reminders", () => {
     ]);
     const result = await sendReminders();
     expect(result.sent).toBe(0);
+  });
+
+  it("catches up later in the evening, but not after 11 pm", async () => {
+    await link("u1", 11, {
+      reminders: true,
+      timeZone: eveningZone(new Date(), 22),
+    });
+    await link("u2", 12, {
+      reminders: true,
+      timeZone: eveningZone(new Date(), 23),
+    });
+    for (const userId of ["u1", "u2"]) {
+      await testDb.insert(schema.xpEvent).values({
+        userId,
+        amount: 10,
+        reason: "exercise",
+        ref: "x",
+        createdAt: yesterday(),
+      });
+    }
+    expect(await sendReminders()).toEqual({ checked: 2, sent: 1 });
+    expect(sent.find((s) => s.method === "sendMessage")?.body.chat_id).toBe(11);
   });
 
   it("turns reminders off for learners who blocked the bot", async () => {

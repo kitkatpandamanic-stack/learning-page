@@ -264,13 +264,13 @@ export function settingsText(locale: BotLocale, s: Settings) {
     ? [
         "⚙️ <b>Настройки</b>",
         "",
-        `🔔 Напоминание в 20:00, если серия под угрозой: <b>${s.reminders ? "вкл" : "выкл"}</b>`,
+        `🔔 Вечернее напоминание (с 20:00), если серия под угрозой: <b>${s.reminders ? "вкл" : "выкл"}</b>`,
         `🏆 Ваше имя в рейтинге недели на канале: <b>${s.leaderboard ? "вкл" : "выкл"}</b>`,
       ].join("\n")
     : [
         "⚙️ <b>Settings</b>",
         "",
-        `🔔 A reminder at 8 pm when your streak is at risk: <b>${s.reminders ? "on" : "off"}</b>`,
+        `🔔 An evening reminder (from 8 pm) when your streak is at risk: <b>${s.reminders ? "on" : "off"}</b>`,
         `🏆 Your name on the channel's weekly leaderboard: <b>${s.leaderboard ? "on" : "off"}</b>`,
       ].join("\n");
 }
