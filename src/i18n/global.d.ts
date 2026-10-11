@@ -25,6 +25,7 @@ import type saved from "../../messages/en/saved.json";
 import type review from "../../messages/en/review.json";
 import type welcome from "../../messages/en/welcome.json";
 import type report from "../../messages/en/report.json";
+import type admin from "../../messages/en/admin.json";
 import type notFound from "../../messages/en/notFound.json";
 
 type Messages = {
@@ -52,6 +53,7 @@ type Messages = {
   review: typeof review;
   welcome: typeof welcome;
   report: typeof report;
+  admin: typeof admin;
   notFound: typeof notFound;
 };
 

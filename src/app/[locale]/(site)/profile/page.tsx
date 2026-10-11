@@ -21,6 +21,7 @@ import { getLanguage } from "@/lib/content";
 import { alternates, localeParam } from "@/lib/i18n";
 import { getLearnerProfile } from "@/lib/learner-profile";
 import { getLinkedProviders, getTimeZone } from "@/lib/progress";
+import { isAdmin } from "@/lib/admin";
 import { requireSession } from "@/lib/session";
 import { BOT_USERNAME, telegramConfigured } from "@/lib/telegram/api";
 import { getLinkForUser } from "@/lib/telegram/links";
@@ -132,6 +133,11 @@ export default async function ProfilePage({
       <GlassCard className="flex flex-col gap-4">
         <h2 className="text-lg font-semibold text-white">{t("account")}</h2>
         <div className="flex flex-col items-start gap-4">
+          {isAdmin(user.email) && (
+            <Button asChild variant="glass">
+              <Link href="/admin">{t("adminPanel")}</Link>
+            </Button>
+          )}
           <SignOutButton />
           <DeleteAccountButton />
         </div>
