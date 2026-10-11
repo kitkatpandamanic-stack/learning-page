@@ -55,15 +55,23 @@ export default async function AdminPage({
   const session = await getSession();
   if (!session || !isAdmin(session.user.email)) notFound();
 
-  const [overview, database, reports, dailyRuns, botRuns, followers] =
-    await Promise.all([
-      getAdminOverview(30),
-      getDatabaseInfo(),
-      getReports(),
-      getJobRuns("telegram.yml"),
-      getJobRuns("telegram-bot.yml"),
-      getChannelMembers(),
-    ]);
+  const [
+    overview,
+    database,
+    reports,
+    dailyRuns,
+    botRuns,
+    leaderboardRuns,
+    followers,
+  ] = await Promise.all([
+    getAdminOverview(30),
+    getDatabaseInfo(),
+    getReports(),
+    getJobRuns("telegram.yml"),
+    getJobRuns("telegram-bot.yml"),
+    getJobRuns("telegram-leaderboard.yml"),
+    getChannelMembers(),
+  ]);
   const t = await getTranslations("admin");
   const format = await getFormatter();
   const now = new Date();
@@ -270,6 +278,13 @@ export default async function AdminPage({
           <JobRuns
             title={t("telegram.botJobs")}
             runs={botRuns}
+            unavailable={t("telegram.unavailable")}
+            statusLabel={(s) => t(`telegram.status.${s}`)}
+            ago={ago}
+          />
+          <JobRuns
+            title={t("telegram.leaderboardJob")}
+            runs={leaderboardRuns}
             unavailable={t("telegram.unavailable")}
             statusLabel={(s) => t(`telegram.status.${s}`)}
             ago={ago}

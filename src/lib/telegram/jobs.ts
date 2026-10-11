@@ -18,13 +18,17 @@ import {
   reminderText,
 } from "@/lib/telegram/texts";
 
-/** Reminders go out at this hour on the learner's clock. */
-export const REMINDER_HOUR = 20;
+/**
+ * Reminders go out in the evening on the learner's clock, from 8 pm until
+ * 11 pm: the scheduler sometimes skips a run, so a later one catches up.
+ */
+export const REMINDER_HOURS = { from: 20, to: 22 };
 const LEADERBOARD_SIZE = 10;
 
 /**
- * Runs every hour: learners who asked for reminders, whose evening it is now,
- * who have a streak going and haven't practised yet today, get one message.
+ * Runs twice an hour: learners who asked for reminders, whose evening it is
+ * now, who have a streak going and haven't practised yet today, get one
+ * message a day.
  */
 export async function sendReminders(now = new Date()) {
   const links = await db
@@ -33,7 +37,8 @@ export async function sendReminders(now = new Date()) {
     .where(eq(telegramLink.reminders, true));
   let sent = 0;
   for (const link of links) {
-    if (localHour(link.timeZone, now) !== REMINDER_HOUR) continue;
+    const hour = localHour(link.timeZone, now);
+    if (hour < REMINDER_HOURS.from || hour > REMINDER_HOURS.to) continue;
     const today = dayIn(link.timeZone, now);
     if (link.lastReminded === today) continue;
     const locale = link.locale as Locale;
