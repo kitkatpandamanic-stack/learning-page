@@ -59,7 +59,7 @@ export function PracticeProgress({
                 />
               )}
               {language?.name ?? i.language}
-              <span className="font-mono text-xs text-white/45">
+              <span className="font-mono text-xs text-white/55">
                 {i.solved}/{i.total}
               </span>
             </button>
@@ -80,7 +80,7 @@ export function PracticeProgress({
           <div key={d} className="flex flex-col gap-1.5">
             <span className="flex items-center justify-between text-xs text-white/60">
               {tp(`difficulty.${d}`)}
-              <span className="font-mono text-white/45">
+              <span className="font-mono text-white/55">
                 {item.difficulty[d].solved}/{item.difficulty[d].total}
               </span>
             </span>
@@ -96,7 +96,7 @@ export function PracticeProgress({
       </div>
 
       <div className="flex flex-col gap-2">
-        <h3 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+        <h3 className="text-xs font-medium tracking-wide text-white/55 uppercase">
           {t("topics")}
         </h3>
         <ul className="grid grid-cols-1 gap-x-5 gap-y-2.5 sm:grid-cols-2">
@@ -111,7 +111,7 @@ export function PracticeProgress({
                 )}
               >
                 <span className="truncate">{topicName(topic.topic)}</span>
-                <span className="font-mono text-xs text-white/45">
+                <span className="font-mono text-xs text-white/55">
                   {topic.solved}/{topic.total}
                 </span>
               </span>

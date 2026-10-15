@@ -86,12 +86,10 @@ export default async function LessonPage({
 
   return (
     <div className="mx-auto grid w-full max-w-[90rem] gap-8 px-4 py-8 sm:px-6 lg:grid-cols-[17rem_minmax(0,1fr)] lg:px-8 xl:grid-cols-[17rem_minmax(0,1fr)_14rem]">
-      <aside
-        aria-label={tr("courseContents")}
-        className="sticky top-24 hidden max-h-[calc(100vh-7rem)] self-start overflow-y-auto rounded-2xl p-4 glass lg:block"
-      >
+      {/* The sidebar and the table of contents are <nav>s themselves. */}
+      <div className="sticky top-24 hidden max-h-[calc(100vh-7rem)] self-start overflow-y-auto rounded-2xl p-4 glass lg:block">
         {sidebar}
-      </aside>
+      </div>
 
       <article className="mx-auto w-full max-w-3xl min-w-0">
         <JsonLd
@@ -212,12 +210,9 @@ export default async function LessonPage({
         </div>
       </article>
 
-      <aside
-        aria-label={tr("onThisPage")}
-        className="sticky top-24 hidden self-start xl:block"
-      >
+      <div className="sticky top-24 hidden self-start xl:block">
         <TableOfContents toc={lesson.toc} />
-      </aside>
+      </div>
     </div>
   );
 }

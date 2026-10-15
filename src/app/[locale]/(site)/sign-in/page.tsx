@@ -134,7 +134,7 @@ export default async function SignInPage({
           >
             {t("guest")} <ArrowRight className="size-4" />
           </Link>
-          <p className="text-xs text-white/45">{t("guestHint")}</p>
+          <p className="text-xs text-white/55">{t("guestHint")}</p>
         </div>
 
         <p className="text-xs text-white/55">

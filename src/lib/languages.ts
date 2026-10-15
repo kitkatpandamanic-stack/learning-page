@@ -62,6 +62,20 @@ export const languages: Language[] = [
     },
   },
   {
+    slug: "sql",
+    name: "SQL",
+    monogram: "SQ",
+    description: "Talk to databases. Every developer needs it sooner or later.",
+    usedFor: ["Databases", "Analytics", "Backend"],
+    status: "available",
+    color: {
+      text: "text-lang-sql",
+      bg: "bg-lang-sql",
+      soft: "bg-lang-sql/15",
+      border: "hover:border-lang-sql/50",
+    },
+  },
+  {
     slug: "java",
     name: "Java",
     monogram: "Jv",
@@ -134,20 +148,6 @@ export const languages: Language[] = [
       bg: "bg-lang-cpp",
       soft: "bg-lang-cpp/15",
       border: "hover:border-lang-cpp/50",
-    },
-  },
-  {
-    slug: "sql",
-    name: "SQL",
-    monogram: "SQ",
-    description: "Talk to databases. Every developer needs it sooner or later.",
-    usedFor: ["Databases", "Analytics", "Backend"],
-    status: "available",
-    color: {
-      text: "text-lang-sql",
-      bg: "bg-lang-sql",
-      soft: "bg-lang-sql/15",
-      border: "hover:border-lang-sql/50",
     },
   },
 ];

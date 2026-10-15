@@ -36,7 +36,7 @@ export function ProsePage({
           <>
             {description}
             {updated && (
-              <span className="mt-2 block text-sm text-white/45">
+              <span className="mt-2 block text-sm text-white/55">
                 {t("lastUpdated", {
                   date: format.dateTime(updated, {
                     dateStyle: "long",

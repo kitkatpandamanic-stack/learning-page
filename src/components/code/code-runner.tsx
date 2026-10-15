@@ -482,7 +482,7 @@ function RunnerBody({
                   <span>
                     {test.name}
                     {test.error && (
-                      <span className="block text-xs text-white/45">
+                      <span className="block text-xs text-white/55">
                         {localizeRunnerText(test.error, t)}
                       </span>
                     )}

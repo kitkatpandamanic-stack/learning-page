@@ -56,7 +56,7 @@ export function ReportButton({ permalink }: { permalink: string }) {
 
   return (
     <Dialog.Root open={open} onOpenChange={changeOpen}>
-      <Dialog.Trigger className="inline-flex items-center gap-2 self-start rounded-lg px-2 py-1 text-sm text-white/45 transition hover:bg-white/6 hover:text-white/80 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none">
+      <Dialog.Trigger className="inline-flex items-center gap-2 self-start rounded-lg px-2 py-1 text-sm text-white/55 transition hover:bg-white/6 hover:text-white/80 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none">
         <Flag className="size-4" /> {t("button")}
       </Dialog.Trigger>
       <Dialog.Portal>
@@ -138,7 +138,7 @@ export function ReportButton({ permalink }: { permalink: string }) {
                 aria-hidden
                 className="absolute -left-[9999px] size-px opacity-0"
               />
-              <p className="text-xs text-white/45">{t("public")}</p>
+              <p className="text-xs text-white/55">{t("public")}</p>
               {state !== "idle" && state !== "sending" && (
                 <p role="alert" className="text-sm text-pink-300">
                   {t(`errors.${state}`)}

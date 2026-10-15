@@ -281,7 +281,7 @@ export default async function DashboardPage({
           </div>
           {place.recent.length > 1 && (
             <div className="flex flex-col gap-2 border-t border-white/10 pt-3">
-              <p className="text-xs font-medium tracking-wide text-white/45 uppercase">
+              <p className="text-xs font-medium tracking-wide text-white/55 uppercase">
                 {t("continue.recent")}
               </p>
               <ul className="flex flex-wrap gap-2">
@@ -310,7 +310,7 @@ export default async function DashboardPage({
       <div className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
         {/* Today: first on phones, the right-hand column on wide screens */}
         <div className="flex flex-col gap-6 lg:order-2">
-          <h2 className="text-xs font-semibold tracking-wider text-white/45 uppercase">
+          <h2 className="text-xs font-semibold tracking-wider text-white/55 uppercase">
             {t("columns.today")}
           </h2>
           {/* Daily goal */}
@@ -402,7 +402,7 @@ export default async function DashboardPage({
                   ))}
                 </p>
               )}
-              <p className="text-xs text-white/40">
+              <p className="text-xs text-white/55">
                 {t("freeze.hint", { every: FREEZE_EVERY, max: MAX_FREEZES })}
               </p>
             </GlassCard>
@@ -537,7 +537,7 @@ export default async function DashboardPage({
 
         {/* Progress */}
         <div className="flex flex-col gap-6 lg:order-1">
-          <h2 className="text-xs font-semibold tracking-wider text-white/45 uppercase">
+          <h2 className="text-xs font-semibold tracking-wider text-white/55 uppercase">
             {t("columns.progress")}
           </h2>
           {/* Activity calendar */}
@@ -584,7 +584,7 @@ export default async function DashboardPage({
                     className="hover:text-white"
                   >
                     {c.name}{" "}
-                    <span className="text-white/45">
+                    <span className="text-white/55">
                       · {c.completed}/{c.total}
                     </span>
                   </Link>
@@ -648,7 +648,7 @@ export default async function DashboardPage({
                     <p
                       className={cn(
                         "mt-1 text-xs",
-                        unlocked ? tone.text : "text-white/40",
+                        unlocked ? tone.text : "text-white/55",
                       )}
                     >
                       {a.unlockedAt
@@ -682,7 +682,7 @@ export default async function DashboardPage({
                   {recentLabel(e.reason, e.lessonTitle)}
                 </span>
                 <span className="flex shrink-0 items-center gap-3">
-                  <span className="text-xs text-white/40">{timeAgo(e.at)}</span>
+                  <span className="text-xs text-white/55">{timeAgo(e.at)}</span>
                   <span className="font-mono font-semibold text-amber-300">
                     {t("recent.xp", { xp: e.amount })}
                   </span>

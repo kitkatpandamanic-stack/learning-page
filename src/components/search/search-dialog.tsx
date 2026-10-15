@@ -175,7 +175,7 @@ export function SearchDialog({
               enterKeyHint="go"
               spellCheck={false}
               autoComplete="off"
-              className="h-14 min-w-0 flex-1 bg-transparent text-base text-white placeholder:text-white/40 focus:outline-none [&::-webkit-search-cancel-button]:hidden"
+              className="h-14 min-w-0 flex-1 bg-transparent text-base text-white placeholder:text-white/55 focus:outline-none [&::-webkit-search-cancel-button]:hidden"
             />
             <Dialog.Close className="flex size-8 shrink-0 items-center justify-center rounded-lg text-white/50 hover:bg-white/10 hover:text-white focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none">
               <XIcon className="size-4" />
@@ -301,7 +301,7 @@ export function SearchDialog({
                         {i === active && (
                           <CornerDownLeft
                             aria-hidden
-                            className="mt-2.5 hidden size-4 shrink-0 text-white/40 sm:block"
+                            className="mt-2.5 hidden size-4 shrink-0 text-white/55 sm:block"
                           />
                         )}
                       </Link>
@@ -317,7 +317,7 @@ export function SearchDialog({
               ? t("resultCount", { count: results.length })
               : ""}
           </p>
-          <div className="hidden shrink-0 items-center gap-4 border-t border-white/10 px-4 py-2.5 text-xs text-white/45 sm:flex">
+          <div className="hidden shrink-0 items-center gap-4 border-t border-white/10 px-4 py-2.5 text-xs text-white/55 sm:flex">
             <span className="flex items-center gap-1.5">
               <Kbd>↑</Kbd>
               <Kbd>↓</Kbd> {t("keys.move")}

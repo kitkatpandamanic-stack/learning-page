@@ -20,6 +20,20 @@ export function ContinueBanner() {
   const { data } = useContinue(signedIn);
   const local = useLastVisit();
   const [hidden, setHidden] = React.useState(false);
+  // On phones the card would cover the hero's buttons, so it waits until
+  // the visitor scrolls a little; wider screens have room from the start.
+  const [roomy, setRoomy] = React.useState(false);
+  React.useEffect(() => {
+    const wide = window.matchMedia("(min-width: 640px)");
+    const update = () => setRoomy(wide.matches || window.scrollY > 240);
+    update();
+    window.addEventListener("scroll", update, { passive: true });
+    wide.addEventListener("change", update);
+    return () => {
+      window.removeEventListener("scroll", update);
+      wide.removeEventListener("change", update);
+    };
+  }, []);
 
   const target = signedIn
     ? data?.target && data.target.reason !== "start"
@@ -34,10 +48,10 @@ export function ContinueBanner() {
       : null
     : local && { href: local.permalink, title: local.title, label: t("label") };
 
-  if (hidden || isPending || !target) return null;
+  if (hidden || !roomy || isPending || !target) return null;
 
   return (
-    <aside
+    <section
       aria-label={target.label}
       className="fixed inset-x-4 bottom-4 z-30 mx-auto flex max-w-md animate-in items-center gap-3 rounded-2xl py-2.5 pr-2 pl-3 glass-strong fade-in-0 slide-in-from-bottom-4 sm:bottom-6"
     >
@@ -60,6 +74,6 @@ export function ContinueBanner() {
       >
         <XIcon className="size-4" />
       </button>
-    </aside>
+    </section>
   );
 }

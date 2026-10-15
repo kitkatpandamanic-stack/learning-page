@@ -53,7 +53,8 @@ export function Callout({
   const Icon = v.icon;
 
   return (
-    <aside
+    <div
+      role="note"
       className={cn(
         "not-prose my-6 flex gap-3 rounded-2xl border px-4 py-3.5 backdrop-blur-md",
         v.className,
@@ -66,6 +67,6 @@ export function Callout({
         </p>
         {children}
       </div>
-    </aside>
+    </div>
   );
 }

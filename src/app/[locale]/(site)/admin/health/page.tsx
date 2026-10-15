@@ -85,7 +85,7 @@ const text: Record<Status, string> = {
   ok: "text-lime-300",
   warn: "text-amber-300",
   bad: "text-pink-300",
-  unknown: "text-white/45",
+  unknown: "text-white/55",
 };
 const providerNames: Record<string, string> = {
   github: "GitHub",
@@ -230,7 +230,7 @@ export default async function HealthPage({
               </p>
             </div>
           </div>
-          <div className="flex flex-col items-start gap-1 text-xs text-white/45 sm:items-end">
+          <div className="flex flex-col items-start gap-1 text-xs text-white/55 sm:items-end">
             <span>{t("checked", { when: ago(now) })}</span>
             <span>
               {collectedAt
@@ -271,7 +271,7 @@ export default async function HealthPage({
 
         {findings.length > 0 && (
           <div className="flex flex-col gap-2">
-            <h2 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+            <h2 className="text-xs font-medium tracking-wide text-white/55 uppercase">
               {t("needsLook")}
             </h2>
             <ul className="flex flex-col gap-1.5">
@@ -328,7 +328,7 @@ export default async function HealthPage({
                         <Badge tone="pink">{t("errors.new")}</Badge>
                       )}
                     </span>
-                    <span className="truncate font-mono text-xs text-white/40">
+                    <span className="truncate font-mono text-xs text-white/55">
                       {issue.culprit}
                     </span>
                   </span>
@@ -384,7 +384,7 @@ export default async function HealthPage({
                 <p
                   className={cn(
                     "text-xs",
-                    m.projected > m.limit ? "text-amber-300" : "text-white/45",
+                    m.projected > m.limit ? "text-amber-300" : "text-white/55",
                   )}
                 >
                   {t("limits.projected", {
@@ -393,7 +393,7 @@ export default async function HealthPage({
                 </p>
               )}
               {m.key === "vercelStorage" && (
-                <p className="text-xs text-white/45">
+                <p className="text-xs text-white/55">
                   {t("limits.estimate", {
                     count: deployments.filter((d) => d.state === "READY")
                       .length,
@@ -409,13 +409,13 @@ export default async function HealthPage({
             return !p || (!p.ok && notSetUp(p.error));
           })
           .map((part) => (
-            <p key={part} className="text-xs text-white/45">
+            <p key={part} className="text-xs text-white/55">
               {t("limits.notSetUpPart", { part })} · {t("notSetUp")}
             </p>
           ))}
         <div className="grid gap-6 md:grid-cols-2">
           <div className="flex flex-col gap-2">
-            <h3 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+            <h3 className="text-xs font-medium tracking-wide text-white/55 uppercase">
               {t("limits.computePerDay")}
             </h3>
             {computePerDay.length < 2 ? (
@@ -439,7 +439,7 @@ export default async function HealthPage({
           </div>
           {vercel?.ok && (
             <div className="flex flex-col gap-2">
-              <h3 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+              <h3 className="text-xs font-medium tracking-wide text-white/55 uppercase">
                 {t("limits.deployments")}
               </h3>
               <p className="text-sm text-white/80">
@@ -499,7 +499,7 @@ export default async function HealthPage({
               <span className="text-2xl font-bold text-white">
                 {format.number(s.last24h)}
               </span>
-              <span className="text-xs text-white/45">
+              <span className="text-xs text-white/55">
                 {t("learners.normal", {
                   value: format.number(s.dailyAverage, {
                     maximumFractionDigits: 1,
@@ -584,10 +584,10 @@ export default async function HealthPage({
         />
         <div className="grid gap-6 lg:grid-cols-2">
           <div className="flex min-w-0 flex-col gap-2">
-            <h3 className="flex items-center gap-1.5 text-xs font-medium tracking-wide text-white/45 uppercase">
+            <h3 className="flex items-center gap-1.5 text-xs font-medium tracking-wide text-white/55 uppercase">
               <KeyRound className="size-3.5" /> {t("security.secrets")}
             </h3>
-            <p className="text-xs text-white/45">{t("security.secretsHint")}</p>
+            <p className="text-xs text-white/55">{t("security.secretsHint")}</p>
             <ul className="flex flex-col gap-1">
               {secrets.map((s) => {
                 const status: Status =
@@ -617,7 +617,7 @@ export default async function HealthPage({
                     <span className={cn("text-xs", text[status])}>
                       {t(`security.${s.state}`)}
                       {s.updatedAt && (
-                        <span className="text-white/40">
+                        <span className="text-white/55">
                           {" · "}
                           {s.old
                             ? t("security.old")
@@ -633,7 +633,7 @@ export default async function HealthPage({
 
           <div className="flex min-w-0 flex-col gap-6">
             <div className="flex flex-col gap-2">
-              <h3 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+              <h3 className="text-xs font-medium tracking-wide text-white/55 uppercase">
                 {t("security.events")}
               </h3>
               <dl className="grid grid-cols-2 gap-2">
@@ -646,7 +646,7 @@ export default async function HealthPage({
                       <span className="text-xl font-bold">
                         {events.last24h[kind].n}
                       </span>{" "}
-                      <span className="text-xs text-white/45">
+                      <span className="text-xs text-white/55">
                         {t("security.eventSources", {
                           people: events.last24h[kind].people,
                         })}
@@ -658,7 +658,7 @@ export default async function HealthPage({
             </div>
 
             <div className="flex flex-col gap-2">
-              <h3 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+              <h3 className="text-xs font-medium tracking-wide text-white/55 uppercase">
                 {t("security.alerts")}
               </h3>
               <p className="text-sm text-white/80">
@@ -685,7 +685,7 @@ export default async function HealthPage({
         </div>
 
         <div className="flex flex-col gap-2">
-          <h3 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+          <h3 className="text-xs font-medium tracking-wide text-white/55 uppercase">
             {t("security.latest")}
           </h3>
           {events.latest.length === 0 ? (
@@ -702,13 +702,13 @@ export default async function HealthPage({
                   <span className="text-white/80">
                     {t(`security.eventKinds.${e.kind}`)}
                     {e.detail && (
-                      <span className="font-mono text-white/45">
+                      <span className="font-mono text-white/55">
                         {" "}
                         · {e.detail}
                       </span>
                     )}
                   </span>
-                  <span className="font-mono text-xs text-white/40">
+                  <span className="font-mono text-xs text-white/55">
                     {e.who ?? "—"} · {ago(e.createdAt)}
                   </span>
                 </li>
@@ -719,10 +719,10 @@ export default async function HealthPage({
 
         <div className="grid gap-6 lg:grid-cols-2">
           <div className="flex min-w-0 flex-col gap-2">
-            <h3 className="flex items-center gap-1.5 text-xs font-medium tracking-wide text-white/45 uppercase">
+            <h3 className="flex items-center gap-1.5 text-xs font-medium tracking-wide text-white/55 uppercase">
               <Monitor className="size-3.5" /> {t("security.access")}
             </h3>
-            <p className="text-xs text-white/45">{t("security.accessHint")}</p>
+            <p className="text-xs text-white/55">{t("security.accessHint")}</p>
             <ul className="flex flex-col gap-2">
               {access.sessions.map((s) => (
                 <li
@@ -732,7 +732,7 @@ export default async function HealthPage({
                   <span className="text-sm text-white/85">
                     {describeDevice(s.userAgent) ?? t("security.unknownDevice")}
                     {s.ip && (
-                      <span className="font-mono text-white/45">
+                      <span className="font-mono text-white/55">
                         {" "}
                         · {maskIp(s.ip)}
                       </span>
@@ -743,7 +743,7 @@ export default async function HealthPage({
                       </Badge>
                     )}
                   </span>
-                  <span className="text-xs text-white/45">
+                  <span className="text-xs text-white/55">
                     {s.email} ·{" "}
                     {t("security.signedIn", {
                       when: ago(s.createdAt),
@@ -763,7 +763,7 @@ export default async function HealthPage({
             )}
           </div>
           <div className="flex flex-col gap-2">
-            <h3 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+            <h3 className="text-xs font-medium tracking-wide text-white/55 uppercase">
               {t("security.providers")}
             </h3>
             <ul className="flex flex-col gap-1 text-sm">
@@ -771,9 +771,9 @@ export default async function HealthPage({
                 <li key={i} className="flex justify-between gap-3">
                   <span className="text-white/80">
                     <span>{providerNames[p.provider] ?? p.provider}</span>
-                    <span className="text-white/45"> · {p.email}</span>
+                    <span className="text-white/55"> · {p.email}</span>
                   </span>
-                  <span className="text-xs text-white/40">
+                  <span className="text-xs text-white/55">
                     {t("security.linked", { when: ago(p.linkedAt) })}
                   </span>
                 </li>
@@ -783,7 +783,7 @@ export default async function HealthPage({
         </div>
       </GlassCard>
 
-      <div id="collector" className="scroll-mt-24 text-xs text-white/40">
+      <div id="collector" className="scroll-mt-24 text-xs text-white/55">
         <span className="inline-flex items-center gap-1.5">
           <StatusIcon status={areas.collector.status} className="size-3.5" />
           {collectedAt

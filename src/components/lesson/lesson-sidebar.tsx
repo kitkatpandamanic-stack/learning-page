@@ -55,7 +55,7 @@ export function LessonSidebar({
                 <span className="flex-1">
                   {level.level} · {levelNames(`${level.level}.name`)}
                 </span>
-                <span className="text-xs font-normal text-white/40">
+                <span className="text-xs font-normal text-white/55">
                   {lessonCount}
                 </span>
                 <ChevronRight className="size-4 text-white/40 transition group-open:rotate-90" />

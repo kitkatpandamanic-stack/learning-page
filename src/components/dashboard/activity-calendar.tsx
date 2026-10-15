@@ -71,7 +71,7 @@ export function ActivityCalendar({
         {/* Weekday names: a spacer as tall as the month row, then 7 rows. */}
         <div
           aria-hidden
-          className="flex flex-col gap-1.5 text-[0.68rem] leading-none text-white/45"
+          className="flex flex-col gap-1.5 text-[0.68rem] leading-none text-white/55"
         >
           <span className="h-3.5" />
           <div className="grid flex-1 grid-rows-7 gap-[3px]">
@@ -94,7 +94,7 @@ export function ActivityCalendar({
           <div className="flex min-w-[22rem] flex-col gap-1.5">
             <div
               aria-hidden
-              className="grid h-3.5 text-[0.68rem] leading-none text-white/45"
+              className="grid h-3.5 text-[0.68rem] leading-none text-white/55"
               style={{
                 gridTemplateColumns: `repeat(${columns.length}, minmax(0, 1fr))`,
               }}

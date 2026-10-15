@@ -53,7 +53,7 @@ function ModuleCard({ module, tone }: { module: CourseModule; tone: Tone }) {
                 <span className="flex-1 text-sm text-white/85 group-hover:text-white">
                   {lesson.title}
                 </span>
-                <span className="flex shrink-0 items-center gap-1 text-xs text-white/45">
+                <span className="flex shrink-0 items-center gap-1 text-xs text-white/55">
                   <Clock className="size-3" />
                   {common("minutes", { count: lesson.duration })}
                 </span>
@@ -207,7 +207,7 @@ export function CourseRoadmap({ levels }: { levels: CourseLevel[] }) {
                           <span className="flex-1 text-sm text-white/85 group-hover:text-white">
                             {lesson.title}
                           </span>
-                          <span className="flex shrink-0 items-center gap-1 text-xs text-white/45">
+                          <span className="flex shrink-0 items-center gap-1 text-xs text-white/55">
                             <Clock className="size-3" />
                             {common("minutes", { count: lesson.duration })}
                           </span>

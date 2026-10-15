@@ -213,7 +213,7 @@ export function Playground() {
         storageId={`playground-${language}`}
         minHeight="360px"
       />
-      <p className="text-sm text-white/45">{t("note")}</p>
+      <p className="text-sm text-white/55">{t("note")}</p>
     </div>
   );
 }
