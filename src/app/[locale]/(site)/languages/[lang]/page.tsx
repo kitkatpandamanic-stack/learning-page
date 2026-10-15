@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { cn } from "cn";
 
+import { CourseLibrary } from "@/components/languages/course-library";
 import { CourseRoadmap } from "@/components/languages/course-roadmap";
 import {
   LanguageMonogram,
@@ -36,6 +37,9 @@ import { siteConfig, siteUrl } from "@/lib/site";
 import { toneClasses } from "@/lib/tones";
 
 export const dynamicParams = false;
+// The library section reads the book catalog from storage: rebuilt at most
+// every 5 minutes, so new books show up without a redeploy.
+export const revalidate = 300;
 
 export function generateStaticParams() {
   return languages.map((l) => ({ lang: l.slug }));
@@ -248,6 +252,8 @@ export default async function LanguagePage({
       ) : (
         <ComingSoon languageName={language.name} />
       )}
+
+      <CourseLibrary slug={language.slug} locale={locale} />
     </Container>
   );
 }

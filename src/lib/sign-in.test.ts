@@ -38,6 +38,12 @@ describe("signInReason", () => {
     });
   });
 
+  it("explains library books, whatever page they're on", () => {
+    expect(signInReason("/languages/python", "library", titleOf)).toEqual({
+      key: "library",
+    });
+  });
+
   it("falls back to the general welcome elsewhere", () => {
     expect(signInReason("/", undefined, titleOf)).toBeNull();
     expect(signInReason("/languages/python", "save", titleOf)).toBeNull();
