@@ -56,7 +56,7 @@ export function ReportButton({ permalink }: { permalink: string }) {
 
   return (
     <Dialog.Root open={open} onOpenChange={changeOpen}>
-      <Dialog.Trigger className="inline-flex items-center gap-2 self-start rounded-lg px-2 py-1 text-sm text-white/55 transition hover:bg-white/6 hover:text-white/80 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none">
+      <Dialog.Trigger className="inline-flex items-center gap-2 self-start rounded-lg px-2 py-1 text-sm text-white/55 transition hover:bg-white/6 hover:text-white/80 focus-visible:ring-3 focus-visible:ring-ring focus-visible:outline-none pointer-coarse:min-h-11">
         <Flag className="size-4" /> {t("button")}
       </Dialog.Trigger>
       <Dialog.Portal>
@@ -71,7 +71,7 @@ export function ReportButton({ permalink }: { permalink: string }) {
                 {t("intro")}
               </Dialog.Description>
             </div>
-            <Dialog.Close className="flex size-8 shrink-0 items-center justify-center rounded-lg text-white/50 hover:bg-white/10 hover:text-white focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none">
+            <Dialog.Close className="flex size-8 shrink-0 items-center justify-center rounded-lg text-white/50 hover:bg-white/10 hover:text-white focus-visible:ring-3 focus-visible:ring-ring focus-visible:outline-none">
               <XIcon className="size-4" />
               <span className="sr-only">{t("close")}</span>
             </Dialog.Close>
