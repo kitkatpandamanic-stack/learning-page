@@ -173,7 +173,7 @@ export function WelcomeSteps({
                 <span className="block text-sm text-white/60">
                   {tInfo(`${language.slug as "python"}.description`)}
                 </span>
-                <span className="block text-xs text-white/40">
+                <span className="block text-xs text-white/55">
                   {t("language.lessons", { count: lessons })}
                 </span>
               </span>

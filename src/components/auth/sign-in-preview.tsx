@@ -81,7 +81,7 @@ export async function SignInPreview() {
           padding="sm"
           className="flex flex-col gap-2 font-mono text-xs"
         >
-          <span className="flex items-center gap-1.5 font-sans text-white/45">
+          <span className="flex items-center gap-1.5 font-sans text-white/55">
             <Cloud className="size-3.5" /> {t("preview.saved")}
           </span>
           <span className="text-white/80">

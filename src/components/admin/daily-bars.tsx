@@ -37,7 +37,7 @@ export function DailyBars({
           />
         ))}
       </div>
-      <div className="flex justify-between text-[0.68rem] text-white/40">
+      <div className="flex justify-between text-[0.68rem] text-white/55">
         <span>{formatDay(data[0]?.day ?? "")}</span>
         <span>{formatDay(data.at(-1)?.day ?? "")}</span>
       </div>

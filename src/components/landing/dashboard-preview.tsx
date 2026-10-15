@@ -88,8 +88,8 @@ export function DashboardPreview() {
             role="img"
           >
             <div className="grid lg:grid-cols-[220px_1fr]">
-              {/* Sidebar */}
-              <aside className="hidden flex-col gap-1 border-r border-white/8 p-4 lg:flex">
+              {/* Sidebar: a picture of one, not a real landmark */}
+              <div className="hidden flex-col gap-1 border-r border-white/8 p-4 lg:flex">
                 <div className="mb-5 flex items-center gap-2 px-2">
                   <LogoMark className="size-7" />
                   <span className="font-bold text-white">
@@ -124,7 +124,7 @@ export function DashboardPreview() {
                     className="mt-2"
                   />
                 </div>
-              </aside>
+              </div>
 
               {/* Main */}
               <div className="flex flex-col gap-5 p-4 sm:p-6">

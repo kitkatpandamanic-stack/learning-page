@@ -174,7 +174,7 @@ function LibraryRow({
               <ExternalLink className="ml-1.5 inline size-3 text-white/40" />
             )}
           </span>
-          <span className="text-xs text-white/45">
+          <span className="text-xs text-white/55">
             {[
               t(`types.${type ?? "other"}`),
               item.author,

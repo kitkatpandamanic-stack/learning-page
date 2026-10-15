@@ -97,11 +97,11 @@ export function Navbar() {
           <Logo />
         </Link>
 
-        <ul className="hidden items-center gap-1 md:flex">
+        <ul className="hidden items-center gap-1 lg:flex">
           {mainNav.map((link) => (
             <li
               key={link.href}
-              className={cn(link.wideOnly && "hidden lg:block")}
+              className={cn(link.wideOnly && "hidden xl:block")}
             >
               <Link
                 href={link.href}
@@ -117,7 +117,7 @@ export function Navbar() {
           ))}
         </ul>
 
-        <div className="hidden items-center gap-3 md:flex">
+        <div className="hidden items-center gap-3 lg:flex">
           <button
             type="button"
             onClick={() => setSearchOpen(true)}
@@ -125,11 +125,10 @@ export function Navbar() {
             onFocus={prefetchSearch}
             aria-label={ts("open")}
             aria-keyshortcuts={isMac ? "Meta+K" : "Control+K"}
-            className="flex size-9 items-center justify-center gap-2 rounded-full text-sm text-white/70 ring-1 ring-white/12 transition-colors hover:bg-white/8 hover:text-white focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none xl:w-auto xl:px-3"
+            className="flex size-9 items-center justify-center gap-2 rounded-full text-sm text-white/70 ring-1 ring-white/12 transition-colors hover:bg-white/8 hover:text-white focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none 2xl:w-auto 2xl:px-3"
           >
             <SearchIcon className="size-4" />
-            <span className="hidden xl:inline">{ts("open")}</span>
-            <Kbd className="hidden xl:inline">{isMac ? "⌘K" : "Ctrl K"}</Kbd>
+            <Kbd className="hidden 2xl:inline">{isMac ? "⌘K" : "Ctrl K"}</Kbd>
           </button>
           <LanguageSwitcher />
           {isPending ? (
@@ -164,7 +163,7 @@ export function Navbar() {
           )}
         </div>
 
-        <div className="flex items-center gap-2 md:hidden">
+        <div className="flex items-center gap-2 lg:hidden">
           <Button
             variant="glass"
             size="icon-lg"

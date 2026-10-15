@@ -112,7 +112,7 @@ export default async function AdminPage({
         </div>
         <p className="text-muted-foreground">{t("subtitle")}</p>
         {commit && (
-          <p className="text-xs text-white/40">
+          <p className="text-xs text-white/55">
             {t("deployed", {
               commit: `${commit} · ${process.env.VERCEL_GIT_COMMIT_MESSAGE?.split("\n")[0] ?? ""}`,
             })}
@@ -166,7 +166,7 @@ export default async function AdminPage({
             <div key={key} className="flex flex-col gap-2">
               <p className="flex items-baseline justify-between gap-2 text-sm text-white/70">
                 {t(`charts.${key}`)}
-                <span className="font-mono text-xs text-white/45">
+                <span className="font-mono text-xs text-white/55">
                   Σ {format.number(data.reduce((n, d) => n + d.value, 0))}
                 </span>
               </p>
@@ -223,7 +223,7 @@ export default async function AdminPage({
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
-                <thead className="text-left text-xs text-white/45">
+                <thead className="text-left text-xs text-white/55">
                   <tr>
                     <th className="pb-2 font-medium">
                       {t("languages.language")}
@@ -352,13 +352,13 @@ export default async function AdminPage({
                           "truncate",
                           r.state === "open"
                             ? "text-white/85"
-                            : "text-white/45",
+                            : "text-white/55",
                         )}
                       >
                         {r.title}
                       </span>
                     </span>
-                    <span className="shrink-0 text-xs text-white/40">
+                    <span className="shrink-0 text-xs text-white/55">
                       {ago(r.createdAt)}
                     </span>
                   </a>
@@ -392,7 +392,7 @@ export default async function AdminPage({
           })}
         />
         <div className="flex flex-col gap-2">
-          <h3 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+          <h3 className="text-xs font-medium tracking-wide text-white/55 uppercase">
             {t("database.tables")}
           </h3>
           <ul className="grid grid-cols-1 gap-x-6 gap-y-1 text-sm sm:grid-cols-2">
@@ -402,7 +402,7 @@ export default async function AdminPage({
                 className="flex justify-between gap-3 text-white/75"
               >
                 <span className="font-mono">{table.name}</span>
-                <span className="text-white/45">
+                <span className="text-white/55">
                   {t("database.rows", { count: format.number(table.rows) })}
                 </span>
               </li>
@@ -431,7 +431,7 @@ function JobRuns({
 }) {
   return (
     <div className="flex flex-col gap-2">
-      <h3 className="text-xs font-medium tracking-wide text-white/45 uppercase">
+      <h3 className="text-xs font-medium tracking-wide text-white/55 uppercase">
         {title}
       </h3>
       {!runs ? (
@@ -465,7 +465,7 @@ function JobRuns({
                           ? "text-lime-300"
                           : status === "failure"
                             ? "text-pink-300"
-                            : "text-white/45",
+                            : "text-white/55",
                       )}
                     />
                     <span className="text-white/80">
@@ -482,7 +482,7 @@ function JobRuns({
                       )}
                     </span>
                   </span>
-                  <span className="text-xs text-white/40">
+                  <span className="text-xs text-white/55">
                     {ago(run.createdAt)}
                   </span>
                 </a>

@@ -85,7 +85,7 @@ export function RunnerToolbar({
             title={saveLabel ?? undefined}
             className={cn(
               "flex items-center gap-1 text-xs",
-              saveStatus === "error" ? "text-amber-300" : "text-white/40",
+              saveStatus === "error" ? "text-amber-300" : "text-white/55",
             )}
           >
             {saveStatus === "saving" ? (
@@ -218,7 +218,7 @@ export function EditorPlaceholder(props: PlaceholderProps) {
         )}
       />
       <div
-        className="flex animate-pulse items-center justify-center bg-white/2 text-sm text-white/40"
+        className="flex animate-pulse items-center justify-center bg-white/2 text-sm text-white/55"
         style={{ height: editorHeight(starter, minHeight) }}
       >
         {t("loadingEditor")}

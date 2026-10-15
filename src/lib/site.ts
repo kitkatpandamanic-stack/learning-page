@@ -24,7 +24,7 @@ export const siteConfig = {
 
 /**
  * `label` is a key in the "nav" translations. `wideOnly` links are left out
- * of the top bar on tablet widths (they stay in the mobile menu and footer).
+ * of the top bar below 1280px (they stay in the mobile menu and footer).
  */
 export type NavLink = { label: string; href: string; wideOnly?: boolean };
 
@@ -33,7 +33,7 @@ export const mainNav: NavLink[] = [
   { label: "practice", href: "/practice" },
   { label: "roadmap", href: "/#roadmap", wideOnly: true },
   { label: "playground", href: "/playground" },
-  { label: "pricing", href: "/pricing" },
+  { label: "pricing", href: "/pricing", wideOnly: true },
 ];
 
 /** Group titles and labels are keys in the "footer" and "nav" translations. */
