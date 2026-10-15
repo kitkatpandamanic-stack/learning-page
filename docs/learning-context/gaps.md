@@ -125,3 +125,7 @@ with cheap fixes nudged up. "Who" says which audience feels it.
 | Problems with no or broken lesson link | 0 / 0. Weak links: see #7.                                                                                                       |
 | Modules with no practice problem       | JS 12/20, Python 16/25, SQL 5/16, TS 8/17.                                                                                       |
 | Modules with no mini-project           | JS 10/20, Python 11/25, SQL 14/16, TS 8/17 (2026-10-11, after the basics projects).                                              |
+
+## Dated to-dos
+
+- After 2026-10-28 (Node 26 becomes LTS): update Node 24 pins in JS `realtime-chat/03-the-client-and-shipping-it` (`node:24-alpine`, `node-version: 24`), and check other `node-version` pins across the courses.
