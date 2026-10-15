@@ -116,17 +116,17 @@ export default async function LessonPage({
             aria-label={tr("breadcrumb")}
             className="flex flex-wrap items-center gap-1 text-sm text-white/50"
           >
-            <Link href="/languages" className="hover:text-white">
+            <Link href="/languages" className="tap-target hover:text-white">
               {tr("languages")}
             </Link>
             <ChevronRight className="size-3.5" />
-            <Link href={roadmapHref} className="hover:text-white">
+            <Link href={roadmapHref} className="tap-target hover:text-white">
               {language.name}
             </Link>
             <ChevronRight className="size-3.5" />
             <Link
               href={`${roadmapHref}#level-${level.level}`}
-              className="hover:text-white"
+              className="tap-target hover:text-white"
             >
               {levelNames(`${level.level}.name`)}
             </Link>

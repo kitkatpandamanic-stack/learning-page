@@ -58,7 +58,7 @@ export function Pre(props: React.ComponentProps<"pre">) {
         type="button"
         onClick={copy}
         aria-label={copied ? t("copied") : t("copyCode")}
-        className="absolute top-2.5 right-2.5 flex size-8 items-center justify-center rounded-lg border border-white/10 bg-space-900/90 text-white/60 opacity-0 transition group-hover/pre:opacity-100 hover:text-white focus-visible:opacity-100"
+        className="absolute top-2.5 right-2.5 flex size-8 items-center justify-center rounded-lg border border-white/10 bg-space-900/90 text-white/60 opacity-0 transition group-hover/pre:opacity-100 hover:text-white focus-visible:opacity-100 pointer-coarse:top-1.5 pointer-coarse:right-1.5 pointer-coarse:size-11 pointer-coarse:opacity-100"
       >
         {copied ? (
           <Check className="size-4 text-lime-300" />

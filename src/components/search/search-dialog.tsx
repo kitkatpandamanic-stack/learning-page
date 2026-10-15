@@ -177,7 +177,7 @@ export function SearchDialog({
               autoComplete="off"
               className="h-14 min-w-0 flex-1 bg-transparent text-base text-white placeholder:text-white/55 focus:outline-none [&::-webkit-search-cancel-button]:hidden"
             />
-            <Dialog.Close className="flex size-8 shrink-0 items-center justify-center rounded-lg text-white/50 hover:bg-white/10 hover:text-white focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none">
+            <Dialog.Close className="flex size-8 shrink-0 items-center justify-center rounded-lg text-white/50 hover:bg-white/10 hover:text-white focus-visible:ring-3 focus-visible:ring-ring focus-visible:outline-none">
               <XIcon className="size-4" />
               <span className="sr-only">{t("keys.close")}</span>
             </Dialog.Close>

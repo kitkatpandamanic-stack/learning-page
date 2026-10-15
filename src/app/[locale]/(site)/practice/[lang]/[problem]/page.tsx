@@ -107,11 +107,11 @@ export default async function ProblemPage({
         aria-label={t("breadcrumb")}
         className="mb-6 flex flex-wrap items-center gap-1 text-sm text-white/50"
       >
-        <Link href="/practice" className="hover:text-white">
+        <Link href="/practice" className="tap-target hover:text-white">
           {t("eyebrow")}
         </Link>
         <ChevronRight className="size-3.5" />
-        <Link href={listHref} className="hover:text-white">
+        <Link href={listHref} className="tap-target hover:text-white">
           {language.name}
         </Link>
         <ChevronRight className="size-3.5" />
