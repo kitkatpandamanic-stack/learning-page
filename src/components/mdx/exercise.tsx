@@ -91,7 +91,7 @@ function Reveal({
 }) {
   return (
     <details className="group rounded-xl border border-white/10 bg-white/4 open:bg-white/6">
-      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-sm font-medium text-white/80 select-none hover:text-white [&::-webkit-details-marker]:hidden">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-sm font-medium text-white/80 select-none hover:text-white pointer-coarse:min-h-11 [&::-webkit-details-marker]:hidden">
         <ChevronRight className="size-4 transition group-open:rotate-90" />
         {icon}
         {label}

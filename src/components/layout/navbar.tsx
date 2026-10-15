@@ -92,7 +92,7 @@ export function Navbar() {
         <Link
           href="/"
           aria-label={t("home")}
-          className="rounded-lg focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+          className="rounded-lg focus-visible:ring-3 focus-visible:ring-ring focus-visible:outline-none pointer-coarse:flex pointer-coarse:min-h-11 pointer-coarse:items-center"
         >
           <Logo />
         </Link>
@@ -125,7 +125,7 @@ export function Navbar() {
             onFocus={prefetchSearch}
             aria-label={ts("open")}
             aria-keyshortcuts={isMac ? "Meta+K" : "Control+K"}
-            className="flex size-9 items-center justify-center gap-2 rounded-full text-sm text-white/70 ring-1 ring-white/12 transition-colors hover:bg-white/8 hover:text-white focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none 2xl:w-auto 2xl:px-3"
+            className="flex size-9 items-center justify-center gap-2 rounded-full text-sm text-white/70 ring-1 ring-white/12 transition-colors hover:bg-white/8 hover:text-white focus-visible:ring-3 focus-visible:ring-ring focus-visible:outline-none 2xl:w-auto 2xl:px-3"
           >
             <SearchIcon className="size-4" />
             <Kbd className="hidden 2xl:inline">{isMac ? "⌘K" : "Ctrl K"}</Kbd>

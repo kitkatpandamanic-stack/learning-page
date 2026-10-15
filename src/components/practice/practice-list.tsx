@@ -50,7 +50,7 @@ function FilterGroup<T extends string>({
             aria-pressed={value === option.value}
             onClick={() => onChange(option.value)}
             className={cn(
-              "rounded-full px-3.5 py-1.5 text-sm font-medium text-white/70 ring-1 ring-white/10 transition hover:text-white",
+              "rounded-full px-3.5 py-1.5 text-sm font-medium text-white/70 ring-1 ring-white/10 transition hover:text-white pointer-coarse:min-h-11 pointer-coarse:px-4",
               value === option.value
                 ? "bg-gradient-brand text-white shadow-glow-violet ring-transparent"
                 : "bg-white/5",
@@ -142,7 +142,7 @@ export function PracticeList({
               {progress ? (
                 <Link
                   href={{ pathname: "/sign-in", query: { next: "/practice" } }}
-                  className="text-cyan-300 hover:underline"
+                  className="text-cyan-300 hover:underline pointer-coarse:inline-flex pointer-coarse:min-h-11 pointer-coarse:items-center"
                 >
                   {t("signInToTrack")}
                 </Link>

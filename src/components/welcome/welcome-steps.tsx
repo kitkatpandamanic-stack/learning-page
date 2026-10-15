@@ -41,7 +41,7 @@ function OptionCard({
       className={cn(
         "relative flex cursor-pointer items-center gap-4 rounded-2xl border p-4 transition",
         "border-white/10 bg-white/4 hover:border-white/25 hover:bg-white/8",
-        "has-focus-visible:ring-3 has-focus-visible:ring-ring/50",
+        "has-focus-visible:ring-3 has-focus-visible:ring-ring",
         selected && "border-neon-violet/60 bg-neon-violet/12",
       )}
     >

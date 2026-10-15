@@ -35,12 +35,12 @@ export function Footer() {
               <h2 className="mb-4 text-sm font-semibold text-white">
                 {t(group.title as Parameters<typeof t>[0])}
               </h2>
-              <ul className="flex flex-col gap-2.5">
+              <ul className="flex flex-col gap-2.5 pointer-coarse:gap-0">
                 {group.links.map((link) => (
                   <li key={link.href}>
                     <Link
                       href={link.href}
-                      className="text-sm text-muted-foreground transition-colors hover:text-white"
+                      className="text-sm text-muted-foreground transition-colors hover:text-white pointer-coarse:inline-flex pointer-coarse:min-h-11 pointer-coarse:min-w-11 pointer-coarse:items-center"
                     >
                       {nav(link.label as Parameters<typeof nav>[0])}
                     </Link>
@@ -60,7 +60,7 @@ export function Footer() {
                 href={siteConfig.telegramUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex w-fit items-center gap-2 rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/12 transition hover:bg-white/12"
+                className="inline-flex w-fit items-center gap-2 rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/12 transition hover:bg-white/12 pointer-coarse:min-h-11"
               >
                 <Send className="size-4 text-sky-300" /> {t("telegram")}
               </a>
@@ -68,7 +68,7 @@ export function Footer() {
                 href={siteConfig.githubUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex w-fit items-center gap-2 rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/12 transition hover:bg-white/12"
+                className="inline-flex w-fit items-center gap-2 rounded-full bg-white/8 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/12 transition hover:bg-white/12 pointer-coarse:min-h-11"
               >
                 <GitHubIcon className="size-4" /> {t("followOnGitHub")}
               </a>
@@ -84,10 +84,10 @@ export function Footer() {
             })}
           </p>
           <div className="flex items-center gap-5">
-            <Link href="/privacy" className="hover:text-white">
+            <Link href="/privacy" className="tap-target hover:text-white">
               {t("privacy")}
             </Link>
-            <Link href="/terms" className="hover:text-white">
+            <Link href="/terms" className="tap-target hover:text-white">
               {t("terms")}
             </Link>
             <a
@@ -95,7 +95,7 @@ export function Footer() {
               target="_blank"
               rel="noopener noreferrer"
               aria-label={t("onGitHub")}
-              className="hover:text-white"
+              className="tap-target hover:text-white"
             >
               <GitHubIcon className="size-5" />
             </a>
