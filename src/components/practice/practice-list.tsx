@@ -8,6 +8,7 @@ import { cn } from "cn";
 import { useProgress } from "@/components/progress/use-progress";
 import { DifficultyBadge } from "@/components/practice/difficulty-badge";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Link } from "@/i18n/navigation";
 import {
   difficulties,
@@ -155,9 +156,20 @@ export function PracticeList({
       </div>
 
       {visible.length === 0 ? (
-        <p className="rounded-2xl p-8 text-center text-white/60 glass">
-          {t("empty")}
-        </p>
+        <div className="flex flex-col items-center gap-4 rounded-2xl p-8 text-center glass">
+          <p className="text-white/70">{t("empty")}</p>
+          <Button
+            type="button"
+            variant="glass"
+            onClick={() => {
+              setDifficulty("all");
+              setTopic("all");
+              setHideSolved(false);
+            }}
+          >
+            {t("clearFilters")}
+          </Button>
+        </div>
       ) : (
         <ol className="flex flex-col gap-3">
           {visible.map((item) => {
