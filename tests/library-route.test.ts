@@ -11,6 +11,8 @@ const state = vi.hoisted(() => ({
 }));
 vi.mock("server-only", () => ({}));
 vi.mock("@/lib/session", () => ({ getSession: async () => state.session }));
+const recordSecurityEvent = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/security-events", () => ({ recordSecurityEvent }));
 vi.mock("@/lib/library", () => ({
   getCatalog: async () => state.catalog,
   signedFileUrl: async (file: string) =>
@@ -76,6 +78,22 @@ describe("GET /api/library/[...path]", () => {
   it("only opens files listed in the catalog", async () => {
     expect((await open("courses/python/books/other.pdf")).status).toBe(404);
     expect((await open("catalog.json")).status).toBe(404);
+  });
+
+  it("limits how many files one learner opens, and logs refusals", async () => {
+    state.session = { user: { id: "hoarder" } };
+    for (let i = 0; i < 30; i++) expect((await open(book)).status).toBe(307);
+    const refused = await open(book);
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get("retry-after")).toBe("600");
+    expect(recordSecurityEvent).toHaveBeenCalledWith(
+      "rate-limited",
+      "library",
+      "u:hoarder",
+    );
+    // Others keep their own allowance.
+    state.session = { user: { id: "reader" } };
+    expect((await open(book)).status).toBe(307);
   });
 
   it("says coming soon while storage isn't set up", async () => {
