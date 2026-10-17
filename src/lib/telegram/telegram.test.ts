@@ -71,6 +71,7 @@ const { sendReminders, postLeaderboard, postDaily, runTick } =
   await import("@/lib/telegram/jobs");
 const { CHANNEL } = await import("@/lib/telegram/api");
 const { handleUpdate } = await import("@/lib/telegram/bot");
+const { cronSecret } = await import("@/lib/telegram/secret");
 const quizzes = await import("@/lib/telegram/quiz");
 
 const dir = join(__dirname, "..", "..", "..", "drizzle");
@@ -599,5 +600,21 @@ describe("weekly leaderboard", () => {
       entries: 0,
     });
     expect(sent.filter((s) => s.method === "sendMessage")).toHaveLength(0);
+  });
+});
+
+describe("the scheduler's secret", () => {
+  it("comes in X-Cron-Secret or as a Bearer token", () => {
+    expect(cronSecret(new Headers({ "X-Cron-Secret": "abc" }))).toBe("abc");
+    expect(cronSecret(new Headers({ Authorization: "Bearer abc" }))).toBe(
+      "abc",
+    );
+    // cron-job.org may still send an Authorization header of its own.
+    expect(
+      cronSecret(
+        new Headers({ "X-Cron-Secret": "abc", Authorization: "Basic xyz" }),
+      ),
+    ).toBe("abc");
+    expect(cronSecret(new Headers())).toBeNull();
   });
 });

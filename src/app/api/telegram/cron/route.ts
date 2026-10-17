@@ -7,10 +7,11 @@ import {
   runTick,
   sendReminders,
 } from "@/lib/telegram/jobs";
-import { secretMatches } from "@/lib/telegram/secret";
+import { cronSecret, secretMatches } from "@/lib/telegram/secret";
 
 /**
- * Scheduled bot jobs, with "Authorization: Bearer <CRON_SECRET>":
+ * Scheduled bot jobs, with "X-Cron-Secret: <CRON_SECRET>" (cron-job.org)
+ * or "Authorization: Bearer <CRON_SECRET>" (GitHub Actions):
  *   GET /api/telegram/cron?job=tick         every hour, on the hour
  *                                           (cron-job.org; GitHub Actions
  *                                           .github/workflows/telegram-bot.yml
@@ -22,13 +23,7 @@ import { secretMatches } from "@/lib/telegram/secret";
  * answers 500 so the scheduler shows it.
  */
 export async function GET(request: NextRequest) {
-  const auth = request.headers.get("authorization");
-  if (
-    !secretMatches(
-      auth?.replace(/^Bearer /, "") ?? null,
-      process.env.CRON_SECRET,
-    )
-  ) {
+  if (!secretMatches(cronSecret(request.headers), process.env.CRON_SECRET)) {
     recordSecurityEvent("bad-secret", "telegram-cron", await requester());
     return new Response("Forbidden", { status: 403 });
   }

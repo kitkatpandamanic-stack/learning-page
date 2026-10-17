@@ -9,3 +9,16 @@ export function secretMatches(given: string | null, expected?: string) {
   const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
 }
+
+/**
+ * The scheduler's secret: "X-Cron-Secret: <secret>" (cron-job.org, which
+ * doesn't pass a custom Authorization header through) or
+ * "Authorization: Bearer <secret>" (GitHub Actions).
+ */
+export function cronSecret(headers: Headers) {
+  return (
+    headers.get("x-cron-secret") ??
+    headers.get("authorization")?.replace(/^Bearer /, "") ??
+    null
+  );
+}
