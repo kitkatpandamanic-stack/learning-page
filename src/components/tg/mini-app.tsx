@@ -4,6 +4,7 @@ import Script from "next/script";
 import { useCallback, useState } from "react";
 
 import { BlitzTab } from "@/components/tg/blitz-tab";
+import { DuelTab, startChallenge } from "@/components/tg/duel-tab";
 import { PandaTab } from "@/components/tg/panda-tab";
 import { callApi, telegramScript, webApp } from "@/components/tg/telegram";
 import type { MiniAppHome } from "@/lib/tg-app/home";
@@ -11,10 +12,10 @@ import { appTexts, type AppLocale } from "@/lib/tg-app/texts";
 
 const SPACE = "#070814";
 
-type Tab = "panda" | "blitz";
+type Tab = "panda" | "blitz" | "duel";
 
 /**
- * PandaDev inside Telegram: the learner's panda and the Daily Blitz. Runs
+ * PandaDev inside Telegram: the learner's panda, the Daily Blitz and duels. Runs
  * only in Telegram (it needs the signed launch data); elsewhere it points
  * to the bot.
  */
@@ -25,6 +26,8 @@ export function MiniApp({ bot }: { bot: string }) {
   const [home, setHome] = useState<MiniAppHome | null>(null);
   const [tab, setTab] = useState<Tab>("panda");
   const [blitzLanguage, setBlitzLanguage] = useState<string | null>(null);
+  const [duel, setDuel] = useState<string | null>(null);
+  const [duelNotice, setDuelNotice] = useState<string | null>(null);
   const [locale, setLocale] = useState<AppLocale>("en");
 
   const load = useCallback(async () => {
@@ -33,6 +36,19 @@ export function MiniApp({ bot }: { bot: string }) {
       setState("ready");
     } catch {
       setState("failed");
+    }
+  }, []);
+
+  /** "Challenge a friend" and the bot's Rematch: a new duel, opened to play. */
+  const challenge = useCallback(async (language: string) => {
+    const created = await startChallenge(language);
+    setTab("duel");
+    if ("id" in created) {
+      setDuelNotice(null);
+      setDuel(created.id);
+    } else {
+      setDuel(null);
+      setDuelNotice(created.error);
     }
   }, []);
 
@@ -50,15 +66,21 @@ export function MiniApp({ bot }: { bot: string }) {
     setLocale(
       tg.initDataUnsafe.user?.language_code?.startsWith("ru") ? "ru" : "en",
     );
-    // t.me/<bot>?startapp=blitz_python opens that Blitz.
+    // t.me/<bot>?startapp=blitz_python opens that Blitz, duel_<id> a duel,
+    // duelnew_python a new challenge (the bot's Rematch button).
     const param = tg.initDataUnsafe.start_param ?? "";
     const asked = /^blitz_([a-z]+)$/.exec(param);
+    const opened = /^duel_([\w-]{6,16})$/.exec(param);
+    const rematch = /^duelnew_([a-z]+)$/.exec(param);
     if (asked || param === "blitz") {
       setTab("blitz");
       setBlitzLanguage(asked?.[1] ?? null);
-    }
+    } else if (opened) {
+      setTab("duel");
+      setDuel(opened[1]);
+    } else if (rematch) void challenge(rematch[1]);
     void load();
-  }, [load]);
+  }, [load, challenge]);
 
   const appLocale = home?.locale ?? locale;
   const t = appTexts[appLocale];
@@ -98,24 +120,37 @@ export function MiniApp({ bot }: { bot: string }) {
       )}
       {state === "ready" && home && (
         <>
-          {tab === "panda" ? (
-            <PandaTab home={home} />
-          ) : (
+          {tab === "panda" && <PandaTab home={home} />}
+          {tab === "blitz" && (
             <BlitzTab
               home={home}
               language={blitzLanguage}
               onLanguage={setBlitzLanguage}
               onChange={load}
+              onChallenge={(language) => void challenge(language)}
+            />
+          )}
+          {tab === "duel" && (
+            <DuelTab
+              home={home}
+              duel={duel}
+              onDuel={setDuel}
+              notice={
+                duelNotice === "duelLimit" || duelNotice === "failed"
+                  ? t[duelNotice]
+                  : null
+              }
             />
           )}
           <nav className="fixed inset-x-0 bottom-0 z-10 mx-auto flex max-w-md gap-2 bg-[#070814]/90 px-4 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur">
-            {(["panda", "blitz"] as const).map((name) => (
+            {(["panda", "blitz", "duel"] as const).map((name) => (
               <button
                 key={name}
                 type="button"
                 onClick={() => {
                   setTab(name);
                   if (name === "blitz") setBlitzLanguage(null);
+                  if (name === "duel") setDuel(null);
                 }}
                 aria-current={tab === name ? "page" : undefined}
                 className={`tap-target flex-1 rounded-2xl py-3 font-semibold ${
@@ -124,7 +159,7 @@ export function MiniApp({ bot }: { bot: string }) {
                     : "text-slate-300 glass"
                 }`}
               >
-                {name === "panda" ? "🐼" : "⚡"} {t.tabs[name]}
+                {{ panda: "🐼", blitz: "⚡", duel: "⚔️" }[name]} {t.tabs[name]}
               </button>
             ))}
           </nav>

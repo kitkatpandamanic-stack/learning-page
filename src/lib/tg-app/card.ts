@@ -16,7 +16,8 @@ export type CardFormat = "story" | "wide";
 
 export type Card =
   | {
-      kind: "blitz";
+      /** A Blitz (10 questions, 60 s) or a duel (5 questions, 30 s) result */
+      kind: "blitz" | "duel";
       locale: AppLocale;
       format: CardFormat;
       number: number;
@@ -49,7 +50,7 @@ export function cardQuery(card: Card) {
     l: card.locale,
     f: card.format,
   });
-  if (card.kind === "blitz") {
+  if (card.kind !== "panda") {
     q.set("n", String(card.number));
     q.set("lang", card.language);
     q.set("g", card.grid.map((ok) => (ok ? "1" : "0")).join(""));
@@ -68,15 +69,22 @@ export function parseCard(q: URLSearchParams): Card | null {
   const locale = q.get("l") === "ru" ? "ru" : q.get("l") === "en" ? "en" : null;
   const format = q.get("f") === "wide" ? "wide" : "story";
   if (!locale) return null;
-  if (q.get("k") === "blitz") {
+  const kind = q.get("k");
+  if (kind === "blitz" || kind === "duel") {
+    // A duel has no number (n=1) and half the questions and time.
+    const size = kind === "blitz" ? 10 : 5;
     const number = int(q.get("n"), 1, 99_999);
-    const seconds = int(q.get("t"), 0, 60);
+    const seconds = int(q.get("t"), 0, size * 6);
     const language = q.get("lang") ?? "";
     const grid = q.get("g") ?? "";
     if (number === null || seconds === null) return null;
-    if (!(language in languageNames) || !/^[01]{0,10}$/.test(grid)) return null;
+    if (
+      !(language in languageNames) ||
+      !new RegExp(`^[01]{0,${size}}$`).test(grid)
+    )
+      return null;
     return {
-      kind: "blitz",
+      kind,
       locale,
       format,
       number,

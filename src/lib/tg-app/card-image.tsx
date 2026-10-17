@@ -30,13 +30,17 @@ export async function renderCard(card: Card) {
   let detail: string;
   let panda: string;
   let grid: boolean[] | null = null;
-  if (card.kind === "blitz") {
+  if (card.kind !== "panda") {
+    const size = card.kind === "blitz" ? 10 : 5;
     const score = card.grid.filter(Boolean).length;
-    eyebrow = `${t.blitzTitle(card.number)} · ${languageNames[card.language]}`;
-    headline = t.result(score, 10);
+    eyebrow =
+      card.kind === "blitz"
+        ? `${t.blitzTitle(card.number)} · ${languageNames[card.language]}`
+        : `${t.tabs.duel} · ${languageNames[card.language]}`;
+    headline = t.result(score, size);
     detail = t.seconds(card.seconds * 1000);
-    grid = Array.from({ length: 10 }, (_, i) => card.grid[i] ?? false);
-    panda = pandaSvg({ stage: 3, mood: blitzMood(score, 10) });
+    grid = Array.from({ length: size }, (_, i) => card.grid[i] ?? false);
+    panda = pandaSvg({ stage: 3, mood: blitzMood(score, size) });
   } else {
     eyebrow = t.level(card.level);
     headline = card.locale === "ru" ? "Моя панда" : "My panda";
@@ -100,7 +104,7 @@ export async function renderCard(card: Card) {
         <div
           style={{
             display: "flex",
-            fontSize: px(card.kind === "blitz" ? 200 : 120),
+            fontSize: px(card.kind === "panda" ? 120 : 200),
             fontWeight: 700,
             letterSpacing: -4,
             lineHeight: 1,

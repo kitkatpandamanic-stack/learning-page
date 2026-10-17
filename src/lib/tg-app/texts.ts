@@ -28,7 +28,7 @@ const en = {
   openBot: "Open @{bot}",
   failed:
     "Something went wrong. Pull down to reload, or try again in a minute.",
-  tabs: { panda: "Panda", blitz: "Blitz" },
+  tabs: { panda: "Panda", blitz: "Blitz", duel: "Duel" },
   hello: (name: string) => `Hi, ${name}!`,
   mood: {
     proud: "Today's goal is done. Your panda is proud of you!",
@@ -92,6 +92,43 @@ const en = {
   shareCaption: (text: string) => `${text}\n\nCan you beat it?`,
   shareButton: "Play the Blitz",
   storyText: "My Daily Blitz on PandaDev",
+  duelTitle: "Duels",
+  duelIntro:
+    "Play 5 questions in 30 seconds, then send the challenge to a chat. Anyone who opens it plays the same questions.",
+  duelXp: "+5 XP for each finished duel and +5 more for a win (3 duels a day).",
+  duelGuest: "Connect your account to get XP for duels.",
+  challenge: "⚔️ Challenge a friend",
+  pickLanguage: "Pick a language:",
+  challengedBy: (name: string, language: string) =>
+    `${name} challenges you to a ${language} duel`,
+  toBeat: (score: number, size: number, ms: number) =>
+    `Score to beat: ${score}/${size} in ${Math.round(ms / 1000)} s`,
+  accept: "Accept the challenge",
+  duelEnded: "This duel has ended. Start your own!",
+  duelNotReady:
+    "The challenger hasn't finished playing yet. Try again in a minute.",
+  duelMissing: "This duel can't be played any more. Start your own!",
+  won: "You won! 🏆",
+  lost: "Not this time. Rematch?",
+  yourDuel: (language: string) => `Your ${language} challenge`,
+  sendChallenge: "Send the challenge",
+  duelRanking: "This duel's ranking",
+  challengerMark: "challenger",
+  recentDuels: "Your recent duels",
+  players: (n: number) => `${n} ${n === 1 ? "player" : "players"}`,
+  notFinished: "not finished",
+  duelLimit: "That's a lot of duels for today. Come back tomorrow!",
+  duelCaption: (
+    name: string,
+    language: string,
+    score: number,
+    size: number,
+    ms: number,
+  ) =>
+    `⚔️ ${name} challenges you to a ${language} duel: ${score}/${size} in ${Math.round(ms / 1000)} s. Can you beat it?`,
+  duelButton: "⚔️ Accept the duel",
+  rematch: "Rematch",
+  duelStoryText: "Beat my score in a PandaDev duel!",
 };
 
 type Texts = typeof en;
@@ -102,7 +139,7 @@ const ru: Texts = {
   openBot: "Открыть @{bot}",
   failed:
     "Что-то пошло не так. Потяните вниз, чтобы обновить, или попробуйте через минуту.",
-  tabs: { panda: "Панда", blitz: "Блиц" },
+  tabs: { panda: "Панда", blitz: "Блиц", duel: "Дуэль" },
   hello: (name) => `Привет, ${name}!`,
   mood: {
     proud: "Цель на сегодня выполнена. Панда вами гордится!",
@@ -166,6 +203,37 @@ const ru: Texts = {
   shareCaption: (text) => `${text}\n\nСможете лучше?`,
   shareButton: "Сыграть в блиц",
   storyText: "Мой блиц дня на PandaDev",
+  duelTitle: "Дуэли",
+  duelIntro:
+    "Ответьте на 5 вопросов за 30 секунд и отправьте вызов в чат. Каждый, кто его откроет, получит те же вопросы.",
+  duelXp:
+    "+5 XP за каждую сыгранную дуэль и ещё +5 за победу (3 дуэли в день).",
+  duelGuest: "Подключите аккаунт, чтобы получать XP за дуэли.",
+  challenge: "⚔️ Вызвать друга",
+  pickLanguage: "Выберите язык:",
+  challengedBy: (name, language) =>
+    `${name} вызывает вас на дуэль по ${language}`,
+  toBeat: (score, size, ms) =>
+    `Нужно обойти: ${score}/${size} за ${Math.round(ms / 1000)} с`,
+  accept: "Принять вызов",
+  duelEnded: "Эта дуэль уже закончилась. Начните свою!",
+  duelNotReady: "Соперник ещё не доиграл. Попробуйте через минуту.",
+  duelMissing: "В эту дуэль больше нельзя сыграть. Начните свою!",
+  won: "Вы победили! 🏆",
+  lost: "Не в этот раз. Реванш?",
+  yourDuel: (language) => `Ваш вызов по ${language}`,
+  sendChallenge: "Отправить вызов",
+  duelRanking: "Рейтинг этой дуэли",
+  challengerMark: "соперник",
+  recentDuels: "Ваши последние дуэли",
+  players: (n) => `${n} ${ruPlural(n, "игрок", "игрока", "игроков")}`,
+  notFinished: "не закончена",
+  duelLimit: "На сегодня дуэлей достаточно. Возвращайтесь завтра!",
+  duelCaption: (name, language, score, size, ms) =>
+    `⚔️ ${name} вызывает вас на дуэль по ${language}: ${score}/${size} за ${Math.round(ms / 1000)} с. Сможете лучше?`,
+  duelButton: "⚔️ Принять дуэль",
+  rematch: "Реванш",
+  duelStoryText: "Обойдите мой результат в дуэли PandaDev!",
 };
 
 export const appTexts: Record<AppLocale, Texts> = { en, ru };
@@ -189,4 +257,35 @@ export function blitzShareText(
   const name = languageNames[r.language] ?? r.language;
   const title = locale === "ru" ? "Блиц PandaDev" : "PandaDev Blitz";
   return `⚡ ${title} #${r.number} · ${name}\n${cells}\n${t.result(score, r.size)} · ${t.seconds(r.ms)}`;
+}
+
+/**
+ * The bot's message to a challenger when a friend finishes their duel.
+ * Plain text (names are the players' own Telegram names).
+ */
+export function duelNotice(
+  locale: AppLocale,
+  n: {
+    name: string;
+    language: string;
+    size: number;
+    them: { score: number; ms: number };
+    you: { score: number; ms: number };
+    theyWon: boolean;
+    bonus: boolean;
+  },
+) {
+  const lang = languageNames[n.language] ?? n.language;
+  const sec = (ms: number) => Math.round(ms / 1000);
+  if (locale === "ru")
+    return `⚔️ ${n.name} сыграл(а) вашу дуэль по ${lang}: ${n.them.score}/${n.size} за ${sec(n.them.ms)} с, у вас ${n.you.score}/${n.size} за ${sec(n.you.ms)} с.\n${
+      n.theyWon
+        ? `Победа за ${n.name}. Реванш?`
+        : `Вы удержали победу!${n.bonus ? " +5 XP" : ""}`
+    }`;
+  return `⚔️ ${n.name} played your ${lang} duel: ${n.them.score}/${n.size} in ${sec(n.them.ms)} s vs your ${n.you.score}/${n.size} in ${sec(n.you.ms)} s.\n${
+    n.theyWon
+      ? `${n.name} wins. Rematch?`
+      : `You held on!${n.bonus ? " +5 XP" : ""}`
+  }`;
 }
