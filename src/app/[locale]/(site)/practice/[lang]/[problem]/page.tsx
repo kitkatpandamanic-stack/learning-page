@@ -32,16 +32,14 @@ import {
 import { loadProblemBody } from "@/lib/lesson-body";
 import { reportsConfigured } from "@/lib/reports";
 import { DailyBadge } from "@/components/daily/daily-problem";
-import {
-  getAllProblems,
-  getDailyCandidates,
-  getProblemContext,
-} from "@/lib/practice";
+import { getDailyCandidates, getProblemContext } from "@/lib/practice";
 
-export const dynamicParams = false;
-
+// Problems are built on their first visit and kept until the next deploy,
+// like most lessons (see getStarterLessons in src/lib/content.ts). An empty
+// list, not a missing function, keeps them cached instead of rendered on
+// every request. Unknown slugs still 404 via notFound().
 export function generateStaticParams() {
-  return getAllProblems().map((p) => ({ lang: p.language, problem: p.slug }));
+  return [];
 }
 
 export async function generateMetadata({

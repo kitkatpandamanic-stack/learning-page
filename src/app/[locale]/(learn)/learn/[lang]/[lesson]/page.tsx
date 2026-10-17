@@ -17,7 +17,11 @@ import { CompleteLesson } from "@/components/progress/complete-lesson";
 import { JsonLd } from "@/components/seo/json-ld";
 import { Badge } from "@/components/ui/badge";
 import { Link } from "@/i18n/navigation";
-import { getAllLessons, getLanguage, getLessonContext } from "@/lib/content";
+import {
+  getLanguage,
+  getLessonContext,
+  getStarterLessons,
+} from "@/lib/content";
 import { loadLessonBody } from "@/lib/lesson-body";
 import { reportsConfigured } from "@/lib/reports";
 import { alternates, localeParam } from "@/lib/i18n";
@@ -28,10 +32,11 @@ import {
 } from "@/lib/seo";
 import { toneClasses } from "@/lib/tones";
 
-export const dynamicParams = false;
-
+// The first module of each course is built ahead; every other lesson is
+// built on its first visit and kept until the next deploy (see
+// getStarterLessons). Unknown slugs still 404 via notFound() below.
 export function generateStaticParams() {
-  return getAllLessons().map((l) => ({ lang: l.language, lesson: l.slug }));
+  return getStarterLessons().map((l) => ({ lang: l.language, lesson: l.slug }));
 }
 
 export async function generateMetadata({
