@@ -9,7 +9,8 @@ loadEnv();
 
 const commands = {
   en: [
-    ["app", "Your panda and the Daily Blitz"],
+    ["app", "Your panda, the Daily Blitz and duels"],
+    ["league", "A weekly table for your group (in a group)"],
     ["today", "Problem of the day"],
     ["quiz", "A quiz question (+5 XP when you're right)"],
     ["random", "A random practice problem (add python, js, ts or sql)"],
@@ -19,7 +20,8 @@ const commands = {
     ["help", "What the bot can do"],
   ],
   ru: [
-    ["app", "Ваша панда и блиц дня"],
+    ["app", "Ваша панда, блиц дня и дуэли"],
+    ["league", "Рейтинг недели для группы (в группе)"],
     ["today", "Задача дня"],
     ["quiz", "Вопрос из уроков (+5 XP за верный ответ)"],
     ["random", "Случайная задача (python, js, ts или sql)"],

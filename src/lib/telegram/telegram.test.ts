@@ -67,8 +67,9 @@ vi.stubGlobal(
 );
 
 const links = await import("@/lib/telegram/links");
-const { sendReminders, postLeaderboard, postDaily, runTick } =
+const { sendReminders, postLeaderboard, postDaily, postLeagues, runTick } =
   await import("@/lib/telegram/jobs");
+const leagues = await import("@/lib/tg-app/league");
 const { CHANNEL } = await import("@/lib/telegram/api");
 const { handleUpdate } = await import("@/lib/telegram/bot");
 const { cronSecret } = await import("@/lib/telegram/secret");
@@ -520,6 +521,7 @@ describe("scheduled posts", () => {
       "reminders",
       "daily-post",
       "leaderboard",
+      "leagues",
       "cleanup",
     ]);
   });
@@ -616,5 +618,102 @@ describe("the scheduler's secret", () => {
       ),
     ).toBe("abc");
     expect(cronSecret(new Headers())).toBeNull();
+  });
+});
+
+describe("group leagues in the bot", () => {
+  const GROUP = -100777;
+  const say = (text: string, from = 11, type = "supergroup") =>
+    handleUpdate({
+      message: {
+        chat: {
+          id: type === "private" ? from : GROUP,
+          type,
+          title: "Class 9B",
+        },
+        from: { id: from },
+        text,
+      },
+    });
+
+  beforeEach(async () => {
+    await client.exec(`TRUNCATE tg_group CASCADE`);
+  });
+
+  it("posts the join button in a group, and explains itself in private", async () => {
+    await say("/league@panda_learning_bot");
+    const message = sent.find((s) => s.method === "sendMessage")!;
+    expect(message.body.chat_id).toBe(GROUP);
+    expect(String(message.body.text)).toContain("Class 9B league");
+    expect(JSON.stringify(message.body.reply_markup)).toContain(
+      `startapp=${leagues.leagueParam(GROUP)}`,
+    );
+    sent = [];
+    await say("/league", 11, "private");
+    expect(String(sent[0].body.text)).toContain("Leagues are for groups");
+  });
+
+  it("lets only admins turn the Monday post off", async () => {
+    await say("/league");
+    reply = (method) =>
+      method === "getChatMember"
+        ? { ok: true, result: { status: "member" } }
+        : { ok: true, result: {} };
+    sent = [];
+    await say("/league off");
+    expect(String(sent.at(-1)?.body.text)).toContain("Only the group's admins");
+    reply = (method) =>
+      method === "getChatMember"
+        ? { ok: true, result: { status: "administrator" } }
+        : { ok: true, result: {} };
+    await say("/league off");
+    const [group] = await testDb.select().from(schema.tgGroup);
+    expect(group.weekly).toBe(false);
+  });
+
+  it("posts last week's table on Monday, once, only where someone earned XP", async () => {
+    await link("u1", 11);
+    await leagues.registerGroup(GROUP, "Class 9B");
+    await leagues.registerGroup(-200, "Quiet group");
+    await leagues.joinLeague(GROUP, 11, "Mei");
+    await leagues.joinLeague(-200, 12, "Bao");
+    await testDb.insert(schema.xpEvent).values({
+      userId: "u1",
+      amount: 40,
+      reason: "quiz",
+      ref: "w",
+      createdAt: new Date("2026-10-08T10:00:00Z"),
+    });
+    const monday = new Date("2026-10-12T07:30:00Z");
+    expect(await postLeagues(monday)).toEqual({ posted: 1 });
+    const post = sent.find((s) => s.method === "sendMessage")!;
+    expect(post.body.chat_id).toBe(GROUP);
+    expect(String(post.body.text)).toContain("Mei · <b>40 XP</b>");
+    sent = [];
+    expect(await postLeagues(monday)).toEqual({ posted: 0 });
+    expect(sent).toHaveLength(0);
+  });
+
+  it("stops posting to a group that removed the bot", async () => {
+    await link("u1", 11);
+    await leagues.registerGroup(GROUP, "Class 9B");
+    await leagues.joinLeague(GROUP, 11, "Mei");
+    await testDb.insert(schema.xpEvent).values({
+      userId: "u1",
+      amount: 40,
+      reason: "quiz",
+      ref: "w",
+      createdAt: new Date("2026-10-08T10:00:00Z"),
+    });
+    reply = () => ({
+      ok: false,
+      error_code: 403,
+      description: "bot was kicked",
+    });
+    expect(await postLeagues(new Date("2026-10-12T07:30:00Z"))).toEqual({
+      posted: 0,
+    });
+    const [group] = await testDb.select().from(schema.tgGroup);
+    expect(group.weekly).toBe(false);
   });
 });
