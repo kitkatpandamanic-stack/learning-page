@@ -7,13 +7,13 @@ Last refreshed: 2026-10-11 (repo HEAD `947f15b`). Generated from `course.yml`, l
 
 | Course     | Levels | Modules (+ capstones) | Lessons                            | Exercises | Quizzes | Practice (easy/med/hard) |
 | ---------- | ------ | --------------------- | ---------------------------------- | --------- | ------- | ------------------------ |
-| JavaScript | 4      | 20 + 4                | 72 (L0 15 · L1 16 · L2 22 · L3 19) | 71        | 116     | 40 (12/18/10)            |
+| JavaScript | 4      | 20 + 4                | 74 (L0 15 · L1 18 · L2 22 · L3 19) | 73        | 118     | 40 (12/18/10)            |
 | Python     | 4      | 25 + 4                | 94 (L0 16 · L1 23 · L2 33 · L3 22) | 93        | 162     | 40 (12/18/10)            |
 | SQL        | 4      | 16 + 4                | 60 (15 per level)                  | 60        | 113     | 40 (12/18/10)            |
 | TypeScript | 4      | 17 + 4                | 62 (L0 15 · L1 15 · L2 15 · L3 17) | 62        | 100     | 40 (12/18/10)            |
-| **All**    |        | **78 + 16**           | **288** (+288 RU)                  | 286       | 491     | **160** (+160 RU)        |
+| **All**    |        | **78 + 16**           | **290** (+290 RU)                  | 288       | 493     | **160** (+160 RU)        |
 
-Lesson counts include capstone parts (3 per capstone). Module mini-projects present: JS 10/20, Python 14/25, SQL 2/16, TS 9/17 (35 of 78; 43 modules have none). Quiz counts updated 2026-10-11 after the basics mini-projects (JS 116, Python 162).
+Lesson counts include capstone parts (3 per capstone). Module mini-projects present: JS 10/20, Python 14/25, SQL 2/16, TS 9/17 (35 of 78; 43 modules have none). Quiz counts updated 2026-10-11 after the basics mini-projects (JS 116, Python 162). JS lesson/exercise/quiz counts updated 2026-10-17 after `recursion` was split into `04-recursion` + `05-recursion-or-loop` (recounted: 74 lessons, 73 exercises, 118 quizzes; all courses 290 lessons, 288 exercises, 493 quizzes).
 
 ## How to read the lesson lines
 
@@ -29,8 +29,11 @@ Prerequisite rule: a lesson may use anything from lessons above it in the same c
 - String method chaining (`.strip().upper()`, `.trim().toUpperCase()`) is taught in `basics/working-with-strings` (JS + Python) since 2026-10-11; Python `text-adventure` uses `.lower().strip()` and JS L1 `array-methods` chains array methods.
 - Python L0 capstone avoids dictionaries on purpose (rooms are strings + `match`). Good model for L0 capstones.
 - TS L0 `typed-data` introduces `Record` and `Partial` early; L1 `utility-types` covers them properly.
-- JS and TS have **no lessons on recursion, regular expressions or algorithms/data structures**, but JS practice
-  has 2 recursion, 5 algorithms and 3 text problems, and TS has 3 algorithms problems (see `gaps.md`).
+- JS has recursion lessons since 2026-10-11 (`arrays-and-objects/04-recursion` and, since the 2026-10-17 split, `05-recursion-or-loop`, L1). JS and TS still have **no lessons on
+  regular expressions or algorithms/data structures**, and TS has no runtime recursion lesson (only recursive _types_ at L3),
+  but JS practice has 5 algorithms and 3 text problems, and TS has 3 algorithms problems (see `gaps.md`).
+- JS `recursion` introduces `Array.isArray` and `"  ".repeat(n)`, and `recursion-or-loop` introduces `push(...items)`, with a
+  one-line explanation each (none were taught earlier in JS).
 
 ## Cross-language map (same idea, lesson slug in each course)
 
@@ -58,7 +61,7 @@ Prerequisite rule: a lesson may use anything from lessons above it in the same c
 | Git                        | npm-and-git                                                                  | —                                                                    | —                                                                                                             | —                                                                             |
 | Browser DOM                | the-dom, events, building-pages                                              | —                                                                    | typing-the-dom                                                                                                | —                                                                             |
 | Regex / dates              | —                                                                            | regular-expressions, dates-and-times                                 | —                                                                                                             | text-functions, date-functions                                                |
-| Recursion & algorithms     | —                                                                            | recursion, big-o, searching-and-sorting, stacks-queues-and-hash-maps | —                                                                                                             | recursive-ctes                                                                |
+| Recursion & algorithms     | recursion, recursion-or-loop (L1; no algorithms lessons)                     | recursion, big-o, searching-and-sorting, stacks-queues-and-hash-maps | —                                                                                                             | recursive-ctes                                                                |
 | Closures / decorators      | closures-and-higher-order-functions                                          | decorators                                                           | arrow-functions-and-callbacks (function types)                                                                | —                                                                             |
 | Generators / iterators     | map-set-and-generators                                                       | generators-and-context-managers                                      | (typed-sdk/the-client: async iterator)                                                                        | —                                                                             |
 | Static types               | —                                                                            | type-hints                                                           | whole course                                                                                                  | creating-tables (types)                                                       |
@@ -127,14 +130,16 @@ All 16 capstones exist with 3 parts each.
 - `02-turns-and-scoring` Part 2: Turns, limits and scoring (20m, 30xp, ex 1, quiz 1): Counting attempts; Stopping when the player wins; A limit on attempts; Skipping invalid guesses; Keeping score; Putting it together: playGame
 - `03-playing-in-the-browser` Part 3: Play it in the browser (25m, 30xp, ex 1, quiz 1): The page and the glue code; One click is one turn; Ending the game; Starting a new game
 
-### JavaScript L1 (5 modules + capstone, 16 lessons)
+### JavaScript L1 (5 modules + capstone, 18 lessons)
 
 **Module `arrays-and-objects`: Arrays & Objects** · yml project: Shopping list analyser · mini-project exercise: Shopping list analyser (in `working-with-data`)
 
 - `01-arrays` Arrays: Lists of Values (12m, 20xp, ex 1, quiz 1): Creating an array; Indexes: finding items by position; Adding and removing items; Searching an array; slice vs splice; Arrays are references
 - `02-array-methods` Array Methods: map, filter, reduce and Friends (15m, 25xp, ex 1, quiz 2): forEach: do something with each item; map: transform every item; filter: keep only some items; find and findIndex: the first match; some and every: yes/no questions; reduce: boil an array down to one value; Chaining methods; Sorting
 - `03-objects` Objects: Grouping Related Data (15m, 25xp, ex 1, quiz 1): Creating an object; Dot vs bracket notation; Adding, changing and deleting properties; Methods and this; Looping over an object; Destructuring; Spread: copying and merging objects; Optional chaining
-- `04-working-with-data` Working with Real Data (15m, 25xp, ex 1, quiz 1): Arrays of objects; Adding things up; Counting and grouping; Sorting records; JSON: saving and sending data
+- `04-recursion` Recursion: Functions That Call Themselves (16m, 25xp, ex 1, quiz 1) **[added 2026-10-11, split 2026-10-17]**: A function that calls itself; Base case and recursive case; Watching the call stack (indented trace of `sumTo`, stack diagram); Nested arrays (`Array.isArray`); Walking a tree: a comment thread (pass depth down, counts up); Data of any shape (`findAll` with array / object / other checks, accumulator passed down); When it never stops: Maximum call stack size exceeded (Firefox `InternalError`); Common mistakes (missing `return`, ignored result, stopping a search early, circular data). Exercise "Menu explorer": `countLinks` + `breadcrumbs` on a nested menu, 7 tests, 2 hints. Ends with a pointer to `recursion-or-loop`
+- `05-recursion-or-loop` Recursion or a Loop? (14m, 20xp, ex 1, quiz 1) **[added 2026-10-17, split from `recursion`]**: When a loop is better (flat jobs, depth vs size, untrusted JSON depth; explicit to-do list with `[...comments]`, `pop()`, `push(...items)`); Tail calls: why JavaScript won't save you (PTC only in Safari; memoisation pointer). Exercise "Folders too deep for the stack": rewrite a recursive `totalSize` as a `while` loop with a to-do array + write `deepestLevel` carrying `{ folder, level }` items, 8 tests incl. 100,000-level folders and a no-mutation check, 2 hints
+- `06-working-with-data` Working with Real Data (15m, 25xp, ex 1, quiz 1): Arrays of objects; Adding things up; Counting and grouping; Sorting records; JSON: saving and sending data
 
 **Module `dom-and-events`: The DOM & Events** · yml project: Colour picker with live preview · mini-project exercise: Colour picker with live preview (in `building-pages`)
 
@@ -725,11 +730,11 @@ All 160 EN problems link to an existing lesson (0 broken links) and have a RU tw
 | 12  | dig-into-an-object     | Dig into an object                     | easy   | objects    | spread-rest-and-optional-chaining (javascript L2 modern-javascript)   |
 | 13  | zip-the-columns        | Zip the columns                        | medium | arrays     | arrays (javascript L1 arrays-and-objects)                             |
 | 14  | stock-changes          | What changed in the stock?             | medium | objects    | objects (javascript L1 arrays-and-objects)                            |
-| 15  | flatten-to-a-depth     | Flatten to a depth                     | medium | arrays     | spread-rest-and-optional-chaining (javascript L2 modern-javascript)   |
+| 15  | flatten-to-a-depth     | Flatten to a depth                     | medium | arrays     | recursion (javascript L1 arrays-and-objects)                          |
 | 16  | pipe-and-compose       | Pipe and compose                       | medium | functions  | closures-and-higher-order-functions (javascript L2 modern-javascript) |
 | 17  | memoize-any-arguments  | Remember every answer                  | medium | functions  | closures-and-higher-order-functions (javascript L2 modern-javascript) |
 | 18  | wrap-text              | Wrap the text                          | medium | strings    | working-with-strings (javascript L0 basics)                           |
-| 19  | merge-settings         | Merge the settings                     | medium | objects    | spread-rest-and-optional-chaining (javascript L2 modern-javascript)   |
+| 19  | merge-settings         | Merge the settings                     | medium | objects    | recursion (javascript L1 arrays-and-objects)                          |
 | 20  | share-out-fairly       | Share it out fairly                    | medium | numbers    | arithmetic (javascript L0 operators-and-conditions)                   |
 | 21  | panda-thermostat       | The panda-house thermostat             | medium | classes    | classes (javascript L1 classes)                                       |
 | 22  | format-duration        | How long did the panda nap?            | medium | strings    | working-with-strings (javascript L0 basics)                           |
@@ -738,19 +743,19 @@ All 160 EN problems link to an existing lesson (0 broken links) and have a RU tw
 | 25  | merge-bookings         | Squash the visiting slots              | medium | algorithms | array-methods (javascript L1 arrays-and-objects)                      |
 | 26  | first-tall-enough      | The first tall-enough bamboo           | medium | algorithms | measuring-performance (javascript L3 performance)                     |
 | 27  | event-emitter          | The bamboo-feed newsroom               | medium | classes    | closures-and-higher-order-functions (javascript L2 modern-javascript) |
-| 28  | deep-equal             | Are these two pandas the same?         | medium | recursion  | objects (javascript L1 arrays-and-objects)                            |
-| 29  | flatten-to-dotted-keys | Flatten the settings file              | medium | objects    | objects (javascript L1 arrays-and-objects)                            |
+| 28  | deep-equal             | Are these two pandas the same?         | medium | recursion  | recursion (javascript L1 arrays-and-objects)                          |
+| 29  | flatten-to-dotted-keys | Flatten the settings file              | medium | objects    | recursion (javascript L1 arrays-and-objects)                          |
 | 30  | retry-with-backoff     | Try, try again (with a nap in between) | medium | async      | async-await (javascript L2 async)                                     |
 | 31  | panda-parade           | Who can see whom at the panda parade?  | hard   | arrays     | arrays (javascript L1 arrays-and-objects)                             |
 | 32  | expiring-cache         | The bamboo cache that goes stale       | hard   | objects    | map-set-and-generators (javascript L2 modern-javascript)              |
-| 33  | deep-clone             | Clone the whole panda family tree      | hard   | recursion  | spread-rest-and-optional-chaining (javascript L2 modern-javascript)   |
+| 33  | deep-clone             | Clone the whole panda family tree      | hard   | recursion  | recursion (javascript L1 arrays-and-objects)                          |
 | 34  | build-order            | Which job comes first?                 | hard   | algorithms | map-set-and-generators (javascript L2 modern-javascript)              |
 | 35  | promise-pool           | Only three trucks at a time            | hard   | async      | promises (javascript L2 async)                                        |
 | 36  | debounce-async         | Wait until the typing stops            | hard   | async      | closures-and-higher-order-functions (javascript L2 modern-javascript) |
 | 37  | spelling-suggestions   | Did you mean "bamboo"?                 | hard   | algorithms | measuring-performance (javascript L3 performance)                     |
 | 38  | tokenizer              | Chop code into tokens                  | hard   | text       | working-with-strings (javascript L0 basics)                           |
 | 39  | grid-route             | The panda's way out of the maze        | hard   | algorithms | arrays (javascript L1 arrays-and-objects)                             |
-| 40  | mini-templates         | A tiny template engine                 | hard   | text       | objects (javascript L1 arrays-and-objects)                            |
+| 40  | mini-templates         | A tiny template engine                 | hard   | text       | recursion (javascript L1 arrays-and-objects)                          |
 
 ### Python practice (40 problems)
 
