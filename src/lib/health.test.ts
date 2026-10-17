@@ -192,8 +192,31 @@ describe("meters", () => {
       0,
       now,
     );
-    expect(vercel.used).toBeCloseTo(7 * FREE_LIMITS.deploymentBytes);
+    expect(vercel.used).toBeCloseTo(7 * FREE_LIMITS.oldDeploymentBytes);
     expect(vercel.status).toBe("warn");
+  });
+
+  it("counts deployments since lessons are built on visit as smaller", () => {
+    const deployment = (createdAt: string, state = "READY") => ({
+      state,
+      target: "production",
+      createdAt,
+    });
+    const deployments = [
+      deployment("2026-10-16T12:00:00Z"),
+      deployment("2026-10-17T05:26:11Z"),
+      deployment("2026-10-18T09:00:00Z"),
+      deployment("2026-10-18T10:00:00Z", "ERROR"),
+    ];
+    const [vercel] = meters(
+      { version: 1, vercel: { ok: true, deployments, env: [] } },
+      0,
+      new Date("2026-10-18T12:00:00Z"),
+    );
+    expect(vercel.used).toBeCloseTo(
+      FREE_LIMITS.oldDeploymentBytes + 2 * FREE_LIMITS.deploymentBytes,
+    );
+    expect(vercel.status).toBe("ok");
   });
 
   it("warns when Neon compute is on track to pass the limit", () => {
