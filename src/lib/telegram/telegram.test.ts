@@ -1,5 +1,6 @@
 /**
- * Linking Telegram, evening reminders and the weekly leaderboard against a
+ * Linking Telegram, reminders, quiz answers, achievement pictures, the daily
+ * post and the weekly leaderboard against a
  * real PostgreSQL (PGlite) with the app's migrations. Telegram itself is a
  * fake `fetch` that records what the bot would send.
  */
@@ -17,7 +18,27 @@ vi.mock("server-only", () => ({}));
 const client = new PGlite();
 const testDb = drizzle(client, { schema });
 vi.mock("@/db", () => ({ db: testDb }));
-vi.mock("@/lib/content", () => ({ getCourse: () => undefined }));
+vi.mock("@/lib/content", () => ({
+  getCourse: () => undefined,
+  getLanguage: (slug: string) => ({ slug, name: slug.toUpperCase() }),
+}));
+const quiz = (question: string) => ({
+  question,
+  options: ["one", "two", "three"],
+  answer: 1,
+  explanation: "Because.",
+});
+vi.mock("@/lib/daily-feed", () => ({
+  getPollQuizzes: () => [
+    { permalink: "/learn/sql/select", en: quiz("Q?"), ru: quiz("В?") },
+  ],
+  clipExplanation: (text?: string) => text,
+  getDailyFeed: (date: string) => ({
+    date,
+    problems: [],
+    quiz: { en: quiz("Q?"), ru: quiz("В?") },
+  }),
+}));
 const sqlProblems = () =>
   ["a", "b"].map((slug) => ({
     slug,
@@ -46,8 +67,11 @@ vi.stubGlobal(
 );
 
 const links = await import("@/lib/telegram/links");
-const { sendReminders, postLeaderboard } = await import("@/lib/telegram/jobs");
+const { sendReminders, postLeaderboard, postDaily, runTick } =
+  await import("@/lib/telegram/jobs");
 const { CHANNEL } = await import("@/lib/telegram/api");
+const { handleUpdate } = await import("@/lib/telegram/bot");
+const quizzes = await import("@/lib/telegram/quiz");
 
 const dir = join(__dirname, "..", "..", "..", "drizzle");
 for (const file of readdirSync(dir)
@@ -63,7 +87,7 @@ for (const file of readdirSync(dir)
 beforeEach(async () => {
   sent = [];
   reply = () => ({ ok: true, result: {} });
-  await client.exec(`TRUNCATE "user" CASCADE`);
+  await client.exec(`TRUNCATE "user", telegram_job_run CASCADE`);
   await testDb.insert(schema.user).values([
     { id: "u1", name: "Mei Lin", email: "mei@pandadev.test" },
     { id: "u2", name: "Bao", email: "bao@pandadev.test" },
@@ -154,7 +178,11 @@ describe("evening reminders", () => {
     expect(await sendReminders()).toEqual({ checked: 1, sent: 1 });
     const message = sent.find((s) => s.method === "sendMessage");
     expect(message?.body.chat_id).toBe(11);
-    expect(String(message?.body.text)).toContain("1 day streak");
+    expect(String(message?.body.text)).toContain("1 day streak is at risk");
+    expect(String(message?.body.text)).toContain("new record: 2 days");
+    expect(JSON.stringify(message?.body.reply_markup)).toContain(
+      '"callback_data":"quiz"',
+    );
 
     sent = [];
     expect((await sendReminders()).sent).toBe(0);
@@ -224,6 +252,286 @@ describe("evening reminders", () => {
     });
     expect((await sendReminders()).sent).toBe(0);
     expect((await links.getLinkForUser("u1"))?.reminders).toBe(false);
+  });
+});
+
+describe("reminder time and pause", () => {
+  const yesterday = () => new Date(Date.now() - 24 * 3_600_000);
+  async function streakOfOne(userId: string) {
+    await testDb.insert(schema.xpEvent).values({
+      userId,
+      amount: 10,
+      reason: "exercise",
+      ref: "x",
+      createdAt: yesterday(),
+    });
+  }
+
+  it("goes out at the hour the learner picked", async () => {
+    const morning = eveningZone(new Date(), 9);
+    await link("u1", 11, { reminders: true, timeZone: morning });
+    await link("u2", 12, {
+      reminders: true,
+      timeZone: morning,
+      reminderHour: 8,
+    });
+    await streakOfOne("u1");
+    await streakOfOne("u2");
+    // u1 keeps the 8 pm default; u2's 8 am reminder is an hour late: catch up.
+    expect(await sendReminders()).toEqual({ checked: 2, sent: 1 });
+    expect(sent.find((s) => s.method === "sendMessage")?.body.chat_id).toBe(12);
+  });
+
+  it("waits while paused, and comes back on the day it ends", async () => {
+    const tz = eveningZone();
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(
+      new Date(),
+    );
+    const tomorrow = new Date(Date.now() + 86_400_000);
+    await link("u1", 11, {
+      reminders: true,
+      timeZone: tz,
+      remindersResumeOn: new Intl.DateTimeFormat("en-CA", {
+        timeZone: tz,
+      }).format(tomorrow),
+    });
+    await link("u2", 12, {
+      reminders: true,
+      timeZone: tz,
+      remindersResumeOn: today,
+    });
+    await streakOfOne("u1");
+    await streakOfOne("u2");
+    expect(await sendReminders()).toEqual({ checked: 2, sent: 1 });
+    expect(sent.find((s) => s.method === "sendMessage")?.body.chat_id).toBe(12);
+  });
+
+  it("gives the day back when Telegram fails, so a later run retries", async () => {
+    await link("u1", 11, { reminders: true, timeZone: eveningZone() });
+    await streakOfOne("u1");
+    reply = () => ({ ok: false, error_code: 500, description: "oops" });
+    await expect(sendReminders()).rejects.toThrow();
+    expect((await links.getLinkForUser("u1"))?.lastReminded).toBeNull();
+    reply = () => ({ ok: true, result: {} });
+    expect((await sendReminders()).sent).toBe(1);
+  });
+
+  it("sets the hour and a pause from /settings buttons", async () => {
+    await link("u1", 11);
+    const press = (data: string) =>
+      handleUpdate({
+        callback_query: {
+          id: "q",
+          from: { id: 11 },
+          data,
+          message: { chat: { id: 11 }, message_id: 5 },
+        },
+      });
+    await press("menu:hour");
+    expect(JSON.stringify(sent.at(-2)?.body.reply_markup)).toContain("hour:19");
+    await press("hour:19");
+    let saved = await links.getLinkForUser("u1");
+    expect(saved).toMatchObject({ reminders: true, reminderHour: 19 });
+    await press("pause:3");
+    saved = await links.getLinkForUser("u1");
+    expect(saved?.remindersResumeOn).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(String(sent.at(-2)?.body.text)).toContain("Paused, back on");
+    await press("pause:0");
+    expect((await links.getLinkForUser("u1"))?.remindersResumeOn).toBeNull();
+    await press("toggle:pings");
+    expect((await links.getLinkForUser("u1"))?.pings).toBe(false);
+    // Made-up buttons do nothing.
+    await press("hour:3");
+    expect((await links.getLinkForUser("u1"))?.reminderHour).toBe(19);
+  });
+});
+
+describe("quizzes in the bot", () => {
+  let polls = 0;
+  beforeEach(() => {
+    reply = (method) =>
+      method === "sendPoll"
+        ? { ok: true, result: { poll: { id: `p${++polls}` } } }
+        : { ok: true, result: {} };
+  });
+  const answer = (pollId: string, option: number, from = 11) =>
+    handleUpdate({
+      poll_answer: {
+        poll_id: pollId,
+        user: { id: from },
+        option_ids: [option],
+      },
+    });
+  const lastPoll = () => `p${polls}`;
+
+  it("pays XP for a right answer, once per poll, and replies", async () => {
+    await link("u1", 11);
+    await handleUpdate({
+      message: {
+        chat: { id: 11, type: "private" },
+        from: { id: 11 },
+        text: "/quiz",
+      },
+    });
+    const poll = sent.find((s) => s.method === "sendPoll")!;
+    expect(poll.body.is_anonymous).toBe(false);
+    await answer(lastPoll(), 1);
+    await answer(lastPoll(), 1);
+    const events = await testDb.select().from(schema.xpEvent);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ reason: "telegram", amount: 5 });
+    const replies = sent.filter((s) => s.method === "sendMessage");
+    expect(replies).toHaveLength(1);
+    expect(String(replies[0].body.text)).toContain("+5 XP");
+    expect(String(replies[0].body.text)).toContain("Quiz streak: 1 day");
+    expect(String(replies[0].body.text)).toContain("1/1 right this week");
+  });
+
+  it("explains a wrong answer, without XP", async () => {
+    await link("u1", 11);
+    await quizzes.sendQuiz(11, "en", await links.getLinkForUser("u1"));
+    await answer(lastPoll(), 0);
+    expect(await testDb.select().from(schema.xpEvent)).toHaveLength(0);
+    const text = String(
+      sent.find((s) => s.method === "sendMessage")?.body.text,
+    );
+    expect(text).toContain("The answer: <b>two</b>");
+    expect(text).toContain("0/1 right this week");
+  });
+
+  it("caps the day's quiz XP but still counts the answers", async () => {
+    await link("u1", 11);
+    const linked = await links.getLinkForUser("u1");
+    for (let i = 0; i < quizzes.BOT_QUIZ_DAILY + 1; i++) {
+      await quizzes.sendQuiz(11, "en", linked);
+      await answer(lastPoll(), 1);
+    }
+    const events = await testDb.select().from(schema.xpEvent);
+    expect(events).toHaveLength(quizzes.BOT_QUIZ_DAILY);
+    expect(await quizzes.getQuizStats("u1", "UTC")).toEqual({
+      answered: 6,
+      correct: 6,
+      streak: 1,
+    });
+  });
+
+  it("doesn't remember polls in groups or for people who aren't linked", async () => {
+    await link("u1", 11);
+    await quizzes.sendQuiz(-100, "en", await links.getLinkForUser("u1"));
+    await quizzes.sendQuiz(99, "en", null);
+    expect(await testDb.select().from(schema.telegramQuiz)).toHaveLength(0);
+  });
+
+  it("sends a picture when a right answer unlocks an achievement", async () => {
+    await link("u1", 11);
+    await testDb.insert(schema.xpEvent).values({
+      userId: "u1",
+      amount: 95,
+      reason: "lesson",
+      ref: "/learn/sql/select",
+    });
+    await quizzes.sendQuiz(11, "en", await links.getLinkForUser("u1"));
+    await answer(lastPoll(), 1);
+    const photo = sent.find((s) => s.method === "sendPhoto");
+    expect(photo?.body.photo).toContain(
+      "/api/telegram/achievement-card?id=xp-100&lang=en",
+    );
+    expect(String(photo?.body.caption)).toContain(
+      "Achievement unlocked: Century",
+    );
+  });
+
+  it("counts the quiz streak over days in a row with a right answer", async () => {
+    await link("u1", 11);
+    const day = (n: number) =>
+      new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+    await testDb.insert(schema.telegramQuiz).values([
+      {
+        pollId: "a",
+        userId: "u1",
+        ref: "x#0",
+        correctOption: 1,
+        day: day(0),
+        correct: true,
+      },
+      {
+        pollId: "b",
+        userId: "u1",
+        ref: "x#0",
+        correctOption: 1,
+        day: day(1),
+        correct: true,
+      },
+      {
+        pollId: "c",
+        userId: "u1",
+        ref: "x#0",
+        correctOption: 1,
+        day: day(2),
+        correct: false,
+      },
+      {
+        pollId: "d",
+        userId: "u1",
+        ref: "x#0",
+        correctOption: 1,
+        day: day(9),
+        correct: true,
+      },
+    ]);
+    expect(await quizzes.getQuizStats("u1", "UTC")).toEqual({
+      answered: 3,
+      correct: 2,
+      streak: 2,
+    });
+  });
+});
+
+describe("scheduled posts", () => {
+  // 12:30 in Tashkent on a Monday.
+  const monday = new Date("2026-10-12T07:30:00Z");
+
+  it("posts the daily post once however many schedulers ask", async () => {
+    expect(await postDaily(monday)).toEqual({ posted: true, polls: 2 });
+    expect(await postDaily(monday)).toEqual({ posted: false, already: true });
+    expect(sent.filter((s) => s.method === "sendPhoto")).toHaveLength(1);
+    expect(sent.find((s) => s.method === "sendPhoto")?.body.chat_id).toBe(
+      CHANNEL,
+    );
+  });
+
+  it("tries again later when the picture didn't go out", async () => {
+    reply = () => ({ ok: false, error_code: 400, description: "bad photo" });
+    await expect(postDaily(monday)).rejects.toThrow();
+    reply = () => ({ ok: true, result: {} });
+    expect((await postDaily(monday)).posted).toBe(true);
+  });
+
+  it("runs what's due on each tick", async () => {
+    const early = new Date("2026-10-12T04:00:00Z"); // 9:00 in Tashkent
+    expect(Object.keys((await runTick(early)).results)).toEqual([
+      "reminders",
+      "cleanup",
+    ]);
+    const tick = await runTick(monday);
+    expect(tick.ok).toBe(true);
+    expect(Object.keys(tick.results)).toEqual([
+      "reminders",
+      "daily-post",
+      "leaderboard",
+      "cleanup",
+    ]);
+  });
+
+  it("keeps going when one job fails", async () => {
+    reply = (method) =>
+      method === "sendPhoto"
+        ? { ok: false, error_code: 400, description: "bad photo" }
+        : { ok: true, result: {} };
+    const tick = await runTick(monday);
+    expect(tick.ok).toBe(false);
+    expect(tick.results["daily-post"]).toBe("failed");
+    expect(tick.results.cleanup).toBe("ok");
   });
 });
 

@@ -11,7 +11,7 @@ import type { Locale } from "@/lib/i18n";
 const TOKEN_MINUTES = 15;
 
 export type TelegramLink = typeof telegramLink.$inferSelect;
-export type LinkOption = "reminders" | "leaderboard";
+export type LinkOption = "reminders" | "leaderboard" | "pings";
 
 /**
  * A one-time code for t.me/<bot>?start=<code>. Telegram allows 64 characters
@@ -108,6 +108,22 @@ export async function setLinkOption(
   await db
     .update(telegramLink)
     .set({ [option]: value })
+    .where(eq(telegramLink.userId, userId));
+}
+
+/** Picks the reminder's hour, which also turns reminders on. */
+export async function setReminderHour(userId: string, hour: number) {
+  await db
+    .update(telegramLink)
+    .set({ reminderHour: hour, reminders: true })
+    .where(eq(telegramLink.userId, userId));
+}
+
+/** No reminders before `resumeOn` (a local day); null resumes them. */
+export async function pauseReminders(userId: string, resumeOn: string | null) {
+  await db
+    .update(telegramLink)
+    .set({ remindersResumeOn: resumeOn })
     .where(eq(telegramLink.userId, userId));
 }
 

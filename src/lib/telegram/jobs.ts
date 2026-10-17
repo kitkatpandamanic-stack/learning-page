@@ -1,34 +1,51 @@
 import "server-only";
 
-import { and, desc, eq, gte, lt, sql, sum } from "drizzle-orm";
+import { and, desc, eq, gte, isNull, lt, ne, or, sql, sum } from "drizzle-orm";
 
 import { db } from "@/db";
-import { telegramLink, user, xpEvent } from "@/db/schema";
+import { telegramJobRun, telegramLink, user, xpEvent } from "@/db/schema";
 import { localizedPath, type Locale } from "@/lib/i18n";
 import { getDailySummary } from "@/lib/learning";
 import { getStreakStatus } from "@/lib/progress";
 import { siteUrl } from "@/lib/site";
-import { CHANNEL, sendMessage, TelegramError } from "@/lib/telegram/api";
+import {
+  CHANNEL,
+  CHANNEL_TIME_ZONE,
+  sendMessage,
+  telegram,
+  TelegramError,
+} from "@/lib/telegram/api";
+import { dailyPost } from "@/lib/telegram/daily-post";
 import { setLinkOption } from "@/lib/telegram/links";
+import { forgetUnansweredQuizzes } from "@/lib/telegram/quiz";
 import {
   dayIn,
   displayName,
+  hoursUntilMidnight,
   leaderboardText,
   localHour,
+  reminderKeyboard,
   reminderText,
 } from "@/lib/telegram/texts";
 
 /**
- * Reminders go out in the evening on the learner's clock, from 8 pm until
- * 11 pm: the scheduler sometimes skips a run, so a later one catches up.
+ * A reminder goes out at the hour the learner picked (8 pm by default) or,
+ * when a scheduler run was skipped, up to two hours later; never after
+ * 11 pm, when the day is nearly over.
  */
-export const REMINDER_HOURS = { from: 20, to: 22 };
+export function reminderDue(hour: number, chosen: number) {
+  return hour >= chosen && hour <= Math.min(chosen + 2, 23);
+}
+
+/** When the channel's daily post and the Monday leaderboard go out (Tashkent). */
+export const DAILY_POST_HOUR = 11;
+export const LEADERBOARD_HOUR = 12;
 const LEADERBOARD_SIZE = 10;
 
 /**
- * Runs twice an hour: learners who asked for reminders, whose evening it is
- * now, who have a streak going and haven't practised yet today, get one
- * message a day.
+ * Runs every hour: learners who asked for reminders, whose reminder hour it
+ * is now, who aren't on a pause, have a streak going and haven't practised
+ * yet today, get one message a day.
  */
 export async function sendReminders(now = new Date()) {
   const links = await db
@@ -38,27 +55,53 @@ export async function sendReminders(now = new Date()) {
   let sent = 0;
   for (const link of links) {
     const hour = localHour(link.timeZone, now);
-    if (hour < REMINDER_HOURS.from || hour > REMINDER_HOURS.to) continue;
+    if (!reminderDue(hour, link.reminderHour)) continue;
     const today = dayIn(link.timeZone, now);
     if (link.lastReminded === today) continue;
+    if (link.remindersResumeOn && today < link.remindersResumeOn) continue;
     const locale = link.locale as Locale;
     const status = await getStreakStatus(link.userId, link.timeZone);
-    const { current, activeToday } = status.streak;
+    const { current, longest, activeToday } = status.streak;
     if (activeToday || current === 0) continue;
 
+    // Claim today's reminder before sending, so two schedulers running at
+    // the same time send it once.
+    const claimed = await db
+      .update(telegramLink)
+      .set({ lastReminded: today })
+      .where(
+        and(
+          eq(telegramLink.userId, link.userId),
+          or(
+            isNull(telegramLink.lastReminded),
+            ne(telegramLink.lastReminded, today),
+          ),
+        ),
+      )
+      .returning({ userId: telegramLink.userId });
+    if (claimed.length === 0) continue;
+
     const daily = await getDailySummary(link.userId, link.timeZone, locale);
-    const path = daily.problem?.permalink ?? "/practice";
+    const url = `${siteUrl}${localizedPath(daily.problem?.permalink ?? "/practice", locale)}`;
     try {
       await sendMessage(
         link.telegramId,
         reminderText(locale, {
           streak: current,
+          best: longest,
           freezes: status.freezes,
-          url: `${siteUrl}${localizedPath(path, locale)}`,
+          hoursLeft: hoursUntilMidnight(link.timeZone, now),
+          url,
         }),
+        { reply_markup: reminderKeyboard(locale, url) },
       );
       sent++;
     } catch (error) {
+      // Not sent: give the day back, so a later run can try again.
+      await db
+        .update(telegramLink)
+        .set({ lastReminded: link.lastReminded })
+        .where(eq(telegramLink.userId, link.userId));
       // 403: the learner blocked the bot. Stop trying instead of failing daily.
       if (error instanceof TelegramError && error.code === 403) {
         await setLinkOption(link.userId, "reminders", false);
@@ -66,12 +109,108 @@ export async function sendReminders(now = new Date()) {
       }
       throw error;
     }
-    await db
-      .update(telegramLink)
-      .set({ lastReminded: today })
-      .where(eq(telegramLink.userId, link.userId));
   }
   return { checked: links.length, sent };
+}
+
+/**
+ * Runs `job` once per channel day however many schedulers call it: the
+ * first caller claims the day; a failure (or nothing to post) gives it back.
+ */
+async function once<T extends { posted: boolean }>(
+  job: string,
+  day: string,
+  run: () => Promise<T>,
+): Promise<T | { posted: false; already: true }> {
+  const claimed = await db
+    .insert(telegramJobRun)
+    .values({ job, day })
+    .onConflictDoNothing()
+    .returning({ job: telegramJobRun.job });
+  if (claimed.length === 0) return { posted: false, already: true };
+  const release = () =>
+    db
+      .delete(telegramJobRun)
+      .where(and(eq(telegramJobRun.job, job), eq(telegramJobRun.day, day)));
+  try {
+    const result = await run();
+    if (!result.posted) await release();
+    return result;
+  } catch (error) {
+    await release();
+    throw error;
+  }
+}
+
+/**
+ * The channel's daily post: the picture of the problems of the day with hint
+ * buttons, then the quiz question as polls. Once a day.
+ */
+export function postDaily(now = new Date()) {
+  const day = dayIn(CHANNEL_TIME_ZONE, now);
+  return once("daily-post", day, async () => {
+    const post = dailyPost(day, "both");
+    await telegram("sendPhoto", {
+      chat_id: CHANNEL,
+      photo: post.photo,
+      caption: post.caption,
+      parse_mode: "HTML",
+      reply_markup: post.reply_markup,
+    });
+    // The picture is out: a failed poll must not post the day twice.
+    let polls = 0;
+    for (const poll of post.polls) {
+      try {
+        await telegram("sendPoll", { chat_id: CHANNEL, ...poll });
+        polls++;
+      } catch (error) {
+        console.error("daily poll failed", error);
+      }
+    }
+    return { posted: true, polls };
+  });
+}
+
+/** The Monday leaderboard, once however many schedulers ask for it. */
+export function postLeaderboardOnce(now = new Date()) {
+  return once("leaderboard", dayIn(CHANNEL_TIME_ZONE, now), () =>
+    postLeaderboard(now),
+  );
+}
+
+/**
+ * The hourly tick (cron-job.org on the hour, GitHub Actions as a backup):
+ * reminders that are due, the daily post from 11:00 Tashkent, the
+ * leaderboard on Mondays from 12:00. Each job runs on its own, so one
+ * failing doesn't stop the others.
+ */
+export async function runTick(now = new Date()) {
+  const hour = localHour(CHANNEL_TIME_ZONE, now);
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    timeZone: CHANNEL_TIME_ZONE,
+    weekday: "short",
+  }).format(now);
+  const jobs: [string, () => Promise<unknown>][] = [
+    ["reminders", () => sendReminders(now)],
+  ];
+  if (hour >= DAILY_POST_HOUR) jobs.push(["daily-post", () => postDaily(now)]);
+  if (weekday === "Mon" && hour >= LEADERBOARD_HOUR)
+    jobs.push(["leaderboard", () => postLeaderboardOnce(now)]);
+  jobs.push(["cleanup", () => forgetUnansweredQuizzes(now)]);
+
+  const results: Record<string, unknown> = {};
+  let failed = false;
+  for (const [name, run] of jobs) {
+    try {
+      results[name] = (await run()) ?? "ok";
+    } catch (error) {
+      console.error(`telegram ${name} failed`, error);
+      // Details stay in the logs; the scheduler only needs to know it failed.
+      results[name] = "failed";
+      failed = true;
+    }
+  }
+  return { ok: !failed, results };
 }
 
 /**

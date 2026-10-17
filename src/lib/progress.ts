@@ -1,6 +1,7 @@
 import "server-only";
 
 import { cookies } from "next/headers";
+import { after } from "next/server";
 import { and, count, desc, eq, or, sql, sum } from "drizzle-orm";
 
 import { db } from "@/db";
@@ -29,6 +30,7 @@ import { buildCalendar } from "@/lib/activity";
 import { MAX_FREEZES, planFreezes } from "@/lib/daily";
 import { languages } from "@/lib/languages";
 import { getLearnerProfile } from "@/lib/learner-profile";
+import { pingAchievements } from "@/lib/telegram/notify";
 import { isValidTimeZone } from "@/lib/time-zone";
 
 // ---------------------------------------------------------------------------
@@ -74,15 +76,18 @@ export async function awardXp(
   return rows.length > 0;
 }
 
+/** Records a finished lesson; true the first time. */
 export async function markLessonComplete(
   userId: string,
   language: string,
   lessonSlug: string,
 ) {
-  await db
+  const rows = await db
     .insert(lessonProgress)
     .values({ userId, language, lessonSlug })
-    .onConflictDoNothing();
+    .onConflictDoNothing()
+    .returning({ slug: lessonProgress.lessonSlug });
+  return rows.length > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +258,14 @@ export async function summarizeAward(userId: string, xpAwarded: number) {
     await getTimeZone(),
   );
   const level = levelFromXp(stats.totalXp).level;
+  // A picture in Telegram for each new badge, once the response has gone.
+  if (newAchievements.length > 0)
+    after(() =>
+      pingAchievements(
+        userId,
+        newAchievements.map((a) => a.id),
+      ),
+    );
   return {
     ok: true as const,
     xpAwarded,
@@ -323,7 +336,7 @@ function lessonTitles(locale: Locale) {
 }
 
 export type RecentReason =
-  "lesson" | "exercise" | "quiz" | "review" | "daily" | "other";
+  "lesson" | "exercise" | "quiz" | "review" | "daily" | "telegram" | "other";
 
 /** What an XP event was for; the dashboard turns this into a sentence. */
 function describeEvent(
@@ -333,7 +346,14 @@ function describeEvent(
 ) {
   const [permalink] = (ref ?? "").split("#");
   return {
-    reason: (["lesson", "exercise", "quiz", "review", "daily"].includes(reason)
+    reason: ([
+      "lesson",
+      "exercise",
+      "quiz",
+      "review",
+      "daily",
+      "telegram",
+    ].includes(reason)
       ? reason
       : "other") as RecentReason,
     /** null when the lesson no longer exists */
