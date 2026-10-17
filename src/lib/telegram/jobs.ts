@@ -18,6 +18,7 @@ import {
 import { dailyPost } from "@/lib/telegram/daily-post";
 import { setLinkOption } from "@/lib/telegram/links";
 import { forgetUnansweredQuizzes } from "@/lib/telegram/quiz";
+import { forgetOldDuels } from "@/lib/tg-app/duel";
 import {
   dayIn,
   displayName,
@@ -179,7 +180,7 @@ export function postLeaderboardOnce(now = new Date()) {
 }
 
 /**
- * The hourly tick (cron-job.org on the hour, GitHub Actions as a backup):
+ * The tick (GitHub Actions, twice an hour; telegram-bot.yml):
  * reminders that are due, the daily post from 11:00 Tashkent, the
  * leaderboard on Mondays from 12:00. Each job runs on its own, so one
  * failing doesn't stop the others.
@@ -196,7 +197,13 @@ export async function runTick(now = new Date()) {
   if (hour >= DAILY_POST_HOUR) jobs.push(["daily-post", () => postDaily(now)]);
   if (weekday === "Mon" && hour >= LEADERBOARD_HOUR)
     jobs.push(["leaderboard", () => postLeaderboardOnce(now)]);
-  jobs.push(["cleanup", () => forgetUnansweredQuizzes(now)]);
+  jobs.push([
+    "cleanup",
+    async () => {
+      await forgetUnansweredQuizzes(now);
+      await forgetOldDuels(now);
+    },
+  ]);
 
   const results: Record<string, unknown> = {};
   let failed = false;

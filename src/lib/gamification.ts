@@ -14,7 +14,9 @@ export type XpReason =
   /** A right answer to a quiz poll in the Telegram bot */
   | "telegram"
   /** Daily Blitz in the Telegram Mini App */
-  | "blitz";
+  | "blitz"
+  /** A duel in the Telegram Mini App (playing it, winning it) */
+  | "duel";
 
 // ---------------------------------------------------------------------------
 // Learner levels: level L needs 50·L·(L−1) XP → 0, 100, 300, 600, 1000, …

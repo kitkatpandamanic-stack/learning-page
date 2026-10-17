@@ -307,6 +307,63 @@ export const tgBlitz = pgTable(
 );
 
 /**
+ * Duels in the Telegram Mini App: someone picks a language and plays 5
+ * questions, then shares the challenge; anyone who opens it plays the same
+ * questions. Open for 48 hours.
+ */
+export const tgDuel = pgTable("tg_duel", {
+  /** Short random id, used in t.me/<bot>?startapp=duel_<id> */
+  id: text("id").primaryKey(),
+  creatorTelegramId: bigint("creator_telegram_id", {
+    mode: "number",
+  }).notNull(),
+  creatorUserId: text("creator_user_id").references(() => user.id, {
+    onDelete: "set null",
+  }),
+  /** The challenger's Telegram first name, shown to the people they challenge */
+  creatorName: text("creator_name").notNull(),
+  /** The challenger's language, for the bot's messages about results */
+  creatorLocale: text("creator_locale").notNull(),
+  language: text("language").notNull(),
+  /** The questions, as "<lesson permalink>#<quiz number in that lesson>" */
+  refs: jsonb("refs").$type<string[]>().notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  expiresAt: timestamp("expires_at").notNull(),
+});
+
+/** One person's go at a duel (the challenger's too): graded and timed on the server. */
+export const tgDuelPlay = pgTable(
+  "tg_duel_play",
+  {
+    duelId: text("duel_id")
+      .notNull()
+      .references(() => tgDuel.id, { onDelete: "cascade" }),
+    telegramId: bigint("telegram_id", { mode: "number" }).notNull(),
+    userId: text("user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    /** Telegram first name, for the duel's ranking */
+    name: text("name").notNull(),
+    startedAt: timestamp("started_at").notNull(),
+    answers: jsonb("answers")
+      .$type<{ c: number; ok: boolean; ms: number }[]>()
+      .default([])
+      .notNull(),
+    score: smallint("score").default(0).notNull(),
+    ms: integer("ms").default(0).notNull(),
+    finishedAt: timestamp("finished_at"),
+    /** XP this play paid (finishing, winning) */
+    xp: smallint("xp").default(0).notNull(),
+    /** The challenger got the bot's message about this result */
+    notified: boolean("notified").default(false).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.duelId, table.telegramId] }),
+    index("tg_duel_play_telegram_idx").on(table.telegramId, table.startedAt),
+  ],
+);
+
+/**
  * What the health collector (.github/workflows/health.yml) found outside the
  * site: Vercel deployments, Neon usage, Sentry errors, GitHub security
  * alerts. One row per run, kept for 90 days; /admin/health reads the latest.

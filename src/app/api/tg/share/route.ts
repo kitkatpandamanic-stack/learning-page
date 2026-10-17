@@ -1,16 +1,18 @@
 import { blitzResult } from "@/lib/tg-app/blitz";
+import { duelResult } from "@/lib/tg-app/duel";
 import type { Card } from "@/lib/tg-app/card";
 import { miniAppHome } from "@/lib/tg-app/home";
 import { parseOutfit, wornOutfit } from "@/lib/tg-app/panda";
 import { miniAppCaller } from "@/lib/tg-app/player";
 import { appLink, cardUrl, prepareShare } from "@/lib/tg-app/share";
-import { appTexts, blitzShareText } from "@/lib/tg-app/texts";
+import { appTexts, blitzShareText, languageNames } from "@/lib/tg-app/texts";
 
 /**
  * Something to share from the Mini App, built from the server's own data
  * (never numbers from the browser):
  *   { kind: "blitz", language }  today's result in that language
  *   { kind: "panda", outfit }    the learner's panda (outfit from CloudStorage)
+ *   { kind: "duel", duel }       a challenge: the player's score to beat
  * Returns a prepared message id for shareMessage, a picture for Stories, and
  * plain text for older Telegram apps.
  */
@@ -21,6 +23,7 @@ export async function POST(request: Request) {
     kind?: string;
     language?: string;
     outfit?: string;
+    duel?: string;
   } | null;
   const { locale, player, init } = caller;
   const t = appTexts[locale];
@@ -44,6 +47,28 @@ export async function POST(request: Request) {
     text = blitzShareText(locale, { ...result, size: result.size });
     start = `blitz_${result.language}`;
     button = `⚡ ${t.shareButton}`;
+  } else if (body?.kind === "duel") {
+    // Only the challenger sends their duel; others start their own.
+    const result = await duelResult(player, String(body.duel ?? ""));
+    if (!result?.yours) return new Response("Bad request", { status: 400 });
+    card = {
+      kind: "duel",
+      locale,
+      format: "story",
+      number: 1,
+      language: result.language,
+      grid: result.grid,
+      seconds: Math.round(result.ms / 1000),
+    };
+    text = t.duelCaption(
+      result.challenger,
+      languageNames[result.language],
+      result.score,
+      result.size,
+      result.ms,
+    );
+    start = `duel_${result.id}`;
+    button = t.duelButton;
   } else if (body?.kind === "panda") {
     const home = await miniAppHome(caller);
     if (!home.panda) return new Response("Bad request", { status: 400 });
@@ -63,7 +88,7 @@ export async function POST(request: Request) {
     button = `🐼 PandaDev`;
   } else return new Response("Bad request", { status: 400 });
 
-  const caption = t.shareCaption(text);
+  const caption = body.kind === "duel" ? text : t.shareCaption(text);
   let messageId: string | null = null;
   try {
     messageId = await prepareShare(init.user.id, card, caption, start, button);
@@ -74,7 +99,7 @@ export async function POST(request: Request) {
   return Response.json({
     messageId,
     storyUrl: cardUrl(card),
-    storyText: t.storyText,
+    storyText: body.kind === "duel" ? t.duelStoryText : t.storyText,
     link: appLink(start),
     text: caption,
   });

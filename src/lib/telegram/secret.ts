@@ -11,9 +11,9 @@ export function secretMatches(given: string | null, expected?: string) {
 }
 
 /**
- * The scheduler's secret: "X-Cron-Secret: <secret>" (cron-job.org, which
- * doesn't pass a custom Authorization header through) or
- * "Authorization: Bearer <secret>" (GitHub Actions).
+ * The scheduler's secret: "Authorization: Bearer <secret>" (GitHub
+ * Actions) or "X-Cron-Secret: <secret>" (for schedulers that don't pass a
+ * custom Authorization header through, like cron-job.org).
  */
 export function cronSecret(headers: Headers) {
   return (

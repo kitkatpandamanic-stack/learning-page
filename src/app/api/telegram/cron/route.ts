@@ -10,12 +10,10 @@ import {
 import { cronSecret, secretMatches } from "@/lib/telegram/secret";
 
 /**
- * Scheduled bot jobs, with "X-Cron-Secret: <CRON_SECRET>" (cron-job.org)
- * or "Authorization: Bearer <CRON_SECRET>" (GitHub Actions):
- *   GET /api/telegram/cron?job=tick         every hour, on the hour
- *                                           (cron-job.org; GitHub Actions
- *                                           .github/workflows/telegram-bot.yml
- *                                           as a backup)
+ * Scheduled bot jobs, called by GitHub Actions with "Authorization: Bearer
+ * <CRON_SECRET>" (or "X-Cron-Secret: <CRON_SECRET>" from other schedulers):
+ *   GET /api/telegram/cron?job=tick         twice an hour
+ *                                           (.github/workflows/telegram-bot.yml)
  *   GET /api/telegram/cron?job=reminders    reminders only
  *   GET /api/telegram/cron?job=daily-post   the channel's daily post
  *   GET /api/telegram/cron?job=leaderboard  the Monday leaderboard
