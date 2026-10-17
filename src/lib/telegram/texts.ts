@@ -98,6 +98,7 @@ const days = (n: number, locale: BotLocale) =>
 
 const commands = {
   en: [
+    "/app: your panda and the Daily Blitz",
     "/today: the problem of the day",
     "/quiz: a quiz question (+5 XP when you're right)",
     "/random python: a random practice problem (python, js, ts or sql)",
@@ -106,6 +107,7 @@ const commands = {
     "/settings: reminders (time, pause) and the weekly leaderboard",
   ],
   ru: [
+    "/app: ваша панда и блиц дня",
     "/today: задача дня",
     "/quiz: вопрос из уроков (+5 XP за верный ответ)",
     "/random python: случайная задача (python, js, ts или sql)",
@@ -173,6 +175,29 @@ export function randomText(locale: BotLocale, problem: DailyItem) {
   return `${head}\n\n${languageEmoji[problem.language] ?? "•"} <b>${escapeHtml(problem.name)}</b> · ${
     difficulty[locale][problem.difficulty as Difficulty] ?? problem.difficulty
   }\n${a(problem.url, problem.title)}`;
+}
+
+/**
+ * /app: a button that opens the Mini App. In a private chat it opens right
+ * there (web_app); groups only allow links, so it's the app's t.me link.
+ */
+export function appMessage(
+  locale: BotLocale,
+  {
+    private: inPrivate,
+    appUrl,
+    link,
+  }: { private: boolean; appUrl: string; link: string },
+) {
+  const ru = locale === "ru";
+  const text = ru
+    ? "🐼 <b>PandaDev в Telegram</b>\nВаша панда растёт вместе с вами, а блиц дня: 10 вопросов за 60 секунд. Сможете обогнать друзей?"
+    : "🐼 <b>PandaDev in Telegram</b>\nYour panda grows with you, and the Daily Blitz is 10 questions in 60 seconds. Can you beat your friends?";
+  const label = ru ? "⚡ Открыть" : "⚡ Open";
+  const button = inPrivate
+    ? { text: label, web_app: { url: appUrl } }
+    : { text: label, url: link };
+  return { text, reply_markup: { inline_keyboard: [[button]] } };
 }
 
 export function notLinkedText(locale: BotLocale, profileUrl: string) {

@@ -272,6 +272,41 @@ export const telegramLinkToken = pgTable("telegram_link_token", {
 });
 
 /**
+ * Daily Blitz in the Telegram Mini App: one try a day per language, keyed
+ * by the Telegram account so people who haven't linked one can play too
+ * (without XP). Answers are graded and timed on the server.
+ */
+export const tgBlitz = pgTable(
+  "tg_blitz",
+  {
+    telegramId: bigint("telegram_id", { mode: "number" }).notNull(),
+    /** The Blitz day (Tashkent), the same set of questions for everyone */
+    day: date("day", { mode: "string" }).notNull(),
+    language: text("language").notNull(),
+    /** The linked PandaDev account, for XP and the ranking */
+    userId: text("user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    startedAt: timestamp("started_at").defaultNow().notNull(),
+    /** [{ c: choice, ok: right?, ms: since the start }] in question order */
+    answers: jsonb("answers")
+      .$type<{ c: number; ok: boolean; ms: number }[]>()
+      .default([])
+      .notNull(),
+    score: smallint("score").default(0).notNull(),
+    /** Time of the last answer, for breaking ties */
+    ms: integer("ms").default(0).notNull(),
+    finishedAt: timestamp("finished_at"),
+    /** XP this Blitz paid (only the day's first finished one pays) */
+    xp: smallint("xp").default(0).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.telegramId, table.day, table.language] }),
+    index("tg_blitz_day_language_idx").on(table.day, table.language),
+  ],
+);
+
+/**
  * What the health collector (.github/workflows/health.yml) found outside the
  * site: Vercel deployments, Neon usage, Sentry errors, GitHub security
  * alerts. One row per run, kept for 90 days; /admin/health reads the latest.
