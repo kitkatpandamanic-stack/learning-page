@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { useTranslations } from "next-intl";
-import { getTranslations } from "next-intl/server";
 import { ArrowLeft, Compass } from "lucide-react";
 
 import { LogoMark } from "@/components/brand/logo";
@@ -12,11 +11,11 @@ import { GlassCard } from "@/components/ui/glass-card";
 import { GradientText } from "@/components/ui/gradient-text";
 import { Link } from "@/i18n/navigation";
 
-// A not-found file gets no params; next-intl reads the request's locale.
-export async function generateMetadata(): Promise<Metadata> {
-  const t = await getTranslations("notFound");
-  return { title: t("metaTitle") };
-}
+// A not-found file gets no params, and asking next-intl for the locale here
+// reads request headers, which breaks lessons and problems built on their
+// first visit (a missing one errored instead of showing this page). So the
+// tab title is "404 · PandaDev" in every language; the page is translated.
+export const metadata: Metadata = { title: "404" };
 
 export default function NotFound() {
   const t = useTranslations("notFound");

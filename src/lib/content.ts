@@ -120,6 +120,19 @@ export function getAllLessons() {
   return originals;
 }
 
+/**
+ * The first module of every course. Only these lessons are built ahead of
+ * time, so a new learner's first clicks are instant. Every other lesson is
+ * built the first time someone opens it, then kept until the next deploy:
+ * prerendering all of them made each deployment ~1.1 GB (Vercel's free
+ * plan stores 10 GB in total).
+ */
+export function getStarterLessons() {
+  return originals.filter(
+    (l) => getCourse(l.language)?.levels[0]?.modules[0]?.slug === l.module,
+  );
+}
+
 /** A lesson plus where it sits in its course: level, module, neighbours and position. */
 export function getLessonContext(
   language: string,

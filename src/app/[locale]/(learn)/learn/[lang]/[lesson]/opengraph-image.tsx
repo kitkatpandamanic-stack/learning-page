@@ -1,6 +1,6 @@
 import { getTranslations } from "next-intl/server";
 
-import { getAllLessons, getLanguage, getLessonContext } from "@/lib/content";
+import { getLanguage, getLessonContext } from "@/lib/content";
 import { localeParam } from "@/lib/i18n";
 import { ogSize, renderOgImage } from "@/lib/og";
 
@@ -8,8 +8,10 @@ export const alt = "PandaDev";
 export const size = ogSize;
 export const contentType = "image/png";
 
+// Drawn the first time a link is shared, then kept until the next deploy
+// (prerendering one per page made deployments much bigger).
 export function generateStaticParams() {
-  return getAllLessons().map((l) => ({ lang: l.language, lesson: l.slug }));
+  return [];
 }
 
 export default async function Image({
