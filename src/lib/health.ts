@@ -22,8 +22,15 @@ export type Area = { status: Status; findings: Finding[] };
  */
 export const FREE_LIMITS = {
   vercelStorageBytes: 10 * 1024 ** 3,
-  /** One deployment of the site (measured with `next build`): about 1.1 GB */
-  deploymentBytes: 1.1 * 1024 ** 3,
+  /**
+   * One deployment of the site, measured with `next build` (Hobby has no
+   * usage API). About 1.1 GB while every lesson was prerendered; about
+   * 0.2 GB since lessons are built on first visit (PR #49, deployed
+   * 2026-10-17 05:26 UTC): pages, server code and public files.
+   */
+  deploymentBytes: 0.2 * 1024 ** 3,
+  oldDeploymentBytes: 1.1 * 1024 ** 3,
+  smallDeploymentsSince: Date.parse("2026-10-17T05:20:00Z"),
   neonComputeHours: 100,
   neonStorageBytes: 1024 ** 3,
   neonTransferBytes: 5 * 1024 ** 3,
@@ -346,8 +353,16 @@ export function meters(
   const result: Meter[] = [];
   const vercel = snapshot?.vercel;
   if (vercel?.ok) {
-    const kept = vercel.deployments.filter((d) => d.state === "READY").length;
-    const used = kept * FREE_LIMITS.deploymentBytes;
+    const used = vercel.deployments
+      .filter((d) => d.state === "READY")
+      .reduce(
+        (sum, d) =>
+          sum +
+          (Date.parse(d.createdAt) < FREE_LIMITS.smallDeploymentsSince
+            ? FREE_LIMITS.oldDeploymentBytes
+            : FREE_LIMITS.deploymentBytes),
+        0,
+      );
     result.push({
       key: "vercelStorage",
       used,
