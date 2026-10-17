@@ -40,10 +40,17 @@ const contentSecurityPolicy = [
   // it broke the production build served over http on localhost.)
 ].join("; ");
 
+// The Telegram Mini App (/tg, /ru/tg) is the one page that may be framed:
+// Telegram Web shows Mini Apps in an iframe on web.telegram.org. It also
+// loads Telegram's script (telegram-web-app.js).
+const miniAppPolicy = contentSecurityPolicy
+  .replace("frame-ancestors 'none'", "frame-ancestors https://web.telegram.org")
+  .replace("script-src 'self'", "script-src 'self' https://telegram.org");
+const miniAppPaths = ["/tg", "/ru/tg"];
+
 const securityHeaders = [
   { key: "Content-Security-Policy", value: contentSecurityPolicy },
   { key: "X-Content-Type-Options", value: "nosniff" },
-  { key: "X-Frame-Options", value: "DENY" },
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
   {
     key: "Permissions-Policy",
@@ -62,6 +69,16 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       { source: "/:path*", headers: securityHeaders },
+      // Every page but the Mini App refuses to be framed.
+      {
+        source: "/:path((?!tg$|ru/tg$).*)",
+        headers: [{ key: "X-Frame-Options", value: "DENY" }],
+      },
+      // Later rules win: the Mini App's own policy.
+      ...miniAppPaths.map((source) => ({
+        source,
+        headers: [{ key: "Content-Security-Policy", value: miniAppPolicy }],
+      })),
       // The service worker must always be fresh, so updates reach everyone.
       {
         source: "/sw.js",
@@ -86,6 +103,12 @@ const nextConfig: NextConfig = {
     "/[locale]/practice/[lang]/[problem]": ["./.velite/bodies/practice/**/*"],
     // The daily picture is drawn on request, with the share images' font.
     "/api/telegram/daily-card": [
+      "./node_modules/@fontsource/onest/files/onest-*-normal.woff",
+    ],
+    "/api/telegram/achievement-card": [
+      "./node_modules/@fontsource/onest/files/onest-*-normal.woff",
+    ],
+    "/api/tg/card": [
       "./node_modules/@fontsource/onest/files/onest-*-normal.woff",
     ],
   },

@@ -33,6 +33,7 @@ import {
   sendQuiz,
 } from "@/lib/telegram/quiz";
 import {
+  appMessage,
   botLocale,
   dayIn,
   escapeHtml,
@@ -153,6 +154,14 @@ async function onMessage(
         console.error(error);
         return reply(today(locale, link));
       }
+    }
+    case "app": {
+      const message = appMessage(locale, {
+        private: chat.type === "private",
+        appUrl: `${siteUrl}${locale === "ru" ? "/ru" : ""}/tg`,
+        link: `https://t.me/${BOT_USERNAME}?startapp`,
+      });
+      return reply(message.text, { reply_markup: message.reply_markup });
     }
     case "quiz":
       return sendQuiz(chat.id, locale, link);

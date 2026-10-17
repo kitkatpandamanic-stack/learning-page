@@ -336,7 +336,14 @@ function lessonTitles(locale: Locale) {
 }
 
 export type RecentReason =
-  "lesson" | "exercise" | "quiz" | "review" | "daily" | "telegram" | "other";
+  | "lesson"
+  | "exercise"
+  | "quiz"
+  | "review"
+  | "daily"
+  | "telegram"
+  | "blitz"
+  | "other";
 
 /** What an XP event was for; the dashboard turns this into a sentence. */
 function describeEvent(
@@ -353,6 +360,7 @@ function describeEvent(
       "review",
       "daily",
       "telegram",
+      "blitz",
     ].includes(reason)
       ? reason
       : "other") as RecentReason,

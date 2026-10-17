@@ -15,6 +15,11 @@ const fontDir = join(process.cwd(), "node_modules/@fontsource/onest/files");
 let fonts: Promise<ConstructorParameters<typeof ImageResponse>[1]> | null =
   null;
 
+/** Onest (Latin + Cyrillic) for other generated pictures, e.g. the Mini App's. */
+export async function ogFonts() {
+  return (await loadFonts())?.fonts ?? [];
+}
+
 function loadFonts() {
   fonts ??= Promise.all(
     (["latin", "cyrillic"] as const).flatMap((subset) =>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  appMessage,
   botLocale,
   dailyCaption,
   dailyKeyboard,
@@ -312,5 +313,23 @@ describe("the daily post", () => {
     expect(hintSpoiler("ru", "x")).toBe(
       "💡 Подсказка: <tg-spoiler>x</tg-spoiler>",
     );
+  });
+});
+
+describe("/app", () => {
+  it("opens the Mini App in private chats and links to it in groups", () => {
+    const where = {
+      appUrl: "https://x.test/tg",
+      link: "https://t.me/b?startapp",
+    };
+    const inPrivate = appMessage("en", { ...where, private: true });
+    expect(inPrivate.reply_markup.inline_keyboard[0][0]).toMatchObject({
+      web_app: { url: "https://x.test/tg" },
+    });
+    const inGroup = appMessage("ru", { ...where, private: false });
+    expect(inGroup.reply_markup.inline_keyboard[0][0]).toMatchObject({
+      url: "https://t.me/b?startapp",
+    });
+    expect(inGroup.text).toContain("блиц дня");
   });
 });

@@ -9,6 +9,7 @@ loadEnv();
 
 const commands = {
   en: [
+    ["app", "Your panda and the Daily Blitz"],
     ["today", "Problem of the day"],
     ["quiz", "A quiz question (+5 XP when you're right)"],
     ["random", "A random practice problem (add python, js, ts or sql)"],
@@ -18,6 +19,7 @@ const commands = {
     ["help", "What the bot can do"],
   ],
   ru: [
+    ["app", "Ваша панда и блиц дня"],
     ["today", "Задача дня"],
     ["quiz", "Вопрос из уроков (+5 XP за верный ответ)"],
     ["random", "Случайная задача (python, js, ts или sql)"],
@@ -87,4 +89,13 @@ if (process.argv.includes("--check")) {
     });
   }
   console.log("✓ commands and description (EN + RU)");
+  // The button next to the message field opens the Mini App.
+  await telegram("setChatMenuButton", {
+    menu_button: {
+      type: "web_app",
+      text: "PandaDev",
+      web_app: { url: `${SITE}/tg` },
+    },
+  });
+  console.log(`✓ menu button → ${SITE}/tg`);
 }
