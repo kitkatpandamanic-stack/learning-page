@@ -5,6 +5,7 @@ import { useCallback, useState } from "react";
 
 import { BlitzTab } from "@/components/tg/blitz-tab";
 import { DuelTab, startChallenge } from "@/components/tg/duel-tab";
+import { LeagueTab } from "@/components/tg/league-tab";
 import { PandaTab } from "@/components/tg/panda-tab";
 import { callApi, telegramScript, webApp } from "@/components/tg/telegram";
 import type { MiniAppHome } from "@/lib/tg-app/home";
@@ -12,7 +13,7 @@ import { appTexts, type AppLocale } from "@/lib/tg-app/texts";
 
 const SPACE = "#070814";
 
-type Tab = "panda" | "blitz" | "duel";
+type Tab = "panda" | "blitz" | "duel" | "league";
 
 /**
  * PandaDev inside Telegram: the learner's panda, the Daily Blitz and duels. Runs
@@ -28,6 +29,8 @@ export function MiniApp({ bot }: { bot: string }) {
   const [blitzLanguage, setBlitzLanguage] = useState<string | null>(null);
   const [duel, setDuel] = useState<string | null>(null);
   const [duelNotice, setDuelNotice] = useState<string | null>(null);
+  /** g_<chat id>_<signature>: opened from a group's /league button */
+  const [leagueInvite, setLeagueInvite] = useState<string | null>(null);
   const [locale, setLocale] = useState<AppLocale>("en");
 
   const load = useCallback(async () => {
@@ -79,6 +82,10 @@ export function MiniApp({ bot }: { bot: string }) {
       setTab("duel");
       setDuel(opened[1]);
     } else if (rematch) void challenge(rematch[1]);
+    else if (/^g_-?\d+_[\w-]+$/.test(param)) {
+      setTab("league");
+      setLeagueInvite(param);
+    }
     void load();
   }, [load, challenge]);
 
@@ -130,6 +137,7 @@ export function MiniApp({ bot }: { bot: string }) {
               onChallenge={(language) => void challenge(language)}
             />
           )}
+          {tab === "league" && <LeagueTab home={home} invite={leagueInvite} />}
           {tab === "duel" && (
             <DuelTab
               home={home}
@@ -143,7 +151,7 @@ export function MiniApp({ bot }: { bot: string }) {
             />
           )}
           <nav className="fixed inset-x-0 bottom-0 z-10 mx-auto flex max-w-md gap-2 bg-[#070814]/90 px-4 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur">
-            {(["panda", "blitz", "duel"] as const).map((name) => (
+            {(["panda", "blitz", "duel", "league"] as const).map((name) => (
               <button
                 key={name}
                 type="button"
@@ -153,13 +161,16 @@ export function MiniApp({ bot }: { bot: string }) {
                   if (name === "duel") setDuel(null);
                 }}
                 aria-current={tab === name ? "page" : undefined}
-                className={`tap-target flex-1 rounded-2xl py-3 font-semibold ${
+                className={`tap-target flex flex-1 flex-col items-center gap-0.5 rounded-2xl py-2 text-xs font-semibold ${
                   tab === name
                     ? "bg-gradient-brand text-white"
                     : "text-slate-300 glass"
                 }`}
               >
-                {{ panda: "🐼", blitz: "⚡", duel: "⚔️" }[name]} {t.tabs[name]}
+                <span aria-hidden className="text-lg leading-none">
+                  {{ panda: "🐼", blitz: "⚡", duel: "⚔️", league: "👥" }[name]}
+                </span>
+                {t.tabs[name]}
               </button>
             ))}
           </nav>

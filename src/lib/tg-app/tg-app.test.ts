@@ -60,6 +60,7 @@ vi.mock("@/lib/daily-feed", () => ({
 
 const blitz = await import("@/lib/tg-app/blitz");
 const duels = await import("@/lib/tg-app/duel");
+const leagues = await import("@/lib/tg-app/league");
 type Player = import("@/lib/tg-app/blitz").Player;
 
 const dir = join(__dirname, "..", "..", "..", "drizzle");
@@ -537,5 +538,95 @@ describe("duels", () => {
     expect(
       parseCard(new URLSearchParams("k=duel&l=en&n=1&lang=python&g=1&t=45")),
     ).toBeNull();
+  });
+});
+
+describe("group leagues", () => {
+  const GROUP = -1001234567890;
+
+  beforeEach(async () => {
+    await client.exec(`TRUNCATE "user", tg_group, telegram_link CASCADE`);
+    await testDb.insert(schema.user).values([
+      { id: "u1", name: "Anora", email: "a@pandadev.test" },
+      { id: "u2", name: "Mei", email: "m@pandadev.test" },
+    ]);
+    await testDb.insert(schema.telegramLink).values([
+      { userId: "u1", telegramId: 10, locale: "en", timeZone: "UTC" },
+      { userId: "u2", telegramId: 20, locale: "ru", timeZone: "UTC" },
+    ]);
+  });
+
+  it("opens only from the bot's own signed link", () => {
+    const param = leagues.leagueParam(GROUP, TOKEN);
+    expect(param).toMatch(/^g_-1001234567890_[\w-]{12}$/);
+    expect(leagues.parseLeagueParam(param, TOKEN)).toBe(GROUP);
+    expect(
+      leagues.parseLeagueParam(param.replace("890_", "891_"), TOKEN),
+    ).toBeNull();
+    expect(leagues.parseLeagueParam(param, "999:other")).toBeNull();
+    expect(leagues.parseLeagueParam("g_1_short", TOKEN)).toBeNull();
+    expect(leagues.parseLeagueParam(undefined, TOKEN)).toBeNull();
+  });
+
+  it("counts members' XP for the week, Monday to Sunday in Tashkent", async () => {
+    await leagues.registerGroup(GROUP, "Class 9B");
+    expect(await leagues.joinLeague(GROUP, 10, "Anora")).toBe(true);
+    expect(await leagues.joinLeague(GROUP, 20, "Mei")).toBe(true);
+    expect(await leagues.joinLeague(GROUP, 30, "Bao")).toBe(true);
+    expect(await leagues.joinLeague(-1, 30, "Bao")).toBe(false);
+    await testDb.insert(schema.xpEvent).values([
+      // Monday 12 Oct, 00:30 in Tashkent: this week.
+      {
+        userId: "u1",
+        amount: 30,
+        reason: "quiz",
+        ref: "a",
+        createdAt: new Date("2026-10-11T19:30:00Z"),
+      },
+      {
+        userId: "u2",
+        amount: 50,
+        reason: "quiz",
+        ref: "b",
+        createdAt: new Date("2026-10-15T10:00:00Z"),
+      },
+      // Sunday 11 Oct in Tashkent: last week.
+      {
+        userId: "u1",
+        amount: 500,
+        reason: "quiz",
+        ref: "c",
+        createdAt: new Date("2026-10-11T18:30:00Z"),
+      },
+    ]);
+    const now = new Date("2026-10-17T07:00:00Z");
+    expect(leagues.weekOf(now)).toBe("2026-10-12");
+    const table = await leagues.leagueTable(GROUP, "2026-10-12");
+    expect(table.map((r) => [r.name, r.xp, r.linked])).toEqual([
+      ["Mei", 50, true],
+      ["Anora", 30, true],
+      ["Bao", 0, false],
+    ]);
+    const mine = await leagues.myLeagues(10, now);
+    expect(mine).toMatchObject([
+      { chatId: GROUP, title: "Class 9B", week: "2026-10-12" },
+    ]);
+    expect(mine[0].table.find((r) => r.you)?.name).toBe("Anora");
+  });
+
+  it("shows the join card, and lets members leave", async () => {
+    await leagues.registerGroup(GROUP, "Class 9B");
+    await leagues.joinLeague(GROUP, 20, "Mei");
+    expect(await leagues.leagueInvite(GROUP, 10)).toEqual({
+      chatId: GROUP,
+      title: "Class 9B",
+      members: 1,
+      joined: false,
+    });
+    await leagues.joinLeague(GROUP, 10, "Anora");
+    expect((await leagues.leagueInvite(GROUP, 10))?.joined).toBe(true);
+    await leagues.leaveLeague(GROUP, 10);
+    expect(await leagues.myLeagues(10)).toEqual([]);
+    expect(await leagues.leagueInvite(-5, 10)).toBeNull();
   });
 });

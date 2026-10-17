@@ -98,7 +98,8 @@ const days = (n: number, locale: BotLocale) =>
 
 const commands = {
   en: [
-    "/app: your panda and the Daily Blitz",
+    "/app: your panda, the Daily Blitz and duels",
+    "/league: a weekly XP table for your group (send it in a group)",
     "/today: the problem of the day",
     "/quiz: a quiz question (+5 XP when you're right)",
     "/random python: a random practice problem (python, js, ts or sql)",
@@ -107,7 +108,8 @@ const commands = {
     "/settings: reminders (time, pause) and the weekly leaderboard",
   ],
   ru: [
-    "/app: ваша панда и блиц дня",
+    "/app: ваша панда, блиц дня и дуэли",
+    "/league: рейтинг недели для вашей группы (отправьте в группе)",
     "/today: задача дня",
     "/quiz: вопрос из уроков (+5 XP за верный ответ)",
     "/random python: случайная задача (python, js, ts или sql)",
@@ -807,4 +809,80 @@ export function hintPopup(markdown: string, max = 200) {
 
 export function hintSpoiler(locale: BotLocale, markdown: string) {
   return `💡 ${locale === "ru" ? "Подсказка" : "Hint"}: <tg-spoiler>${hintHtml(markdown)}</tg-spoiler>`;
+}
+
+// ---------------------------------------------------------------------------
+// Group leagues (/league in a group)
+// ---------------------------------------------------------------------------
+
+export function leaguePrivateText(locale: BotLocale) {
+  return locale === "ru"
+    ? "👥 Лиги для групп: добавьте меня в учебную группу или чат класса и отправьте там /league. У группы появится свой рейтинг недели."
+    : "👥 Leagues are for groups: add me to your study group or class chat and send /league there. The group gets its own weekly table.";
+}
+
+/** /league in a group: what it is, and the button that opens it. */
+export function leagueGroupMessage(
+  locale: BotLocale,
+  { title, link }: { title: string; link: string },
+) {
+  const ru = locale === "ru";
+  const text = ru
+    ? `👥 <b>Лига «${escapeHtml(title)}»</b>\nРейтинг недели для этой группы: XP за уроки, задачи, блиц и дуэли на PandaDev. Нажмите кнопку, чтобы вступить.\n\nПо понедельникам я публикую итоги недели здесь. Админы могут выключить это: /league off.`
+    : `👥 <b>${escapeHtml(title)} league</b>\nA weekly table for this group: XP from lessons, practice, the Blitz and duels on PandaDev. Tap the button to join.\n\nOn Mondays I post last week's results here. Admins can turn that off: /league off.`;
+  return {
+    text,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: ru ? "👥 Вступить в лигу" : "👥 Join the league", url: link }],
+      ],
+    },
+  };
+}
+
+export function leagueToggledText(locale: BotLocale, on: boolean) {
+  if (locale === "ru")
+    return on
+      ? "✅ Итоги недели снова будут здесь по понедельникам."
+      : "🔕 Итоги недели больше не будут публиковаться. Включить снова: /league on.";
+  return on
+    ? "✅ Last week's results will be posted here on Mondays again."
+    : "🔕 No more Monday posts here. Turn them back on with /league on.";
+}
+
+export function leagueAdminsOnlyText(locale: BotLocale) {
+  return locale === "ru"
+    ? "Это могут сделать только админы группы."
+    : "Only the group's admins can do that.";
+}
+
+/** The Monday post in a group: last week's table, both languages. */
+export function leagueWeeklyText(
+  title: string,
+  rows: { name: string; xp: number }[],
+  { from, to }: { from: string; to: string },
+) {
+  const range = (locale: BotLocale) =>
+    `${dayLabel(locale, from)} – ${dayLabel(locale, to)}`;
+  const table = rows
+    .map(
+      (r, i) =>
+        `${medals[i] ?? `${i + 1}.`} ${escapeHtml(r.name)} · <b>${r.xp} XP</b>`,
+    )
+    .join("\n");
+  return [
+    `🏆 <b>${escapeHtml(title)}</b> · ${range("ru")} · ${range("en")}`,
+    table,
+    "Кто следующий? Вступайте в лигу кнопкой ниже. · Who's next? Join with the button below.",
+  ].join("\n\n");
+}
+
+export function leagueButton(locale: BotLocale | "both", link: string) {
+  const text =
+    locale === "both"
+      ? "👥 Лига · League"
+      : locale === "ru"
+        ? "👥 Открыть лигу"
+        : "👥 Open the league";
+  return { inline_keyboard: [[{ text, url: link }]] };
 }
