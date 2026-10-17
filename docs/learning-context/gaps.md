@@ -21,7 +21,7 @@ with cheap fixes nudged up. "Who" says which audience feels it.
 
 ### 2. Practice for Levels 2–3 is almost empty
 
-- Problems by level of the linked lesson: JS L0 11 · L1 12 · L2 15 · L3 2; Python L0 13 · L1 26 · **L2 0** · L3 1;
+- Problems by level of the linked lesson: JS L0 11 · L1 15 · L2 12 · L3 2 (recounted 2026-10-11 after 6 problems were relinked to L1 `recursion`); Python L0 13 · L1 26 · **L2 0** · L3 1;
   SQL L0 14 · L1 15 · L2 10 · L3 1; TS L0 9 · L1 18 · L2 4 · L3 9.
 - 41 of 78 modules have no linked problem, e.g. Python power-tools, testing, web-apis, databases, async, web-clients,
   data-analysis, statistics, machine-learning; JS testing, react, node-and-express, security; SQL
@@ -40,6 +40,13 @@ with cheap fixes nudged up. "Who" says which audience feels it.
 - **TS Level 3 security and system design**: ROADMAP L3 lists both; TS has neither (JS and Python do).
 - **Algorithms, recursion, regex in JS/TS**: Python L1 has `algorithms` (4 lessons) and `regular-expressions`. JS/TS have none,
   yet JS practice has 2 recursion, 5 algorithms and 3 text problems and TS has 3 algorithms problems (see #7).
+  - ✅ 2026-10-11: JS recursion closed with `arrays-and-objects/04-recursion` (L1, EN + RU; `working-with-data` renumbered to 05).
+    JS problems 15, 19, 28, 29, 33 and 40 now link to it (EN + RU). Still open: JS/TS algorithms and regex lessons, and TS has no
+    runtime recursion lesson. TS problems 31, 34 and 37 keep their L3 type-level links: the problem page looks the lesson up in the
+    problem's own course (`practice/[lang]/[problem]/page.tsx`), so a link to `/learn/javascript/recursion` would show nothing.
+  - ✅ 2026-10-17: the 3,651-word lesson (2.3× the L1 median, comparison/javascript.md) was split into `04-recursion`
+    (2,838 words) and `05-recursion-or-loop` (2,237 words, new exercise); `working-with-data` renumbered to 06. Both are still
+    above the L1 median (1,594) because each carries a large exercise; a further split ("Walking nested data") stays optional.
 - **Git in Python**: levels.json L1 lists "Git & tooling"; Git is only taught in JS `npm-and-git`.
 - **Code review & mentoring in SQL**: none (JS, Python, TS each have one). Lower priority: SQL is a data course.
 - Who: learners who pick JS/TS as their only language. Engineers switching languages find no matching lesson.
@@ -79,7 +86,7 @@ with cheap fixes nudged up. "Who" says which audience feels it.
 ### 7. Practice links that point to the wrong lesson (or to nothing that teaches the idea)
 
 - No broken links: all 160 `lesson:` values resolve. But some don't teach what the problem needs:
-  - JS `28-deep-equal`, `33-deep-clone` (recursion) → `objects`, `spread-rest-and-optional-chaining`: JS teaches no recursion.
+  - ✅ 2026-10-11 fixed: JS `28-deep-equal`, `33-deep-clone` (and 15, 19, 29, 40, which also need recursion) → `recursion`.
   - JS `25-merge-bookings`, `31-panda-parade`, `39-grid-route` (interval merging, a visibility stack, grid BFS) → `array-methods`, `arrays`, `arrays`.
   - JS `26-first-tall-enough` (binary search), `37-spelling-suggestions` (edit distance) → L3 `measuring-performance`.
   - JS `38-tokenizer` (hard, text) → L0 `working-with-strings`; JS has no regex lesson.
@@ -96,6 +103,7 @@ with cheap fixes nudged up. "Who" says which audience feels it.
   Word counts include code, but still far above a 25-minute read plus an exercise.
 - Who: everyone planning a daily session; hurts trust in "about N min a day".
 - Fix: owner decision (open question 3). Either split long lessons/parts or raise durations (EN and RU together).
+- 2026-10-17: JS `recursion` (18m, 3,651 words) split into `recursion` (16m) + `recursion-or-loop` (14m).
 
 ### 9. Thin modules (2 lessons where siblings have 3–4)
 
@@ -117,7 +125,7 @@ with cheap fixes nudged up. "Who" says which audience feels it.
 | Missing levels                         | None. Every course has 4 levels and 4 capstones (3 parts each).                                                                  |
 | Thin levels                            | JS L0 (short lessons, 12 module lessons); otherwise levels are 15–33 lessons. Python L2 is the heaviest (9 modules, 33 lessons). |
 | Ladder deviations                      | Design patterns at L3, not L2 (all courses). JS/TS no databases at L2. TS no security/system design at L3.                       |
-| Missing prerequisites                  | Arrays before JS L1 (`for-of`); recursion/algorithms/regex never taught in JS/TS but needed by practice.                         |
+| Missing prerequisites                  | Arrays before JS L1 (`for-of`); algorithms/regex never taught in JS/TS, recursion not in TS, but needed by practice.             |
 | Lessons without Exercise               | 2 (`npm-and-git`, `pip-and-virtual-environments`).                                                                               |
 | Lessons without Quiz                   | 0.                                                                                                                               |
 | Lessons without CodeExample            | 12: 10 DOM/React/TSX lessons or capstone parts that use `TryIt` instead (fine), plus the 2 tooling lessons above.                |
