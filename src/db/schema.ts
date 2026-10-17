@@ -9,6 +9,7 @@ import {
   pgTable,
   primaryKey,
   serial,
+  smallint,
   text,
   timestamp,
   uniqueIndex,
@@ -209,11 +210,55 @@ export const telegramLink = pgTable("telegram_link", {
   /** The learner's time zone, for "today" and the evening reminder */
   timeZone: text("time_zone").notNull(),
   reminders: boolean("reminders").default(false).notNull(),
+  /** The local hour (0–23) the reminder goes out, chosen in the bot's /settings */
+  reminderHour: smallint("reminder_hour").default(20).notNull(),
+  /** "Pause N days": no reminders before this local day */
+  remindersResumeOn: date("reminders_resume_on", { mode: "string" }),
+  /** A picture message when an achievement unlocks or a course is finished */
+  pings: boolean("pings").default(true).notNull(),
   leaderboard: boolean("leaderboard").default(false).notNull(),
   /** The learner's local day of the last reminder (one a day at most) */
   lastReminded: date("last_reminded", { mode: "string" }),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
+
+/**
+ * Quiz polls the bot sent to a linked learner in a private chat (/quiz), so
+ * the answer (a poll_answer update) can earn XP and count for the quiz streak.
+ */
+export const telegramQuiz = pgTable(
+  "telegram_quiz",
+  {
+    /** Telegram's poll id */
+    pollId: text("poll_id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    /** The lesson quiz it came from, e.g. "/learn/python/loops#2" */
+    ref: text("ref").notNull(),
+    correctOption: smallint("correct_option").notNull(),
+    sentAt: timestamp("sent_at").defaultNow().notNull(),
+    /** The learner's local day of the answer; null until answered */
+    day: date("day", { mode: "string" }),
+    correct: boolean("correct"),
+  },
+  (table) => [index("telegram_quiz_user_day_idx").on(table.userId, table.day)],
+);
+
+/**
+ * Scheduled posts that already went out (the daily post, the leaderboard),
+ * so several schedulers can call the same job and it still runs once.
+ */
+export const telegramJobRun = pgTable(
+  "telegram_job_run",
+  {
+    job: text("job").notNull(),
+    /** The channel's day (Tashkent) */
+    day: date("day", { mode: "string" }).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.job, table.day] })],
+);
 
 /** One-time codes behind the "Connect Telegram" button; valid for minutes. */
 export const telegramLinkToken = pgTable("telegram_link_token", {

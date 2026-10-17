@@ -1,27 +1,37 @@
 import "server-only";
 
 import { getLanguage } from "@/lib/content";
-import {
-  clipExplanation,
-  getDailyFeed,
-  getPollQuizzes,
-} from "@/lib/daily-feed";
+import { getDailyFeed } from "@/lib/daily-feed";
 import { localizedPath, type Locale } from "@/lib/i18n";
 import { getContinue } from "@/lib/learning";
 import { getPracticeLanguages, getProblems } from "@/lib/practice";
-import { getStreakStatus } from "@/lib/progress";
+import { evaluateAchievements, getStreakStatus } from "@/lib/progress";
 import { prepareIndex, search, type Prepared } from "@/lib/search";
 import { buildSearchIndex } from "@/lib/search-index";
 import { siteUrl } from "@/lib/site";
-import { BOT_USERNAME, sendMessage, telegram } from "@/lib/telegram/api";
+import {
+  BOT_USERNAME,
+  CHANNEL_TIME_ZONE,
+  sendMessage,
+  telegram,
+} from "@/lib/telegram/api";
 import { dailyHint, dailyPost } from "@/lib/telegram/daily-post";
 import {
   getLinkByTelegramId,
+  pauseReminders,
   redeemLinkToken,
   setLinkOption,
+  setReminderHour,
   unlinkTelegram,
   type TelegramLink,
 } from "@/lib/telegram/links";
+import { pingAchievements } from "@/lib/telegram/notify";
+import {
+  getQuizStats,
+  recordPollAnswer,
+  replyToAnswer,
+  sendQuiz,
+} from "@/lib/telegram/quiz";
 import {
   botLocale,
   dayIn,
@@ -29,14 +39,19 @@ import {
   helpText,
   hintPopup,
   hintSpoiler,
+  hourKeyboard,
+  hourPrompt,
   languageEmoji,
   languageFromArg,
   linkedText,
   linkFailedText,
   nextText,
   notLinkedText,
+  parseButton,
   parseCommand,
   parseHintButton,
+  pauseKeyboard,
+  pausePrompt,
   randomText,
   settingsKeyboard,
   settingsText,
@@ -45,13 +60,14 @@ import {
   todayText,
   unlinkedText,
   type BotLocale,
+  type Settings,
 } from "@/lib/telegram/texts";
 
 /** Same order as the channel's daily post. */
 const order = ["python", "javascript", "typescript", "sql"];
 
 /** "Today" for people who haven't linked an account: the channel's clock. */
-const DEFAULT_TIME_ZONE = "Asia/Tashkent";
+const DEFAULT_TIME_ZONE = CHANNEL_TIME_ZONE;
 
 type From = { id: number; username?: string; language_code?: string };
 
@@ -65,6 +81,8 @@ export type Update = {
     message?: { chat: { id: number }; message_id: number };
   };
   inline_query?: { id: string; from: From; query: string };
+  /** An answer to a quiz poll the bot sent (only from non-anonymous polls) */
+  poll_answer?: { poll_id: string; user?: From; option_ids: number[] };
 };
 
 const url = (path: string, locale: Locale) =>
@@ -79,6 +97,7 @@ export async function handleUpdate(update: Update) {
     );
   if (update.callback_query) return onButton(update.callback_query);
   if (update.inline_query) return onInlineQuery(update.inline_query);
+  if (update.poll_answer) return onPollAnswer(update.poll_answer);
 }
 
 async function onMessage(
@@ -136,7 +155,7 @@ async function onMessage(
       }
     }
     case "quiz":
-      return sendQuiz(chat.id, locale);
+      return sendQuiz(chat.id, locale, link);
     case "random":
       return reply(randomProblem(locale, parsed.arg));
     case "streak":
@@ -158,8 +177,8 @@ async function onMessage(
     }
     case "settings":
       if (!link) return reply(notLinkedText(locale, profile));
-      return reply(settingsText(locale, link), {
-        reply_markup: settingsKeyboard(locale, link),
+      return reply(settingsText(locale, settingsOf(link)), {
+        reply_markup: settingsKeyboard(locale, settingsOf(link)),
       });
     default:
       return reply(
@@ -185,22 +204,6 @@ function today(locale: BotLocale, link: TelegramLink | null) {
   );
 }
 
-async function sendQuiz(chatId: number, locale: BotLocale) {
-  const quizzes = getPollQuizzes();
-  const pick = quizzes[Math.floor(Math.random() * quizzes.length)];
-  if (!pick) return;
-  const quiz = pick[locale];
-  await telegram("sendPoll", {
-    chat_id: chatId,
-    question: quiz.question,
-    options: quiz.options.map((text) => ({ text })),
-    type: "quiz",
-    correct_option_id: quiz.answer,
-    explanation: clipExplanation(quiz.explanation),
-    is_anonymous: false,
-  });
-}
-
 function randomProblem(locale: BotLocale, arg: string) {
   const all = getPracticeLanguages();
   const asked = languageFromArg(arg);
@@ -223,16 +226,61 @@ function randomProblem(locale: BotLocale, arg: string) {
 }
 
 async function streak(link: TelegramLink) {
-  const { streak, ...status } = await getStreakStatus(
-    link.userId,
-    link.timeZone,
-  );
+  const [{ streak, ...status }, quiz] = await Promise.all([
+    getStreakStatus(link.userId, link.timeZone),
+    getQuizStats(link.userId, link.timeZone),
+  ]);
   return streakText(link.locale as BotLocale, {
     ...status,
     current: streak.current,
     longest: streak.longest,
     activeToday: streak.activeToday,
+    quiz,
   });
+}
+
+function addDays(day: string, n: number) {
+  const d = new Date(`${day}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+/** What /settings shows; a pause that has ended doesn't count. */
+function settingsOf(link: TelegramLink): Settings {
+  const today = dayIn(link.timeZone);
+  return {
+    reminders: link.reminders,
+    reminderHour: link.reminderHour,
+    pausedUntil:
+      link.remindersResumeOn && link.remindersResumeOn > today
+        ? link.remindersResumeOn
+        : null,
+    pings: link.pings,
+    leaderboard: link.leaderboard,
+  };
+}
+
+/** A quiz answered: XP, the reply, and a picture for any badge it unlocked. */
+async function onPollAnswer(answer: NonNullable<Update["poll_answer"]>) {
+  if (!answer.user) return;
+  const link = await getLinkByTelegramId(answer.user.id);
+  const result = await recordPollAnswer(
+    answer.poll_id,
+    answer.option_ids,
+    link,
+  );
+  if (!link || !result) return;
+  await replyToAnswer(link, result);
+  if (result.xp > 0) {
+    const { newAchievements } = await evaluateAchievements(
+      link.userId,
+      link.timeZone,
+    );
+    await pingAchievements(
+      link.userId,
+      newAchievements.map((a) => a.id),
+    );
+  }
 }
 
 async function onButton(query: NonNullable<Update["callback_query"]>) {
@@ -255,32 +303,64 @@ async function onButton(query: NonNullable<Update["callback_query"]>) {
     });
   }
   const message = query.message;
-  if (!link || !message) {
+  const button = parseButton(query.data);
+  // "Quick quiz" under a reminder, "Another question" under an answer.
+  if (button?.kind === "quiz" && message) {
+    const locale = link
+      ? (link.locale as BotLocale)
+      : botLocale(query.from.language_code);
+    await telegram("answerCallbackQuery", { callback_query_id: query.id });
+    return sendQuiz(message.chat.id, locale, link);
+  }
+  if (!link || !message || !button) {
     return telegram("answerCallbackQuery", { callback_query_id: query.id });
   }
   const locale = link.locale as BotLocale;
-  if (query.data === "unlink") {
-    await unlinkTelegram(query.from.id);
-    await telegram("editMessageText", {
+  const edit = (text: string, reply_markup?: object) =>
+    telegram("editMessageText", {
       chat_id: message.chat.id,
       message_id: message.message_id,
-      text: unlinkedText(locale),
-    });
-  } else if (
-    query.data === "toggle:reminders" ||
-    query.data === "toggle:leaderboard"
-  ) {
-    const option =
-      query.data === "toggle:reminders" ? "reminders" : "leaderboard";
-    const settings = { ...link, [option]: !link[option] };
-    await setLinkOption(link.userId, option, settings[option]);
-    await telegram("editMessageText", {
-      chat_id: message.chat.id,
-      message_id: message.message_id,
-      text: settingsText(locale, settings),
+      text,
       parse_mode: "HTML",
-      reply_markup: settingsKeyboard(locale, settings),
+      ...(reply_markup ? { reply_markup } : {}),
     });
+  const showSettings = (settings: Settings) =>
+    edit(settingsText(locale, settings), settingsKeyboard(locale, settings));
+  const current = settingsOf(link);
+
+  switch (button.kind) {
+    case "unlink":
+      await unlinkTelegram(query.from.id);
+      await edit(unlinkedText(locale));
+      break;
+    case "toggle": {
+      const value = !current[button.option];
+      await setLinkOption(link.userId, button.option, value);
+      await showSettings({ ...current, [button.option]: value });
+      break;
+    }
+    case "menu":
+      if (button.menu === "hour")
+        await edit(hourPrompt(locale), hourKeyboard(locale, link.reminderHour));
+      else if (button.menu === "pause")
+        await edit(pausePrompt(locale), pauseKeyboard(locale));
+      else await showSettings(current);
+      break;
+    case "hour":
+      await setReminderHour(link.userId, button.hour);
+      await showSettings({
+        ...current,
+        reminders: true,
+        reminderHour: button.hour,
+      });
+      break;
+    case "pause": {
+      const resumeOn =
+        button.days > 0 ? addDays(dayIn(link.timeZone), button.days) : null;
+      await pauseReminders(link.userId, resumeOn);
+      await showSettings({ ...current, pausedUntil: resumeOn });
+      break;
+    }
   }
   return telegram("answerCallbackQuery", { callback_query_id: query.id });
 }

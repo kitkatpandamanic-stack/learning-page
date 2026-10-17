@@ -115,6 +115,7 @@ export default async function DashboardPage({
     if (reason === "other") return t("recent.other");
     if (reason === "review") return t("recent.review");
     if (reason === "daily") return t("recent.daily");
+    if (reason === "telegram") return t("recent.telegram");
     return title
       ? t(`recent.${reason}`, { title })
       : t(`recent.${reason}Unknown`);

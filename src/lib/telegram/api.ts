@@ -5,6 +5,8 @@ export const BOT_USERNAME =
   process.env.NEXT_PUBLIC_TELEGRAM_BOT ?? "panda_learning_bot";
 /** The channel the weekly leaderboard is posted to. */
 export const CHANNEL = process.env.TELEGRAM_CHANNEL ?? "@Kitkatpandamanic";
+/** The channel's clock: the daily post and the leaderboard go by Tashkent time. */
+export const CHANNEL_TIME_ZONE = "Asia/Tashkent";
 
 export const telegramConfigured = Boolean(process.env.TELEGRAM_BOT_TOKEN);
 

@@ -1,5 +1,7 @@
 "use server";
 
+import { after } from "next/server";
+
 import { getAllLessons } from "@/lib/content";
 import { DAILY_BONUS_XP, dailyProblem } from "@/lib/daily";
 import { getAllProblems, getDailyCandidates } from "@/lib/practice";
@@ -14,6 +16,7 @@ import {
 import { createRateLimiter } from "@/lib/rate-limit";
 import { recordSecurityEvent } from "@/lib/security-events";
 import { getSession } from "@/lib/session";
+import { pingIfCourseFinished } from "@/lib/telegram/notify";
 
 /** A learner finishes a few things a minute; a script trying thousands doesn't get far. */
 const allowAward = createRateLimiter(30, 60_000);
@@ -50,7 +53,8 @@ export async function completeLesson(
 
   const userId = session.user.id;
   const awarded = await awardXp(userId, "lesson", lesson.permalink, lesson.xp);
-  await markLessonComplete(userId, language, slug);
+  if (await markLessonComplete(userId, language, slug))
+    after(() => pingIfCourseFinished(userId, language));
   return summarizeAward(userId, awarded ? lesson.xp : 0);
 }
 

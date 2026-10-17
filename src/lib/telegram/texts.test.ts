@@ -12,9 +12,16 @@ import {
   languageFromArg,
   leaderboardText,
   localHour,
+  hoursUntilMidnight,
+  hourKeyboard,
+  parseButton,
   parseCommand,
   parseHintButton,
+  pingCaption,
+  quizAnswerText,
   reminderText,
+  settingsKeyboard,
+  settingsText,
   streakText,
 } from "@/lib/telegram/texts";
 
@@ -102,13 +109,132 @@ describe("writing messages", () => {
   });
 
   it("mentions freezes in reminders only when there are some", () => {
-    const url = "https://x.test/practice";
-    expect(reminderText("en", { streak: 4, freezes: 0, url })).not.toContain(
-      "freeze",
+    const r = {
+      streak: 4,
+      best: 9,
+      hoursLeft: 4,
+      url: "https://x.test/practice",
+    };
+    expect(reminderText("en", { ...r, freezes: 0 })).not.toContain("freeze");
+    expect(reminderText("en", { ...r, freezes: 2 })).toContain("2 freezes");
+  });
+
+  it("says how long is left, and when today would be a record", () => {
+    const r = { streak: 5, best: 5, freezes: 0, hoursLeft: 4, url: "u" };
+    expect(reminderText("en", r)).toContain("less than 4 hours until midnight");
+    expect(reminderText("en", r)).toContain("new record: 6 days");
+    expect(reminderText("en", { ...r, best: 8 })).not.toContain("record");
+    expect(reminderText("ru", { ...r, hoursLeft: 1 })).toContain(
+      "до полуночи меньше часа",
     );
-    expect(reminderText("en", { streak: 4, freezes: 2, url })).toContain(
-      "2 freezes",
+    expect(reminderText("ru", r)).toContain("новый рекорд: 6 дней");
+  });
+
+  it("counts the hours to midnight on the learner's clock", () => {
+    const at = new Date("2026-10-12T15:30:00Z");
+    expect(hoursUntilMidnight("UTC", at)).toBe(9);
+    expect(hoursUntilMidnight("Asia/Tashkent", at)).toBe(4); // 20:30
+    expect(hoursUntilMidnight("UTC", new Date("2026-10-12T23:59:00Z"))).toBe(1);
+  });
+
+  it("adds the bot's quizzes to /streak", () => {
+    const base = {
+      current: 2,
+      longest: 2,
+      activeToday: true,
+      totalXp: 10,
+      level: 1,
+      todayXp: 10,
+      dailyGoal: 50,
+      freezes: 0,
+    };
+    expect(streakText("en", base)).toContain("/quiz: +5 XP");
+    const quiz = { answered: 5, correct: 4, streak: 3 };
+    expect(streakText("en", { ...base, quiz })).toContain(
+      "4/5 right this week · quiz streak 3 days",
     );
+    expect(streakText("ru", { ...base, quiz })).toContain(
+      "4/5 верно за неделю · серия 3 дня",
+    );
+  });
+
+  it("answers quiz answers in both languages", () => {
+    const stats = { answered: 2, correct: 1, streak: 1 };
+    expect(
+      quizAnswerText("en", { correct: true, xp: 5, answer: "", stats }),
+    ).toContain("+5 XP");
+    expect(
+      quizAnswerText("ru", { correct: true, xp: 0, answer: "", stats }),
+    ).toContain("XP за квизы на сегодня уже получены");
+    expect(
+      quizAnswerText("ru", { correct: false, xp: 0, answer: "<i>", stats }),
+    ).toContain("Ответ: <b>&lt;i&gt;</b>");
+  });
+
+  it("writes achievement and course captions", () => {
+    expect(
+      pingCaption("ru", {
+        kind: "achievement",
+        emoji: "🔥",
+        title: "В ударе",
+        description: "Занимайтесь 3 дня подряд",
+      }),
+    ).toContain("Новое достижение: В ударе");
+    expect(pingCaption("en", { kind: "course", name: "Python" })).toContain(
+      "You finished the Python course!",
+    );
+  });
+});
+
+describe("settings", () => {
+  const s = {
+    reminders: true,
+    reminderHour: 8,
+    pausedUntil: null,
+    pings: true,
+    leaderboard: false,
+  };
+
+  it("shows the reminder time, a pause and every option", () => {
+    expect(settingsText("en", s)).toContain("<b>on</b>, at <b>08:00</b>");
+    const paused = settingsText("ru", { ...s, pausedUntil: "2026-10-20" });
+    expect(paused).toContain("в <b>08:00</b>");
+    expect(paused).toContain("На паузе, снова с 20 октября");
+    expect(settingsText("en", { ...s, reminders: false })).not.toContain(
+      "08:00",
+    );
+  });
+
+  it("offers time and pause buttons only while reminders are on", () => {
+    const on = JSON.stringify(settingsKeyboard("en", s));
+    expect(on).toContain("menu:hour");
+    expect(on).toContain("menu:pause");
+    expect(on).toContain("toggle:pings");
+    const paused = JSON.stringify(
+      settingsKeyboard("en", { ...s, pausedUntil: "2026-10-20" }),
+    );
+    expect(paused).toContain("pause:0");
+    const off = JSON.stringify(
+      settingsKeyboard("en", { ...s, reminders: false }),
+    );
+    expect(off).not.toContain("menu:hour");
+    expect(JSON.stringify(hourKeyboard("en", 20))).toContain("✓ 20:00");
+  });
+
+  it("reads only the buttons it made", () => {
+    expect(parseButton("hour:21")).toEqual({ kind: "hour", hour: 21 });
+    expect(parseButton("hour:3")).toBeNull();
+    expect(parseButton("pause:7")).toEqual({ kind: "pause", days: 7 });
+    expect(parseButton("pause:0")).toEqual({ kind: "pause", days: 0 });
+    expect(parseButton("pause:30")).toBeNull();
+    expect(parseButton("toggle:pings")).toEqual({
+      kind: "toggle",
+      option: "pings",
+    });
+    expect(parseButton("toggle:admin")).toBeNull();
+    expect(parseButton("menu:hour")).toEqual({ kind: "menu", menu: "hour" });
+    expect(parseButton("quiz")).toEqual({ kind: "quiz" });
+    expect(parseButton(undefined)).toBeNull();
   });
 });
 

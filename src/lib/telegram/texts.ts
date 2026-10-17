@@ -99,19 +99,19 @@ const days = (n: number, locale: BotLocale) =>
 const commands = {
   en: [
     "/today: the problem of the day",
-    "/quiz: a quiz question from the lessons",
+    "/quiz: a quiz question (+5 XP when you're right)",
     "/random python: a random practice problem (python, js, ts or sql)",
     "/streak: your streak and XP",
     "/next: where you left off",
-    "/settings: reminders and the weekly leaderboard",
+    "/settings: reminders (time, pause) and the weekly leaderboard",
   ],
   ru: [
     "/today: задача дня",
-    "/quiz: вопрос из уроков",
+    "/quiz: вопрос из уроков (+5 XP за верный ответ)",
     "/random python: случайная задача (python, js, ts или sql)",
     "/streak: ваша серия и XP",
     "/next: где вы остановились",
-    "/settings: напоминания и рейтинг недели",
+    "/settings: напоминания (время, пауза) и рейтинг недели",
   ],
 };
 
@@ -190,7 +190,31 @@ export type StreakInfo = {
   todayXp: number;
   dailyGoal: number;
   freezes: number;
+  /** Quiz polls answered in the bot */
+  quiz?: QuizStats;
 };
+
+export type QuizStats = {
+  /** The last 7 days, today included */
+  answered: number;
+  correct: number;
+  /** Days in a row with a right answer in the bot */
+  streak: number;
+};
+
+function quizLine(locale: BotLocale, q?: QuizStats) {
+  if (!q || (q.answered === 0 && q.streak === 0))
+    return locale === "ru"
+      ? "🧠 /quiz: +5 XP за каждый верный ответ"
+      : "🧠 /quiz: +5 XP for each right answer";
+  const streak =
+    q.streak > 0
+      ? ` · ${locale === "ru" ? "серия" : "quiz streak"} ${days(q.streak, locale)}`
+      : "";
+  return locale === "ru"
+    ? `🧠 Квизы в боте: ${q.correct}/${q.answered} верно за неделю${streak}`
+    : `🧠 Bot quizzes: ${q.correct}/${q.answered} right this week${streak}`;
+}
 
 export function streakText(locale: BotLocale, s: StreakInfo) {
   const goal = Math.min(s.todayXp, s.dailyGoal);
@@ -202,6 +226,7 @@ export function streakText(locale: BotLocale, s: StreakInfo) {
       `⭐ Уровень ${s.level} · ${s.totalXp} XP`,
       `🎯 Сегодня: ${goal}/${s.dailyGoal} XP${done ? " ✅" : ""}`,
       `🧊 Заморозки: ${s.freezes}`,
+      quizLine(locale, s.quiz),
     ].join("\n");
   }
   return [
@@ -210,6 +235,7 @@ export function streakText(locale: BotLocale, s: StreakInfo) {
     `⭐ Level ${s.level} · ${s.totalXp} XP`,
     `🎯 Today: ${goal}/${s.dailyGoal} XP${done ? " ✅" : ""}`,
     `🧊 Freezes: ${s.freezes}`,
+    quizLine(locale, s.quiz),
   ].join("\n");
 }
 
@@ -243,8 +269,8 @@ export function nextText(
 
 export function linkedText(locale: BotLocale, name: string) {
   return locale === "ru"
-    ? `✅ Готово, ${escapeHtml(name)}! Telegram подключён к PandaDev.\n\nТеперь работают /streak и /next. В /settings можно включить вечерние напоминания и рейтинг недели.`
-    : `✅ Done, ${escapeHtml(name)}! Telegram is connected to PandaDev.\n\n/streak and /next work now. Turn on evening reminders and the weekly leaderboard in /settings.`;
+    ? `✅ Готово, ${escapeHtml(name)}! Telegram подключён к PandaDev.\n\nТеперь работают /streak и /next, а за верные ответы в /quiz начисляются XP. В /settings можно включить напоминания (и выбрать время) и рейтинг недели.`
+    : `✅ Done, ${escapeHtml(name)}! Telegram is connected to PandaDev.\n\n/streak and /next work now, and right answers in /quiz earn XP. Turn on reminders (at a time you pick) and the weekly leaderboard in /settings.`;
 }
 
 export function linkFailedText(locale: BotLocale) {
@@ -259,37 +285,83 @@ export function takenText(locale: BotLocale) {
     : "This Telegram account is already connected to another PandaDev account. Disconnect it there first (/settings → Disconnect).";
 }
 
-export type Settings = { reminders: boolean; leaderboard: boolean };
+export type Settings = {
+  reminders: boolean;
+  /** Local hour of the reminder, 0–23 */
+  reminderHour: number;
+  /** Reminders are paused before this local day (null: not paused) */
+  pausedUntil: string | null;
+  pings: boolean;
+  leaderboard: boolean;
+};
+
+/** The hours offered for the reminder. */
+export const REMINDER_HOUR_CHOICES = [8, 10, 12, 14, 16, 18, 19, 20, 21, 22];
+/** "Pause reminders" lengths, in days. */
+export const PAUSE_CHOICES = [1, 3, 7];
+
+const clock = (hour: number) => `${String(hour).padStart(2, "0")}:00`;
+const onOff = (locale: BotLocale, on: boolean) =>
+  locale === "ru" ? (on ? "вкл" : "выкл") : on ? "on" : "off";
 
 export function settingsText(locale: BotLocale, s: Settings) {
-  return locale === "ru"
-    ? [
-        "⚙️ <b>Настройки</b>",
-        "",
-        `🔔 Вечернее напоминание (с 20:00), если серия под угрозой: <b>${s.reminders ? "вкл" : "выкл"}</b>`,
-        `🏆 Ваше имя в рейтинге недели на канале: <b>${s.leaderboard ? "вкл" : "выкл"}</b>`,
-      ].join("\n")
-    : [
-        "⚙️ <b>Settings</b>",
-        "",
-        `🔔 An evening reminder (from 8 pm) when your streak is at risk: <b>${s.reminders ? "on" : "off"}</b>`,
-        `🏆 Your name on the channel's weekly leaderboard: <b>${s.leaderboard ? "on" : "off"}</b>`,
-      ].join("\n");
+  const ru = locale === "ru";
+  const reminder = ru
+    ? `🔔 Напоминание, если серия под угрозой: <b>${onOff(locale, s.reminders)}</b>${s.reminders ? `, в <b>${clock(s.reminderHour)}</b>` : ""}`
+    : `🔔 A reminder when your streak is at risk: <b>${onOff(locale, s.reminders)}</b>${s.reminders ? `, at <b>${clock(s.reminderHour)}</b>` : ""}`;
+  const paused =
+    s.reminders && s.pausedUntil
+      ? ru
+        ? `⏸ На паузе, снова с ${dayLabel(locale, s.pausedUntil)}`
+        : `⏸ Paused, back on ${dayLabel(locale, s.pausedUntil)}`
+      : null;
+  return [
+    ru ? "⚙️ <b>Настройки</b>" : "⚙️ <b>Settings</b>",
+    "",
+    reminder,
+    ...(paused ? [paused] : []),
+    ru
+      ? `🏅 Сообщение о новом достижении: <b>${onOff(locale, s.pings)}</b>`
+      : `🏅 A message when you unlock an achievement: <b>${onOff(locale, s.pings)}</b>`,
+    ru
+      ? `🏆 Ваше имя в рейтинге недели на канале: <b>${onOff(locale, s.leaderboard)}</b>`
+      : `🏆 Your name on the channel's weekly leaderboard: <b>${onOff(locale, s.leaderboard)}</b>`,
+  ].join("\n");
 }
 
 export function settingsKeyboard(locale: BotLocale, s: Settings) {
   const ru = locale === "ru";
+  const reminderRow = s.reminders
+    ? [
+        [
+          { text: `🕗 ${clock(s.reminderHour)}`, callback_data: "menu:hour" },
+          s.pausedUntil
+            ? {
+                text: ru ? "▶️ Снять паузу" : "▶️ Resume",
+                callback_data: "pause:0",
+              }
+            : { text: ru ? "⏸ Пауза" : "⏸ Pause", callback_data: "menu:pause" },
+        ],
+      ]
+    : [];
   return {
     inline_keyboard: [
       [
         {
-          text: `🔔 ${ru ? "Напоминания" : "Reminders"}: ${s.reminders ? (ru ? "вкл" : "on") : ru ? "выкл" : "off"}`,
+          text: `🔔 ${ru ? "Напоминания" : "Reminders"}: ${onOff(locale, s.reminders)}`,
           callback_data: "toggle:reminders",
+        },
+      ],
+      ...reminderRow,
+      [
+        {
+          text: `🏅 ${ru ? "Достижения" : "Achievements"}: ${onOff(locale, s.pings)}`,
+          callback_data: "toggle:pings",
         },
       ],
       [
         {
-          text: `🏆 ${ru ? "Рейтинг" : "Leaderboard"}: ${s.leaderboard ? (ru ? "вкл" : "on") : ru ? "выкл" : "off"}`,
+          text: `🏆 ${ru ? "Рейтинг" : "Leaderboard"}: ${onOff(locale, s.leaderboard)}`,
           callback_data: "toggle:leaderboard",
         },
       ],
@@ -303,28 +375,234 @@ export function settingsKeyboard(locale: BotLocale, s: Settings) {
   };
 }
 
+const backButton = (locale: BotLocale) => ({
+  text: locale === "ru" ? "« Назад" : "« Back",
+  callback_data: "menu:main",
+});
+
+/** "At what time?": the hours, five to a row, the current one ticked. */
+export function hourKeyboard(locale: BotLocale, current: number) {
+  const buttons = REMINDER_HOUR_CHOICES.map((hour) => ({
+    text: `${hour === current ? "✓ " : ""}${clock(hour)}`,
+    callback_data: `hour:${hour}`,
+  }));
+  return {
+    inline_keyboard: [
+      buttons.slice(0, 5),
+      buttons.slice(5),
+      [backButton(locale)],
+    ],
+  };
+}
+
+export function pauseKeyboard(locale: BotLocale) {
+  return {
+    inline_keyboard: [
+      PAUSE_CHOICES.map((n) => ({
+        text: days(n, locale),
+        callback_data: `pause:${n}`,
+      })),
+      [backButton(locale)],
+    ],
+  };
+}
+
+export function hourPrompt(locale: BotLocale) {
+  return locale === "ru"
+    ? "🕗 В какое время напоминать? Время ваше, местное."
+    : "🕗 What time should the reminder come? Your local time.";
+}
+
+export function pausePrompt(locale: BotLocale) {
+  return locale === "ru"
+    ? "⏸ На сколько поставить напоминания на паузу? Серия от этого не защищена: для неё есть заморозки."
+    : "⏸ Pause reminders for how long? This doesn't protect your streak: freezes do that.";
+}
+
+export type SettingsButton =
+  | { kind: "toggle"; option: "reminders" | "pings" | "leaderboard" }
+  | { kind: "menu"; menu: "main" | "hour" | "pause" }
+  | { kind: "hour"; hour: number }
+  | { kind: "pause"; days: number }
+  | { kind: "unlink" }
+  | { kind: "quiz" };
+
+/** The buttons under /settings, reminders and quiz answers. */
+export function parseButton(data?: string): SettingsButton | null {
+  if (data === "unlink") return { kind: "unlink" };
+  if (data === "quiz") return { kind: "quiz" };
+  const [kind, value] = (data ?? "").split(":");
+  if (
+    kind === "toggle" &&
+    (value === "reminders" || value === "pings" || value === "leaderboard")
+  )
+    return { kind, option: value };
+  if (
+    kind === "menu" &&
+    (value === "main" || value === "hour" || value === "pause")
+  )
+    return { kind, menu: value };
+  if (kind === "hour" && REMINDER_HOUR_CHOICES.includes(Number(value)))
+    return { kind, hour: Number(value) };
+  if (
+    kind === "pause" &&
+    (value === "0" || PAUSE_CHOICES.includes(Number(value)))
+  )
+    return { kind, days: Number(value) };
+  return null;
+}
+
 export function unlinkedText(locale: BotLocale) {
   return locale === "ru"
     ? "Telegram отключён от PandaDev. Подключить снова можно в профиле."
     : "Telegram is disconnected from PandaDev. You can connect it again on your profile.";
 }
 
-export function reminderText(
-  locale: BotLocale,
-  { streak, freezes, url }: { streak: number; freezes: number; url: string },
-) {
+export type Reminder = {
+  streak: number;
+  /** The learner's best streak */
+  best: number;
+  freezes: number;
+  /** Whole hours left until midnight, rounded up (1–24) */
+  hoursLeft: number;
+  url: string;
+};
+
+export function reminderText(locale: BotLocale, r: Reminder) {
   if (locale === "ru") {
-    const freeze =
-      freezes > 0
-        ? `\n🧊 Заморозка есть (${freezes}), но лучше не тратить её.`
+    const left =
+      r.hoursLeft <= 1 ? "меньше часа" : `меньше ${r.hoursLeft} часов`;
+    const record =
+      r.streak >= r.best
+        ? `\n🏅 Позанимайтесь сегодня, и это новый рекорд: ${days(r.streak + 1, locale)}.`
         : "";
-    return `🔥 Ваша серия ${days(streak, locale)} закончится в полночь.\nОдно упражнение, и она продолжится: ${a(url, "задача дня")}.${freeze}`;
+    const freeze =
+      r.freezes > 0
+        ? `\n🧊 Заморозка есть (${r.freezes}), но лучше не тратить её.`
+        : "";
+    return `🔥 Ваша серия ${days(r.streak, locale)} под угрозой: до полуночи ${left}.\nХватит одного упражнения (${a(r.url, "задача дня")}) или верного ответа в квизе ниже.${record}${freeze}`;
   }
-  const freeze =
-    freezes > 0
-      ? `\n🧊 You have ${freezes} freeze${freezes > 1 ? "s" : ""}, but save it for a day you really need it.`
+  const left =
+    r.hoursLeft <= 1 ? "less than an hour" : `less than ${r.hoursLeft} hours`;
+  const record =
+    r.streak >= r.best
+      ? `\n🏅 Practise today for a new record: ${days(r.streak + 1, locale)}.`
       : "";
-  return `🔥 Your ${days(streak, locale)} streak ends at midnight.\nOne exercise keeps it going: ${a(url, "the problem of the day")}.${freeze}`;
+  const freeze =
+    r.freezes > 0
+      ? `\n🧊 You have ${r.freezes} freeze${r.freezes > 1 ? "s" : ""}, but save it for a day you really need it.`
+      : "";
+  return `🔥 Your ${days(r.streak, locale)} streak is at risk: ${left} until midnight.\nOne exercise (${a(r.url, "the problem of the day")}) or one right quiz answer below keeps it going.${record}${freeze}`;
+}
+
+/** Under a reminder: a quiz right here, or the problem on the site. */
+export function reminderKeyboard(locale: BotLocale, url: string) {
+  const ru = locale === "ru";
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: ru ? "🧠 Быстрый квиз" : "🧠 Quick quiz",
+          callback_data: "quiz",
+        },
+        { text: ru ? "🧩 Задача дня" : "🧩 Problem of the day", url },
+      ],
+    ],
+  };
+}
+
+/** Whole hours until local midnight, rounded up. */
+export function hoursUntilMidnight(timeZone: string, now = new Date()) {
+  const [hour, minute] = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "numeric",
+    minute: "numeric",
+    hourCycle: "h23",
+  })
+    .format(now)
+    .split(":")
+    .map(Number);
+  return Math.max(1, Math.ceil((24 * 60 - (hour * 60 + minute)) / 60));
+}
+
+// ---------------------------------------------------------------------------
+// Quiz answers and achievement messages
+// ---------------------------------------------------------------------------
+
+export function quizAnswerText(
+  locale: BotLocale,
+  r: {
+    correct: boolean;
+    /** XP this answer earned (0 once today's quiz XP is used up) */
+    xp: number;
+    /** The right option's text, for a wrong answer */
+    answer: string;
+    stats: QuizStats;
+  },
+) {
+  const ru = locale === "ru";
+  const week = ru
+    ? `${r.stats.correct}/${r.stats.answered} верно за неделю`
+    : `${r.stats.correct}/${r.stats.answered} right this week`;
+  if (!r.correct)
+    return ru
+      ? `❌ Не в этот раз. Ответ: <b>${escapeHtml(r.answer)}</b>\n${week}`
+      : `❌ Not this time. The answer: <b>${escapeHtml(r.answer)}</b>\n${week}`;
+  const head =
+    r.xp > 0
+      ? ru
+        ? `✅ Верно! <b>+${r.xp} XP</b>`
+        : `✅ Right! <b>+${r.xp} XP</b>`
+      : ru
+        ? "✅ Верно! XP за квизы на сегодня уже получены, но серия считается."
+        : "✅ Right! Today's quiz XP is already yours, but the streak still counts.";
+  const streak = ru
+    ? `🔥 Серия квизов: ${days(r.stats.streak, locale)} · ${week}`
+    : `🔥 Quiz streak: ${days(r.stats.streak, locale)} · ${week}`;
+  return `${head}\n${streak}`;
+}
+
+export function anotherQuizKeyboard(locale: BotLocale) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: locale === "ru" ? "🧠 Ещё вопрос" : "🧠 Another question",
+          callback_data: "quiz",
+        },
+      ],
+    ],
+  };
+}
+
+/** The caption under an achievement or finished-course picture. */
+export function pingCaption(
+  locale: BotLocale,
+  ping:
+    | { kind: "achievement"; emoji: string; title: string; description: string }
+    | { kind: "course"; name: string },
+) {
+  const ru = locale === "ru";
+  if (ping.kind === "course")
+    return ru
+      ? `🎓 <b>Курс ${escapeHtml(ping.name)} пройден!</b>\nВсе уроки позади. Чтобы не забыть, заглядывайте в /quiz и ежедневное повторение.`
+      : `🎓 <b>You finished the ${escapeHtml(ping.name)} course!</b>\nEvery lesson, done. Keep it fresh with /quiz and the daily review.`;
+  return ru
+    ? `${ping.emoji} <b>Новое достижение: ${escapeHtml(ping.title)}</b>\n${escapeHtml(ping.description)}.`
+    : `${ping.emoji} <b>Achievement unlocked: ${escapeHtml(ping.title)}</b>\n${escapeHtml(ping.description)}.`;
+}
+
+export function pingKeyboard(locale: BotLocale, url: string) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: locale === "ru" ? "🏅 Все достижения" : "🏅 All achievements",
+          url,
+        },
+      ],
+    ],
+  };
 }
 
 export type LeaderboardEntry = { name: string; xp: number };

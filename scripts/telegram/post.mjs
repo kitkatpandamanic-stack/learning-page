@@ -8,6 +8,10 @@
 //
 // The site builds the post (/api/telegram/daily-post), so it always matches
 // the problems of the day there.
+//
+// Normally the site sends the post itself (/api/telegram/cron?job=daily-post,
+// once a day). Sending from here skips that once-a-day check: use --preview,
+// or send by hand only when the scheduled post didn't go out.
 import { CHAT, loadEnv, SITE, telegram, today } from "./lib.mjs";
 
 loadEnv();

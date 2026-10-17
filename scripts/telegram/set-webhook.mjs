@@ -10,20 +10,20 @@ loadEnv();
 const commands = {
   en: [
     ["today", "Problem of the day"],
-    ["quiz", "A quiz question from the lessons"],
+    ["quiz", "A quiz question (+5 XP when you're right)"],
     ["random", "A random practice problem (add python, js, ts or sql)"],
     ["streak", "Your streak and XP"],
     ["next", "Where you left off"],
-    ["settings", "Reminders and the weekly leaderboard"],
+    ["settings", "Reminders (time, pause) and the leaderboard"],
     ["help", "What the bot can do"],
   ],
   ru: [
     ["today", "Задача дня"],
-    ["quiz", "Вопрос из уроков"],
+    ["quiz", "Вопрос из уроков (+5 XP за верный ответ)"],
     ["random", "Случайная задача (python, js, ts или sql)"],
     ["streak", "Ваша серия и XP"],
     ["next", "Где вы остановились"],
-    ["settings", "Напоминания и рейтинг недели"],
+    ["settings", "Напоминания (время, пауза) и рейтинг"],
     ["help", "Что умеет бот"],
   ],
 };
@@ -32,12 +32,12 @@ const about = {
   en: {
     short:
       "Learn to code a few minutes a day: problem of the day, quizzes, streaks. pandadev-chi.vercel.app",
-    long: "🐼 PandaDev's bot: the problem of the day, quiz questions, random practice problems, your streak and an evening reminder. Free. Connect your account on your PandaDev profile.",
+    long: "🐼 PandaDev's bot: the problem of the day, quiz questions that earn XP, random practice problems, your streak and a reminder at the time you pick. Free. Connect your account on your PandaDev profile.",
   },
   ru: {
     short:
       "Учитесь программировать по паре минут в день: задача дня, квизы, серии. pandadev-chi.vercel.app",
-    long: "🐼 Бот PandaDev: задача дня, вопросы-квизы, случайные задачи, ваша серия и вечернее напоминание. Бесплатно. Подключите аккаунт в профиле на PandaDev.",
+    long: "🐼 Бот PandaDev: задача дня, квизы с XP, случайные задачи, ваша серия и напоминание в удобное время. Бесплатно. Подключите аккаунт в профиле на PandaDev.",
   },
 };
 
@@ -60,7 +60,13 @@ if (process.argv.includes("--check")) {
   await telegram("setWebhook", {
     url: `${SITE}/api/telegram/webhook`,
     secret_token: secret,
-    allowed_updates: ["message", "callback_query", "inline_query"],
+    // poll_answer: answers to /quiz polls, which earn XP.
+    allowed_updates: [
+      "message",
+      "callback_query",
+      "inline_query",
+      "poll_answer",
+    ],
     drop_pending_updates: true,
   });
   console.log(`✓ webhook → ${SITE}/api/telegram/webhook`);
