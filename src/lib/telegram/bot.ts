@@ -26,6 +26,7 @@ import {
   type TelegramLink,
 } from "@/lib/telegram/links";
 import { pingAchievements } from "@/lib/telegram/notify";
+import { leagueParam, registerGroup, setWeeklyPost } from "@/lib/tg-app/league";
 import {
   getQuizStats,
   recordPollAnswer,
@@ -44,6 +45,10 @@ import {
   hourPrompt,
   languageEmoji,
   languageFromArg,
+  leagueAdminsOnlyText,
+  leagueGroupMessage,
+  leaguePrivateText,
+  leagueToggledText,
   linkedText,
   linkFailedText,
   nextText,
@@ -74,7 +79,11 @@ type From = { id: number; username?: string; language_code?: string };
 
 /** The parts of a Telegram update the bot uses. */
 export type Update = {
-  message?: { chat: { id: number; type: string }; from?: From; text?: string };
+  message?: {
+    chat: { id: number; type: string; title?: string };
+    from?: From;
+    text?: string;
+  };
   callback_query?: {
     id: string;
     from: From;
@@ -102,7 +111,7 @@ export async function handleUpdate(update: Update) {
 }
 
 async function onMessage(
-  chat: { id: number; type: string },
+  chat: { id: number; type: string; title?: string },
   from: From,
   text: string,
 ) {
@@ -119,6 +128,9 @@ async function onMessage(
 
   switch (parsed?.command) {
     case "start":
+      // t.me/<bot>?startgroup=league: the bot was just added to a group.
+      if (parsed.arg === "league" && chat.type !== "private")
+        return league(chat, from, "", locale, reply);
       // t.me/<bot>?start=streak, from the "My streak" button under posts.
       if (parsed.arg === "streak") {
         if (!link) return reply(notLinkedText(locale, profile));
@@ -163,6 +175,8 @@ async function onMessage(
       });
       return reply(message.text, { reply_markup: message.reply_markup });
     }
+    case "league":
+      return league(chat, from, parsed.arg, locale, reply);
     case "quiz":
       return sendQuiz(chat.id, locale, link);
     case "random":
@@ -194,6 +208,39 @@ async function onMessage(
         helpText(locale, { linked: Boolean(link), siteUrl, bot: BOT_USERNAME }),
       );
   }
+}
+
+/**
+ * /league: in a group, the group's league and its join button (/league off
+ * and /league on, for admins, switch the Monday post); in a private chat,
+ * how to start one.
+ */
+async function league(
+  chat: { id: number; type: string; title?: string },
+  from: From,
+  arg: string,
+  locale: BotLocale,
+  reply: (text: string, extra?: Record<string, unknown>) => Promise<unknown>,
+) {
+  if (chat.type === "private") return reply(leaguePrivateText(locale));
+  const toggle = arg.toLowerCase();
+  if (toggle === "off" || toggle === "on") {
+    const member = await telegram<{ status: string }>("getChatMember", {
+      chat_id: chat.id,
+      user_id: from.id,
+    });
+    if (member.status !== "administrator" && member.status !== "creator")
+      return reply(leagueAdminsOnlyText(locale));
+    await registerGroup(chat.id, chat.title ?? "");
+    await setWeeklyPost(chat.id, toggle === "on");
+    return reply(leagueToggledText(locale, toggle === "on"));
+  }
+  await registerGroup(chat.id, chat.title ?? "");
+  const message = leagueGroupMessage(locale, {
+    title: chat.title ?? "",
+    link: `https://t.me/${BOT_USERNAME}?startapp=${leagueParam(chat.id)}`,
+  });
+  return reply(message.text, { reply_markup: message.reply_markup });
 }
 
 function today(locale: BotLocale, link: TelegramLink | null) {

@@ -364,6 +364,38 @@ export const tgDuelPlay = pgTable(
 );
 
 /**
+ * Group chats with a PandaDev league (/league in the group): members who
+ * joined from the group's button get a weekly XP table, posted in the group
+ * on Mondays unless an admin turned that off.
+ */
+export const tgGroup = pgTable("tg_group", {
+  /** Telegram's chat id (negative for groups) */
+  chatId: bigint("chat_id", { mode: "number" }).primaryKey(),
+  title: text("title").notNull(),
+  /** The Monday post with last week's table */
+  weekly: boolean("weekly").default(true).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+/** Who joined a group's league; XP counts for linked PandaDev accounts. */
+export const tgGroupMember = pgTable(
+  "tg_group_member",
+  {
+    chatId: bigint("chat_id", { mode: "number" })
+      .notNull()
+      .references(() => tgGroup.chatId, { onDelete: "cascade" }),
+    telegramId: bigint("telegram_id", { mode: "number" }).notNull(),
+    /** Telegram first name, shown in the group's table */
+    name: text("name").notNull(),
+    joinedAt: timestamp("joined_at").defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.chatId, table.telegramId] }),
+    index("tg_group_member_telegram_idx").on(table.telegramId),
+  ],
+);
+
+/**
  * What the health collector (.github/workflows/health.yml) found outside the
  * site: Vercel deployments, Neon usage, Sentry errors, GitHub security
  * alerts. One row per run, kept for 90 days; /admin/health reads the latest.

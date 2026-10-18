@@ -28,7 +28,7 @@ const en = {
   openBot: "Open @{bot}",
   failed:
     "Something went wrong. Pull down to reload, or try again in a minute.",
-  tabs: { panda: "Panda", blitz: "Blitz", duel: "Duel" },
+  tabs: { panda: "Panda", blitz: "Blitz", duel: "Duel", league: "Leagues" },
   hello: (name: string) => `Hi, ${name}!`,
   mood: {
     proud: "Today's goal is done. Your panda is proud of you!",
@@ -128,6 +128,21 @@ const en = {
     `⚔️ ${name} challenges you to a ${language} duel: ${score}/${size} in ${Math.round(ms / 1000)} s. Can you beat it?`,
   duelButton: "⚔️ Accept the duel",
   rematch: "Rematch",
+  leagueTitle: "Group leagues",
+  leagueIntro:
+    "A weekly XP table for your study group or class chat. Add the bot to the group and send /league there; everyone joins with the button it posts.",
+  addToGroup: "Add the bot to a group",
+  joinLeague: (title: string) => `Join the ${title} league`,
+  leagueMembers: (n: number) => `${n} ${n === 1 ? "member" : "members"} so far`,
+  leagueCounts:
+    "XP from lessons, practice, the Blitz and duels counts. Your Telegram first name is shown to the group.",
+  join: "Join",
+  leave: "Leave",
+  thisWeek: "This week",
+  noAccount: "no account yet",
+  leagueGuest: "Connect your PandaDev account so your XP counts in the league.",
+  leagueNotFound:
+    "This league link doesn't work any more. Ask in the group for a new one: /league.",
   duelStoryText: "Beat my score in a PandaDev duel!",
 };
 
@@ -139,7 +154,7 @@ const ru: Texts = {
   openBot: "Открыть @{bot}",
   failed:
     "Что-то пошло не так. Потяните вниз, чтобы обновить, или попробуйте через минуту.",
-  tabs: { panda: "Панда", blitz: "Блиц", duel: "Дуэль" },
+  tabs: { panda: "Панда", blitz: "Блиц", duel: "Дуэль", league: "Лиги" },
   hello: (name) => `Привет, ${name}!`,
   mood: {
     proud: "Цель на сегодня выполнена. Панда вами гордится!",
@@ -233,6 +248,22 @@ const ru: Texts = {
     `⚔️ ${name} вызывает вас на дуэль по ${language}: ${score}/${size} за ${Math.round(ms / 1000)} с. Сможете лучше?`,
   duelButton: "⚔️ Принять дуэль",
   rematch: "Реванш",
+  leagueTitle: "Лиги групп",
+  leagueIntro:
+    "Рейтинг недели для вашей учебной группы или чата класса. Добавьте бота в группу и отправьте там /league; все вступают кнопкой из его сообщения.",
+  addToGroup: "Добавить бота в группу",
+  joinLeague: (title) => `Вступить в лигу «${title}»`,
+  leagueMembers: (n) =>
+    `Уже ${n} ${ruPlural(n, "участник", "участника", "участников")}`,
+  leagueCounts:
+    "Считаются XP за уроки, задачи, блиц и дуэли. Группа увидит ваше имя из Telegram.",
+  join: "Вступить",
+  leave: "Выйти",
+  thisWeek: "Эта неделя",
+  noAccount: "ещё без аккаунта",
+  leagueGuest: "Подключите аккаунт PandaDev, чтобы ваши XP считались в лиге.",
+  leagueNotFound:
+    "Эта ссылка на лигу больше не работает. Попросите в группе новую: /league.",
   duelStoryText: "Обойдите мой результат в дуэли PandaDev!",
 };
 

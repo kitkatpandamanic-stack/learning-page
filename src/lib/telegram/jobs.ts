@@ -3,12 +3,14 @@ import "server-only";
 import { and, desc, eq, gte, isNull, lt, ne, or, sql, sum } from "drizzle-orm";
 
 import { db } from "@/db";
+import { addDays } from "@/lib/daily";
 import { telegramJobRun, telegramLink, user, xpEvent } from "@/db/schema";
 import { localizedPath, type Locale } from "@/lib/i18n";
 import { getDailySummary } from "@/lib/learning";
 import { getStreakStatus } from "@/lib/progress";
 import { siteUrl } from "@/lib/site";
 import {
+  BOT_USERNAME,
   CHANNEL,
   CHANNEL_TIME_ZONE,
   sendMessage,
@@ -20,10 +22,20 @@ import { setLinkOption } from "@/lib/telegram/links";
 import { forgetUnansweredQuizzes } from "@/lib/telegram/quiz";
 import { forgetOldDuels } from "@/lib/tg-app/duel";
 import {
+  forgetEmptyGroups,
+  leagueParam,
+  leagueTable,
+  setWeeklyPost,
+  weekOf,
+  weeklyGroups,
+} from "@/lib/tg-app/league";
+import {
   dayIn,
   displayName,
   hoursUntilMidnight,
   leaderboardText,
+  leagueButton,
+  leagueWeeklyText,
   localHour,
   reminderKeyboard,
   reminderText,
@@ -180,6 +192,53 @@ export function postLeaderboardOnce(now = new Date()) {
 }
 
 /**
+ * Mondays: last week's table in each group with a league (unless an admin
+ * turned the post off), once per group. Groups where nobody earned XP get
+ * no post; a group that removed the bot stops getting tried.
+ */
+export async function postLeagues(now = new Date()) {
+  const monday = addDays(weekOf(now), -7);
+  const day = dayIn(CHANNEL_TIME_ZONE, now);
+  let posted = 0;
+  for (const group of await weeklyGroups()) {
+    try {
+      const result = await once(`league:${group.chatId}`, day, async () => {
+        const rows = (await leagueTable(group.chatId, monday)).filter(
+          (r) => r.xp > 0,
+        );
+        if (rows.length === 0) return { posted: false };
+        await sendMessage(
+          group.chatId,
+          leagueWeeklyText(group.title, rows.slice(0, 10), {
+            from: monday,
+            to: addDays(monday, 6),
+          }),
+          {
+            reply_markup: leagueButton(
+              "both",
+              `https://t.me/${BOT_USERNAME}?startapp=${leagueParam(group.chatId)}`,
+            ),
+          },
+        );
+        return { posted: true };
+      });
+      if (result.posted) posted++;
+    } catch (error) {
+      // Removed from the group (403), or the group is gone (400).
+      if (
+        error instanceof TelegramError &&
+        (error.code === 403 || error.code === 400)
+      ) {
+        await setWeeklyPost(group.chatId, false);
+        continue;
+      }
+      console.error("league post failed", error);
+    }
+  }
+  return { posted };
+}
+
+/**
  * The tick (GitHub Actions, twice an hour; telegram-bot.yml):
  * reminders that are due, the daily post from 11:00 Tashkent, the
  * leaderboard on Mondays from 12:00. Each job runs on its own, so one
@@ -195,13 +254,16 @@ export async function runTick(now = new Date()) {
     ["reminders", () => sendReminders(now)],
   ];
   if (hour >= DAILY_POST_HOUR) jobs.push(["daily-post", () => postDaily(now)]);
-  if (weekday === "Mon" && hour >= LEADERBOARD_HOUR)
+  if (weekday === "Mon" && hour >= LEADERBOARD_HOUR) {
     jobs.push(["leaderboard", () => postLeaderboardOnce(now)]);
+    jobs.push(["leagues", () => postLeagues(now)]);
+  }
   jobs.push([
     "cleanup",
     async () => {
       await forgetUnansweredQuizzes(now);
       await forgetOldDuels(now);
+      await forgetEmptyGroups(now);
     },
   ]);
 
