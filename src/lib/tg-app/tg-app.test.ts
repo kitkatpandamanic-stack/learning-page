@@ -20,7 +20,12 @@ import {
   unlockedOutfits,
   wornOutfit,
 } from "@/lib/tg-app/panda";
-import { blitzShareText, duelNotice } from "@/lib/tg-app/texts";
+import {
+  blitzShareText,
+  duelNotice,
+  wordleShareText,
+} from "@/lib/tg-app/texts";
+import { wordleWords } from "@/lib/tg-app/words";
 
 vi.mock("server-only", () => ({}));
 
@@ -61,6 +66,7 @@ vi.mock("@/lib/daily-feed", () => ({
 const blitz = await import("@/lib/tg-app/blitz");
 const duels = await import("@/lib/tg-app/duel");
 const leagues = await import("@/lib/tg-app/league");
+const wordle = await import("@/lib/tg-app/wordle");
 type Player = import("@/lib/tg-app/blitz").Player;
 
 const dir = join(__dirname, "..", "..", "..", "drizzle");
@@ -628,5 +634,159 @@ describe("group leagues", () => {
     await leagues.leaveLeague(GROUP, 10);
     expect(await leagues.myLeagues(10)).toEqual([]);
     expect(await leagues.leagueInvite(-5, 10)).toBeNull();
+  });
+});
+
+describe("Code Wordle", () => {
+  const now = new Date("2026-10-18T07:00:00Z"); // Wordle #1
+  const anora = { telegramId: 10, userId: "u1", locale: "en" as const };
+  const guest = { telegramId: 30, userId: null, locale: "ru" as const };
+  const answer = () => wordle.wordOfDay("2026-10-18", "python")!.word;
+  /** A wrong guess of the right length. */
+  const wrong = (n = 0) =>
+    [...answer()]
+      .map((c, i) =>
+        i === 0
+          ? String.fromCharCode(((c.charCodeAt(0) - 97 + 1 + n) % 26) + 97)
+          : c,
+      )
+      .join("");
+
+  beforeEach(async () => {
+    await client.exec(`TRUNCATE "user", tg_wordle CASCADE`);
+    await testDb
+      .insert(schema.user)
+      .values({ id: "u1", name: "Anora", email: "a@pandadev.test" });
+  });
+
+  it("colours letters like Wordle, repeated letters too", () => {
+    expect(wordle.marks("split", "split")).toEqual(["g", "g", "g", "g", "g"]);
+    expect(wordle.marks("plist", "split")).toEqual(["y", "y", "y", "y", "g"]);
+    // "where" has two e's: the last one is green, so only one more is yellow.
+    expect(wordle.marks("eerie", "where")).toEqual(["y", "x", "y", "x", "g"]);
+    expect(wordle.marks("aaaaa", "where")).toEqual(["x", "x", "x", "x", "x"]);
+  });
+
+  it("gives every word once before any repeats", () => {
+    const words = wordleWords.sql.length;
+    const days = Array.from({ length: words }, (_, i) => {
+      const d = new Date(Date.UTC(2026, 9, 18 + i));
+      return wordle.wordOfDay(d.toISOString().slice(0, 10), "sql")!.word;
+    });
+    expect(new Set(days).size).toBe(words);
+    expect(wordle.wordOfDay("2026-10-18", "cobol")).toBeNull();
+  });
+
+  it("hides the clue until 3 wrong guesses, and the word until the end", async () => {
+    let game = await wordle.wordleToday(anora, "python", now);
+    expect(game).toMatchObject({
+      number: 1,
+      rows: [],
+      hint: null,
+      answer: null,
+      done: false,
+    });
+    expect(await wordle.guessWordle(anora, "python", "x", now)).toBeNull();
+    expect(
+      await wordle.guessWordle(
+        anora,
+        "python",
+        "1".repeat(answer().length),
+        now,
+      ),
+    ).toBeNull();
+    for (let i = 0; i < 3; i++)
+      game = (await wordle.guessWordle(anora, "python", wrong(i), now))!;
+    expect(game?.hint).toBe(wordle.wordOfDay("2026-10-18", "python")!.en);
+    expect(game?.answer).toBeNull();
+    expect(JSON.stringify(game)).not.toContain(`"${answer()}"`);
+  });
+
+  it("pays 10 XP for the day's first solved word only", async () => {
+    await wordle.guessWordle(anora, "python", wrong(), now);
+    const solved = await wordle.guessWordle(
+      anora,
+      "python",
+      answer().toUpperCase(),
+      now,
+    );
+    expect(solved).toMatchObject({
+      solved: true,
+      done: true,
+      xp: 10,
+      paid: 10,
+      answer: answer(),
+    });
+    expect(solved?.rows.at(-1)?.marks.every((m) => m === "g")).toBe(true);
+    const sqlWord = wordle.wordOfDay("2026-10-18", "sql")!.word;
+    expect((await wordle.guessWordle(anora, "sql", sqlWord, now))?.paid).toBe(
+      0,
+    );
+    const xp = await testDb.select().from(schema.xpEvent);
+    expect(xp).toEqual([
+      expect.objectContaining({
+        reason: "wordle",
+        amount: 10,
+        ref: "wordle:2026-10-18",
+      }),
+    ]);
+    // A guess after the end changes nothing.
+    expect(
+      (await wordle.guessWordle(anora, "python", wrong(), now))?.rows,
+    ).toHaveLength(2);
+  });
+
+  it("ends after six tries and shows the word, in the player's language", async () => {
+    let game;
+    for (let i = 0; i < 6; i++)
+      game = await wordle.guessWordle(guest, "python", wrong(i), now);
+    expect(game).toMatchObject({
+      done: true,
+      solved: false,
+      answer: answer(),
+      xp: 0,
+    });
+    expect(game?.hint).toBe(wordle.wordOfDay("2026-10-18", "python")!.ru);
+    expect(await wordle.wordleOverview(guest, now)).toContainEqual({
+      language: "python",
+      status: "failed",
+      tries: 6,
+    });
+  });
+
+  it("shares as rows of squares, and only sensible pictures", () => {
+    expect(
+      wordleShareText({
+        number: 3,
+        language: "python",
+        rows: [
+          ["x", "y", "g"],
+          ["g", "g", "g"],
+        ],
+        solved: true,
+        tries: 6,
+      }),
+    ).toBe("🔤 PandaDev Wordle #3 · Python 2/6\n⬛🟨🟩\n🟩🟩🟩");
+    expect(
+      parseCard(
+        new URLSearchParams("k=wordle&l=en&n=3&lang=sql&r=xyg.ggg&s=1"),
+      ),
+    ).toMatchObject({
+      kind: "wordle",
+      rows: [
+        ["x", "y", "g"],
+        ["g", "g", "g"],
+      ],
+      solved: true,
+    });
+    for (const bad of [
+      "lang=sql&r=xyg.gg",
+      "lang=sql&r=abc",
+      "lang=sql&r=xyg.xyg.xyg.xyg.xyg.xyg.xyg",
+      "lang=cobol&r=ggg",
+    ])
+      expect(
+        parseCard(new URLSearchParams(`k=wordle&l=en&n=3&s=1&${bad}`)),
+      ).toBeNull();
   });
 });

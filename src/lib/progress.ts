@@ -344,6 +344,7 @@ export type RecentReason =
   | "telegram"
   | "blitz"
   | "duel"
+  | "wordle"
   | "other";
 
 /** What an XP event was for; the dashboard turns this into a sentence. */
@@ -363,6 +364,7 @@ function describeEvent(
       "telegram",
       "blitz",
       "duel",
+      "wordle",
     ].includes(reason)
       ? reason
       : "other") as RecentReason,

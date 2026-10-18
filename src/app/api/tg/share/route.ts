@@ -1,11 +1,17 @@
 import { blitzResult } from "@/lib/tg-app/blitz";
 import { duelResult } from "@/lib/tg-app/duel";
+import { wordleToday } from "@/lib/tg-app/wordle";
 import type { Card } from "@/lib/tg-app/card";
 import { miniAppHome } from "@/lib/tg-app/home";
 import { parseOutfit, wornOutfit } from "@/lib/tg-app/panda";
 import { miniAppCaller } from "@/lib/tg-app/player";
 import { appLink, cardUrl, prepareShare } from "@/lib/tg-app/share";
-import { appTexts, blitzShareText, languageNames } from "@/lib/tg-app/texts";
+import {
+  appTexts,
+  blitzShareText,
+  languageNames,
+  wordleShareText,
+} from "@/lib/tg-app/texts";
 
 /**
  * Something to share from the Mini App, built from the server's own data
@@ -13,6 +19,7 @@ import { appTexts, blitzShareText, languageNames } from "@/lib/tg-app/texts";
  *   { kind: "blitz", language }  today's result in that language
  *   { kind: "panda", outfit }    the learner's panda (outfit from CloudStorage)
  *   { kind: "duel", duel }       a challenge: the player's score to beat
+ *   { kind: "wordle", language } today's finished Code Wordle
  * Returns a prepared message id for shareMessage, a picture for Stories, and
  * plain text for older Telegram apps.
  */
@@ -47,6 +54,22 @@ export async function POST(request: Request) {
     text = blitzShareText(locale, { ...result, size: result.size });
     start = `blitz_${result.language}`;
     button = `⚡ ${t.shareButton}`;
+  } else if (body?.kind === "wordle") {
+    const game = await wordleToday(player, String(body.language ?? ""));
+    if (!game?.done) return new Response("Bad request", { status: 400 });
+    const rows = game.rows.map((r) => r.marks);
+    card = {
+      kind: "wordle",
+      locale,
+      format: "story",
+      number: game.number,
+      language: game.language,
+      rows,
+      solved: game.solved,
+    };
+    text = wordleShareText({ ...game, rows });
+    start = "wordle";
+    button = `🔤 ${t.tabs.wordle}`;
   } else if (body?.kind === "duel") {
     // Only the challenger sends their duel; others start their own.
     const result = await duelResult(player, String(body.duel ?? ""));
