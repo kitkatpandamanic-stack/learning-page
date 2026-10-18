@@ -28,7 +28,13 @@ const en = {
   openBot: "Open @{bot}",
   failed:
     "Something went wrong. Pull down to reload, or try again in a minute.",
-  tabs: { panda: "Panda", blitz: "Blitz", duel: "Duel", league: "Leagues" },
+  tabs: {
+    panda: "Panda",
+    blitz: "Blitz",
+    duel: "Duel",
+    wordle: "Wordle",
+    league: "Leagues",
+  },
   hello: (name: string) => `Hi, ${name}!`,
   mood: {
     proud: "Today's goal is done. Your panda is proud of you!",
@@ -141,6 +147,19 @@ const en = {
   thisWeek: "This week",
   noAccount: "no account yet",
   leagueGuest: "Connect your PandaDev account so your XP counts in the league.",
+  wordleTitle: (n: number) => `Code Wordle #${n}`,
+  wordleIntro: (length: number) =>
+    `Guess today's ${length}-letter code word in 6 tries. Green: right letter, right place. Yellow: in the word, elsewhere. Grey: not in it.`,
+  wordleXp: "+10 XP for solving it (once a day).",
+  wordleGuest: "Connect your account to get XP for the Wordle.",
+  wordleHint: "Clue",
+  wordleHintLater: "A clue appears after 3 wrong guesses.",
+  wordleSolved: (tries: number) => `Solved in ${tries}!`,
+  wordleFailed: "Out of tries. The word was:",
+  wordleTooShort: (length: number) => `The word has ${length} letters.`,
+  enter: "Enter",
+  wordleComeBack: "A new word comes tomorrow.",
+  wordleMissed: "Not this time!",
   leagueNotFound:
     "This league link doesn't work any more. Ask in the group for a new one: /league.",
   duelStoryText: "Beat my score in a PandaDev duel!",
@@ -154,7 +173,13 @@ const ru: Texts = {
   openBot: "Открыть @{bot}",
   failed:
     "Что-то пошло не так. Потяните вниз, чтобы обновить, или попробуйте через минуту.",
-  tabs: { panda: "Панда", blitz: "Блиц", duel: "Дуэль", league: "Лиги" },
+  tabs: {
+    panda: "Панда",
+    blitz: "Блиц",
+    duel: "Дуэль",
+    wordle: "Wordle",
+    league: "Лиги",
+  },
   hello: (name) => `Привет, ${name}!`,
   mood: {
     proud: "Цель на сегодня выполнена. Панда вами гордится!",
@@ -262,6 +287,20 @@ const ru: Texts = {
   thisWeek: "Эта неделя",
   noAccount: "ещё без аккаунта",
   leagueGuest: "Подключите аккаунт PandaDev, чтобы ваши XP считались в лиге.",
+  wordleTitle: (n) => `Code Wordle #${n}`,
+  wordleIntro: (length) =>
+    `Угадайте слово из кода (${length} ${ruPlural(length, "буква", "буквы", "букв")}) за 6 попыток. Зелёная: буква на своём месте. Жёлтая: есть в слове, но в другом месте. Серая: её нет.`,
+  wordleXp: "+10 XP за отгаданное слово (раз в день).",
+  wordleGuest: "Подключите аккаунт, чтобы получать XP за Wordle.",
+  wordleHint: "Подсказка",
+  wordleHintLater: "Подсказка появится после 3 неверных попыток.",
+  wordleSolved: (tries) => `Отгадано с ${tries}-й попытки!`,
+  wordleFailed: "Попытки кончились. Это было слово:",
+  wordleTooShort: (length) =>
+    `В слове ${length} ${ruPlural(length, "буква", "буквы", "букв")}.`,
+  enter: "Ввод",
+  wordleComeBack: "Новое слово завтра.",
+  wordleMissed: "Не в этот раз!",
   leagueNotFound:
     "Эта ссылка на лигу больше не работает. Попросите в группе новую: /league.",
   duelStoryText: "Обойдите мой результат в дуэли PandaDev!",
@@ -319,4 +358,19 @@ export function duelNotice(
       ? `${n.name} wins. Rematch?`
       : `You held on!${n.bonus ? " +5 XP" : ""}`
   }`;
+}
+
+/** "PandaDev Wordle #3 · Python 4/6" and the coloured rows, to share. */
+export function wordleShareText(r: {
+  number: number;
+  language: string;
+  rows: ("g" | "y" | "x")[][];
+  solved: boolean;
+  tries: number;
+}) {
+  const name = languageNames[r.language] ?? r.language;
+  const squares = { g: "🟩", y: "🟨", x: "⬛" };
+  return `🔤 PandaDev Wordle #${r.number} · ${name} ${r.solved ? r.rows.length : "X"}/${r.tries}\n${r.rows
+    .map((row) => row.map((m) => squares[m]).join(""))
+    .join("\n")}`;
 }

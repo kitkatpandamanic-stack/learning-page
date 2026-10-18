@@ -26,6 +26,16 @@ export type Card =
       seconds: number;
     }
   | {
+      kind: "wordle";
+      locale: AppLocale;
+      format: CardFormat;
+      number: number;
+      language: string;
+      /** Each guess's colours: g, y, x */
+      rows: ("g" | "y" | "x")[][];
+      solved: boolean;
+    }
+  | {
       kind: "panda";
       locale: AppLocale;
       format: CardFormat;
@@ -50,7 +60,12 @@ export function cardQuery(card: Card) {
     l: card.locale,
     f: card.format,
   });
-  if (card.kind !== "panda") {
+  if (card.kind === "wordle") {
+    q.set("n", String(card.number));
+    q.set("lang", card.language);
+    q.set("r", card.rows.map((row) => row.join("")).join("."));
+    q.set("s", card.solved ? "1" : "0");
+  } else if (card.kind !== "panda") {
     q.set("n", String(card.number));
     q.set("lang", card.language);
     q.set("g", card.grid.map((ok) => (ok ? "1" : "0")).join(""));
@@ -70,6 +85,24 @@ export function parseCard(q: URLSearchParams): Card | null {
   const format = q.get("f") === "wide" ? "wide" : "story";
   if (!locale) return null;
   const kind = q.get("k");
+  if (kind === "wordle") {
+    const number = int(q.get("n"), 1, 99_999);
+    const language = q.get("lang") ?? "";
+    const rows = q.get("r") ?? "";
+    if (number === null || !(language in languageNames)) return null;
+    if (!/^[gyx]{3,10}(\.[gyx]{3,10}){0,5}$/.test(rows)) return null;
+    const parsed = rows.split(".").map((r) => [...r] as ("g" | "y" | "x")[]);
+    if (parsed.some((r) => r.length !== parsed[0].length)) return null;
+    return {
+      kind,
+      locale,
+      format,
+      number,
+      language,
+      rows: parsed,
+      solved: q.get("s") === "1",
+    };
+  }
   if (kind === "blitz" || kind === "duel") {
     // A duel has no number (n=1) and half the questions and time.
     const size = kind === "blitz" ? 10 : 5;

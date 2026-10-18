@@ -396,6 +396,32 @@ export const tgGroupMember = pgTable(
 );
 
 /**
+ * Code Wordle in the Telegram Mini App: one word a day per language, six
+ * guesses, graded on the server. Keyed by the Telegram account so people
+ * without a PandaDev account can play too (without XP).
+ */
+export const tgWordle = pgTable(
+  "tg_wordle",
+  {
+    telegramId: bigint("telegram_id", { mode: "number" }).notNull(),
+    day: date("day", { mode: "string" }).notNull(),
+    language: text("language").notNull(),
+    userId: text("user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    /** The guesses so far, lowercase */
+    guesses: jsonb("guesses").$type<string[]>().default([]).notNull(),
+    solved: boolean("solved").default(false).notNull(),
+    finishedAt: timestamp("finished_at"),
+    /** XP this game paid (the day's first solved word pays) */
+    xp: smallint("xp").default(0).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.telegramId, table.day, table.language] }),
+  ],
+);
+
+/**
  * What the health collector (.github/workflows/health.yml) found outside the
  * site: Vercel deployments, Neon usage, Sentry errors, GitHub security
  * alerts. One row per run, kept for 90 days; /admin/health reads the latest.

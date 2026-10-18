@@ -29,8 +29,25 @@ export async function renderCard(card: Card) {
   let headline: string;
   let detail: string;
   let panda: string;
-  let grid: boolean[] | null = null;
-  if (card.kind !== "panda") {
+  /** Rows of coloured squares under the score */
+  let grid: string[][] | null = null;
+  const GREEN = "#22c55e";
+  if (card.kind === "wordle") {
+    const colors = { g: GREEN, y: "#eab308", x: "#475569" };
+    eyebrow = `${t.wordleTitle(card.number)} · ${languageNames[card.language]}`;
+    headline = `${card.solved ? card.rows.length : "X"}/6`;
+    // Never the word itself: friends may still be playing it.
+    detail = card.solved ? t.wordleSolved(card.rows.length) : t.wordleMissed;
+    grid = card.rows.map((row) => row.map((m) => colors[m]));
+    panda = pandaSvg({
+      stage: 3,
+      mood: !card.solved
+        ? "worried"
+        : card.rows.length <= 3
+          ? "proud"
+          : "happy",
+    });
+  } else if (card.kind !== "panda") {
     const size = card.kind === "blitz" ? 10 : 5;
     const score = card.grid.filter(Boolean).length;
     eyebrow =
@@ -39,7 +56,11 @@ export async function renderCard(card: Card) {
         : `${t.tabs.duel} · ${languageNames[card.language]}`;
     headline = t.result(score, size);
     detail = t.seconds(card.seconds * 1000);
-    grid = Array.from({ length: size }, (_, i) => card.grid[i] ?? false);
+    grid = [
+      Array.from({ length: size }, (_, i) =>
+        card.grid[i] ? GREEN : "#ef4444",
+      ),
+    ];
     panda = pandaSvg({ stage: 3, mood: blitzMood(score, size) });
   } else {
     eyebrow = t.level(card.level);
@@ -116,18 +137,28 @@ export async function renderCard(card: Card) {
           {detail}
         </div>
         {grid && (
-          <div style={{ display: "flex", gap: px(14) }}>
-            {grid.map((ok, i) => (
+          <div
+            style={{ display: "flex", flexDirection: "column", gap: px(10) }}
+          >
+            {grid.map((row, r) => (
               <div
-                key={i}
-                style={{
-                  display: "flex",
-                  width: px(68),
-                  height: px(68),
-                  borderRadius: px(14),
-                  background: ok ? "#22c55e" : "#ef4444",
-                }}
-              />
+                key={r}
+                style={{ display: "flex", gap: px(grid!.length > 1 ? 10 : 14) }}
+              >
+                {row.map((color, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      display: "flex",
+                      // Wordle's rows are smaller, so six of them fit.
+                      width: px(grid!.length > 1 ? 52 : 68),
+                      height: px(grid!.length > 1 ? 52 : 68),
+                      borderRadius: px(12),
+                      background: color,
+                    }}
+                  />
+                ))}
+              </div>
             ))}
           </div>
         )}
@@ -135,8 +166,9 @@ export async function renderCard(card: Card) {
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
         src={pandaDataUri(panda)}
-        width={story ? 760 : 420}
-        height={story ? 836 : 462}
+        // A smaller panda leaves room for Wordle's six rows.
+        width={story ? (grid && grid.length > 1 ? 520 : 760) : 420}
+        height={story ? (grid && grid.length > 1 ? 572 : 836) : 462}
         alt=""
       />
       {story && (
