@@ -45,7 +45,7 @@ Add a rule when something went wrong or the site owner corrected you, phrased as
 - **Blocked or awkward from here:** Reddit (needs a login), hh.ru career pages (HTTP 451), and Stack Overflow's "frequent" tab (403). For Stack Overflow, use the API's linked-question count instead (about 300 requests a day without a key). Stepik was sometimes down (502). Old URLs redirect: mode.com/sql-tutorial → thoughtspot.com, and education.yandex.ru/handbook → contest.yandex.ru.
 - **Long pages and PDFs:** WebFetch truncates long pages, so re-fetch the sections you need. It can't read many PDFs. Copy the PDF into its own scratchpad folder and extract the text with a `python3 -I` script kept elsewhere; there's no `pdftotext` here.
 - **Read signals with care.** Top-voted Stack Overflow questions are mostly from 2008–2013, so check newer features against surveys. Download counts are mostly CI traffic: compare tools with them, never count learners.
-- **Quizzes:** check where the correct answers sit and how long the options are. (2026-10-16: option 2 was correct in 336 of 491 quizzes, and the correct option was the longest in 64%.) Vary the answer position, and keep the correct option about as long as the others.
+- **Quizzes:** check where the correct answers sit and how long the options are. (2026-10-16: option 2 was correct in 336 of 491 quizzes, and the correct option was the longest in 64%.) Since 2026-11-01 the build shuffles options (see "Writing quizzes" below), so position no longer matters, but length still does.
 - **Predict-first exercises:** quiz ids are positional, so you can't put a "predict" quiz before the existing quizzes. Use a `TryIt` with "decide what it prints, then press Run" instead.
 - **Practice links:** check the linked lesson's prerequisites, not just its topic. Several Python problems linked to `working-with-strings`, which comes before `if`, loops and `def`.
 - **TypeScript claims:** check compiler output and flag claims with the repo's own compiler (`node node_modules/typescript/bin/tsc`, in the scratchpad). `erasableSyntaxOnly` does not catch decorators, but Node rejects them.
@@ -71,6 +71,18 @@ Add a rule when something went wrong or the site owner corrected you, phrased as
 - **Parallel fix runs:** several agents can edit different courses at the same time, but only one may run `npm run content`/vitest (velite builds collide). The main session builds and tests once at the end.
 - **RU terms:** TypeScript parameter properties = «свойства-параметры».
 - **UI strings (house style from the infra session, 2026-10-16):** English errors say what happened and what to do, with no "Please", and use "Couldn't" rather than "Could not". On touch screens, interactive elements are at least 44px. Small text is `text-white/55` or brighter.
+
+## Writing quizzes (from the 2026-11-01 Phase 2 run)
+
+- **Options are shuffled at build time** (`src/lib/quiz-order.ts`, keyed by `language/slug#quiz-n`; EN and RU share the order, and "Try again" reshuffles). Write the right answer at any `answer` index. **Never refer to an option by position** in options, questions or explanations ("the first option", "both of the above", "A and B"): name its value instead ("the line with `and`").
+- **Length must not give the answer away.** The right option should not stand out as the longest (or the shortest). Cut the right answer down to its core claim and move the detail into the explanation. Give each wrong option the same shape: a claim plus its own plausible reason ("TypeError, because async calls need await"). Use the same opening words in every option, and describe every option the same way ("Hi on one line" / "H then i on separate lines").
+- **Wrong options are real misconceptions** (the lesson's "Common mistakes", the confusions in research/summary.md and comparison/<course>.md). Before using one, check it can't also be true, and that the question's own setup doesn't contradict it. When a new wrong option teaches a misconception, the explanation gets one sentence on why it's wrong.
+- **If one phrase marks the right option** (e.g. "after SET lock_timeout"), add it to the wrong options too, and let the explanation say why that phrase isn't enough.
+- **When an exact error message or code must be the right answer,** make the wrong options real-looking error lines or code of the same shape, and run each one (node, python3, PGlite, tsc) to prove it's wrong.
+- **RU options run about 10–20% longer than EN:** shorten by restructuring the sentence, not by abbreviating.
+- **Quote rules:** inside the `options={[…]}` JS array, `\"` is fine; inside an `explanation="…"` attribute it isn't, so use `{'…'}` there.
+- **Parsing quizzes in scripts:** read each `<Quiz` block attribute by attribute with brace and string matching (like `extractQuizzes` in velite.config.ts). A regex up to the first `/>` breaks on JSX inside a question. A checked parser lives in the scratchpad pattern `quizzes.mjs`.
+- **Editing many quizzes:** use a script with a table of (file, quiz-n) → new options/explanation that replaces only that array, keeping its one-line or multi-line style. Then rerun the length check and a parse check, and diff against HEAD to prove nothing outside `<Quiz>` changed.
 
 ## Working in this repo
 
