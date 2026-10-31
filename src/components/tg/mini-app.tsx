@@ -4,20 +4,28 @@ import Script from "next/script";
 import { useCallback, useState } from "react";
 
 import { BlitzTab } from "@/components/tg/blitz-tab";
+import { BugHuntTab } from "@/components/tg/bughunt-tab";
 import { DuelTab, startChallenge } from "@/components/tg/duel-tab";
+import { GamesHub, type Game } from "@/components/tg/games-tab";
 import { LeagueTab } from "@/components/tg/league-tab";
 import { WordleTab } from "@/components/tg/wordle-tab";
 import { PandaTab } from "@/components/tg/panda-tab";
-import { callApi, telegramScript, webApp } from "@/components/tg/telegram";
+import {
+  callApi,
+  telegramScript,
+  useBackButton,
+  webApp,
+} from "@/components/tg/telegram";
 import type { MiniAppHome } from "@/lib/tg-app/home";
 import { appTexts, type AppLocale } from "@/lib/tg-app/texts";
 
 const SPACE = "#070814";
 
-type Tab = "panda" | "blitz" | "duel" | "wordle" | "league";
+type Tab = "panda" | "games" | "league";
 
 /**
- * PandaDev inside Telegram: the learner's panda, the Daily Blitz and duels. Runs
+ * PandaDev inside Telegram: the learner's panda, the games (Blitz, duels,
+ * Wordle, Bug Hunt) and group leagues. Runs
  * only in Telegram (it needs the signed launch data); elsewhere it points
  * to the bot.
  */
@@ -27,6 +35,14 @@ export function MiniApp({ bot }: { bot: string }) {
   >("loading");
   const [home, setHome] = useState<MiniAppHome | null>(null);
   const [tab, setTab] = useState<Tab>("panda");
+  /** The game open inside the Games tab (null: the list of games) */
+  const [game, setGame] = useState<Game | null>(null);
+  const openGame = useCallback((next: Game) => {
+    setTab("games");
+    setGame(next);
+  }, []);
+  const closeGame = useCallback(() => setGame(null), []);
+  useBackButton(tab === "games" && game ? closeGame : null, 1);
   const [blitzLanguage, setBlitzLanguage] = useState<string | null>(null);
   const [duel, setDuel] = useState<string | null>(null);
   const [duelNotice, setDuelNotice] = useState<string | null>(null);
@@ -47,7 +63,8 @@ export function MiniApp({ bot }: { bot: string }) {
   /** "Challenge a friend" and the bot's Rematch: a new duel, opened to play. */
   const challenge = useCallback(async (language: string) => {
     const created = await startChallenge(language);
-    setTab("duel");
+    setTab("games");
+    setGame("duel");
     if ("id" in created) {
       setDuelNotice(null);
       setDuel(created.id);
@@ -78,21 +95,22 @@ export function MiniApp({ bot }: { bot: string }) {
     const opened = /^duel_([\w-]{6,16})$/.exec(param);
     const rematch = /^duelnew_([a-z]+)$/.exec(param);
     if (asked || param === "blitz") {
-      setTab("blitz");
+      openGame("blitz");
       setBlitzLanguage(asked?.[1] ?? null);
     } else if (opened) {
-      setTab("duel");
+      openGame("duel");
       setDuel(opened[1]);
     } else if (rematch) void challenge(rematch[1]);
     else if (/^wordle(_[a-z]+)?$/.test(param)) {
-      setTab("wordle");
+      openGame("wordle");
       setWordleLanguage(param.split("_")[1] ?? null);
-    } else if (/^g_-?\d+_[\w-]+$/.test(param)) {
+    } else if (param === "bughunt") openGame("bughunt");
+    else if (/^g_-?\d+_[\w-]+$/.test(param)) {
       setTab("league");
       setLeagueInvite(param);
     }
     void load();
-  }, [load, challenge]);
+  }, [load, challenge, openGame]);
 
   const appLocale = home?.locale ?? locale;
   const t = appTexts[appLocale];
@@ -133,7 +151,19 @@ export function MiniApp({ bot }: { bot: string }) {
       {state === "ready" && home && (
         <>
           {tab === "panda" && <PandaTab home={home} />}
-          {tab === "blitz" && (
+          {tab === "games" && !game && (
+            <GamesHub home={home} onGame={openGame} />
+          )}
+          {tab === "games" && game && (
+            <button
+              type="button"
+              onClick={closeGame}
+              className="mb-3 self-start text-sm font-semibold text-cyan-200"
+            >
+              {t.gamesBack}
+            </button>
+          )}
+          {tab === "games" && game === "blitz" && (
             <BlitzTab
               home={home}
               language={blitzLanguage}
@@ -142,11 +172,7 @@ export function MiniApp({ bot }: { bot: string }) {
               onChallenge={(language) => void challenge(language)}
             />
           )}
-          {tab === "wordle" && (
-            <WordleTab home={home} language={wordleLanguage} />
-          )}
-          {tab === "league" && <LeagueTab home={home} invite={leagueInvite} />}
-          {tab === "duel" && (
+          {tab === "games" && game === "duel" && (
             <DuelTab
               home={home}
               duel={duel}
@@ -158,39 +184,44 @@ export function MiniApp({ bot }: { bot: string }) {
               }
             />
           )}
+          {tab === "games" && game === "wordle" && (
+            <WordleTab home={home} language={wordleLanguage} />
+          )}
+          {tab === "games" && game === "bughunt" && <BugHuntTab home={home} />}
+          {tab === "league" && <LeagueTab home={home} invite={leagueInvite} />}
           <nav className="fixed inset-x-0 bottom-0 z-10 mx-auto flex max-w-md gap-2 bg-[#070814]/90 px-4 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur">
-            {(["panda", "blitz", "duel", "wordle", "league"] as const).map(
-              (name) => (
-                <button
-                  key={name}
-                  type="button"
-                  onClick={() => {
-                    setTab(name);
-                    if (name === "blitz") setBlitzLanguage(null);
-                    if (name === "duel") setDuel(null);
-                  }}
-                  aria-current={tab === name ? "page" : undefined}
-                  className={`tap-target flex flex-1 flex-col items-center gap-0.5 rounded-2xl py-2 text-xs font-semibold ${
-                    tab === name
-                      ? "bg-gradient-brand text-white"
-                      : "text-slate-300 glass"
-                  }`}
-                >
-                  <span aria-hidden className="text-lg leading-none">
+            {(["panda", "games", "league"] as const).map((name) => (
+              <button
+                key={name}
+                type="button"
+                onClick={() => {
+                  setTab(name);
+                  // The Games tab always opens on the list of games.
+                  if (name === "games") {
+                    setGame(null);
+                    setBlitzLanguage(null);
+                    setDuel(null);
+                  }
+                }}
+                aria-current={tab === name ? "page" : undefined}
+                className={`tap-target flex flex-1 flex-col items-center gap-0.5 rounded-2xl py-2 text-xs font-semibold ${
+                  tab === name
+                    ? "bg-gradient-brand text-white"
+                    : "text-slate-300 glass"
+                }`}
+              >
+                <span aria-hidden className="text-lg leading-none">
+                  {
                     {
-                      {
-                        panda: "🐼",
-                        blitz: "⚡",
-                        duel: "⚔️",
-                        wordle: "🔤",
-                        league: "👥",
-                      }[name]
-                    }
-                  </span>
-                  {t.tabs[name]}
-                </button>
-              ),
-            )}
+                      panda: "🐼",
+                      games: "🎮",
+                      league: "👥",
+                    }[name]
+                  }
+                </span>
+                {t.tabs[name]}
+              </button>
+            ))}
           </nav>
         </>
       )}

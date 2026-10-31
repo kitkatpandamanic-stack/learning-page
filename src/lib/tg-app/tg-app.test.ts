@@ -67,6 +67,8 @@ const blitz = await import("@/lib/tg-app/blitz");
 const duels = await import("@/lib/tg-app/duel");
 const leagues = await import("@/lib/tg-app/league");
 const wordle = await import("@/lib/tg-app/wordle");
+const bughunt = await import("@/lib/tg-app/bughunt");
+const { bugHuntSnippets } = await import("@/lib/tg-app/bug-hunt");
 type Player = import("@/lib/tg-app/blitz").Player;
 
 const dir = join(__dirname, "..", "..", "..", "drizzle");
@@ -787,6 +789,151 @@ describe("Code Wordle", () => {
     ])
       expect(
         parseCard(new URLSearchParams(`k=wordle&l=en&n=3&s=1&${bad}`)),
+      ).toBeNull();
+  });
+});
+
+describe("Bug Hunt", () => {
+  const start = new Date("2026-10-31T07:00:00Z");
+  const at = (seconds: number) => new Date(start.getTime() + seconds * 1000);
+  const anora = { telegramId: 10, userId: "u1", locale: "en" as const };
+  const guest = { telegramId: 30, userId: null, locale: "ru" as const };
+
+  beforeEach(async () => {
+    await client.exec(`TRUNCATE "user", tg_bughunt CASCADE`);
+    await testDb
+      .insert(schema.user)
+      .values({ id: "u1", name: "Anora", email: "a@pandadev.test" });
+  });
+
+  /** Whether each card of a round really works, in the order shown. */
+  async function truths(id: string) {
+    const [round] = await testDb
+      .select()
+      .from(schema.tgBugHunt)
+      .where(eq(schema.tgBugHunt.id, id));
+    return round.cards.map((c) => {
+      const [language, n] = c.split(":");
+      return bugHuntSnippets[language][Number(n)].works;
+    });
+  }
+
+  /** Plays a round: `right` right answers, then wrong ones, 1 s apart, `count` cards. */
+  async function play(player: Player, right: number, count = 20, from = start) {
+    const started = await bughunt.startBugHunt(player, "python", from);
+    if (!started || "limit" in started) throw new Error("not started");
+    const truth = await truths(started.id);
+    const t0 = from.getTime();
+    for (let i = 0; i < count; i++)
+      await bughunt.answerBugHunt(
+        player,
+        started.id,
+        i,
+        i < right ? truth[i] : !truth[i],
+        new Date(t0 + (i + 1) * 1000),
+      );
+    return bughunt.bugHuntResult(player, started.id, new Date(t0 + 70_000));
+  }
+
+  it("deals every card of the language, shuffled, without the answers", async () => {
+    const started = await bughunt.startBugHunt(anora, "python", start);
+    if (!started || "limit" in started) throw new Error("not started");
+    expect(started.cards).toHaveLength(bugHuntSnippets.python.length);
+    expect(JSON.stringify(started)).not.toContain('"works"');
+    expect(new Set(started.cards.map((c) => c.code)).size).toBe(
+      started.cards.length,
+    );
+    expect(await bughunt.startBugHunt(anora, "cobol", start)).toBeNull();
+  });
+
+  it("grades each swipe on the server, in order, and not after the minute", async () => {
+    const started = await bughunt.startBugHunt(anora, "python", start);
+    if (!started || "limit" in started) throw new Error("not started");
+    const truth = await truths(started.id);
+    expect(
+      await bughunt.answerBugHunt(anora, started.id, 1, true, at(1)),
+    ).toBeNull();
+    expect(
+      await bughunt.answerBugHunt(anora, started.id, 0, truth[0], at(2)),
+    ).toEqual({
+      counted: true,
+      correct: true,
+      works: truth[0],
+      done: false,
+    });
+    expect(
+      await bughunt.answerBugHunt(guest, started.id, 1, true, at(3)),
+    ).toBeNull();
+    expect(
+      await bughunt.answerBugHunt(anora, started.id, 1, truth[1], at(70)),
+    ).toEqual({
+      counted: false,
+      done: true,
+    });
+    expect(
+      await bughunt.bugHuntResult(anora, started.id, at(70)),
+    ).toMatchObject({
+      score: 1,
+      answered: 1,
+    });
+  });
+
+  it("pays the day's first round, up to 15 XP, and knows a record", async () => {
+    const first = await play(anora, 18);
+    expect(first).toMatchObject({
+      score: 18,
+      answered: 20,
+      xp: 15,
+      paid: 15,
+      best: 0,
+    });
+    expect(first?.review[0].explanation).toBe(
+      bugHuntSnippets.python.find((c) => c.code === first?.review[0].code)?.en,
+    );
+    const second = await play(anora, 19, 20, at(120));
+    expect(second).toMatchObject({ score: 19, xp: 0, best: 18, rank: 1 });
+    const xp = await testDb.select().from(schema.xpEvent);
+    expect(xp).toEqual([
+      expect.objectContaining({
+        reason: "bughunt",
+        amount: 15,
+        ref: "bughunt:2026-10-31",
+      }),
+    ]);
+  });
+
+  it("ranks each player by their best round today; guests play without XP", async () => {
+    await play(anora, 12);
+    await play(anora, 15, 20, at(120));
+    const theirs = await play(guest, 14);
+    expect(theirs).toMatchObject({ xp: 0, rank: 2 });
+    expect(theirs?.top.map((r) => [r.score, r.you])).toEqual([
+      [15, false],
+      [14, true],
+    ]);
+    expect(theirs?.review[0].explanation).toBe(
+      bugHuntSnippets.python.find((c) => c.code === theirs?.review[0].code)?.ru,
+    );
+    const overview = await bughunt.bugHuntOverview(anora, at(300));
+    expect(overview.xpLeft).toBe(false);
+    expect(overview.languages[0]).toMatchObject({
+      language: "python",
+      today: 15,
+      best: 15,
+    });
+    expect(overview.languages[1]).toMatchObject({
+      language: "javascript",
+      today: null,
+    });
+  });
+
+  it("draws only sensible pictures", () => {
+    expect(
+      parseCard(new URLSearchParams("k=bughunt&l=en&lang=sql&s=12&a=14")),
+    ).toMatchObject({ kind: "bughunt", score: 12, answered: 14 });
+    for (const bad of ["s=15&a=14", "s=1&a=100", "s=x&a=2"])
+      expect(
+        parseCard(new URLSearchParams(`k=bughunt&l=en&lang=sql&${bad}`)),
       ).toBeNull();
   });
 });

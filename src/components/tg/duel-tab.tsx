@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import {
   AnswerReview,
@@ -13,7 +13,7 @@ import {
   shareToChat,
   shareToStory,
 } from "@/components/tg/share";
-import { callApi, haptic, webApp } from "@/components/tg/telegram";
+import { callApi, haptic, useBackButton } from "@/components/tg/telegram";
 import type { MiniAppHome } from "@/lib/tg-app/home";
 import { appTexts, languageNames } from "@/lib/tg-app/texts";
 
@@ -112,17 +112,8 @@ export function DuelTab({
   }, [duel]);
 
   // Telegram's back button returns to the duel list.
-  useEffect(() => {
-    const back = webApp()?.BackButton;
-    if (!back || !duel) return;
-    const leave = () => onDuel(null);
-    back.show();
-    back.onClick(leave);
-    return () => {
-      back.offClick(leave);
-      back.hide();
-    };
-  }, [duel, onDuel]);
+  const leave = useCallback(() => onDuel(null), [onDuel]);
+  useBackButton(duel ? leave : null);
 
   async function create(language: string) {
     const created = await startChallenge(language);

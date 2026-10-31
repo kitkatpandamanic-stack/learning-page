@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useCallback } from "react";
 
 import {
   AnswerReview,
@@ -13,7 +13,7 @@ import {
   shareToChat,
   shareToStory,
 } from "@/components/tg/share";
-import { haptic, webApp } from "@/components/tg/telegram";
+import { haptic, useBackButton } from "@/components/tg/telegram";
 import type { MiniAppHome } from "@/lib/tg-app/home";
 import { appTexts, languageNames } from "@/lib/tg-app/texts";
 
@@ -48,20 +48,11 @@ export function BlitzTab({
   const t = appTexts[home.locale];
 
   // Telegram's back button leaves a game for the list.
-  useEffect(() => {
-    const back = webApp()?.BackButton;
-    if (!back || !language) return;
-    const leave = () => {
-      onLanguage(null);
-      onChange();
-    };
-    back.show();
-    back.onClick(leave);
-    return () => {
-      back.offClick(leave);
-      back.hide();
-    };
-  }, [language, onLanguage, onChange]);
+  const leave = useCallback(() => {
+    onLanguage(null);
+    onChange();
+  }, [onLanguage, onChange]);
+  useBackButton(language ? leave : null);
 
   if (language)
     return (

@@ -1,4 +1,5 @@
 import { blitzResult } from "@/lib/tg-app/blitz";
+import { bugHuntResult } from "@/lib/tg-app/bughunt";
 import { duelResult } from "@/lib/tg-app/duel";
 import { wordleToday } from "@/lib/tg-app/wordle";
 import type { Card } from "@/lib/tg-app/card";
@@ -20,6 +21,7 @@ import {
  *   { kind: "panda", outfit }    the learner's panda (outfit from CloudStorage)
  *   { kind: "duel", duel }       a challenge: the player's score to beat
  *   { kind: "wordle", language } today's finished Code Wordle
+ *   { kind: "bughunt", round }   a finished Bug Hunt round
  * Returns a prepared message id for shareMessage, a picture for Stories, and
  * plain text for older Telegram apps.
  */
@@ -31,6 +33,7 @@ export async function POST(request: Request) {
     language?: string;
     outfit?: string;
     duel?: string;
+    round?: string;
   } | null;
   const { locale, player, init } = caller;
   const t = appTexts[locale];
@@ -54,6 +57,24 @@ export async function POST(request: Request) {
     text = blitzShareText(locale, { ...result, size: result.size });
     start = `blitz_${result.language}`;
     button = `⚡ ${t.shareButton}`;
+  } else if (body?.kind === "bughunt") {
+    const result = await bugHuntResult(player, String(body.round ?? ""));
+    if (!result) return new Response("Bad request", { status: 400 });
+    card = {
+      kind: "bughunt",
+      locale,
+      format: "story",
+      language: result.language,
+      score: result.score,
+      answered: result.answered,
+    };
+    text = t.bugHuntShare(
+      languageNames[result.language],
+      result.score,
+      result.answered,
+    );
+    start = "bughunt";
+    button = t.bugHuntButton;
   } else if (body?.kind === "wordle") {
     const game = await wordleToday(player, String(body.language ?? ""));
     if (!game?.done) return new Response("Bad request", { status: 400 });

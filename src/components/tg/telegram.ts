@@ -1,3 +1,5 @@
+import { useEffect } from "react";
+
 /** The parts of Telegram.WebApp (telegram-web-app.js) the Mini App uses. */
 export type WebApp = {
   initData: string;
@@ -75,4 +77,45 @@ export function haptic(kind: "success" | "error" | "tap") {
   if (!h) return;
   if (kind === "tap") h.selectionChanged();
   else h.notificationOccurred(kind);
+}
+
+// Telegram's back button belongs to the deepest screen showing: each screen
+// that can go back adds its handler with its depth (1 = a game inside the
+// Games tab, 2 = a step inside a game), and the deepest one wins. (Effects
+// run children first, so the order they're added can't tell depth.)
+const backStack: { handler: () => void; depth: number }[] = [];
+let backWired = false;
+
+function backDispatch() {
+  const deepest = backStack.reduce<(typeof backStack)[number] | null>(
+    (top, entry) => (!top || entry.depth >= top.depth ? entry : top),
+    null,
+  );
+  deepest?.handler();
+}
+
+function syncBack() {
+  const back = webApp()?.BackButton;
+  if (!back) return;
+  if (!backWired) {
+    back.onClick(backDispatch);
+    backWired = true;
+  }
+  if (backStack.length > 0) back.show();
+  else back.hide();
+}
+
+/** Shows Telegram's back button while `handler` is set (keep it stable: useCallback). */
+export function useBackButton(handler: (() => void) | null, depth = 2) {
+  useEffect(() => {
+    if (!handler) return;
+    const entry = { handler, depth };
+    backStack.push(entry);
+    syncBack();
+    return () => {
+      const at = backStack.indexOf(entry);
+      if (at >= 0) backStack.splice(at, 1);
+      syncBack();
+    };
+  }, [handler, depth]);
 }
