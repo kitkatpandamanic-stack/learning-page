@@ -32,7 +32,16 @@ export async function renderCard(card: Card) {
   /** Rows of coloured squares under the score */
   let grid: string[][] | null = null;
   const GREEN = "#22c55e";
-  if (card.kind === "wordle") {
+  if (card.kind === "bughunt") {
+    eyebrow = `${t.bugHuntTitle} · ${languageNames[card.language]}`;
+    headline = `${card.score}/${card.answered}`;
+    detail = t.bugHuntScore(card.score, card.answered);
+    panda = pandaSvg({
+      stage: 3,
+      mood:
+        card.answered === 0 ? "sleepy" : blitzMood(card.score, card.answered),
+    });
+  } else if (card.kind === "wordle") {
     const colors = { g: GREEN, y: "#eab308", x: "#475569" };
     eyebrow = `${t.wordleTitle(card.number)} · ${languageNames[card.language]}`;
     headline = `${card.solved ? card.rows.length : "X"}/6`;

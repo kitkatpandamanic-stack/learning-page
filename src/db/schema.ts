@@ -422,6 +422,41 @@ export const tgWordle = pgTable(
 );
 
 /**
+ * Bug Hunt rounds in the Telegram Mini App: 60 seconds of "works or has a
+ * bug?" cards in one language, graded and timed on the server. As many
+ * rounds as people like; the day's first finished round pays XP.
+ */
+export const tgBugHunt = pgTable(
+  "tg_bughunt",
+  {
+    /** Short random id the app sends back with each answer */
+    id: text("id").primaryKey(),
+    telegramId: bigint("telegram_id", { mode: "number" }).notNull(),
+    userId: text("user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    /** The Tashkent day the round was played */
+    day: date("day", { mode: "string" }).notNull(),
+    language: text("language").notNull(),
+    /** The cards in the order shown, as "<language>:<card number>" */
+    cards: jsonb("cards").$type<string[]>().notNull(),
+    startedAt: timestamp("started_at").notNull(),
+    /** [{ c: answered "works"?, ok: right?, ms: since the start }] */
+    answers: jsonb("answers")
+      .$type<{ c: boolean; ok: boolean; ms: number }[]>()
+      .default([])
+      .notNull(),
+    score: smallint("score").default(0).notNull(),
+    finishedAt: timestamp("finished_at"),
+    xp: smallint("xp").default(0).notNull(),
+  },
+  (table) => [
+    index("tg_bughunt_day_language_idx").on(table.day, table.language),
+    index("tg_bughunt_telegram_idx").on(table.telegramId, table.language),
+  ],
+);
+
+/**
  * What the health collector (.github/workflows/health.yml) found outside the
  * site: Vercel deployments, Neon usage, Sentry errors, GitHub security
  * alerts. One row per run, kept for 90 days; /admin/health reads the latest.

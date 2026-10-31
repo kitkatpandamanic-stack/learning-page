@@ -36,6 +36,14 @@ export type Card =
       solved: boolean;
     }
   | {
+      kind: "bughunt";
+      locale: AppLocale;
+      format: CardFormat;
+      language: string;
+      score: number;
+      answered: number;
+    }
+  | {
       kind: "panda";
       locale: AppLocale;
       format: CardFormat;
@@ -60,7 +68,11 @@ export function cardQuery(card: Card) {
     l: card.locale,
     f: card.format,
   });
-  if (card.kind === "wordle") {
+  if (card.kind === "bughunt") {
+    q.set("lang", card.language);
+    q.set("s", String(card.score));
+    q.set("a", String(card.answered));
+  } else if (card.kind === "wordle") {
     q.set("n", String(card.number));
     q.set("lang", card.language);
     q.set("r", card.rows.map((row) => row.join("")).join("."));
@@ -85,6 +97,15 @@ export function parseCard(q: URLSearchParams): Card | null {
   const format = q.get("f") === "wide" ? "wide" : "story";
   if (!locale) return null;
   const kind = q.get("k");
+  if (kind === "bughunt") {
+    const language = q.get("lang") ?? "";
+    const score = int(q.get("s"), 0, 99);
+    const answered = int(q.get("a"), 0, 99);
+    if (!(language in languageNames) || score === null || answered === null)
+      return null;
+    if (score > answered) return null;
+    return { kind, locale, format, language, score, answered };
+  }
   if (kind === "wordle") {
     const number = int(q.get("n"), 1, 99_999);
     const language = q.get("lang") ?? "";
