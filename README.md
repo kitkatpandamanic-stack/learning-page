@@ -10,7 +10,7 @@ Next.js 16 (App Router) · React 19 · TypeScript · Tailwind CSS v4 · shadcn/u
 
 ## Getting started
 
-Requires Node.js 24 (see `.nvmrc`).
+Requires Node.js 26 (see `.nvmrc`).
 
 ```bash
 nvm use
@@ -229,7 +229,7 @@ switch with the EN | RU toggle in the navbar; we don't redirect based on browser
 
 The site is hosted on [Vercel](https://vercel.com) and connected to this GitHub repo:
 every push to `main` deploys to production, and other branches get preview deployments.
-Vercel runs `npm run build` on Node 24 (Velite, then Next.js) and doesn't run the tests
+Vercel runs `npm run build` on Node 26 (Velite, then Next.js) and doesn't run the tests
 itself: GitHub Actions (`.github/workflows/ci.yml`) checks formatting, lint, types and
 tests, and solves every exercise in Chrome, on every push and pull request. `main` is
 protected, so code only reaches it through a pull request whose checks all pass.

@@ -136,4 +136,4 @@ with cheap fixes nudged up. "Who" says which audience feels it.
 
 ## Dated to-dos
 
-- After 2026-10-28 (Node 26 becomes LTS): update Node 24 pins in JS `realtime-chat/03-the-client-and-shipping-it` (`node:24-alpine`, `node-version: 24`), and check other `node-version` pins across the courses.
+- ✅ Done 2026-10-31: Node 26 LTS pins in JS `realtime-chat/03-the-client-and-shipping-it` (`node:26-alpine`, `node-version: 26`), and the site, CI, health and backup workflows now run Node 26.
