@@ -9,6 +9,7 @@ import { usePathname } from "@/i18n/navigation";
 
 import { languageFromPath, useAward } from "@/components/progress/use-progress";
 import { Button } from "@/components/ui/button";
+import { quizOrder } from "@/lib/quiz-order";
 
 export function Quiz({
   question,
@@ -16,6 +17,7 @@ export function Quiz({
   answer,
   explanation,
   activityId,
+  orderKey,
 }: {
   question: string;
   options: string[];
@@ -24,6 +26,8 @@ export function Quiz({
   explanation?: string;
   /** Added at build time ("quiz-1", …); used to award XP once */
   activityId?: string;
+  /** Added at build time; shuffles the options (the same order as review and the bot) */
+  orderKey?: string;
 }) {
   const pathname = usePathname();
   const award = useAward(languageFromPath(pathname));
@@ -32,6 +36,17 @@ export function Quiz({
   const id = React.useId();
   const [selected, setSelected] = React.useState<number | null>(null);
   const [checked, setChecked] = React.useState(false);
+  // Each "Try again" shows the options in a new order, so the answer can't
+  // be found by position. Round 0 is the same on the server and the client.
+  const [round, setRound] = React.useState(0);
+  const order = React.useMemo(
+    () =>
+      orderKey
+        ? quizOrder(orderKey, options.length, round)
+        : options.map((_, i) => i),
+    [orderKey, options, round],
+  );
+  // `selected` and `answer` are indexes into `options` (the lesson's order).
   const correct = checked && selected === answer;
 
   return (
@@ -43,7 +58,8 @@ export function Quiz({
       </p>
 
       <div className="mt-4 flex flex-col gap-2">
-        {options.map((option, i) => {
+        {order.map((i) => {
+          const option = options[i];
           const isSelected = selected === i;
           const showRight = checked && i === answer;
           const showWrong = checked && isSelected && i !== answer;
@@ -105,6 +121,7 @@ export function Quiz({
             onClick={() => {
               setChecked(false);
               setSelected(null);
+              setRound((r) => r + 1);
             }}
           >
             <RotateCcw /> {t("tryAgain")}

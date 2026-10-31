@@ -11,6 +11,7 @@ import { visit } from "unist-util-visit";
 import { defineCollection, defineConfig, s } from "velite";
 
 import { languages } from "./src/lib/languages";
+import { quizKey, shuffleQuiz } from "./src/lib/quiz-order";
 import {
   difficulties,
   PRACTICE_XP,
@@ -59,11 +60,29 @@ const prettyCode: Options = {
 };
 
 /**
+ * "…/content/courses/python/basics/02-variables.ru.mdx" → its quizOrder key
+ * prefix ("python", "variables"); practice problems get "practice/python".
+ * The EN and RU files of a lesson give the same key.
+ */
+function quizKeyParts(path: string | undefined) {
+  const parts = (path ?? "").split(/[\\/]/);
+  const at = parts.lastIndexOf("content");
+  if (at < 0 || parts.length < at + 4) return null;
+  const [kind, language] = parts.slice(at + 1, at + 3);
+  const { base } = splitLocale(parts[parts.length - 1].replace(/\.mdx$/, ""));
+  const slug = /^\d+-(.+)$/.exec(base)?.[1] ?? base;
+  return { scope: kind === "courses" ? language : `${kind}/${language}`, slug };
+}
+
+/**
  * Gives every <Exercise> and <Quiz> a stable id ("exercise-1", "quiz-2", …) in
  * document order. The server uses these ids to award XP once per activity.
+ * Quizzes also get an `orderKey`, which shuffles their options (see quizOrder)
+ * the same way as the lesson data that review and the bot read.
  */
 function remarkActivityIds() {
-  return (tree: Parameters<typeof visit>[0]) => {
+  return (tree: Parameters<typeof visit>[0], file: { path?: string }) => {
+    const key = quizKeyParts(file.path);
     const counters: Record<string, number> = { Exercise: 0, Quiz: 0 };
     visit(tree, "mdxJsxFlowElement", (node) => {
       const el = node as {
@@ -77,6 +96,12 @@ function remarkActivityIds() {
           name: "activityId",
           value: `${el.name.toLowerCase()}-${n}`,
         });
+        if (el.name === "Quiz" && key)
+          el.attributes.push({
+            type: "mdxJsxAttribute",
+            name: "orderKey",
+            value: quizKey(key.scope, key.slug, n),
+          });
       }
     });
   };
@@ -355,7 +380,11 @@ const lessons = defineCollection({
         terms: searchTerms(raw),
         exerciseCount: countTags(raw, "Exercise"),
         quizCount: countTags(raw, "Quiz"),
-        quizzes: extractQuizzes(raw),
+        // In quizOrder, like the lesson page (orderKey above), so daily review
+        // and the bot show the same order and grade against the same answer.
+        quizzes: extractQuizzes(raw).map((quiz, i) =>
+          shuffleQuiz(quiz, quizKey(language, match ? match[2] : file, i + 1)),
+        ),
       };
     }),
 });
