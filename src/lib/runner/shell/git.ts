@@ -874,6 +874,11 @@ const COMMANDS: Record<string, Sub> = {
     const verbose = args.some(
       (a) => a === "-v" || a === "-vv" || a === "--verbose",
     );
+    const mergedFilter = args.includes("--merged")
+      ? true
+      : args.includes("--no-merged")
+        ? false
+        : null;
     const names = args.filter((a) => !a.startsWith("-"));
     const current = await this.branch(dir);
     const head = await this.head(dir);
@@ -928,12 +933,25 @@ const COMMANDS: Record<string, Sub> = {
       const rows: [string, string, string | null][] = [];
       if (!current && head)
         rows.push(["*", `(HEAD detached at ${head.slice(0, 7)})`, head]);
-      for (const name of await this.branches(dir))
+      for (const name of await this.branches(dir)) {
+        if (mergedFilter !== null && head) {
+          const oid = (await this.resolveCommit(dir, name))!;
+          const merged =
+            oid === head ||
+            (await git.isDescendent({
+              fs: this.fs,
+              dir,
+              oid: head,
+              ancestor: oid,
+            }));
+          if (merged !== mergedFilter) continue;
+        }
         rows.push([
           name === current ? "*" : " ",
           name,
           verbose ? await this.resolveCommit(dir, name) : null,
         ]);
+      }
       const width = Math.max(...rows.map((r) => r[1].length));
       for (const [mark, name, oid] of rows) {
         if (!verbose || !oid) {
@@ -1039,11 +1057,19 @@ const COMMANDS: Record<string, Sub> = {
     return 0;
   },
 
-  async merge({ io }, args, dir) {
+  async merge(ctx, args, dir) {
+    const { io } = ctx;
     if (args.includes("--abort")) {
       const merge = this.merging(dir);
       if (!merge) fatal("There is no merge to abort (MERGE_HEAD missing).");
       const branch = await this.branch(dir);
+      // Files the merge brought in go away again, like git.
+      const ours = await this.tree(dir, await this.head(dir));
+      for (const path of (await this.tree(dir, merge!.theirs)).keys()) {
+        if (ours.has(path)) continue;
+        if (this.fs.isFile(`${dir}/${path}`)) this.fs.unlink(`${dir}/${path}`);
+        await git.remove({ fs: this.fs, dir, filepath: path });
+      }
       await git.checkout({
         fs: this.fs,
         dir,
@@ -1055,6 +1081,12 @@ const COMMANDS: Record<string, Sub> = {
         if (this.fs.exists(`${dir}/.git/${name}`))
           this.fs.unlink(`${dir}/.git/${name}`);
       return 0;
+    }
+    if (args.includes("--continue")) {
+      if (!this.merging(dir))
+        fatal("There is no merge in progress (MERGE_HEAD missing).");
+      // Real git opens an editor with the prepared message; take it as is.
+      return COMMANDS.commit.call(this, ctx, [], dir);
     }
     if (this.merging(dir))
       fatal(
@@ -1150,6 +1182,22 @@ const COMMANDS: Record<string, Sub> = {
                 "<<<<<<< HEAD",
               ),
           );
+      }
+      // Paths that merged cleanly are staged, like git; only the
+      // conflicts wait for the learner.
+      const stage = await this.stage(dir);
+      const paths = new Set([
+        ...before.keys(),
+        ...(await this.tree(dir, theirs!)).keys(),
+      ]);
+      for (const path of paths) {
+        if (conflicts.includes(path)) continue;
+        const full = `${dir}/${path}`;
+        if (this.fs.isFile(full)) {
+          if (stage.get(path) !== this.fs.readText(full))
+            await git.add({ fs: this.fs, dir, filepath: path });
+        } else if (stage.has(path))
+          await git.remove({ fs: this.fs, dir, filepath: path });
       }
       this.fs.writeFile(`${dir}/.git/MERGE_HEAD`, `${theirs}\n`);
       this.fs.writeFile(`${dir}/.git/MERGE_MSG`, `${message}\n`);
@@ -1261,7 +1309,10 @@ async function longStatus(
   const shown = (p: string) => sandbox.shown(dir, p);
   if (staged.length) {
     io.out(
-      `Changes to be committed:\n  (use "${head ? "git restore --staged <file>..." : "git rm --cached <file>..."}" to unstage)\n`,
+      // Like git, no hint while a merge is going on.
+      merge
+        ? "Changes to be committed:\n"
+        : `Changes to be committed:\n  (use "${head ? "git restore --staged <file>..." : "git rm --cached <file>..."}" to unstage)\n`,
     );
     for (const p of staged) io.out(`\t${label[status[p][0]]}${shown(p)}\n`);
     io.out("\n");
@@ -1494,6 +1545,10 @@ async function checkoutBranch(
 ) {
   const current = await sandbox.branch(dir);
   const was = current ?? (await sandbox.head(dir));
+  if (sandbox.merging(dir))
+    fatal(
+      'cannot switch branch while merging\nConsider "git merge --quit" or "git worktree add".',
+    );
   if (options.create) {
     const head = await sandbox.head(dir);
     const at = options.start

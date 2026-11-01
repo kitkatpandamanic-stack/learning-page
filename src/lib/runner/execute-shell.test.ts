@@ -745,6 +745,112 @@ printf "100%%\\n"`);
   });
 });
 
+describe("a merge that stops on a conflict", () => {
+  // Omar adds a page and edits README; both sides change index.html.
+  const SETUP = `mkdir club && cd club
+git init
+echo "nav: Home" > index.html
+echo "# Club" > README.md
+git add .
+git commit -m "First"
+git switch -c omar
+echo "nav: Films" > index.html
+echo "members" > members.html
+echo "more" >> README.md
+git add .
+git commit -m "Omar"
+git switch main
+echo "nav: Schedule" > index.html
+git commit -am "Mine"`;
+
+  it("stages the other side's clean changes, like git", async () => {
+    const r = await sh(
+      `git merge omar
+git status
+git switch omar
+echo "nav: both" > index.html
+git add index.html
+git status
+git merge --continue
+git show --stat HEAD`,
+      SETUP,
+    );
+    expect(r.printed.slice(3, 15)).toEqual([
+      "On branch main",
+      "You have unmerged paths.",
+      '  (fix conflicts and run "git commit")',
+      '  (use "git merge --abort" to abort the merge)',
+      "",
+      "Changes to be committed:",
+      "\tmodified:   README.md",
+      "\tnew file:   members.html",
+      "",
+      "Unmerged paths:",
+      '  (use "git add <file>..." to mark resolution)',
+      "\tboth modified:   index.html",
+    ]);
+    expect(r.errors).toEqual([
+      "fatal: cannot switch branch while merging",
+      'Consider "git merge --quit" or "git worktree add".',
+    ]);
+    expect(r.text).toContain(`All conflicts fixed but you are still merging.
+  (use "git commit" to conclude merge)
+
+Changes to be committed:
+\tmodified:   README.md
+\tmodified:   index.html
+\tnew file:   members.html`);
+    expect(r.text).toContain("[main ");
+    expect(r.text).toContain("] Merge branch 'omar'");
+  });
+
+  it("keeps every change in the merge commit", async () => {
+    const { tests } = await executeShell(
+      `git merge omar
+echo "nav: both" > index.html
+git add index.html
+git commit -m "Merge omar"`,
+      {
+        setup: SETUP,
+        tests: [
+          {
+            name: "page",
+            check: "(await git.show('HEAD', 'members.html')) === 'members\\n'",
+          },
+          {
+            name: "readme",
+            check:
+              "(await git.show('HEAD', 'README.md')) === '# Club\\nmore\\n'",
+          },
+          {
+            name: "clean",
+            check: "Object.keys(await git.status()).length === 0",
+          },
+        ],
+      },
+    );
+    expect(tests?.map((t) => t.passed)).toEqual([true, true, true]);
+  });
+
+  it("goes back exactly with --abort", async () => {
+    const r = await sh(
+      `git merge omar\ngit merge --abort\ngit status -s\nls`,
+      SETUP,
+    );
+    expect(r.printed.slice(3)).toEqual(["index.html  README.md"]);
+  });
+
+  it("lists merged and unmerged branches", async () => {
+    const r = await sh(
+      `git branch side
+git branch --merged
+git branch --no-merged`,
+      SETUP,
+    );
+    expect(r.printed).toEqual(["* main", "  side", "  omar"]);
+  });
+});
+
 describe("the commit graph", () => {
   /** Each row as "lane message (labels)", newest first. */
   async function graph(code: string, setup = PROJECT) {
