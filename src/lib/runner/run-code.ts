@@ -5,6 +5,7 @@ import type {
   TestSpec,
 } from "./execute";
 import { runPython } from "./run-python";
+import { runShell } from "./run-shell";
 import { runSql } from "./run-sql";
 import { typecheck } from "./run-typecheck";
 import type { WorkerMessage, WorkerRequest } from "./runner.worker";
@@ -32,6 +33,8 @@ export type RunStatus = "loading" | "installing" | "running";
 type RunOptions = {
   language?: RunLanguage;
   tests?: TestSpec[];
+  /** Terminal exercises: commands run first, unseen (the starting folder) */
+  setup?: string;
   timeoutMs?: number;
   onLine?: (line: OutputLine) => void;
   onStatus?: (status: RunStatus, detail?: string) => void;
@@ -42,11 +45,12 @@ type Run = { result: Promise<RunResult>; cancel: () => void };
 /**
  * Runs learner code without freezing the page: JavaScript in a fresh Web
  * Worker, TypeScript after a type check, Python with Pyodide, SQL with
- * PostgreSQL (PGlite).
+ * PostgreSQL (PGlite), terminal commands in an in-memory sandbox with git.
  */
 export function runCode(code: string, options: RunOptions = {}): Run {
   if (options.language === "python") return runPython(code, options);
   if (options.language === "sql") return runSql(code, options);
+  if (options.language === "shell") return runShell(code, options);
   if (options.language === "typescript") return runTypeScript(code, options);
   return runInWorker(code, options);
 }

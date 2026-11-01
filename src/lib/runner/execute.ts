@@ -16,10 +16,11 @@ import { createWsNetwork } from "./ws-shim";
 
 /**
  * "react" is JavaScript with JSX, run in the live preview with React loaded;
- * "tsx" is the same in TypeScript, type-checked first.
+ * "tsx" is the same in TypeScript, type-checked first; "shell" is the
+ * practice terminal (bash commands and git).
  */
 export type RunLanguage =
-  "javascript" | "typescript" | "python" | "react" | "tsx" | "sql";
+  "javascript" | "typescript" | "python" | "react" | "tsx" | "sql" | "shell";
 export type LogLevel = "log" | "info" | "warn" | "error";
 export type OutputLine = {
   level: LogLevel;

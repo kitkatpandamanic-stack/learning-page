@@ -17,6 +17,7 @@ export function Exercise({
   tests,
   expectedOutput,
   html,
+  setup,
   activityId,
   children,
 }: {
@@ -28,6 +29,8 @@ export function Exercise({
   expectedOutput?: string;
   /** JavaScript exercises: the page the code runs against, shown in a preview */
   html?: string;
+  /** Terminal exercises: commands run first, unseen (the starting folder and repository) */
+  setup?: string;
   /** Added at build time ("exercise-1", …); used to award XP once */
   activityId?: string;
   children: ReactNode;
@@ -68,6 +71,7 @@ export function Exercise({
               tests={tests}
               expectedOutput={expectedOutput}
               html={html}
+              setup={setup}
               storageId={activityId ?? title ?? "exercise"}
               activityId={activityId}
             />

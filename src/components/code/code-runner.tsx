@@ -36,6 +36,7 @@ import { typeErrorResult, type TypeEnv } from "@/lib/runner/typecheck";
 import { runDom, type DomRun } from "@/lib/runner/run-dom";
 import { whenIdle } from "@/lib/idle";
 import { isPythonReady, preloadPython } from "@/lib/runner/run-python";
+import { isShellReady, preloadShell } from "@/lib/runner/run-shell";
 import { isSqlReady, preloadSql } from "@/lib/runner/run-sql";
 import {
   isTypeScriptReady,
@@ -94,6 +95,8 @@ type CodeRunnerProps = {
   keys?: React.ComponentProps<typeof CodeEditor>["keys"];
   /** After each run: the code that ran and what it printed */
   onResult?: (code: string, output: OutputLine[]) => void;
+  /** Terminal exercises: commands run first, unseen (the starting folder) */
+  setup?: string;
 };
 
 /**
@@ -128,6 +131,7 @@ function RunnerBody({
   autoRun = false,
   keys,
   onResult,
+  setup,
   initialCode,
   onCodeChange,
   saveStatus,
@@ -227,6 +231,7 @@ function RunnerBody({
   React.useEffect(() => {
     if (language === "python") return whenIdle(preloadPython);
     if (language === "sql") return whenIdle(preloadSql);
+    if (language === "shell") return whenIdle(preloadShell);
     if (typed) return whenIdle(() => preloadTypeScript(typeEnv));
   }, [language, typed, typeEnv]);
 
@@ -244,6 +249,7 @@ function RunnerBody({
     setStatus(
       (language === "python" && !isPythonReady()) ||
         (language === "sql" && !isSqlReady()) ||
+        (language === "shell" && !isShellReady()) ||
         (typed && !isTypeScriptReady(typeEnv))
         ? "loading"
         : null,
@@ -287,6 +293,7 @@ function RunnerBody({
   async function runPlain(withChecks: boolean) {
     const { result: pending, cancel } = runCode(code, {
       language,
+      setup,
       tests: withChecks ? tests : undefined,
       onLine: (line) => setLines((prev) => [...prev, line]),
       onStatus: (next, detail) => {
