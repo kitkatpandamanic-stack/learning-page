@@ -34,6 +34,7 @@ const languageAliases: Record<string, string[]> = {
   typescript: ["typescript", "ts"],
   python: ["python", "py", "питон"],
   sql: ["sql", "postgres", "postgresql"],
+  git: ["git", "terminal", "bash", "shell", "терминал", "гит"],
 };
 
 /** Lower case, no accents, ё = е: "Ёлка" and "елка" match. */

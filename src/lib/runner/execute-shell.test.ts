@@ -187,7 +187,7 @@ git log`);
     );
     expect(r.text).toContain("nothing to commit, working tree clean");
     expect(r.text).toMatch(
-      /commit [0-9a-f]{40} \(HEAD -> main\)\nAuthor: Panda <panda@pandadev\.dev>\nDate: {3}Mon Jan {2}5 09:01:00 2026 \+0000\n\n {4}Add the menu/,
+      /commit [0-9a-f]{40} \(HEAD -> main\)\nAuthor: Panda <panda@pandadev\.dev>\nDate: {3}Mon Jan 5 09:01:00 2026 \+0000\n\n {4}Add the menu/,
     );
   });
 
@@ -426,6 +426,86 @@ touch a && git add a && git commit -m one
 git log -n 1`,
     );
     expect(r.text).toContain("Author: Anora <anora@example.com>");
+  });
+});
+
+describe("matches real git and bash where lessons noticed a difference", () => {
+  it("spaces git status like git: no blank line after the branch once there are commits", async () => {
+    const r = await sh(
+      "echo more >> app.py\ngit status\ngit add app.py\ngit commit -m x\ngit status",
+      PROJECT,
+    );
+    expect(r.text).toContain(
+      '~/project $ git status\nOn branch main\nChanges not staged for commit:\n  (use "git add <file>..." to update what will be committed)\n  (use "git restore <file>..." to discard changes in working directory)\n\tmodified:   app.py\n\nno changes added to commit (use "git add" and/or "git commit -a")',
+    );
+    expect(r.text).toMatch(
+      /~\/project \$ git status\nOn branch main\nnothing to commit, working tree clean$/,
+    );
+  });
+
+  it("prints git status's report when there's nothing to commit", async () => {
+    const r = await sh("touch notes.txt\ngit commit -m x", PROJECT);
+    expect(r.text).toContain(
+      'On branch main\nUntracked files:\n  (use "git add <file>..." to include in what will be committed)\n\tnotes.txt\n\nnothing added to commit but untracked files present (use "git add" to track)',
+    );
+    const first = await sh(
+      "mkdir p && cd p && git init\ntouch a\ngit commit -m x",
+    );
+    expect(first.text).toContain(
+      "On branch main\n\nInitial commit\n\nUntracked files:",
+    );
+  });
+
+  it("reads an unquoted commit message's extra words as file names", async () => {
+    const r = await sh("echo x >> app.py\ngit commit -am Add soup", PROJECT);
+    expect(r.errors).toEqual([
+      "error: pathspec 'soup' did not match any file(s) known to git",
+    ]);
+  });
+
+  it("reads global git config anywhere", async () => {
+    const r = await sh(
+      'git config --global user.name "Anora"\ngit config user.name',
+    );
+    expect(r.printed).toEqual(["Anora"]);
+  });
+
+  it("shows a commit's summary with git show --stat", async () => {
+    const r = await sh("git show --stat", PROJECT);
+    expect(r.text).toContain(
+      " README.md | 1 +\n app.py    | 1 +\n 2 files changed, 2 insertions(+)",
+    );
+  });
+
+  it("sorts ls arguments and wildcard matches like ls and bash", async () => {
+    const r = await sh(
+      "touch Beach.jpg apple.jpg zoo.txt .hidden\nmkdir docs\nls zoo.txt Beach.jpg apple.jpg\necho *.jpg\nls -A\nls -l",
+    );
+    expect(r.printed.slice(0, 3)).toEqual([
+      "apple.jpg  Beach.jpg  zoo.txt",
+      "apple.jpg Beach.jpg",
+      ".hidden  apple.jpg  Beach.jpg  docs  zoo.txt",
+    ]);
+    expect(r.text).toMatch(
+      /drwxr-xr-x 2 panda panda +\d+ Jan +5 \d\d:\d\d docs/,
+    );
+  });
+
+  it("refuses to move into a folder that isn't there", async () => {
+    const r = await sh("touch a.css\nmv a.css css/\nls");
+    expect(r.errors).toEqual([
+      "mv: cannot move 'a.css' to 'css/': Not a directory",
+    ]);
+    expect(r.printed).toEqual(["a.css"]);
+  });
+
+  it("explains tree on a file like tree does", async () => {
+    const r = await sh("touch a\ntree a");
+    expect(r.printed).toEqual([
+      "a [error opening dir]",
+      "",
+      "0 directories, 0 files",
+    ]);
   });
 });
 

@@ -11,7 +11,8 @@ Last refreshed: 2026-10-11 (repo HEAD `947f15b`). Generated from `course.yml`, l
 | Python     | 4      | 25 + 4                | 94 (L0 16 · L1 23 · L2 33 · L3 22) | 93        | 162     | 40 (12/18/10)            |
 | SQL        | 4      | 16 + 4                | 60 (15 per level)                  | 60        | 113     | 40 (12/18/10)            |
 | TypeScript | 4      | 17 + 4                | 62 (L0 15 · L1 15 · L2 15 · L3 17) | 62        | 100     | 40 (12/18/10)            |
-| **All**    |        | **78 + 16**           | **290** (+290 RU)                  | 288       | 493     | **160** (+160 RU)        |
+| Git        | 4      | 14 + 4                | 12 (L0 only so far)                | 20        | 22      | none yet                 |
+| **All**    |        | **92 + 20**           | **302** (+302 RU)                  | 308       | 515     | **160** (+160 RU)        |
 
 Lesson counts include capstone parts (3 per capstone). Module mini-projects present: JS 10/20, Python 14/25, SQL 2/16, TS 9/17 (35 of 78; 43 modules have none). Quiz counts updated 2026-10-11 after the basics mini-projects (JS 116, Python 162). JS lesson/exercise/quiz counts updated 2026-10-17 after `recursion` was split into `04-recursion` + `05-recursion-or-loop` (recounted: 74 lessons, 73 exercises, 118 quizzes; all courses 290 lessons, 288 exercises, 493 quizzes).
 
@@ -707,6 +708,46 @@ All 16 capstones exist with 3 parts each.
 - `01-designing-the-sdk` Part 1: Designing the SDK (25m, 30xp, ex 1, quiz 2): Start with a design doc; Schemas, one more time; Branded ids, parsed at the edge; One description for the whole API; Deriving the types; Type tests are the spec; From input to request
 - `02-the-client` Part 2: The client (25m, 30xp, ex 1, quiz 2): Types outside, one cast inside; Every failure has a kind; Retries that don't make things worse; Pagination as an async iterator; Hooks for auth, logs and metrics; Testing the client
 - `03-shipping-it` Part 3: Shipping it (25m, 30xp, ex 1, quiz 1): The public surface; Overloads where the return type depends on the input; Documentation that travels: JSDoc; Type tests for the whole surface; What users' TypeScript sees; The package; Versions, changelog and CI; Publishing to npm; The README
+
+## Git & Terminal (added 2026-11-01; runs in the practice terminal, `language="shell"`)
+
+### Git L0 (3 modules + capstone, 12 lessons)
+
+**Module `terminal-basics`: Meet the Terminal** · yml project: —
+
+- `01-what-is-a-terminal` What Is a Terminal? (10m, 10xp, ex 1, quiz 2): Terminal and shell; The prompt; Your first commands; How the practice terminal works; Errors are normal
+- `02-folders-and-paths` Folders and Paths (12m, 15xp, ex 2, quiz 2): The folder tree; Where am I?; Looking inside a folder; Moving around with cd; Absolute and relative paths; Going up with ..; Shortcuts home and back; When cd goes wrong
+- `03-commands-options-and-help` Commands, Options and Help (12m, 15xp, ex 2, quiz 2): The parts of a command; Hidden files with ls -a; Details with ls -l; Combining options; Getting help; history: what did I run?; Reading error messages
+- `04-terminal-and-git-on-your-computer` Terminal and Git on Your Computer (12m, 15xp, ex 1, quiz 2): On your computer: open a terminal; On your computer: install Git; Check that Git works; Tell Git who you are
+
+**Module `files-and-folders`: Files & Folders** · yml project: Tidy up a downloads folder
+
+- `01-making-files-and-folders` Making Files and Folders (12m, 15xp, ex 1, quiz 2): Making folders with mkdir; Empty files with touch; Writing text into a file; Reading files with cat; Good file names
+- `02-copying-moving-and-deleting` Copying, Moving and Deleting (13m, 20xp, ex 1, quiz 2): Copying files with cp; Copying folders with cp -r; Renaming and moving with mv; Deleting with rm and rmdir; There is no undo
+- `03-wildcards-and-tidying-up` Wildcards and Tidying Up (15m, 25xp, ex 2, quiz 2): The star * matches anything; ? and [ ] match one character; When nothing matches, and quotes; Moving and deleting many files at once; Mini-project: tidy up a downloads folder
+
+**Module `first-repository`: Your First Repository** · yml project: A recipe book with history
+
+- `01-why-version-control` Why Version Control? (12m, 15xp, ex 1, quiz 2): The trouble with copies; What version control does; Repositories and commits; Make a folder a repository with git init; The hidden .git folder; Ask Git what's going on with git status; Common mistakes
+- `02-staging-and-committing` Staging and Committing (14m, 20xp, ex 1, quiz 2): Three places your work lives; Stage a file with git add; Save it with git commit -m; Change a file and commit again; The short version of git status; Good commit messages; Common mistakes
+- `03-reading-the-history` Reading the History (15m, 25xp, ex 2, quiz 2): The examples' repository; git log: the list of commits; git log --oneline: one line per commit; Short hashes; git show: look inside a commit; Reading a change: + and - lines; Mini-project: a recipe book with history
+
+**Capstone `tidy-project`: Tidy project**
+
+- `01-sort-the-folder` Part 1: Sort the folder (20m, 30xp, ex 3, quiz 1): Meet the messy folder; Timur's plan; A safety net first; Throw out the rubbish; Everything in its place; What you built
+- `02-save-it-in-git` Part 2: Save it in Git (20m, 30xp, ex 3, quiz 1): Turn the folder into a repository; What Git sees; The first commit; A README for visitors; Reading the history; One more fix; What you built; Take it further; Congratulations! 🎉🐼
+
+### Git L1 (3 modules + capstone, 0 lessons: outline only, lessons being written)
+
+Modules: `pipes-and-text` Pipes & Text, `everyday-git` Everyday Git, `branches-and-merging` Branches & Merging; capstone `team-feature` Team feature.
+
+### Git L2 (4 modules + capstone, 0 lessons: outline only, lessons being written)
+
+Modules: `remotes` Remotes, `stash-and-tags` Stash & Tags, `team-workflows` Team Workflows, `scripts-and-environment` Scripts & Environment; capstone `release-day` Release day.
+
+### Git L3 (4 modules + capstone, 0 lessons: outline only, lessons being written)
+
+Modules: `rewriting-history` Rewriting History, `undo-anything` Undo Anything, `debugging-with-git` Debugging with Git, `internals-and-automation` Internals & Automation; capstone `rescue-the-release` Rescue the release.
 
 # Practice problems
 

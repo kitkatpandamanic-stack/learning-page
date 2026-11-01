@@ -92,6 +92,11 @@ export function resolvePath(cwd: string, path: string) {
   return normalize(path.startsWith("/") ? path : `${cwd}/${path}`);
 }
 
+/** How ls and bash order names in an English locale: "apple.jpg" before "Beach.jpg". */
+export const compareNames = (a: string, b: string) =>
+  a.localeCompare(b, "en", { sensitivity: "base" }) ||
+  (a < b ? -1 : a > b ? 1 : 0);
+
 export const dirname = (path: string) =>
   normalize(path).replace(/\/[^/]*$/, "") || "/";
 export const basename = (path: string) =>
@@ -270,9 +275,7 @@ export class MemFs {
   readdir(path: string): string[] {
     const node = this.find(path);
     if (node.type !== "dir") throw new FsError("ENOTDIR", path);
-    return [...node.children.keys()].sort((a, b) =>
-      a.localeCompare(b, "en", { sensitivity: "base" }),
-    );
+    return [...node.children.keys()].sort(compareNames);
   }
 
   unlink(path: string) {

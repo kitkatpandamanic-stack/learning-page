@@ -9,6 +9,11 @@ export function CodeExample({
 }: {
   /** What the code prints; use \n for several lines */
   output: string;
+  /**
+   * Terminal examples (```bash): commands the content tests run first,
+   * unseen, to make the folder the example starts in. Not shown.
+   */
+  setup?: string;
   children: ReactNode;
 }) {
   const t = useTranslations("lesson");

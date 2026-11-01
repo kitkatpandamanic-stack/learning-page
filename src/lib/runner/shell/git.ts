@@ -10,7 +10,7 @@ import * as git from "isomorphic-git";
 
 import { countChanges, hunks } from "./diff";
 import { dirname, FsError, normalize } from "./memfs";
-import { flags, longDate, type CommandContext, type Shell } from "./shell";
+import { flags, type CommandContext, type Shell } from "./shell";
 
 const DEFAULT_NAME = "Panda";
 const DEFAULT_EMAIL = "panda@pandadev.dev";
@@ -428,12 +428,14 @@ export class GitSandbox {
           : "usage: git config [--global] <name> [<value>]\n",
       );
     }
-    if (!global && !dir) fatal("not in a git directory");
+    // Reading works anywhere (the global value); setting needs a repository.
+    if (!global && !dir && value !== undefined) fatal("not in a git directory");
     if (value === undefined) {
-      const found = global
-        ? this.global.get(key)
-        : (((await git.getConfig({ fs: this.fs, dir: dir!, path: key })) as
-            string | undefined) ?? this.global.get(key));
+      const found =
+        global || !dir
+          ? this.global.get(key)
+          : (((await git.getConfig({ fs: this.fs, dir, path: key })) as
+              string | undefined) ?? this.global.get(key));
       if (found === undefined) return 1;
       io.out(`${found}\n`);
       return 0;
@@ -468,84 +470,7 @@ const COMMANDS: Record<string, Sub> = {
         io.out(`${status[path] ?? "??"} ${this.shown(dir, path)}\n`);
       return 0;
     }
-    const branch = await this.branch(dir);
-    const head = await this.head(dir);
-    const merge = this.merging(dir);
-    io.out(
-      branch
-        ? `On branch ${branch}\n`
-        : `HEAD detached at ${head?.slice(0, 7)}\n`,
-    );
-    if (merge) {
-      io.out(
-        merge.conflicts.length
-          ? 'You have unmerged paths.\n  (fix conflicts and run "git commit")\n  (use "git merge --abort" to abort the merge)\n'
-          : 'All conflicts fixed but you are still merging.\n  (use "git commit" to conclude merge)\n',
-      );
-    }
-    if (!head) io.out("\nNo commits yet\n");
-    const staged = paths.filter(
-      (p) => status[p][0] !== " " && status[p][0] !== "?" && status[p] !== "UU",
-    );
-    const unmerged = paths.filter((p) => status[p] === "UU");
-    const unstaged = paths.filter(
-      (p) => status[p][1] === "M" || status[p][1] === "D",
-    );
-    const untracked = collapseUntracked(
-      status,
-      paths.filter((p) => status[p] === "??"),
-      await this.stage(dir),
-    );
-    const label = {
-      A: "new file:   ",
-      M: "modified:   ",
-      D: "deleted:    ",
-    } as Record<string, string>;
-    if (staged.length) {
-      io.out(
-        `\nChanges to be committed:\n  (use "${head ? "git restore --staged <file>..." : "git rm --cached <file>..."}" to unstage)\n`,
-      );
-      for (const p of staged)
-        io.out(`\t${label[status[p][0]]}${this.shown(dir, p)}\n`);
-    }
-    if (unmerged.length) {
-      io.out(
-        '\nUnmerged paths:\n  (use "git add <file>..." to mark resolution)\n',
-      );
-      for (const p of unmerged)
-        io.out(`\tboth modified:   ${this.shown(dir, p)}\n`);
-    }
-    if (unstaged.length) {
-      io.out(
-        '\nChanges not staged for commit:\n  (use "git add <file>..." to update what will be committed)\n  (use "git restore <file>..." to discard changes in working directory)\n',
-      );
-      for (const p of unstaged)
-        io.out(`\t${label[status[p][1]]}${this.shown(dir, p)}\n`);
-    }
-    if (untracked.length) {
-      io.out(
-        '\nUntracked files:\n  (use "git add <file>..." to include in what will be committed)\n',
-      );
-      for (const p of untracked) io.out(`\t${this.shown(dir, p)}\n`);
-    }
-    io.out("\n");
-    if (merge && !merge.conflicts.length && !staged.length && !unstaged.length)
-      return 0;
-    // With something staged, git ends the list without a summary line.
-    if (staged.length) return 0;
-    if (unstaged.length || unmerged.length)
-      io.out(
-        'no changes added to commit (use "git add" and/or "git commit -a")\n',
-      );
-    else if (untracked.length)
-      io.out(
-        'nothing added to commit but untracked files present (use "git add" to track)\n',
-      );
-    else if (!head)
-      io.out(
-        'nothing to commit (create/copy files and use "git add" to track)\n',
-      );
-    else io.out("nothing to commit, working tree clean\n");
+    await longStatus(this, dir, io, "No commits yet");
     return 0;
   },
 
@@ -627,10 +552,17 @@ const COMMANDS: Record<string, Sub> = {
       else if (arg === "--amend") amend = true;
       else if (arg === "--allow-empty") allowEmpty = true;
       else if (arg === "--no-edit") continue;
-      else
+      else if (arg.startsWith("-"))
         throw new GitExit(
           129,
           `error: unknown option \`${arg.replace(/^-+/, "")}'\n`,
+        );
+      // Like git, other words are file names: `git commit -m Add soup`
+      // (no quotes) reads "soup" as a file.
+      else
+        throw new GitExit(
+          1,
+          `error: pathspec '${arg}' did not match any file(s) known to git\n`,
         );
     }
     const merge = this.merging(dir);
@@ -665,30 +597,8 @@ const COMMANDS: Record<string, Sub> = {
       (code) => code[0] !== " " && code[0] !== "?",
     );
     if (!staged && !amend && !allowEmpty && !merge) {
-      const any = Object.keys(status).length;
-      const branch = await this.branch(dir);
-      io.out(
-        branch
-          ? `On branch ${branch}\n`
-          : `HEAD detached at ${head?.slice(0, 7)}\n`,
-      );
-      const untracked = Object.values(status).some((c) => c === "??");
-      const unstaged = Object.values(status).some(
-        (c) => c[1] === "M" || c[1] === "D",
-      );
-      if (unstaged)
-        io.out(
-          'Changes not staged for commit:\n  (use "git add <file>..." to update what will be committed)\n\nno changes added to commit (use "git add" and/or "git commit -a")\n',
-        );
-      else if (untracked)
-        io.out(
-          'Untracked files:\n  (use "git add <file>..." to include in what will be committed)\n\nnothing added to commit but untracked files present (use "git add" to track)\n',
-        );
-      else if (!head && !any)
-        io.out(
-          '\nInitial commit\n\nnothing to commit (create/copy files and use "git add" to track)\n',
-        );
-      else io.out("nothing to commit, working tree clean\n");
+      // Like git: the same report as `git status`, and exit code 1.
+      await longStatus(this, dir, io, "Initial commit");
       return 1;
     }
     const parent =
@@ -778,6 +688,11 @@ const COMMANDS: Record<string, Sub> = {
     io.out(formatCommit(entry, tags ? ` (${tags.join(", ")})` : ""));
     const before = await this.tree(dir, entry.commit.parent[0] ?? null);
     const after = await this.tree(dir, oid!);
+    if (args.includes("--stat")) {
+      const stat = await statText(before, after);
+      if (stat) io.out(`\n${stat}`);
+      return 0;
+    }
     const patch = await patchText(before, after);
     if (patch) io.out(`\n${patch}`);
     return 0;
@@ -1165,6 +1080,119 @@ const COMMANDS: Record<string, Sub> = {
   },
 };
 
+/**
+ * `git status` (and `git commit` with nothing staged), spaced like git:
+ * each section is followed by a blank line; "No commits yet" (or "Initial
+ * commit", for git commit) sits between blank lines.
+ */
+async function longStatus(
+  sandbox: GitSandbox,
+  dir: string,
+  io: CommandContext["io"],
+  intro: "No commits yet" | "Initial commit",
+) {
+  const status = await sandbox.shortStatus(dir);
+  const paths = Object.keys(status).sort();
+  const index = await sandbox.stage(dir);
+  const branch = await sandbox.branch(dir);
+  const head = await sandbox.head(dir);
+  const merge = sandbox.merging(dir);
+  io.out(
+    branch
+      ? `On branch ${branch}\n`
+      : `HEAD detached at ${head?.slice(0, 7)}\n`,
+  );
+  if (merge)
+    io.out(
+      merge.conflicts.length
+        ? 'You have unmerged paths.\n  (fix conflicts and run "git commit")\n  (use "git merge --abort" to abort the merge)\n\n'
+        : 'All conflicts fixed but you are still merging.\n  (use "git commit" to conclude merge)\n\n',
+    );
+  if (!head) io.out(`\n${intro}\n\n`);
+  const staged = paths.filter(
+    (p) => status[p][0] !== " " && status[p][0] !== "?" && status[p] !== "UU",
+  );
+  const unmerged = paths.filter((p) => status[p] === "UU");
+  const unstaged = paths.filter(
+    (p) => status[p][1] === "M" || status[p][1] === "D",
+  );
+  const untracked = collapseUntracked(
+    status,
+    paths.filter((p) => status[p] === "??"),
+    index,
+  );
+  const label: Record<string, string> = {
+    A: "new file:   ",
+    M: "modified:   ",
+    D: "deleted:    ",
+  };
+  const shown = (p: string) => sandbox.shown(dir, p);
+  if (staged.length) {
+    io.out(
+      `Changes to be committed:\n  (use "${head ? "git restore --staged <file>..." : "git rm --cached <file>..."}" to unstage)\n`,
+    );
+    for (const p of staged) io.out(`\t${label[status[p][0]]}${shown(p)}\n`);
+    io.out("\n");
+  }
+  if (unmerged.length) {
+    io.out('Unmerged paths:\n  (use "git add <file>..." to mark resolution)\n');
+    for (const p of unmerged) io.out(`\tboth modified:   ${shown(p)}\n`);
+    io.out("\n");
+  }
+  if (unstaged.length) {
+    io.out(
+      'Changes not staged for commit:\n  (use "git add <file>..." to update what will be committed)\n  (use "git restore <file>..." to discard changes in working directory)\n',
+    );
+    for (const p of unstaged) io.out(`\t${label[status[p][1]]}${shown(p)}\n`);
+    io.out("\n");
+  }
+  if (untracked.length) {
+    io.out(
+      'Untracked files:\n  (use "git add <file>..." to include in what will be committed)\n',
+    );
+    for (const p of untracked) io.out(`\t${shown(p)}\n`);
+    io.out("\n");
+  }
+  // With something staged (or a merge to finish), git adds no summary line.
+  if (staged.length || (merge && !merge.conflicts.length)) return;
+  if (unstaged.length || unmerged.length)
+    io.out(
+      'no changes added to commit (use "git add" and/or "git commit -a")\n',
+    );
+  else if (untracked.length)
+    io.out(
+      'nothing added to commit but untracked files present (use "git add" to track)\n',
+    );
+  else if (!head)
+    io.out(
+      'nothing to commit (create/copy files and use "git add" to track)\n',
+    );
+  else io.out("nothing to commit, working tree clean\n");
+}
+
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+/** git's default date: "Mon Jan 5 09:01:00 2026 +0000" (the day isn't padded). */
+function gitDate(ms: number) {
+  const d = new Date(ms);
+  const two = (n: number) => String(n).padStart(2, "0");
+  return `${DAY_NAMES[d.getUTCDay()]} ${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCDate()} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())}:${two(d.getUTCSeconds())} ${d.getUTCFullYear()} +0000`;
+}
+
 const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** Untracked files inside a folder git doesn't track at all show as "folder/". */
@@ -1203,9 +1231,7 @@ function formatCommit(
   if (commit.parent.length > 1)
     lines.push(`Merge: ${commit.parent.map((p) => p.slice(0, 7)).join(" ")}`);
   lines.push(`Author: ${commit.author.name} <${commit.author.email}>`);
-  lines.push(
-    `Date:   ${longDate(commit.author.timestamp * 1000)} ${new Date(commit.author.timestamp * 1000).getUTCFullYear()} +0000`,
-  );
+  lines.push(`Date:   ${gitDate(commit.author.timestamp * 1000)}`);
   lines.push("");
   for (const line of commit.message.replace(/\n+$/, "").split("\n"))
     lines.push(line ? `    ${line}` : "");

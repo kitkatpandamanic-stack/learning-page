@@ -76,6 +76,21 @@ export const languages: Language[] = [
     },
   },
   {
+    slug: "git",
+    name: "Git & Terminal",
+    monogram: ">_",
+    description:
+      "The command line and version control: the everyday tools of every developer.",
+    usedFor: ["Command line", "Version control", "Teamwork"],
+    status: "available",
+    color: {
+      text: "text-lang-git",
+      bg: "bg-lang-git",
+      soft: "bg-lang-git/15",
+      border: "hover:border-lang-git/50",
+    },
+  },
+  {
     slug: "java",
     name: "Java",
     monogram: "Jv",
