@@ -8,7 +8,7 @@ import { LazyCodeRunner } from "@/components/code/lazy-code-runner";
 import type { RunLanguage } from "@/lib/runner/execute";
 
 /** Starter programs; comments and printed text follow the page language. */
-function starters(locale: string): Record<RunLanguage, string> {
+export function starters(locale: string): Record<RunLanguage, string> {
   const ru = locale === "ru";
   return {
     javascript: ru

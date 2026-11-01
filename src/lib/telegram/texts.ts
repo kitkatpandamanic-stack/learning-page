@@ -98,7 +98,7 @@ const days = (n: number, locale: BotLocale) =>
 
 const commands = {
   en: [
-    "/app: your panda, the Daily Blitz and duels",
+    "/app: your panda, games and a code sandbox",
     "/league: a weekly XP table for your group (send it in a group)",
     "/today: the problem of the day",
     "/quiz: a quiz question (+5 XP when you're right)",
@@ -108,7 +108,7 @@ const commands = {
     "/settings: reminders (time, pause) and the weekly leaderboard",
   ],
   ru: [
-    "/app: ваша панда, блиц дня и дуэли",
+    "/app: ваша панда, игры и песочница для кода",
     "/league: рейтинг недели для вашей группы (отправьте в группе)",
     "/today: задача дня",
     "/quiz: вопрос из уроков (+5 XP за верный ответ)",
@@ -193,8 +193,8 @@ export function appMessage(
 ) {
   const ru = locale === "ru";
   const text = ru
-    ? "🐼 <b>PandaDev в Telegram</b>\nВаша панда растёт вместе с вами, а блиц дня: 10 вопросов за 60 секунд. Сможете обогнать друзей?"
-    : "🐼 <b>PandaDev in Telegram</b>\nYour panda grows with you, and the Daily Blitz is 10 questions in 60 seconds. Can you beat your friends?";
+    ? "🐼 <b>PandaDev в Telegram</b>\nВаша панда растёт вместе с вами, а блиц дня: 10 вопросов за 60 секунд. Сможете обогнать друзей?\n💻 На вкладке «Код» можно запускать Python, JavaScript, SQL и TypeScript."
+    : "🐼 <b>PandaDev in Telegram</b>\nYour panda grows with you, and the Daily Blitz is 10 questions in 60 seconds. Can you beat your friends?\n💻 The Code tab runs Python, JavaScript, SQL and TypeScript.";
   const label = ru ? "⚡ Открыть" : "⚡ Open";
   const button = inPrivate
     ? { text: label, web_app: { url: appUrl } }

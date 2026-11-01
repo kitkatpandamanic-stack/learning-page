@@ -35,6 +35,7 @@ const en = {
     wordle: "Wordle",
     bughunt: "Bug Hunt",
     games: "Games",
+    code: "Code",
     league: "Leagues",
   },
   hello: (name: string) => `Hi, ${name}!`,
@@ -199,6 +200,15 @@ const en = {
   leagueNotFound:
     "This league link doesn't work any more. Ask in the group for a new one: /league.",
   duelStoryText: "Beat my score in a PandaDev duel!",
+  codeTitle: "Code sandbox",
+  codeIntro:
+    "Write code and run it right here. It runs on your phone, not on our servers.",
+  codeLanguage: "Language",
+  codeKeys: "Keys for code",
+  codeFirstRun: (language: string) =>
+    `The first ${language} run downloads ${language} to your phone (a few MB). After that it starts quickly.`,
+  codeSaved:
+    "Your code is saved on this device, for each language. Reset brings back the example.",
 };
 
 type Texts = typeof en;
@@ -216,6 +226,7 @@ const ru: Texts = {
     wordle: "Wordle",
     bughunt: "Охота на баги",
     games: "Игры",
+    code: "Код",
     league: "Лиги",
   },
   hello: (name) => `Привет, ${name}!`,
@@ -376,6 +387,15 @@ const ru: Texts = {
   leagueNotFound:
     "Эта ссылка на лигу больше не работает. Попросите в группе новую: /league.",
   duelStoryText: "Обойдите мой результат в дуэли PandaDev!",
+  codeTitle: "Песочница",
+  codeIntro:
+    "Пишите код и запускайте его прямо здесь. Он работает на вашем телефоне, а не на наших серверах.",
+  codeLanguage: "Язык",
+  codeKeys: "Клавиши для кода",
+  codeFirstRun: (language) =>
+    `При первом запуске ${language} скачивается на телефон (несколько МБ). Потом запускается быстро.`,
+  codeSaved:
+    "Код сохраняется на этом устройстве, отдельно для каждого языка. «Сбросить» возвращает пример.",
 };
 
 export const appTexts: Record<AppLocale, Texts> = { en, ru };
