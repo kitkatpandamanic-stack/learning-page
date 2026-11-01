@@ -295,6 +295,7 @@ git branch`,
     expect(r.errors).toEqual([
       "error: the branch 'feature' is not fully merged",
       "hint: If you are sure you want to delete it, run 'git branch -D feature'",
+      'hint: Disable this message with "git config set advice.forceDeleteBranch false"',
     ]);
     expect(r.text).toMatch(/Deleted branch feature \(was [0-9a-f]{7}\)\./);
   });
@@ -594,7 +595,7 @@ describe("line diffs", () => {
       " line 3",
       " line 4",
       " line 5",
-      "@@ -15,6 +15,5 @@",
+      "@@ -15,6 +15,5 @@ line 14",
       " line 15",
       " line 16",
       " line 17",
@@ -848,6 +849,73 @@ git branch --no-merged`,
       SETUP,
     );
     expect(r.printed).toEqual(["* main", "  side", "  omar"]);
+  });
+});
+
+describe("matching git's smaller messages", () => {
+  it("keeps unrelated edits through a merge and says what it auto-merged", async () => {
+    const r = await sh(
+      `printf "1 tea\\n2 soup\\n3 cake\\n4 pie\\n5 bun\\n6 jam\\n7 egg\\n" > menu.txt
+git add menu.txt
+git commit -m menu
+git switch -c b
+echo "1 TEA" > top.txt
+printf "1 TEA\\n2 soup\\n3 cake\\n4 pie\\n5 bun\\n6 jam\\n7 egg\\n" > menu.txt
+git commit -am b1
+git switch main
+printf "1 tea\\n2 soup\\n3 cake\\n4 pie\\n5 bun\\n6 jam\\n7 EGG\\n" > menu.txt
+git commit -am m1
+echo x >> README.md
+git merge b -m "Merge b"
+git status -s
+git switch b
+git branch -d`,
+      PROJECT,
+    );
+    expect(r.text).toContain(`Auto-merging menu.txt
+Merge made by the 'ort' strategy.`);
+    expect(r.text).toContain("~/project $ git status -s\n M README.md");
+    expect(r.text).toContain("M\tREADME.md\nSwitched to branch 'b'");
+    expect(r.errors).toEqual(["fatal: branch name required"]);
+  });
+
+  it("lists tracked changes before untracked files", async () => {
+    const r = await sh(
+      `touch a.txt\necho x >> README.md\ngit status -s`,
+      PROJECT,
+    );
+    expect(r.printed).toEqual([" M README.md", "?? a.txt"]);
+  });
+
+  it("ends a blocked commit with the files still in conflict", async () => {
+    const r = await sh(
+      `git switch -c b
+echo one > app.py
+git commit -am b
+git switch main
+echo two > app.py
+git commit -am m
+git merge b
+git merge b
+git commit -m x`,
+      PROJECT,
+    );
+    expect(r.errors.slice(0, 1)).toEqual([
+      "error: Merging is not possible because you have unmerged files.",
+    ]);
+    expect(r.printed.at(-1)).toBe("U\tapp.py");
+  });
+
+  it("checks out files silently after --, and skips tracked files in check-ignore", async () => {
+    const r = await sh(
+      `echo "*.py" > .gitignore
+echo bad > app.py
+git checkout -- app.py
+git check-ignore app.py
+echo $?`,
+      PROJECT,
+    );
+    expect(r.printed).toEqual(["1"]);
   });
 });
 
