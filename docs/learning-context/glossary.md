@@ -211,6 +211,28 @@ each course's first lesson is listed. Use these definitions in drafts so wording
 | replication / RPO / RTO                   | Live copies / how much data you may lose / how long recovery may take.        | sql/backups-and-replication                                        |
 | OLTP / OLAP                               | Many small transactions / big analytical queries.                             | sql/choosing-a-database                                            |
 
+## Git & Terminal (Level 1; RU term in brackets)
+
+| Term                             | Definition                                                                                                                        | Introduced in                |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| pipe, pipeline `\|`              | Sends one command's output into the next command's input (RU: конвейер).                                                          | git/pipes-and-redirects      |
+| standard output / standard error | The two streams a command prints to; `>` redirects the first, `2>` the second (RU: стандартный вывод / стандартный поток ошибок). | git/pipes-and-redirects      |
+| redirect                         | `>`, `>>`, `<`, `2>`: send a stream to or from a file (RU: перенаправление).                                                      | git/pipes-and-redirects      |
+| pattern (grep)                   | What grep looks for; a small regular expression (RU: образец; not «шаблон», which is a wildcard).                                 | git/finding-text-with-grep   |
+| field / delimiter                | A column of a line, and the character that splits them, for `cut -d -f` (RU: поле / разделитель).                                 | git/pipes-and-redirects      |
+| diff, hunk                       | The changes between two versions; one block of them starting with `@@` (RU: diff («разница»), фрагмент (hunk)).                   | git/seeing-changes-with-diff |
+| staged / unstaged changes        | Changes already in the staging area / only in the working folder (RU: подготовленные / неподготовленные изменения).               | git/seeing-changes-with-diff |
+| ignored file, `.gitignore`       | A file Git won't show or add because a pattern in `.gitignore` matches it (RU: игнорируемый файл).                                | git/ignoring-files           |
+| untrack                          | Stop Git tracking a committed file but keep it on disk: `git rm --cached` (RU: перестать отслеживать).                            | git/ignoring-files           |
+| amend                            | Replace the last commit with a fixed one: `git commit --amend` (RU: исправить коммит (amend)).                                    | git/undoing-changes          |
+| branch                           | A movable name that points at a commit (RU: ветка).                                                                               | git/what-is-a-branch         |
+| HEAD                             | Where you are: usually the current branch (RU: HEAD).                                                                             | git/what-is-a-branch         |
+| lane                             | One column of the Commits picture, one per line of work (RU: дорожка).                                                            | git/what-is-a-branch         |
+| merge, merge commit              | Bring a branch's commits into the current one; a commit with two parents that joins them (RU: слияние, коммит слияния).           | git/merging-branches         |
+| fast-forward                     | A merge where the branch label just moves forward, no new commit (RU: перемотка (fast-forward)).                                  | git/merging-branches         |
+| feature branch                   | A branch for one task, merged back when it's done (RU: ветка для задачи).                                                         | git/merging-branches         |
+| merge conflict, conflict markers | Both sides changed the same lines; Git marks them with `<<<<<<<`, `=======`, `>>>>>>>` (RU: конфликт слияния, маркеры конфликта). | git/merge-conflicts          |
+
 ## Senior topics (architecture, performance, security, ops)
 
 | Term                                    | Definition                                                                                  | Introduced in                                                                      |
