@@ -437,13 +437,13 @@ export const USAGE: Record<string, string> = {
   rm: "rm [-r] [-f] path...     delete (there's no undo!) (-r: folders, -f: no errors)",
   rmdir: "rmdir folder...          delete empty folders",
   head: "head [-n N] [file...]    the first lines (10 unless -n)",
-  tail: "tail [-n N] [file...]    the last lines (10 unless -n)",
-  wc: "wc [-l] [-w] [-c] [file...] count lines, words and bytes",
-  grep: "grep [-i -v -n -c -l -r -w -E -F] pattern [file...]  find lines",
+  tail: "tail [-n N] [file...]    the last lines (10 unless -n; -n +2: from line 2)",
+  wc: "wc [-l] [-w] [-m] [-c] [file...] count lines, words, characters and bytes",
+  grep: "grep [-i -v -n -c -l -r -w -o -q -E -F] pattern [file...]  find lines",
   sort: "sort [-r] [-n] [-u] [file...]  sort lines",
   uniq: "uniq [-c] [file...]      drop repeated neighbouring lines (-c: count them)",
   cut: "cut -d X -f N[,N] | -c N-M [file...]  pick fields (split at X) or characters",
-  tr: "tr [-d] set1 [set2]      swap or (-d) delete characters, like tr a-z A-Z",
+  tr: "tr [-d|-s] set1 [set2]   swap, delete (-d) or squeeze repeats of (-s) characters, like tr a-z A-Z",
   tee: "tee [-a] file...         copy what comes in to files and the screen (-a: add to the end)",
   printf:
     "printf format [text...]  print with a format: %s text, %d number, \\n new line",
@@ -521,7 +521,11 @@ function inputs(
       continue;
     }
     if (!ctx.shell.fs.exists(full)) {
-      ctx.io.err(`${name}: ${path}: No such file or directory\n`);
+      ctx.io.err(
+        name === "head" || name === "tail"
+          ? `${name}: cannot open '${path}' for reading: No such file or directory\n`
+          : `${name}: ${path}: No such file or directory\n`,
+      );
       failed = true;
       continue;
     }
@@ -887,17 +891,18 @@ const builtins: Record<string, CommandFn> = {
   wc: (ctx) => {
     const { args, io } = ctx;
     if (args.includes("--help")) return usage(io, "wc");
-    const parsed = flags("wc", args, "lwc", "", {
+    const parsed = flags("wc", args, "lwcm", "", {
       lines: "l",
       words: "w",
       bytes: "c",
+      chars: "m",
     });
     if (typeof parsed === "string") {
       io.err(parsed);
       return 1;
     }
     const show = parsed.set.size
-      ? ["l", "w", "c"].filter((f) => parsed.set.has(f))
+      ? ["l", "w", "m", "c"].filter((f) => parsed.set.has(f))
       : ["l", "w", "c"];
     const read = inputs(ctx, "wc", parsed.rest);
     if (!read) return 1;
@@ -906,6 +911,7 @@ const builtins: Record<string, CommandFn> = {
       l: (text.match(/\n/g) ?? []).length,
       w: text.split(/\s+/).filter(Boolean).length,
       c: new TextEncoder().encode(text).length,
+      m: [...text].length,
     }));
     if (counts.length > 1)
       counts.push({
@@ -913,19 +919,22 @@ const builtins: Record<string, CommandFn> = {
         l: counts.reduce((s, c) => s + c.l, 0),
         w: counts.reduce((s, c) => s + c.w, 0),
         c: counts.reduce((s, c) => s + c.c, 0),
+        m: counts.reduce((s, c) => s + c.m, 0),
       });
     const fromStdin = !parsed.rest.length;
-    // GNU wc: one count from stdin is printed bare; otherwise columns line up.
+    // GNU wc: one count of one input is printed bare. Otherwise columns are
+    // as wide as the total size in bytes (at least 7 from a pipe).
     const width =
-      fromStdin && show.length === 1
+      show.length === 1 && read.length === 1
         ? 0
         : fromStdin
           ? 7
-          : Math.max(
-              ...counts.map((c) =>
-                Math.max(...show.map((f) => String(c[f as "l"]).length)),
+          : String(
+              read.reduce(
+                (s, r) => s + new TextEncoder().encode(r.text).length,
+                0,
               ),
-            );
+            ).length;
     for (const c of counts)
       io.out(
         `${show.map((f) => pad(c[f as "l"], width)).join(" ")}${c.label ? ` ${c.label}` : ""}\n`,
@@ -936,13 +945,15 @@ const builtins: Record<string, CommandFn> = {
   grep: (ctx) => {
     const { shell, args, io } = ctx;
     if (args.includes("--help")) return usage(io, "grep");
-    const parsed = flags("grep", args, "ivnclrRwEFhH", "e", {
+    const parsed = flags("grep", args, "ivnclrRwEFhHqo", "e", {
       "ignore-case": "i",
       "invert-match": "v",
       "line-number": "n",
       count: "c",
       "files-with-matches": "l",
       recursive: "r",
+      quiet: "q",
+      "only-matching": "o",
     });
     if (typeof parsed === "string") {
       io.err(parsed);
@@ -957,7 +968,7 @@ const builtins: Record<string, CommandFn> = {
       );
       return 2;
     }
-    let source = set.has("F")
+    const source = set.has("F")
       ? escapeRegex(pattern)
       : set.has("E")
         ? pattern
@@ -965,13 +976,22 @@ const builtins: Record<string, CommandFn> = {
           pattern.replace(/\\([+?|(){}])|([+?|(){}])/g, (_, special, plain) =>
             special ? special : `\\${plain}`,
           );
-    if (set.has("w")) source = `\\b(?:${source})\\b`;
     let regex: RegExp;
     try {
       regex = new RegExp(source, set.has("i") ? "i" : "");
+      // A word is letters (any alphabet), digits and _, like GNU grep.
+      if (set.has("w"))
+        regex = new RegExp(
+          `(?<![\\p{L}\\p{N}_])(?:${regex.source})(?![\\p{L}\\p{N}_])`,
+          set.has("i") ? "iu" : "u",
+        );
     } catch {
-      io.err(`grep: Invalid regular expression\n`);
-      return 2;
+      if (set.has("w"))
+        regex = new RegExp(`\\b(?:${source})\\b`, set.has("i") ? "i" : "");
+      else {
+        io.err(`grep: Invalid regular expression\n`);
+        return 2;
+      }
     }
     const recursive = set.has("r") || set.has("R");
     let files = rest;
@@ -984,33 +1004,48 @@ const builtins: Record<string, CommandFn> = {
             ...shell.fs
               .walk(full)
               .filter((f) => !f.split("/").some((part) => part.startsWith(".")))
+              // No folder named: plain paths; "." gives ./a.js, like GNU.
               .map((f) =>
-                path === "." ? f : `${path.replace(/\/$/, "")}/${f}`,
+                rest.length ? `${path.replace(/\/$/, "")}/${f}` : f,
               ),
           );
         else files.push(path);
       }
     }
-    const read = inputs(ctx, "grep", files);
-    if (!read) return 2;
+    // Like GNU grep: names are shown when there are several file operands,
+    // and each file is read (or reported missing) in order.
     const prefix =
-      (set.has("H") || read.length > 1 || recursive) && !set.has("h");
+      (set.has("H") || files.length > 1 || recursive) && !set.has("h");
+    const quiet = set.has("q");
     let matched = false;
-    for (const { label, text } of read) {
+    let missing = false;
+    for (const file of files.length ? files : [null]) {
+      const read = inputs(ctx, "grep", file === null ? [] : [file]);
+      if (!read?.length) {
+        missing = true;
+        continue;
+      }
+      const { label, text } = read[0];
       let count = 0;
       splitLines(text).forEach((line, i) => {
         if (regex.test(line) === set.has("v")) return;
         matched = true;
         count++;
-        if (set.has("c") || set.has("l")) return;
-        io.out(
-          `${prefix ? `${label}:` : ""}${set.has("n") ? `${i + 1}:` : ""}${line}\n`,
-        );
+        if (quiet || set.has("c") || set.has("l")) return;
+        const head = `${prefix ? `${label}:` : ""}${set.has("n") ? `${i + 1}:` : ""}`;
+        if (set.has("o") && !set.has("v")) {
+          const all = new RegExp(regex.source, `${regex.flags}g`);
+          for (const m of line.matchAll(all))
+            if (m[0]) io.out(`${head}${m[0]}\n`);
+        } else io.out(`${head}${line}\n`);
       });
+      if (quiet) continue;
       if (set.has("c")) io.out(`${prefix ? `${label}:` : ""}${count}\n`);
       if (set.has("l") && count) io.out(`${label || "(standard input)"}\n`);
     }
-    return read.length < files.length ? 2 : matched ? 0 : 1;
+    // -q: 0 as soon as anything matched, even if a file was missing.
+    if (quiet && matched) return 0;
+    return missing ? 2 : matched ? 0 : 1;
   },
 
   sort: (ctx) => {
@@ -1104,19 +1139,31 @@ const builtins: Record<string, CommandFn> = {
   tr: ({ args, io }) => {
     if (args.includes("--help")) return usage(io, "tr");
     const del = args[0] === "-d";
-    const sets = (del ? args.slice(1) : args).map(expandSet);
-    if (sets.length < (del ? 1 : 2) || sets.length > (del ? 1 : 2)) {
+    // -s squeezes repeats of the (last) set into one: tr -s ' '
+    const squeeze = args[0] === "-s";
+    const words = del || squeeze ? args.slice(1) : args;
+    const want = del ? 1 : squeeze ? Math.min(2, Math.max(1, words.length)) : 2;
+    if (words.length !== want) {
       io.err(
-        `tr: ${sets.length ? "extra operand" : "missing operand"}\nTry 'tr --help' for more information.\n`,
+        words.length > want
+          ? `tr: extra operand '${words[want]}'\nTry 'tr --help' for more information.\n`
+          : `tr: missing operand${words.length ? ` after '${words[0]}'` : ""}\nTry 'tr --help' for more information.\n`,
       );
       return 1;
     }
-    const [from, to = []] = sets;
+    const [from, to = []] = words.map(expandSet);
     let out = "";
     for (const ch of io.stdin) {
       const i = from.indexOf(ch);
-      if (i === -1) out += ch;
+      if (i === -1 || (squeeze && !to.length)) out += ch;
       else if (!del) out += to[Math.min(i, to.length - 1)] ?? "";
+    }
+    if (squeeze) {
+      const set = to.length ? to : from;
+      let squeezed = "";
+      for (const ch of out)
+        if (!(set.includes(ch) && squeezed.endsWith(ch))) squeezed += ch;
+      out = squeezed;
     }
     io.out(out);
     return 0;
@@ -1316,17 +1363,28 @@ function headTail(ctx: CommandContext, name: "head" | "tail") {
     io.err(parsed);
     return 1;
   }
-  const n = Number(parsed.values.get("n") ?? 10);
+  const raw = parsed.values.get("n") ?? "10";
+  // tail -n +2: from line 2 to the end (skips a header line).
+  const from = name === "tail" && raw.startsWith("+");
+  const n = Number(from ? raw.slice(1) : raw);
   if (!Number.isInteger(n) || n < 0) {
     io.err(`${name}: invalid number of lines: '${parsed.values.get("n")}'\n`);
     return 1;
   }
   const read = inputs(ctx, name, parsed.rest);
   if (!read) return 1;
+  // Like GNU: a header per file whenever several were named.
   read.forEach(({ label, text }, i) => {
-    if (read.length > 1) io.out(`${i ? "\n" : ""}==> ${label} <==\n`);
+    if (parsed.rest.length > 1) io.out(`${i ? "\n" : ""}==> ${label} <==\n`);
     const all = splitLines(text);
-    const picked = name === "head" ? all.slice(0, n) : n ? all.slice(-n) : [];
+    const picked =
+      name === "head"
+        ? all.slice(0, n)
+        : from
+          ? all.slice(Math.max(0, n - 1))
+          : n
+            ? all.slice(-n)
+            : [];
     if (picked.length) io.out(`${picked.join("\n")}\n`);
   });
   return read.length < parsed.rest.length ? 1 : 0;

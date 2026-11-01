@@ -919,6 +919,69 @@ echo $?`,
   });
 });
 
+describe("text tools, like GNU coreutils and grep", () => {
+  it("skips a header with tail -n +2 and reports missing files like head", async () => {
+    const r = await sh(`printf "name\\nann\\nbob\\n" > p.csv
+tail -n +2 p.csv
+head 3 p.csv`);
+    expect(r.printed).toEqual([
+      "ann",
+      "bob",
+      "==> p.csv <==",
+      "name",
+      "ann",
+      "bob",
+    ]);
+    expect(r.errors).toEqual([
+      "head: cannot open '3' for reading: No such file or directory",
+    ]);
+  });
+
+  it("names files when grep gets several, in order, missing ones included", async () => {
+    const r = await sh(`echo tea > a.txt
+echo tea > c.txt
+grep tea a.txt missing.txt c.txt
+grep -c tea a.txt c.txt
+grep -rn tea .
+grep -q tea a.txt && echo found
+echo "green tea, black tea" | grep -o tea
+echo "чай и привет" | grep -w привет`);
+    expect(
+      r.output.filter((l) => l.level !== "info").map((l) => l.text),
+    ).toEqual([
+      "a.txt:tea",
+      "grep: missing.txt: No such file or directory",
+      "c.txt:tea",
+      "a.txt:1",
+      "c.txt:1",
+      "./a.txt:1:tea",
+      "./c.txt:1:tea",
+      "found",
+      "tea",
+      "tea",
+      "чай и привет",
+    ]);
+  });
+
+  it("squeezes with tr -s, counts characters with wc -m, pads wc like GNU", async () => {
+    const r = await sh(`echo "a   b  c" | tr -s " "
+tr a-z A-Z notes.txt
+echo "чай" | wc -m
+printf "a\\nb\\nc\\n" > x.txt
+printf "%s\\n" 1 2 3 4 5 6 7 8 9 10 > y.txt
+wc -l x.txt y.txt`);
+    expect(r.printed).toEqual([
+      "a b c",
+      "4",
+      // As wide as the total bytes (27): two digits.
+      " 3 x.txt",
+      "10 y.txt",
+      "13 total",
+    ]);
+    expect(r.errors[0]).toBe("tr: extra operand 'notes.txt'");
+  });
+});
+
 describe("the commit graph", () => {
   /** Each row as "lane message (labels)", newest first. */
   async function graph(code: string, setup = PROJECT) {
