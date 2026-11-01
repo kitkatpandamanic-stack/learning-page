@@ -7,6 +7,7 @@ import {
   type TestSpec,
 } from "./execute";
 import { installGit, type ShortStatus } from "./shell/git";
+import { commitGraph } from "./shell/graph";
 import { resolvePath } from "./shell/memfs";
 import { ShellSyntaxError } from "./shell/parse";
 import { Shell } from "./shell/shell";
@@ -28,6 +29,8 @@ import { Shell } from "./shell/shell";
  *   commands      the lines the learner ran
  *   status        the last command's exit code
  *   __output      the printed lines
+ * The result's `graph` is the commit graph of the repository the learner
+ * ended in, for the picture under the output.
  */
 export async function executeShell(
   code: string,
@@ -113,6 +116,13 @@ export async function executeShell(
     } else if (!(caught instanceof Stopped)) throw caught;
   }
   flush();
+
+  // The picture of the repository you ended in (or started in), before
+  // checks run more commands.
+  const graphRepo = git.repoOf() ?? git.repoOf(start);
+  const graph = graphRepo
+    ? ((await commitGraph(git, graphRepo)) ?? undefined)
+    : undefined;
 
   let testResults: TestResult[] | undefined;
   if (tests.length) {
@@ -241,7 +251,7 @@ export async function executeShell(
     }
   }
 
-  return { output, error, tests: testResults };
+  return { output, error, tests: testResults, graph };
 }
 
 class Stopped {}

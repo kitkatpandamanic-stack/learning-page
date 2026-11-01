@@ -106,6 +106,9 @@ recursion, algorithms, text, filtering, joins, grouping, subqueries, windows, ch
   like `git status -s`)/`show(ref, path)`/`tags()`/`conflicts()`/`isRepo()`, `commands` (lines run), `status`,
   `__output`. Paths in checks are relative to where `setup` ended. No loops, `$(…)`, editors or network: the runner
   says so. Not built in yet: reset, revert, rebase, stash, remotes, bisect, reflog, blame (later steps of the plan).
+- Commit graphs: every terminal run with a repository draws its commits under the output (lanes per branch, merges,
+  HEAD, branch and tag labels; newest 24). In a lesson, `<GitGraph setup={`…`} caption="…" />` draws the repository
+  that `setup` makes, at build time, without a Run button. Use it to show branches before the learner makes them.
   Solutions use a ```bash fence.
 - `npm test` checks every solution passes and every starter fails; `npm run content` validates structure.
 
@@ -135,6 +138,7 @@ recursion, algorithms, text, filtering, joins, grouping, subqueries, windows, ch
 | (observed) | Level 0 DOM is used via provided "glue code" in the JS L0 capstone, explained in L1               | `number-guessing-game/03-playing-in-the-browser` |
 | 2026-10-11 | Learning-context files created in `docs/learning-context/`                                        | this run                                         |
 | 2026-11-01 | Terminal runner (`language="shell"`): own small bash + isomorphic-git, in-browser, no new servers | git course plan, step 1                          |
+| 2026-11-01 | Commit graph under terminal output; `<GitGraph setup caption>` draws one in lessons at build time | git course plan, step 3                          |
 
 ## Open questions for the site owner
 

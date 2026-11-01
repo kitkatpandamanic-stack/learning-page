@@ -12,6 +12,7 @@ import {
   type TimerFunctions,
   type VitestSummary,
 } from "./vitest-shim";
+import type { CommitGraph } from "./shell/graph";
 import { createWsNetwork } from "./ws-shim";
 
 /**
@@ -41,6 +42,8 @@ export type ExecuteResult = {
   tests?: TestResult[];
   /** When the code defined Vitest tests: how they went */
   vitest?: VitestSummary;
+  /** Terminal only: the repository's commits, drawn under the output */
+  graph?: CommitGraph;
 };
 
 /** Code with import/export statements needs turning into require() calls. */

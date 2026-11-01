@@ -362,6 +362,25 @@ describe("Terminal examples", () => {
   );
 });
 
+/** <GitGraph setup={…}>: the setup builds a repository without errors. */
+describe("Commit graph pictures", () => {
+  const graphs = files.flatMap((file) =>
+    [...readFileSync(file, "utf8").matchAll(/<GitGraph\b([\s\S]*?)\/>/g)].map(
+      (m, i) => ({
+        name: `${file.slice(ROOT.length + 1)} #${i + 1}`,
+        setup: String(parseAttributes(m[1], file).setup ?? ""),
+      }),
+    ),
+  );
+
+  if (graphs.length === 0) it.skip("none in these lessons", () => {});
+  it.each(graphs.map((g) => [g.name, g] as const))("%s", async (_name, g) => {
+    const result = await executeShell("", { setup: g.setup });
+    expect(result.output.map((l) => l.text)).toEqual([]);
+    expect(result.graph?.commits.length).toBeGreaterThan(0);
+  });
+});
+
 describe("TryIt live previews", () => {
   const blocks = files.flatMap((file) => {
     const source = readFileSync(file, "utf8");

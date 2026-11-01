@@ -115,7 +115,10 @@ commit times come from a sandbox clock, so the same steps make the same hashes. 
 is shown after a prompt (`~/project $ git status`). Checks see `file(path)`, `exists`, `isDir`,
 `ls`, `cwd`, `run(command)`, `git` (`branch()`, `branches()`, `log(ref)`, `status()` as
 `git status -s` codes, `show(ref, path)`, `tags()`, `conflicts()`, `isRepo()`), `commands`,
-`status` and `__output` (`src/lib/runner/execute-shell.ts`).
+`status` and `__output` (`src/lib/runner/execute-shell.ts`). After each run the repository's commits
+are drawn under the output (branches in coloured lanes, merges, HEAD, tags;
+`src/lib/runner/shell/graph.ts`). Lessons can show the same picture without a Run button:
+`<GitGraph setup={`…commands…`} caption="…" />` runs `setup` when the page is built.
 
 JavaScript can `fetch` the built-in practice API at `https://api.pandadev.test`
 (`/movies`, `/weather?city=`, `/recipes`, `/users`, `/posts`, `/todos` with full CRUD,

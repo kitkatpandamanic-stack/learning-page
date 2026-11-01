@@ -91,6 +91,7 @@ Add a rule when something went wrong or the site owner corrected you, phrased as
 - Check results, not keystrokes: prefer `file()`, `ls()`, `git.log()`, `git.status()`; use `commands` only when using a specific command is the point (ls -a, git log --oneline).
 - Commit hashes are deterministic (sandbox clock), so lessons may show them. Translated commit messages change the hashes: run the RU examples too.
 - YAML frontmatter: quote a `description` that contains `: ` (common in RU). An unquoted one breaks `npm run content` for the whole site.
+- Branches and merges are hard to picture from text. Every run with a repository draws a **Commits** graph under its output; in the lesson text, `<GitGraph setup={`…`} caption="…" />` draws one at build time (the content tests run each setup). Show the shape before asking the learner to make it, and refer to the picture by its name, "Commits" / «Коммиты».
 - Lessons in one module can't link to another module's lessons until those files exist (the link test fails). Writing modules in parallel, link within your module, and add cross-module links in a final pass.
 
 ## Working in this repo

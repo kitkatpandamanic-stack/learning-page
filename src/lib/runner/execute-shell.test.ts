@@ -604,3 +604,106 @@ describe("line diffs", () => {
     ]);
   });
 });
+
+describe("the commit graph", () => {
+  /** Each row as "lane message (labels)", newest first. */
+  async function graph(code: string, setup = PROJECT) {
+    const { graph } = await executeShell(code, { setup });
+    return {
+      graph,
+      rows: graph?.commits.map(
+        (c) =>
+          `${c.lane} ${c.message}${c.labels.length ? ` (${c.labels.map((l) => l.name).join(", ")})` : ""}`,
+      ),
+      edges: graph?.edges
+        .map(
+          (e) =>
+            `${e.from}->${e.to ?? "…"} ${e.fromLane}/${e.lane}/${e.toLane}`,
+        )
+        .sort(),
+    };
+  }
+
+  it("is left out without a repository or commits", async () => {
+    expect((await graph("ls", "")).graph).toBeUndefined();
+    expect((await graph("git init", "")).graph).toBeUndefined();
+  });
+
+  it("draws a straight line of commits, HEAD on the newest", async () => {
+    const {
+      graph: g,
+      rows,
+      edges,
+    } = await graph(`echo more >> README.md\ngit commit -am "Second"`);
+    expect(rows).toEqual(["0 Second (main)", "0 First commit"]);
+    expect(edges).toEqual(["0->1 0/0/0"]);
+    expect(g?.commits.map((c) => c.head)).toEqual([true, false]);
+    expect(g?.commits[0].labels[0].kind).toBe("head");
+    expect(g?.branch).toBe("main");
+    expect(g?.lanes).toBe(1);
+  });
+
+  it("puts branches side by side and joins them at a merge", async () => {
+    const {
+      rows,
+      edges,
+      graph: g,
+    } = await graph(`git switch -c menu
+echo soup > menu.txt
+git add menu.txt
+git commit -m "Add menu"
+git switch main
+echo hi >> README.md
+git commit -am "Update README"
+git merge menu -m "Merge menu"`);
+    expect(rows).toEqual([
+      "0 Merge menu (main)",
+      "0 Update README",
+      "1 Add menu (menu)",
+      "0 First commit",
+    ]);
+    // The merge's second line leaves into lane 1; both lines meet at the
+    // first commit, where lane 1 bends back into lane 0.
+    expect(edges).toEqual([
+      "0->1 0/0/0",
+      "0->2 0/1/1",
+      "1->3 0/0/0",
+      "2->3 1/1/0",
+    ]);
+    expect(g?.lanes).toBe(2);
+  });
+
+  it("labels tags and a detached HEAD", async () => {
+    const { rows, graph: g } = await graph(`git tag v1
+echo more >> README.md
+git commit -am "Second"
+git checkout v1`);
+    expect(rows).toEqual(["0 Second (main)", "0 First commit (HEAD, v1)"]);
+    expect(g?.branch).toBeNull();
+    expect(g?.commits[1].head).toBe(true);
+  });
+
+  it("shows the newest commits and counts the rest", async () => {
+    const commits = Array.from(
+      { length: 30 },
+      (_, i) => `echo ${i} > n.txt\ngit add n.txt\ngit commit -m "Commit ${i}"`,
+    ).join("\n");
+    const { graph: g } = await graph(commits);
+    expect(g?.commits).toHaveLength(24);
+    expect(g?.more).toBe(7);
+    expect(g?.edges.at(-1)?.to).toBeNull();
+  });
+
+  it("is drawn before checks run more commands", async () => {
+    const { graph: g } = await executeShell("", {
+      setup: PROJECT,
+      tests: [
+        {
+          name: "x",
+          check: `(await run('git commit --allow-empty -m Later'), true)`,
+        },
+      ],
+    });
+    expect(g?.commits.map((c) => c.message)).toEqual(["First commit"]);
+  });
+});
