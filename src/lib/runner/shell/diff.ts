@@ -114,8 +114,14 @@ export function hunks(before: string, after: string, context = 3): string[] {
     const newCount = body.filter((l) => l.op !== "-").length;
     const range = (from: number, count: number) =>
       count === 1 ? `${from}` : `${count === 0 ? from - 1 : from},${count}`;
+    // Like git, the nearest earlier line that starts with a letter, _ or $
+    // (a function, a heading…) follows the @@, cut to 80 characters.
+    const oldLines = diff.filter((l) => l.op !== "+").map((l) => l.text);
+    let heading: string | undefined;
+    for (let j = oldStart - 2; j >= 0 && !heading; j--)
+      if (/^[A-Za-z_$]/.test(oldLines[j])) heading = oldLines[j];
     out.push(
-      `@@ -${range(oldStart, oldCount)} +${range(newStart, newCount)} @@`,
+      `@@ -${range(oldStart, oldCount)} +${range(newStart, newCount)} @@${heading ? ` ${heading.trimEnd().slice(0, 80)}` : ""}`,
     );
     for (const line of body) out.push(`${line.op}${line.text}`);
     i = end;

@@ -116,6 +116,16 @@ export class GitSandbox {
     return (await git.listBranches({ fs: this.fs, dir })).sort();
   }
 
+  /** The branch (or commit) before the last switch, for `git switch -`. */
+  previous(dir: string) {
+    const file = `${dir}/.git/PANDA_PREVIOUS`;
+    return this.fs.isFile(file) ? this.fs.readText(file).trim() : null;
+  }
+
+  remember(dir: string, where: string) {
+    this.fs.writeFile(`${dir}/.git/PANDA_PREVIOUS`, `${where}\n`);
+  }
+
   /** State files of a merge that stopped on conflicts. */
   merging(dir: string) {
     const head = `${dir}/.git/MERGE_HEAD`;
@@ -311,11 +321,16 @@ export class GitSandbox {
     const merge = this.merging(dir);
     const signature = await this.signature(dir);
     const head = await this.head(dir);
+    // Like git, --amend keeps the original author and date.
+    const author =
+      options.amend && head
+        ? (await git.readCommit({ fs: this.fs, dir, oid: head })).commit.author
+        : signature;
     const oid = await git.commit({
       fs: this.fs,
       dir,
       message,
-      author: signature,
+      author,
       committer: signature,
       amend: options.amend,
       ...(merge && head ? { parent: [head, merge.theirs] } : {}),
@@ -462,11 +477,13 @@ const COMMANDS: Record<string, Sub> = {
     const status = await this.shortStatus(dir);
     const paths = Object.keys(status).sort();
     if (short) {
-      for (const path of collapseUntracked(
-        status,
-        paths,
-        await this.stage(dir),
-      ))
+      const rows = collapseUntracked(status, paths, await this.stage(dir));
+      // Like git: tracked changes first, then untracked files.
+      const untracked = (path: string) => (status[path] ?? "??") === "??";
+      for (const path of [
+        ...rows.filter((p) => !untracked(p)),
+        ...rows.filter(untracked),
+      ])
         io.out(`${status[path] ?? "??"} ${this.shown(dir, path)}\n`);
       return 0;
     }
@@ -524,7 +541,7 @@ const COMMANDS: Record<string, Sub> = {
     if (ignored.length)
       throw new GitExit(
         1,
-        `The following paths are ignored by one of your .gitignore files:\n${ignored.join("\n")}\nhint: Use -f if you really want to add them.\n`,
+        `The following paths are ignored by one of your .gitignore files:\n${ignored.join("\n")}\nhint: Use -f if you really want to add them.\nhint: Disable this message with "git config set advice.addIgnoredFile false"\n`,
       );
     return 0;
   },
@@ -566,11 +583,14 @@ const COMMANDS: Record<string, Sub> = {
         );
     }
     const merge = this.merging(dir);
-    if (merge?.conflicts.length)
-      throw new GitExit(
-        128,
+    if (merge?.conflicts.length) {
+      // Like git: the error, then the files still in conflict.
+      io.err(
         "error: Committing is not possible because you have unmerged files.\nhint: Fix them up in the work tree, and then use 'git add/rm <file>'\nhint: as appropriate to mark resolution and make a commit.\nfatal: Exiting because of an unresolved conflict.\n",
       );
+      for (const path of merge.conflicts) io.out(`U\t${path}\n`);
+      return 128;
+    }
     if (all) {
       const rows = await git.statusMatrix({ fs: this.fs, dir });
       for (const [path, head, work, stage] of rows) {
@@ -614,14 +634,24 @@ const COMMANDS: Record<string, Sub> = {
     const branch = await this.branch(dir);
     const where = branch ?? "detached HEAD";
     io.out(
-      `[${where}${parent ? "" : " (root-commit)"} ${oid.slice(0, 7)}] ${message.split("\n")[0]}\n`,
+      `[${where}${parent || amend ? "" : " (root-commit)"} ${oid.slice(0, 7)}] ${message.split("\n")[0]}\n`,
     );
+    if (amend) {
+      const { author } = (await git.readCommit({ fs: this.fs, dir, oid }))
+        .commit;
+      io.out(` Date: ${gitDate(author.timestamp * 1000)}\n`);
+    }
     // Like git, a merge commit gets no summary of changed files.
     if (!merge) io.out(await summary(this, dir, parent, oid, true));
     return 0;
   },
 
   async log({ io }, args, dir) {
+    if (args.includes("--graph"))
+      throw new GitExit(
+        1,
+        "git log --graph isn't in this practice terminal: the Commits picture under the output shows the graph.\n",
+      );
     const parsed = flags("git log", args, "", "n", {
       oneline: "o",
       all: "a",
@@ -633,11 +663,6 @@ const COMMANDS: Record<string, Sub> = {
     const max = parsed.values.has("n")
       ? Number(parsed.values.get("n"))
       : Infinity;
-    if (args.includes("--graph"))
-      throw new GitExit(
-        1,
-        "git log --graph isn't in this practice terminal yet: the picture under the output shows the graph.\n",
-      );
     const head = await this.head(dir);
     let commits: Awaited<ReturnType<typeof git.log>> = [];
     if (parsed.set.has("a")) {
@@ -675,6 +700,30 @@ const COMMANDS: Record<string, Sub> = {
     return 0;
   },
 
+  async "check-ignore"({ io }, args, dir) {
+    const paths = args.filter((a) => !a.startsWith("-"));
+    if (args.some((a) => a.startsWith("-")))
+      throw new GitExit(
+        1,
+        "git check-ignore here takes just file names (no options).\n",
+      );
+    if (!paths.length) fatal("no path specified");
+    // Like git, files Git already tracks are never reported.
+    const index = await this.stage(dir);
+    let found = false;
+    for (const path of paths) {
+      const filepath = this.rel(dir, path);
+      if (
+        !index.has(filepath) &&
+        (await git.isIgnored({ fs: this.fs, dir, filepath }))
+      ) {
+        io.out(`${path}\n`);
+        found = true;
+      }
+    }
+    return found ? 0 : 1;
+  },
+
   async show({ io }, args, dir) {
     const ref = args.find((a) => !a.startsWith("-")) ?? "HEAD";
     const oid = await this.resolveCommit(dir, ref);
@@ -701,13 +750,48 @@ const COMMANDS: Record<string, Sub> = {
   async diff({ io }, args, dir) {
     const staged = args.includes("--staged") || args.includes("--cached");
     const stat = args.includes("--stat");
-    const paths = args
-      .filter((a) => !a.startsWith("-") && a !== "--")
-      .map((p) => this.rel(dir, p));
+    // Words before `--` that name commits (HEAD~1, main, a..b) are commits;
+    // the rest are paths.
+    const dash = args.indexOf("--");
+    const refs: string[] = [];
+    const specs: string[] = dash === -1 ? [] : args.slice(dash + 1);
+    for (const word of dash === -1 ? args : args.slice(0, dash)) {
+      if (word.startsWith("-")) continue;
+      const range = /^(.+?)\.\.(.+)$/.exec(word);
+      const names = range ? [range[1], range[2]] : [word];
+      const oids = await Promise.all(
+        names.map((n) => this.resolveCommit(dir, n)),
+      );
+      if (
+        oids.every(Boolean) &&
+        (range || !this.fs.exists(this.shell.resolve(word)))
+      )
+        refs.push(...(oids as string[]));
+      else if (
+        this.fs.exists(this.shell.resolve(word)) ||
+        refs.length ||
+        specs.length
+      )
+        specs.push(word);
+      else
+        throw new GitExit(
+          128,
+          `fatal: ambiguous argument '${word}': unknown revision or path not in the working tree.\nUse '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'\n`,
+        );
+    }
+    const paths = specs.map((p) => this.rel(dir, p));
     const index = await this.stage(dir);
     let before: Map<string, string>;
     let after: Map<string, string>;
-    if (staged) {
+    if (refs.length >= 2) {
+      before = await this.tree(dir, refs[0]);
+      after = await this.tree(dir, refs[1]);
+    } else if (refs.length === 1) {
+      before = await this.tree(dir, refs[0]);
+      after = staged
+        ? index
+        : this.work(dir, new Set([...index.keys(), ...before.keys()]));
+    } else if (staged) {
       before = await this.tree(dir, await this.head(dir));
       after = index;
     } else {
@@ -796,10 +880,37 @@ const COMMANDS: Record<string, Sub> = {
 
   async branch({ io }, args, dir) {
     const del = args.find((a) => a === "-d" || a === "-D" || a === "--delete");
+    const move = args.find((a) => a === "-m" || a === "-M" || a === "--move");
+    const verbose = args.some(
+      (a) => a === "-v" || a === "-vv" || a === "--verbose",
+    );
+    const mergedFilter = args.includes("--merged")
+      ? true
+      : args.includes("--no-merged")
+        ? false
+        : null;
     const names = args.filter((a) => !a.startsWith("-"));
     const current = await this.branch(dir);
     const head = await this.head(dir);
+    if (move) {
+      const [from, to] = names.length >= 2 ? names : [current, names[0]];
+      if (!to) fatal("branch name required");
+      const all = await this.branches(dir);
+      if (!from || !all.includes(from)) fatal(`no branch named '${from}'`);
+      if (from === to) return 0;
+      if (all.includes(to!) && move !== "-M")
+        fatal(`a branch named '${to}' already exists`);
+      await git.renameBranch({
+        fs: this.fs,
+        dir,
+        oldref: from!,
+        ref: to!,
+        checkout: from === current,
+      });
+      return 0;
+    }
     if (del) {
+      if (!names.length) fatal("branch name required");
       for (const name of names) {
         if (!(await this.branches(dir)).includes(name))
           throw new GitExit(1, `error: branch '${name}' not found\n`);
@@ -822,7 +933,7 @@ const COMMANDS: Record<string, Sub> = {
         if (!merged && del !== "-D")
           throw new GitExit(
             1,
-            `error: the branch '${name}' is not fully merged\nhint: If you are sure you want to delete it, run 'git branch -D ${name}'\n`,
+            `error: the branch '${name}' is not fully merged\nhint: If you are sure you want to delete it, run 'git branch -D ${name}'\nhint: Disable this message with "git config set advice.forceDeleteBranch false"\n`,
           );
         await git.deleteBranch({ fs: this.fs, dir, ref: name });
         io.out(`Deleted branch ${name} (was ${oid.slice(0, 7)}).\n`);
@@ -830,10 +941,39 @@ const COMMANDS: Record<string, Sub> = {
       return 0;
     }
     if (!names.length) {
+      const rows: [string, string, string | null][] = [];
       if (!current && head)
-        io.out(`* (HEAD detached at ${head.slice(0, 7)})\n`);
-      for (const name of await this.branches(dir))
-        io.out(`${name === current ? "*" : " "} ${name}\n`);
+        rows.push(["*", `(HEAD detached at ${head.slice(0, 7)})`, head]);
+      for (const name of await this.branches(dir)) {
+        if (mergedFilter !== null && head) {
+          const oid = (await this.resolveCommit(dir, name))!;
+          const merged =
+            oid === head ||
+            (await git.isDescendent({
+              fs: this.fs,
+              dir,
+              oid: head,
+              ancestor: oid,
+            }));
+          if (merged !== mergedFilter) continue;
+        }
+        rows.push([
+          name === current ? "*" : " ",
+          name,
+          verbose ? await this.resolveCommit(dir, name) : null,
+        ]);
+      }
+      const width = Math.max(...rows.map((r) => r[1].length));
+      for (const [mark, name, oid] of rows) {
+        if (!verbose || !oid) {
+          io.out(`${mark} ${name}\n`);
+          continue;
+        }
+        const { commit } = await git.readCommit({ fs: this.fs, dir, oid });
+        io.out(
+          `${mark} ${name.padEnd(width)} ${oid.slice(0, 7)} ${commit.message.split("\n")[0]}\n`,
+        );
+      }
       return 0;
     }
     if (!head) fatal(`not a valid object name: '${current ?? "main"}'`);
@@ -849,13 +989,21 @@ const COMMANDS: Record<string, Sub> = {
       (a) => a === "-c" || a === "--create" || a === "-C",
     );
     const detach = args.includes("--detach");
-    const [name, start] = args.filter((a) => !a.startsWith("-"));
+    const words = args.filter((a) => a === "-" || !a.startsWith("-"));
+    const start = words[1];
+    let name = words[0];
     if (!name) fatal("missing branch or commit argument");
+    if (name === "-") {
+      const previous = this.previous(dir);
+      if (!previous) fatal("invalid reference: @{-1}");
+      name = previous!;
+      if (!(await this.branches(dir)).includes(name))
+        return checkoutDetached(this, ctx, dir, name);
+    }
     if (create)
       return checkoutBranch(this, ctx, dir, name, { create: true, start });
     if ((await this.branches(dir)).includes(name))
       return checkoutBranch(this, ctx, dir, name, {});
-    if (name === "-") return checkoutBranch(this, ctx, dir, name, {});
     const oid = await this.resolveCommit(dir, name);
     if (oid && detach) return checkoutDetached(this, ctx, dir, oid);
     if (oid)
@@ -882,6 +1030,13 @@ const COMMANDS: Record<string, Sub> = {
         start: words[1],
       });
     }
+    if (!files.length && words.length === 0 && args.includes("-")) {
+      const previous = this.previous(dir);
+      if (!previous) fatal("invalid reference: @{-1}");
+      return (await this.branches(dir)).includes(previous!)
+        ? checkoutBranch(this, ctx, dir, previous!, {})
+        : checkoutDetached(this, ctx, dir, previous!);
+    }
     if (!files.length && words.length === 1) {
       const name = words[0];
       if ((await this.branches(dir)).includes(name))
@@ -907,17 +1062,27 @@ const COMMANDS: Record<string, Sub> = {
       for (const path of matches)
         this.fs.writeFile(`${dir}/${path}`, index.get(path)!);
     }
-    ctx.io.out(
-      `Updated ${targets.length} path${targets.length === 1 ? "" : "s"} from the index\n`,
-    );
+    // Like git: silent after `--`, a count without it.
+    if (!files.length)
+      ctx.io.out(
+        `Updated ${targets.length} path${targets.length === 1 ? "" : "s"} from the index\n`,
+      );
     return 0;
   },
 
-  async merge({ io }, args, dir) {
+  async merge(ctx, args, dir) {
+    const { io } = ctx;
     if (args.includes("--abort")) {
       const merge = this.merging(dir);
       if (!merge) fatal("There is no merge to abort (MERGE_HEAD missing).");
       const branch = await this.branch(dir);
+      // Files the merge brought in go away again, like git.
+      const ours = await this.tree(dir, await this.head(dir));
+      for (const path of (await this.tree(dir, merge!.theirs)).keys()) {
+        if (ours.has(path)) continue;
+        if (this.fs.isFile(`${dir}/${path}`)) this.fs.unlink(`${dir}/${path}`);
+        await git.remove({ fs: this.fs, dir, filepath: path });
+      }
       await git.checkout({
         fs: this.fs,
         dir,
@@ -930,6 +1095,17 @@ const COMMANDS: Record<string, Sub> = {
           this.fs.unlink(`${dir}/.git/${name}`);
       return 0;
     }
+    if (args.includes("--continue")) {
+      if (!this.merging(dir))
+        fatal("There is no merge in progress (MERGE_HEAD missing).");
+      // Real git opens an editor with the prepared message; take it as is.
+      return COMMANDS.commit.call(this, ctx, [], dir);
+    }
+    if (this.merging(dir)?.conflicts.length)
+      throw new GitExit(
+        128,
+        "error: Merging is not possible because you have unmerged files.\nhint: Fix them up in the work tree, and then use 'git add/rm <file>'\nhint: as appropriate to mark resolution and make a commit.\nfatal: Exiting because of an unresolved conflict.\n",
+      );
     if (this.merging(dir))
       fatal(
         "You have not concluded your merge (MERGE_HEAD exists).\nPlease, commit your changes before you merge.",
@@ -962,15 +1138,51 @@ const COMMANDS: Record<string, Sub> = {
       io.out("Already up to date.\n");
       return 0;
     }
-    // Like git: refuse when uncommitted changes to tracked files could be lost.
-    const dirty = Object.entries(await this.shortStatus(dir))
-      .filter(([, c]) => c !== "??")
+    const [base] = await git.findMergeBase({
+      fs: this.fs,
+      dir,
+      oids: [head!, theirs!],
+    });
+    const baseTree = await this.tree(dir, base ?? null);
+    const theirTree = await this.tree(dir, theirs!);
+    const ourTree = await this.tree(dir, head!);
+    const touched = (p: string) => baseTree.get(p) !== theirTree.get(p);
+    // Like git: refuse when uncommitted changes could be lost (staged ones,
+    // or edits to files the merge changes); other edits just stay.
+    const changes = Object.entries(await this.shortStatus(dir)).filter(
+      ([, c]) => c !== "??",
+    );
+    const blocking = changes
+      .filter(([p, c]) => c[0] !== " " || touched(p))
       .map(([p]) => p);
-    if (dirty.length)
+    if (blocking.length)
       throw new GitExit(
         1,
-        `error: Your local changes to the following files would be overwritten by merge:\n${dirty.map((p) => `\t${p}`).join("\n")}\nPlease commit your changes or stash them before you merge.\nAborting\n`,
+        `error: Your local changes to the following files would be overwritten by merge:\n${blocking.map((p) => `\t${p}`).join("\n")}\nPlease commit your changes or stash them before you merge.\nAborting\n`,
       );
+    const kept = new Map<string, string | null>();
+    for (const [p] of changes)
+      kept.set(
+        p,
+        this.fs.isFile(`${dir}/${p}`) ? this.fs.readText(`${dir}/${p}`) : null,
+      );
+    const putBack = () => {
+      for (const [p, text] of kept)
+        if (text === null) {
+          if (this.fs.isFile(`${dir}/${p}`)) this.fs.unlink(`${dir}/${p}`);
+        } else this.fs.writeFile(`${dir}/${p}`, text);
+    };
+    // Files both sides changed, which git reports as "Auto-merging".
+    const bothChanged = [...new Set([...ourTree.keys(), ...theirTree.keys()])]
+      .filter(
+        (p) =>
+          baseTree.has(p) &&
+          ourTree.has(p) &&
+          theirTree.has(p) &&
+          baseTree.get(p) !== ourTree.get(p) &&
+          baseTree.get(p) !== theirTree.get(p),
+      )
+      .sort();
     const message =
       custom ??
       `Merge branch '${name}'${current === "main" || current === "master" ? "" : ` into ${current}`}`;
@@ -990,12 +1202,16 @@ const COMMANDS: Record<string, Sub> = {
         committer: signature,
       });
       await git.checkout({ fs: this.fs, dir, ref: current!, force: true });
+      putBack();
       const after = await this.tree(dir, result.oid ?? theirs!);
       if (result.fastForward) {
         io.out(
           `Updating ${head!.slice(0, 7)}..${theirs!.slice(0, 7)}\nFast-forward\n`,
         );
-      } else io.out("Merge made by the 'ort' strategy.\n");
+      } else {
+        for (const p of bothChanged) io.out(`Auto-merging ${p}\n`);
+        io.out("Merge made by the 'ort' strategy.\n");
+      }
       io.out(await statText(before, after, true));
       return 0;
     } catch (error) {
@@ -1025,11 +1241,30 @@ const COMMANDS: Record<string, Sub> = {
               ),
           );
       }
+      // Paths that merged cleanly are staged, like git; only the
+      // conflicts wait for the learner.
+      const stage = await this.stage(dir);
+      const paths = new Set([
+        ...before.keys(),
+        ...(await this.tree(dir, theirs!)).keys(),
+      ]);
+      for (const path of paths) {
+        // Conflicts wait for the learner; their own edits stay unstaged.
+        if (conflicts.includes(path) || kept.has(path)) continue;
+        const full = `${dir}/${path}`;
+        if (this.fs.isFile(full)) {
+          if (stage.get(path) !== this.fs.readText(full))
+            await git.add({ fs: this.fs, dir, filepath: path });
+        } else if (stage.has(path))
+          await git.remove({ fs: this.fs, dir, filepath: path });
+      }
       this.fs.writeFile(`${dir}/.git/MERGE_HEAD`, `${theirs}\n`);
       this.fs.writeFile(`${dir}/.git/MERGE_MSG`, `${message}\n`);
       this.fs.writeFile(`${dir}/.git/PANDA_CONFLICTS`, conflicts.join("\n"));
-      for (const path of conflicts) {
+      putBack();
+      for (const path of [...new Set([...bothChanged, ...conflicts])].sort()) {
         io.out(`Auto-merging ${path}\n`);
+        if (!conflicts.includes(path)) continue;
         const kind =
           data.deleteByUs.includes(path) || data.deleteByTheirs.includes(path)
             ? "modify/delete"
@@ -1135,7 +1370,10 @@ async function longStatus(
   const shown = (p: string) => sandbox.shown(dir, p);
   if (staged.length) {
     io.out(
-      `Changes to be committed:\n  (use "${head ? "git restore --staged <file>..." : "git rm --cached <file>..."}" to unstage)\n`,
+      // Like git, no hint while a merge is going on.
+      merge
+        ? "Changes to be committed:\n"
+        : `Changes to be committed:\n  (use "${head ? "git restore --staged <file>..." : "git rm --cached <file>..."}" to unstage)\n`,
     );
     for (const p of staged) io.out(`\t${label[status[p][0]]}${shown(p)}\n`);
     io.out("\n");
@@ -1367,6 +1605,11 @@ async function checkoutBranch(
   options: { create?: boolean; start?: string },
 ) {
   const current = await sandbox.branch(dir);
+  const was = current ?? (await sandbox.head(dir));
+  if (sandbox.merging(dir))
+    fatal(
+      'cannot switch branch while merging\nConsider "git merge --quit" or "git worktree add".',
+    );
   if (options.create) {
     const head = await sandbox.head(dir);
     const at = options.start
@@ -1393,6 +1636,9 @@ async function checkoutBranch(
     io.out(`Already on '${name}'\n`);
     return 0;
   }
+  const carried = Object.entries(await sandbox.shortStatus(dir)).filter(
+    ([, code]) => code !== "??",
+  );
   try {
     await git.checkout({ fs: sandbox.fs, dir, ref: name });
   } catch (error) {
@@ -1405,6 +1651,10 @@ async function checkoutBranch(
     }
     throw error;
   }
+  if (was) sandbox.remember(dir, was);
+  // Like git: uncommitted changes that came along, then the switch.
+  for (const [path, code] of carried)
+    io.out(`${code.trim()[0]}\t${sandbox.shown(dir, path)}\n`);
   io.out(
     options.create
       ? `Switched to a new branch '${name}'\n`
@@ -1419,6 +1669,7 @@ async function checkoutDetached(
   dir: string,
   oid: string,
 ) {
+  const was = (await sandbox.branch(dir)) ?? (await sandbox.head(dir));
   try {
     await git.checkout({ fs: sandbox.fs, dir, ref: oid });
   } catch (error) {
@@ -1431,6 +1682,7 @@ async function checkoutDetached(
     }
     throw error;
   }
+  if (was && was !== oid) sandbox.remember(dir, was);
   const { commit } = await git.readCommit({ fs: sandbox.fs, dir, oid });
   io.out(
     `Note: switching to '${oid.slice(0, 7)}'.\n\nYou are in 'detached HEAD' state. You can look around, make experimental\nchanges and commit them, and you can discard any commits you make in this\nstate without impacting any branches by switching back to a branch.\n\nHEAD is now at ${oid.slice(0, 7)} ${commit.message.split("\n")[0]}\n`,

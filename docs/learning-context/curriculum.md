@@ -11,8 +11,8 @@ Last refreshed: 2026-10-11 (repo HEAD `947f15b`). Generated from `course.yml`, l
 | Python     | 4      | 25 + 4                | 94 (L0 16 · L1 23 · L2 33 · L3 22) | 93        | 162     | 40 (12/18/10)            |
 | SQL        | 4      | 16 + 4                | 60 (15 per level)                  | 60        | 113     | 40 (12/18/10)            |
 | TypeScript | 4      | 17 + 4                | 62 (L0 15 · L1 15 · L2 15 · L3 17) | 62        | 100     | 40 (12/18/10)            |
-| Git        | 4      | 14 + 4                | 12 (L0 only so far)                | 20        | 22      | none yet                 |
-| **All**    |        | **92 + 20**           | **302** (+302 RU)                  | 308       | 515     | **160** (+160 RU)        |
+| Git        | 4      | 14 + 4                | 23 (L0 12 · L1 11; L2–L3 to come)  | 47        | 52      | none yet                 |
+| **All**    |        | **92 + 20**           | **313** (+313 RU)                  | 335       | 545     | **160** (+160 RU)        |
 
 Lesson counts include capstone parts (3 per capstone). Module mini-projects present: JS 10/20, Python 14/25, SQL 2/16, TS 9/17 (35 of 78; 43 modules have none). Quiz counts updated 2026-10-11 after the basics mini-projects (JS 116, Python 162). JS lesson/exercise/quiz counts updated 2026-10-17 after `recursion` was split into `04-recursion` + `05-recursion-or-loop` (recounted: 74 lessons, 73 exercises, 118 quizzes; all courses 290 lessons, 288 exercises, 493 quizzes).
 
@@ -737,9 +737,32 @@ All 16 capstones exist with 3 parts each.
 - `01-sort-the-folder` Part 1: Sort the folder (20m, 30xp, ex 3, quiz 1): Meet the messy folder; Timur's plan; A safety net first; Throw out the rubbish; Everything in its place; What you built
 - `02-save-it-in-git` Part 2: Save it in Git (20m, 30xp, ex 3, quiz 1): Turn the folder into a repository; What Git sees; The first commit; A README for visitors; Reading the history; One more fix; What you built; Take it further; Congratulations! 🎉🐼
 
-### Git L1 (3 modules + capstone, 0 lessons: outline only, lessons being written)
+### Git L1 (3 modules + capstone, 11 lessons)
 
-Modules: `pipes-and-text` Pipes & Text, `everyday-git` Everyday Git, `branches-and-merging` Branches & Merging; capstone `team-feature` Team feature.
+**Module `pipes-and-text`: Pipes & Text** · yml project: A traffic report from the server log
+
+- `01-looking-inside-files` Looking Inside Files (13m, 20xp, ex 2, quiz 3): The first lines: head; The last lines: tail; Several files at once; Counting with wc; Bytes aren't letters; wc -l counts line breaks; Reading long files on your computer
+- `02-finding-text-with-grep` Finding Text with grep (15m, 25xp, ex 2, quiz 3): Your first grep; Options that change what grep finds; Options that change what grep prints; Quotes around the pattern; Searching a whole project with -r; A few special characters
+- `03-pipes-and-redirects` Pipes and Redirects (18m, 30xp, ex 2, quiz 4): The pipe: one command's output is the next one's input; Sorting lines with sort; Counting repeats with uniq; Cutting out columns with cut; Swapping characters with tr; Building a pipeline step by step; Saving the result: >, >> and tee; Errors have their own stream: 2>; Only if it worked: &&; Mini-project: a traffic report from the server log
+
+**Module `everyday-git`: Everyday Git** · yml project: Clean up a messy session
+
+- `01-seeing-changes-with-diff` Seeing Changes with diff (16m, 25xp, ex 2, quiz 3): The examples' project; git diff: changes you haven't staged; Reading a hunk; Staged changes: git diff --staged; New files don't show up; Comparing two commits; Just the numbers: --stat; One file at a time; Common mistakes
+- `02-ignoring-files` Ignoring Files with .gitignore (15m, 25xp, ex 2, quiz 3): Files that don't belong in Git; Your first .gitignore; Patterns; Exceptions with !; Is this file ignored? git check-ignore; Ignored files and git add; Ignoring doesn't untrack (git rm --cached); Common mistakes
+- `03-undoing-changes` Undoing Changes (18m, 30xp, ex 3, quiz 3): Throw away an edit: git restore; Unstage a file: git restore --staged; When a bad edit is already staged; Fix the last commit: git commit --amend (A better message; A forgotten file; Don't amend what you've shared); Common mistakes; Mini-project: clean up a messy session
+
+**Module `branches-and-merging`: Branches & Merging** · yml project: A menu from two branches
+
+- `01-what-is-a-branch` What Is a Branch? (16m, 25xp, ex 2, quiz 3): The examples' repository; A branch is a label on a commit; HEAD: where you are; Listing branches: git branch; Making a branch: git branch name; Switching: git switch; Committing on a branch; What happens to your files when you switch; Shortcuts: git switch -c and git switch -; The older way: git checkout; Renaming and deleting branches; "Your local changes would be overwritten"
+- `02-merging-branches` Merging Branches (17m, 25xp, ex 3, quiz 3): The examples' repository; git merge: bring a branch in; Fast-forward: the label just moves; When both branches moved: a merge commit; A commit with two parents; Always a merge commit: --no-ff; Which branches are merged?; Tidy up: delete the merged branch; The feature-branch flow
+- `03-merge-conflicts` Merge Conflicts (18m, 30xp, ex 3, quiz 3): The examples' repository; Why conflicts happen; The conflict; Reading git status during a merge; Conflict markers; Resolving the conflict (git merge --continue); Don't commit the markers; Changed your mind: git merge --abort; Avoiding conflicts; Common mistakes; Mini-project: a menu from two branches
+
+Notes: `printf` is first explained in `03-merge-conflicts`; `git log --all` first in `01-what-is-a-branch`; `git rm --cached` in `02-ignoring-files`. The branches lessons draw shapes with `<GitGraph>` (12 pictures).
+
+**Capstone `team-feature`: Team feature** (the Friday Film Club website; Lina's repository, teammate Omar)
+
+- `01-build-it-on-a-branch` Part 1: Build it on a branch (20m, 30xp, ex 3, quiz 1): Meet the repository; What's in the film list; Reading the history; A branch for the feature; Keep generated files out; Mistakes happen (Undo the edit with git restore; Fix the last commit with --amend); What you built
+- `02-merge-and-resolve` Part 2: Merge and resolve (20m, 30xp, ex 3, quiz 1): What happened on main; Which way to merge; The conflict (The way out: git merge --abort); Resolving the conflict; Bringing it into main; What you built; Take it further; Congratulations! 🎉🐼
 
 ### Git L2 (4 modules + capstone, 0 lessons: outline only, lessons being written)
 

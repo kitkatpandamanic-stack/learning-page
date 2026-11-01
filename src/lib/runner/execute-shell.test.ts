@@ -295,6 +295,7 @@ git branch`,
     expect(r.errors).toEqual([
       "error: the branch 'feature' is not fully merged",
       "hint: If you are sure you want to delete it, run 'git branch -D feature'",
+      'hint: Disable this message with "git config set advice.forceDeleteBranch false"',
     ]);
     expect(r.text).toMatch(/Deleted branch feature \(was [0-9a-f]{7}\)\./);
   });
@@ -594,7 +595,7 @@ describe("line diffs", () => {
       " line 3",
       " line 4",
       " line 5",
-      "@@ -15,6 +15,5 @@",
+      "@@ -15,6 +15,5 @@ line 14",
       " line 15",
       " line 16",
       " line 17",
@@ -602,6 +603,382 @@ describe("line diffs", () => {
       " line 19",
       " line 20",
     ]);
+  });
+});
+
+describe("Level 1 commands", () => {
+  // The repository the outputs were checked against in git 2.50.
+  const MENU = PROJECT.replace("# Menu app", "# Menu");
+
+  it("amends like git: same author date, a Date line, no root-commit", async () => {
+    const r = await sh(
+      `echo more >> README.md
+git add README.md
+git commit --amend -m "First commit, fixed"
+echo x > b.txt
+git add b.txt
+git commit -m "Add b"
+echo y >> b.txt
+git commit -a --amend --no-edit`,
+      MENU,
+    );
+    // Hashes and output checked against git 2.50.
+    expect(r.printed.slice(0, 2)).toEqual([
+      "[main 33e0abf] First commit, fixed",
+      " Date: Mon Jan 5 09:01:00 2026 +0000",
+    ]);
+    expect(r.printed).toContain("[main 9531a46] Add b");
+    expect(r.printed).toContain(" Date: Mon Jan 5 09:03:00 2026 +0000");
+  });
+
+  it("lists branches with -v, renames with -m and goes back with switch -", async () => {
+    const r = await sh(
+      `git switch -
+git branch menu
+git branch feature-long
+git branch -v
+git branch -m feature-long main
+git branch -m feature-long food
+git branch -m nope new
+git switch menu
+git switch -
+git checkout -
+git branch`,
+      MENU,
+    );
+    expect(r.printed.slice(0, 3)).toEqual([
+      "  feature-long 4a4936d First commit",
+      "* main         4a4936d First commit",
+      "  menu         4a4936d First commit",
+    ]);
+    expect(r.errors).toEqual([
+      "fatal: invalid reference: @{-1}",
+      "fatal: a branch named 'main' already exists",
+      "fatal: no branch named 'nope'",
+    ]);
+    expect(r.printed.slice(3)).toEqual([
+      "Switched to branch 'menu'",
+      "Switched to branch 'main'",
+      "Switched to branch 'menu'",
+      "  food",
+      "  main",
+      "* menu",
+    ]);
+  });
+
+  it("diffs against commits and between them", async () => {
+    const r = await sh(
+      `echo x > b.txt
+git add b.txt
+git commit -m "Add b"
+echo z >> app.py
+git add app.py
+echo w >> app.py
+git diff HEAD
+git diff HEAD~1 HEAD --stat
+git diff HEAD~1..HEAD --stat
+git diff nothing`,
+      MENU,
+    );
+    expect(r.printed.slice(3)).toEqual([
+      "diff --git a/app.py b/app.py",
+      "index 11b15b1..3501232 100644",
+      "--- a/app.py",
+      "+++ b/app.py",
+      "@@ -1 +1,3 @@",
+      ' print("hello")',
+      "+z",
+      "+w",
+      " b.txt | 1 +",
+      " 1 file changed, 1 insertion(+)",
+      " b.txt | 1 +",
+      " 1 file changed, 1 insertion(+)",
+    ]);
+    expect(r.errors[0]).toBe(
+      "fatal: ambiguous argument 'nothing': unknown revision or path not in the working tree.",
+    );
+  });
+
+  it("checks what .gitignore leaves out", async () => {
+    const r = await sh(
+      `echo "*.log" > .gitignore
+touch debug.log
+git check-ignore debug.log app.py
+echo $?
+git check-ignore app.py
+echo $?`,
+      MENU,
+    );
+    expect(r.printed).toEqual(["debug.log", "0", "1"]);
+  });
+
+  it("cuts, translates, tees and printfs like coreutils", async () => {
+    const r = await sh(`printf "a,b\\nc,d\\n" | cut -d, -f2
+echo panda | cut -c1-3
+echo "a b  c" | cut -d" " -f2,3
+echo hello | tr -d l
+echo hello | tr el ip
+echo "a:b" | tr ":" "\\n"
+echo hi | tr a-z A-Z
+echo hi | tee t.txt
+echo more | tee -a t.txt
+cat t.txt
+printf "%s is %d\\n" panda 5 koala 7
+printf "100%%\\n"`);
+    expect(r.printed).toEqual([
+      "b",
+      "d",
+      "pan",
+      "b ",
+      "heo",
+      "hippo",
+      "a",
+      "b",
+      "HI",
+      "hi",
+      "more",
+      "hi",
+      "more",
+      "panda is 5",
+      "koala is 7",
+      "100%",
+    ]);
+  });
+});
+
+describe("a merge that stops on a conflict", () => {
+  // Omar adds a page and edits README; both sides change index.html.
+  const SETUP = `mkdir club && cd club
+git init
+echo "nav: Home" > index.html
+echo "# Club" > README.md
+git add .
+git commit -m "First"
+git switch -c omar
+echo "nav: Films" > index.html
+echo "members" > members.html
+echo "more" >> README.md
+git add .
+git commit -m "Omar"
+git switch main
+echo "nav: Schedule" > index.html
+git commit -am "Mine"`;
+
+  it("stages the other side's clean changes, like git", async () => {
+    const r = await sh(
+      `git merge omar
+git status
+git switch omar
+echo "nav: both" > index.html
+git add index.html
+git status
+git merge --continue
+git show --stat HEAD`,
+      SETUP,
+    );
+    expect(r.printed.slice(3, 15)).toEqual([
+      "On branch main",
+      "You have unmerged paths.",
+      '  (fix conflicts and run "git commit")',
+      '  (use "git merge --abort" to abort the merge)',
+      "",
+      "Changes to be committed:",
+      "\tmodified:   README.md",
+      "\tnew file:   members.html",
+      "",
+      "Unmerged paths:",
+      '  (use "git add <file>..." to mark resolution)',
+      "\tboth modified:   index.html",
+    ]);
+    expect(r.errors).toEqual([
+      "fatal: cannot switch branch while merging",
+      'Consider "git merge --quit" or "git worktree add".',
+    ]);
+    expect(r.text).toContain(`All conflicts fixed but you are still merging.
+  (use "git commit" to conclude merge)
+
+Changes to be committed:
+\tmodified:   README.md
+\tmodified:   index.html
+\tnew file:   members.html`);
+    expect(r.text).toContain("[main ");
+    expect(r.text).toContain("] Merge branch 'omar'");
+  });
+
+  it("keeps every change in the merge commit", async () => {
+    const { tests } = await executeShell(
+      `git merge omar
+echo "nav: both" > index.html
+git add index.html
+git commit -m "Merge omar"`,
+      {
+        setup: SETUP,
+        tests: [
+          {
+            name: "page",
+            check: "(await git.show('HEAD', 'members.html')) === 'members\\n'",
+          },
+          {
+            name: "readme",
+            check:
+              "(await git.show('HEAD', 'README.md')) === '# Club\\nmore\\n'",
+          },
+          {
+            name: "clean",
+            check: "Object.keys(await git.status()).length === 0",
+          },
+        ],
+      },
+    );
+    expect(tests?.map((t) => t.passed)).toEqual([true, true, true]);
+  });
+
+  it("goes back exactly with --abort", async () => {
+    const r = await sh(
+      `git merge omar\ngit merge --abort\ngit status -s\nls`,
+      SETUP,
+    );
+    expect(r.printed.slice(3)).toEqual(["index.html  README.md"]);
+  });
+
+  it("lists merged and unmerged branches", async () => {
+    const r = await sh(
+      `git branch side
+git branch --merged
+git branch --no-merged`,
+      SETUP,
+    );
+    expect(r.printed).toEqual(["* main", "  side", "  omar"]);
+  });
+});
+
+describe("matching git's smaller messages", () => {
+  it("keeps unrelated edits through a merge and says what it auto-merged", async () => {
+    const r = await sh(
+      `printf "1 tea\\n2 soup\\n3 cake\\n4 pie\\n5 bun\\n6 jam\\n7 egg\\n" > menu.txt
+git add menu.txt
+git commit -m menu
+git switch -c b
+echo "1 TEA" > top.txt
+printf "1 TEA\\n2 soup\\n3 cake\\n4 pie\\n5 bun\\n6 jam\\n7 egg\\n" > menu.txt
+git commit -am b1
+git switch main
+printf "1 tea\\n2 soup\\n3 cake\\n4 pie\\n5 bun\\n6 jam\\n7 EGG\\n" > menu.txt
+git commit -am m1
+echo x >> README.md
+git merge b -m "Merge b"
+git status -s
+git switch b
+git branch -d`,
+      PROJECT,
+    );
+    expect(r.text).toContain(`Auto-merging menu.txt
+Merge made by the 'ort' strategy.`);
+    expect(r.text).toContain("~/project $ git status -s\n M README.md");
+    expect(r.text).toContain("M\tREADME.md\nSwitched to branch 'b'");
+    expect(r.errors).toEqual(["fatal: branch name required"]);
+  });
+
+  it("lists tracked changes before untracked files", async () => {
+    const r = await sh(
+      `touch a.txt\necho x >> README.md\ngit status -s`,
+      PROJECT,
+    );
+    expect(r.printed).toEqual([" M README.md", "?? a.txt"]);
+  });
+
+  it("ends a blocked commit with the files still in conflict", async () => {
+    const r = await sh(
+      `git switch -c b
+echo one > app.py
+git commit -am b
+git switch main
+echo two > app.py
+git commit -am m
+git merge b
+git merge b
+git commit -m x`,
+      PROJECT,
+    );
+    expect(r.errors.slice(0, 1)).toEqual([
+      "error: Merging is not possible because you have unmerged files.",
+    ]);
+    expect(r.printed.at(-1)).toBe("U\tapp.py");
+  });
+
+  it("checks out files silently after --, and skips tracked files in check-ignore", async () => {
+    const r = await sh(
+      `echo "*.py" > .gitignore
+echo bad > app.py
+git checkout -- app.py
+git check-ignore app.py
+echo $?`,
+      PROJECT,
+    );
+    expect(r.printed).toEqual(["1"]);
+  });
+});
+
+describe("text tools, like GNU coreutils and grep", () => {
+  it("skips a header with tail -n +2 and reports missing files like head", async () => {
+    const r = await sh(`printf "name\\nann\\nbob\\n" > p.csv
+tail -n +2 p.csv
+head 3 p.csv`);
+    expect(r.printed).toEqual([
+      "ann",
+      "bob",
+      "==> p.csv <==",
+      "name",
+      "ann",
+      "bob",
+    ]);
+    expect(r.errors).toEqual([
+      "head: cannot open '3' for reading: No such file or directory",
+    ]);
+  });
+
+  it("names files when grep gets several, in order, missing ones included", async () => {
+    const r = await sh(`echo tea > a.txt
+echo tea > c.txt
+grep tea a.txt missing.txt c.txt
+grep -c tea a.txt c.txt
+grep -rn tea .
+grep -q tea a.txt && echo found
+echo "green tea, black tea" | grep -o tea
+echo "чай и привет" | grep -w привет`);
+    expect(
+      r.output.filter((l) => l.level !== "info").map((l) => l.text),
+    ).toEqual([
+      "a.txt:tea",
+      "grep: missing.txt: No such file or directory",
+      "c.txt:tea",
+      "a.txt:1",
+      "c.txt:1",
+      "./a.txt:1:tea",
+      "./c.txt:1:tea",
+      "found",
+      "tea",
+      "tea",
+      "чай и привет",
+    ]);
+  });
+
+  it("squeezes with tr -s, counts characters with wc -m, pads wc like GNU", async () => {
+    const r = await sh(`echo "a   b  c" | tr -s " "
+tr a-z A-Z notes.txt
+echo "чай" | wc -m
+printf "a\\nb\\nc\\n" > x.txt
+printf "%s\\n" 1 2 3 4 5 6 7 8 9 10 > y.txt
+wc -l x.txt y.txt`);
+    expect(r.printed).toEqual([
+      "a b c",
+      "4",
+      // As wide as the total bytes (27): two digits.
+      " 3 x.txt",
+      "10 y.txt",
+      "13 total",
+    ]);
+    expect(r.errors[0]).toBe("tr: extra operand 'notes.txt'");
   });
 });
 

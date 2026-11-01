@@ -31,3 +31,19 @@ External sources a run relied on, grouped by the lesson they informed. Facts onl
 
 - The "When a loop is better" and "Tail calls" sections moved here unchanged, so the MDN, TC39, compat-table, V8 and Bugzilla sources above still apply (checked 2026-10-11).
 - New exercise "Folders too deep for the stack", checked locally (Node v24.21.0, strict mode like the runner): the recursive `totalSize` overflows with `RangeError: Maximum call stack size exceeded` on a 100,000-level folder chain, and the `while`-loop solution returns `100000` for both functions. Browser stack limits weren't measured; the test relies on 100,000 levels being well above Chrome/Node's roughly ten thousand frames.
+
+## content/courses/git (Level 1: pipes-and-text, everyday-git, branches-and-merging, team-feature) (2026-11-01)
+
+git-scm.com refused connections from the writers' machine, so git facts were checked in the git 2.50.1 man pages and the git/git GitHub mirror (same text). Every terminal output was compared with real git 2.50.1 and bash on macOS; GNU widths come from the coreutils source.
+
+- https://git-scm.com/docs/git-diff: what each form compares, `--staged` = `--cached`, `A..B` = `A B`, function names in hunk headers.
+- https://git-scm.com/docs/gitignore: pattern rules, a file can't be re-included if its folder is excluded, tracked files aren't affected (`git rm --cached`), `core.excludesFile` defaults to `~/.config/git/ignore`.
+- https://git-scm.com/docs/git-check-ignore
+- https://git-scm.com/docs/git-restore: restores from the index by default, from HEAD with `--staged`.
+- https://git-scm.com/docs/git-commit#Documentation/git-commit.txt---amend: `--amend` replaces the tip, keeps parents and author.
+- https://git-scm.com/docs/git-branch: `-d` needs the branch merged, `-D` forces; `--merged` / `--no-merged`.
+- https://github.com/git/git/blob/master/Documentation/git-switch.adoc and RelNotes 2.23.0 (switch/restore added) and 2.51.0 (no longer experimental).
+- https://github.com/git/git/blob/master/Documentation/git-merge.adoc and merge-options.adoc: conflicts, `--abort`, `--continue`, `--no-ff`, `--no-edit`, clean paths are updated in the index.
+- Pro Git 3.2, Basic Branching and Merging (wording of fast-forward and conflict markers; nothing copied).
+- https://www.gnu.org/software/grep/manual/grep.html: `-w`, `-r` with no operand, `-c` with `-v`, exit status, `-E`/`-F`.
+- https://github.com/coreutils/coreutils/blob/master/src/wc.c (column widths) and uniq.c (`-c` is 7 wide); the GNU uniq and sort manual pages (adjacent repeats; locale order).
