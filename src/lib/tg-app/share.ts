@@ -44,3 +44,33 @@ export async function prepareShare(
   });
   return prepared.id;
 }
+
+/**
+ * Like prepareShare, but a text message (code doesn't fit on a picture):
+ * HTML text and one button that opens the app.
+ */
+export async function prepareTextShare(
+  telegramId: number,
+  title: string,
+  html: string,
+  button: { text: string; url: string },
+) {
+  const prepared = await telegram<{ id: string }>("savePreparedInlineMessage", {
+    user_id: telegramId,
+    result: {
+      type: "article",
+      id: randomBytes(8).toString("hex"),
+      title,
+      input_message_content: {
+        message_text: html,
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+      },
+      reply_markup: { inline_keyboard: [[button]] },
+    },
+    allow_user_chats: true,
+    allow_group_chats: true,
+    allow_channel_chats: true,
+  });
+  return prepared.id;
+}

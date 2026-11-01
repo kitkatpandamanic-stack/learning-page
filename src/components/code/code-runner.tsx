@@ -92,6 +92,8 @@ type CodeRunnerProps = {
   autoRun?: boolean;
   /** A row of keys under the editor, for phones (see CodeEditor) */
   keys?: React.ComponentProps<typeof CodeEditor>["keys"];
+  /** After each run: the code that ran and what it printed */
+  onResult?: (code: string, output: OutputLine[]) => void;
 };
 
 /**
@@ -125,6 +127,7 @@ function RunnerBody({
   html: page,
   autoRun = false,
   keys,
+  onResult,
   initialCode,
   onCodeChange,
   saveStatus,
@@ -252,6 +255,7 @@ function RunnerBody({
     setResult(res);
     setRunning(false);
     setStatus(null);
+    onResult?.(code, res.output);
 
     if (withChecks) {
       // Code with type errors never ran, so there's no output to compare.

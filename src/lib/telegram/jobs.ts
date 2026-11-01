@@ -21,6 +21,7 @@ import { dailyPost } from "@/lib/telegram/daily-post";
 import { setLinkOption } from "@/lib/telegram/links";
 import { forgetUnansweredQuizzes } from "@/lib/telegram/quiz";
 import { forgetOldDuels } from "@/lib/tg-app/duel";
+import { forgetOldSnippets } from "@/lib/tg-app/snippet";
 import {
   forgetEmptyGroups,
   leagueParam,
@@ -263,6 +264,7 @@ export async function runTick(now = new Date()) {
     async () => {
       await forgetUnansweredQuizzes(now);
       await forgetOldDuels(now);
+      await forgetOldSnippets(now);
       await forgetEmptyGroups(now);
     },
   ]);

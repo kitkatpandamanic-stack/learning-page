@@ -209,6 +209,18 @@ const en = {
     `The first ${language} run downloads ${language} to your phone (a few MB). After that it starts quickly.`,
   codeSaved:
     "Your code is saved on this device, for each language. Reset brings back the example.",
+  codeLoading: "Opening the code…",
+  codeFrom: (name: string) => `💬 Code from ${name}`,
+  codeFromYou: "💬 Your code from the chat",
+  codeCaution:
+    "Read it before you run it: it runs on your phone. Your changes here aren't saved.",
+  codeMissing:
+    "This code isn't here any more: ▶ Run links work for 30 days. Ask for it again with /run.",
+  codeBack: "‹ My code",
+  codeShare: "📤 Share code and result",
+  codeShareHint: "Run the code first, then share it with what it printed.",
+  codeShareFailed:
+    "Couldn't share this code: it may be over 4,000 characters, or you've shared a lot today.",
 };
 
 type Texts = typeof en;
@@ -396,6 +408,18 @@ const ru: Texts = {
     `При первом запуске ${language} скачивается на телефон (несколько МБ). Потом запускается быстро.`,
   codeSaved:
     "Код сохраняется на этом устройстве, отдельно для каждого языка. «Сбросить» возвращает пример.",
+  codeLoading: "Открываем код…",
+  codeFrom: (name) => `💬 Код от ${name}`,
+  codeFromYou: "💬 Ваш код из чата",
+  codeCaution:
+    "Прочитайте его перед запуском: он выполнится на вашем телефоне. Изменения здесь не сохраняются.",
+  codeMissing:
+    "Этого кода уже нет: ссылки «Запустить» работают 30 дней. Попросите отправить его снова через /run.",
+  codeBack: "‹ Мой код",
+  codeShare: "📤 Поделиться кодом и результатом",
+  codeShareHint: "Сначала запустите код, потом поделитесь им вместе с выводом.",
+  codeShareFailed:
+    "Не получилось поделиться: код длиннее 4000 символов или вы сегодня уже много делились.",
 };
 
 export const appTexts: Record<AppLocale, Texts> = { en, ru };
