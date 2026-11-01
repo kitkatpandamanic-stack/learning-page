@@ -64,16 +64,34 @@ export function parseRunCode(
     };
   }
   const body = text.slice(head).trim();
-  const fence = /^(\w*)\s*```([\w+-]*)[ \t]*\n?([\s\S]*?)```\s*$/.exec(body);
-  if (fence)
-    return {
-      code: tidy(fence[3]),
-      language: sandboxLanguage(fence[2]) ?? sandboxLanguage(fence[1]),
-    };
+  const fence = fenced(body);
+  if (fence) return fence;
   const [word] = body.split(/\s/, 1);
   const language = sandboxLanguage(word);
   if (language) return { code: tidy(body.slice(word.length)), language };
   return { code: tidy(body), language: null };
+}
+
+/**
+ * "py ```python\ncode\n```": code in ``` fences, with the language after
+ * the opening fence (or the word before it). Plain string work rather than
+ * one regular expression, which could take very long on crafted text.
+ */
+function fenced(body: string): RunInput | null {
+  const open = /^(\w*)\s*```/.exec(body);
+  if (!open || !body.endsWith("```") || body.length < open[0].length + 3)
+    return null;
+  const inner = body.slice(open[0].length, -3);
+  const newline = inner.indexOf("\n");
+  // "```print(1)```": all code. Otherwise the first line may name the language.
+  const tag = newline === -1 ? "" : inner.slice(0, newline).trim();
+  const named = /^[\w+-]*$/.test(tag);
+  const code =
+    newline === -1 ? inner : named ? inner.slice(newline + 1) : inner;
+  return {
+    code: tidy(code),
+    language: (named ? sandboxLanguage(tag) : null) ?? sandboxLanguage(open[1]),
+  };
 }
 
 /** The first lines of the code, for a message; `cut` when there's more. */

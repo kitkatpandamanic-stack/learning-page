@@ -55,6 +55,32 @@ describe("/run finds the code", () => {
     });
   });
 
+  it("in fences on one line, or with code right after the fence", () => {
+    expect(parseRunCode("/run ```print(1)```")).toEqual({
+      code: "print(1)",
+      language: null,
+    });
+    expect(parseRunCode("/run sql ```SELECT 1;```")).toEqual({
+      code: "SELECT 1;",
+      language: "sql",
+    });
+    expect(parseRunCode("/run ```\nx = 1  # no closing fence")).toEqual({
+      code: "```\nx = 1  # no closing fence",
+      language: null,
+    });
+  });
+
+  it("stays fast on text made to slow it down", () => {
+    const crafted = [
+      `/run \`\`\`${"\t".repeat(4000)}`,
+      `/run ${"a".repeat(2000)}\`\`\`${" \n".repeat(1000)}`,
+      `/run \`\`\`${"\t\n".repeat(2000)}x`,
+    ];
+    const started = performance.now();
+    for (const text of crafted) parseRunCode(text);
+    expect(performance.now() - started).toBeLessThan(50);
+  });
+
   it("after a language word, keeping the code's indent", () => {
     expect(
       parseRunCode(
