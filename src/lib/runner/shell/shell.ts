@@ -6,6 +6,7 @@
  */
 import {
   basename,
+  compareNames,
   dirname,
   FsError,
   MemFs,
@@ -289,7 +290,7 @@ export class Shell {
       }
       paths = next;
     }
-    return paths.sort();
+    return paths.sort(compareNames);
   }
 
   cd(path: string) {
@@ -424,7 +425,7 @@ export function flags(
 export const USAGE: Record<string, string> = {
   pwd: "pwd                      print the folder you're in",
   cd: "cd [folder]              go to a folder (no folder: home; -: back)",
-  ls: "ls [-a] [-l] [-F] [path] list a folder (-a: hidden files too, -l: details)",
+  ls: "ls [-a] [-A] [-l] [-F] [path] list a folder (-a: hidden files too, -l: details)",
   tree: "tree [folder]            show folders and files as a tree",
   mkdir:
     "mkdir [-p] folder...     make folders (-p: with parents, no error if they exist)",
@@ -488,7 +489,7 @@ function lsDate(ms: number) {
   const d = new Date(ms);
   return `${MONTHS[d.getUTCMonth()]} ${pad(d.getUTCDate(), 2)} ${pad(d.getUTCHours(), 2).replace(" ", "0")}:${pad(d.getUTCMinutes(), 2).replace(" ", "0")}`;
 }
-export function longDate(ms: number) {
+function longDate(ms: number) {
   const d = new Date(ms);
   const two = (n: number) => String(n).padStart(2, "0");
   return `${DAYS[d.getUTCDay()]} ${MONTHS[d.getUTCMonth()]} ${pad(d.getUTCDate(), 2)} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())}:${two(d.getUTCSeconds())}`;
@@ -565,7 +566,10 @@ const builtins: Record<string, CommandFn> = {
   ls: (ctx) => {
     const { shell, args, io } = ctx;
     if (args.includes("--help")) return usage(io, "ls");
-    const parsed = flags("ls", args, "alF1R", "", { all: "a" });
+    const parsed = flags("ls", args, "aAlF1R", "", {
+      all: "a",
+      "almost-all": "A",
+    });
     if (typeof parsed === "string") {
       io.err(parsed);
       return 2;
@@ -575,7 +579,8 @@ const builtins: Record<string, CommandFn> = {
     let status = 0;
     const files: string[] = [];
     const dirs: string[] = [];
-    for (const path of paths) {
+    // Like ls: files first, then folders, each in name order.
+    for (const path of [...paths].sort(compareNames)) {
       const full = shell.resolve(path);
       if (!shell.fs.exists(full)) {
         io.err(`ls: cannot access '${path}': No such file or directory\n`);
@@ -589,6 +594,14 @@ const builtins: Record<string, CommandFn> = {
       if (shell.fs.isDir(full)) return `${entry}/`;
       return shell.fs.stat(full).mode & 0o111 ? `${entry}*` : entry;
     };
+    // A folder's link count: itself, its entry in the parent, and each subfolder's "..".
+    const links = (full: string) =>
+      shell.fs.isDir(full)
+        ? 2 +
+          shell.fs
+            .readdir(full)
+            .filter((e) => shell.fs.isDir(resolvePath(full, e))).length
+        : 1;
     const show = (dir: string, entries: string[]) => {
       if (set.has("l")) {
         const stats = entries.map((e) =>
@@ -602,7 +615,7 @@ const builtins: Record<string, CommandFn> = {
         entries.forEach((e, i) => {
           const s = stats[i];
           io.out(
-            `${modeString(s.mode, s.isDirectory())} 1 ${USER} ${USER} ${pad(s.size, width)} ${lsDate(s.mtimeMs)} ${name(dir, e)}\n`,
+            `${modeString(s.mode, s.isDirectory())} ${links(resolvePath(shell.resolve(dir), e))} ${USER} ${USER} ${pad(s.size, width)} ${lsDate(s.mtimeMs)} ${name(dir, e)}\n`,
           );
         });
       } else if (entries.length) {
@@ -621,8 +634,9 @@ const builtins: Record<string, CommandFn> = {
     dirs.forEach((dir, index) => {
       const full = shell.resolve(dir);
       let entries = shell.fs.readdir(full);
-      if (!set.has("a")) entries = entries.filter((e) => !e.startsWith("."));
-      else entries = [".", "..", ...entries];
+      if (set.has("a")) entries = [".", "..", ...entries];
+      else if (!set.has("A"))
+        entries = entries.filter((e) => !e.startsWith("."));
       if (paths.length > 1)
         io.out(`${index || files.length ? "\n" : ""}${dir}:\n`);
       show(dir, entries);
@@ -635,7 +649,7 @@ const builtins: Record<string, CommandFn> = {
     const root = args[0] ?? ".";
     const full = shell.resolve(root);
     if (!shell.fs.isDir(full)) {
-      io.err(`${root} [error opening dir]\n`);
+      io.out(`${root} [error opening dir]\n\n0 directories, 0 files\n`);
       return 2;
     }
     let dirs = 0;
@@ -1189,6 +1203,16 @@ function moveOrCopy(
   const sources = args.slice(0, -1);
   const targetFull = shell.resolve(target);
   const intoDir = shell.fs.isDir(targetFull);
+  // "css/" means a folder: if there isn't one, refuse rather than rename.
+  if (target.endsWith("/") && !intoDir) {
+    for (const source of sources)
+      io.err(
+        name === "mv"
+          ? `mv: cannot move '${source}' to '${target}': Not a directory\n`
+          : `cp: cannot create regular file '${target}': Not a directory\n`,
+      );
+    return 1;
+  }
   if (sources.length > 1 && !intoDir) {
     io.err(`${name}: target '${target}' is not a directory\n`);
     return 1;

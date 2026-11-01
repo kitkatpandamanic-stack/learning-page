@@ -50,6 +50,7 @@ export const languageEmoji: Record<string, string> = {
   javascript: "🟨",
   typescript: "🔷",
   sql: "🗄",
+  git: "🌿",
 };
 
 const difficulty = {

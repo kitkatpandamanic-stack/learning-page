@@ -12,7 +12,7 @@ Add a rule when something went wrong or the site owner corrected you, phrased as
 
 - A `project:` label in `course.yml` must match a `Mini-project: …` Exercise title in that module's lessons. If a module has no mini-project, leave out `project:` (it's optional in the schema). Never label a project that doesn't exist. (2026-10-11: 5 labels fixed.)
 - Every change to course content is made in both EN and RU: `.mdx` + `.ru.mdx`, `course.yml` + `course.ru.yml`.
-- Mini-project placement: every lesson has exactly one `<Exercise>`, and at L0 the mini-project _is_ that Exercise in an existing lesson (JS/Python conditions, loops, functions, TS basics). Adding one to an existing lesson means replacing its exercise, so fold the old exercise's skill into the project. (2026-10-11: basics projects went into `04-working-with-strings`.)
+- Mini-project placement: in the JS/Python/TS/SQL courses every lesson has exactly one `<Exercise>` (the Git & Terminal course, 2026-11-01, uses 2–3 small terminal exercises in some lessons; that works: ids are exercise-1, -2…), and at L0 the mini-project _is_ that Exercise in an existing lesson (JS/Python conditions, loops, functions, TS basics). Adding one to an existing lesson means replacing its exercise, so fold the old exercise's skill into the project. (2026-10-11: basics projects went into `04-working-with-strings`.)
 - Exercise and Quiz ids are positional (`exercise-1`, `quiz-N` in document order; saved code is keyed `locale:path#exercise-1`, see `velite.config.ts` and `src/lib/saved-code.ts`). Add a new Quiz **after** the existing ones so old progress and review cards keep pointing at the same question. Replacing an exercise keeps its id: learners who did the old one see their old code and get no new +10 XP. Say so in the report. (2026-10-11: the site owner said replacing the exercise is fine: stale saved code and no repeat XP are acceptable.)
 - For "change the values and run it again" generator exercises: actually run the solution with the values you suggest and check the promised effect happens (2026-10-11: the first suggested Mad Libs words gave a title of the same length, so the "underline grows or shrinks" claim didn't show). Test names are shown to learners, so phrase defaults as "like HAPPY BIRTHDAY, ZARA!", not as the only right answer.
 - RU twins of fill-in-the-words exercises: write the template so inserted words never need declension or agreement (present tense for the hero, nominative slots, numbers standing alone instead of "7 пельменей"), and say the needed form in the starter comment ("прилагательное мужского рода").
@@ -84,7 +84,18 @@ Add a rule when something went wrong or the site owner corrected you, phrased as
 - **Parsing quizzes in scripts:** read each `<Quiz` block attribute by attribute with brace and string matching (like `extractQuizzes` in velite.config.ts). A regex up to the first `/>` breaks on JSX inside a question. A checked parser lives in the scratchpad pattern `quizzes.mjs`.
 - **Editing many quizzes:** use a script with a table of (file, quiz-n) → new options/explanation that replaces only that array, keeping its one-line or multi-line style. Then rerun the length check and a parse check, and diff against HEAD to prove nothing outside `<Quiz>` changed.
 
+## Terminal lessons (from the 2026-11-01 Git & Terminal Level 0 run)
+
+- Show terminal output with `<CodeExample setup={…} output={…}>` + a ```bash fence: the content tests run every one through the practice terminal and compare (output = stdout and errors in order, no prompts). Paste outputs from a real run, never from memory.
+- The practice terminal is our own small bash plus real git (isomorphic-git). Where it differed from real git or bash, fix the runner (`src/lib/runner/shell/`) rather than teaching its quirk: writers compared with real git 2.50 and found git status spacing, git's unpadded date (`Mon Jan 5`), the empty-commit report, ls sorting and `mv file css/` into a missing folder, all fixed. Still different and worth a sentence where it shows: ls prints one line (no columns or colours) and doesn't quote names with spaces.
+- Check results, not keystrokes: prefer `file()`, `ls()`, `git.log()`, `git.status()`; use `commands` only when using a specific command is the point (ls -a, git log --oneline).
+- Commit hashes are deterministic (sandbox clock), so lessons may show them. Translated commit messages change the hashes: run the RU examples too.
+- YAML frontmatter: quote a `description` that contains `: ` (common in RU). An unquoted one breaks `npm run content` for the whole site.
+- Lessons in one module can't link to another module's lessons until those files exist (the link test fails). Writing modules in parallel, link within your module, and add cross-module links in a final pass.
+
 ## Working in this repo
+
+- A worktree's `node_modules` is a symlink to `site/node_modules`. After a PR adds a dependency, run `npm install` in `site/` (on main, once it's merged); otherwise every worktree's tests fail with "Cannot find package". (2026-11-01: isomorphic-git was missing after #70.)
 
 - The site owner often has uncommitted work in progress in `src/`, `drizzle/` and `messages/`. Never touch, stage or commit it. If files change during a run, they belong to the owner.
 

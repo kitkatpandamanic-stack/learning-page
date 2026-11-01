@@ -260,6 +260,8 @@ describe("practice hints", () => {
     file.slice(ROOT.length + 1).startsWith("practice/"),
   );
 
+  // Some courses (Git) have no practice problems yet.
+  if (practice.length === 0) it.skip("none in these lessons", () => {});
   // Hints open one at a time: a nudge, the plan, then a code skeleton.
   it.each(practice.map((file) => [file.slice(ROOT.length + 1), file]))(
     "%s has three hints",
@@ -316,6 +318,47 @@ describe("Code + Output examples", () => {
       expect(steadyTimes(got)).toBe(steadyTimes(ex.expected));
     },
     PACKAGE_TIMEOUT_MS,
+  );
+});
+
+/**
+ * Terminal examples (```bash inside <CodeExample>): the commands run in the
+ * practice terminal, after an optional `setup`, and print exactly the
+ * output shown (errors included, prompts not).
+ */
+describe("Terminal examples", () => {
+  const examples = files.flatMap((file) => {
+    const source = readFileSync(file, "utf8");
+    return [...source.matchAll(/<CodeExample\b([\s\S]*?)<\/CodeExample>/g)]
+      .map((m) => {
+        const fence =
+          /\n\s*```(?:bash|sh|shell|console)[^\n]*\n([\s\S]*?)```/.exec(m[1]);
+        if (!fence) return null;
+        const tag = m[1].slice(0, fence.index).trim().replace(/>$/, "");
+        const attrs = parseAttributes(tag, file);
+        return { attrs, code: fence[1] };
+      })
+      .filter((ex) => ex !== null)
+      .map((ex, i) => ({
+        name: `${file.slice(ROOT.length + 1)} #${i + 1}`,
+        expected: String(ex.attrs.output ?? "").trim(),
+        setup: ex.attrs.setup as string | undefined,
+        code: ex.code,
+      }));
+  });
+
+  if (examples.length === 0) it.skip("none in these lessons", () => {});
+  it.each(examples.map((ex) => [ex.name, ex] as const))(
+    "%s",
+    async (_name, ex) => {
+      const result = await executeShell(ex.code, { setup: ex.setup });
+      const got = result.output
+        .filter((l) => l.level !== "info")
+        .map((l) => l.text)
+        .join("\n")
+        .trim();
+      expect(got).toBe(ex.expected);
+    },
   );
 });
 

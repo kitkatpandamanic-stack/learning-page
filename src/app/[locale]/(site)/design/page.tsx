@@ -54,6 +54,7 @@ const languages = [
   { name: "Rust", className: "bg-lang-rust" },
   { name: "C++", className: "bg-lang-cpp" },
   { name: "SQL", className: "bg-lang-sql" },
+  { name: "Git", className: "bg-lang-git" },
 ];
 
 /** Made-up but steady activity for the calendar sample: busier lately. */
