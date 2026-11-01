@@ -7,6 +7,7 @@ import { useLocale, useTranslations } from "next-intl";
 import { cn } from "cn";
 
 import { CodeEditor } from "@/components/code/code-editor";
+import { CommitGraphView } from "@/components/code/commit-graph";
 import { useCodeSync, type SaveStatus } from "@/components/code/use-code-sync";
 import {
   EditorPlaceholder,
@@ -451,6 +452,8 @@ function RunnerBody({
           </p>
         )}
       </OutputPanel>
+
+      {!running && result?.graph && <CommitGraphView graph={result.graph} />}
 
       {/* Check results */}
       {check && (

@@ -935,7 +935,11 @@ const COMMANDS: Record<string, Sub> = {
         "You have not concluded your merge (MERGE_HEAD exists).\nPlease, commit your changes before you merge.",
       );
     const noFf = args.includes("--no-ff");
-    const name = args.find((a) => !a.startsWith("-"));
+    const m = args.indexOf("-m");
+    const custom = m === -1 ? undefined : args[m + 1];
+    const name = args.find(
+      (a, i) => !a.startsWith("-") && (m === -1 || i !== m + 1),
+    );
     if (!name) fatal("No remote for the current branch.");
     const current = await this.branch(dir);
     const head = await this.head(dir);
@@ -967,7 +971,9 @@ const COMMANDS: Record<string, Sub> = {
         1,
         `error: Your local changes to the following files would be overwritten by merge:\n${dirty.map((p) => `\t${p}`).join("\n")}\nPlease commit your changes or stash them before you merge.\nAborting\n`,
       );
-    const message = `Merge branch '${name}'${current === "main" || current === "master" ? "" : ` into ${current}`}`;
+    const message =
+      custom ??
+      `Merge branch '${name}'${current === "main" || current === "master" ? "" : ` into ${current}`}`;
     const signature = await this.signature(dir);
     const before = await this.tree(dir, head);
     try {

@@ -4,6 +4,7 @@ import * as runtime from "react/jsx-runtime";
 import { Callout } from "@/components/mdx/callout";
 import { CodeExample } from "@/components/mdx/code-example";
 import { Exercise, Hint, Solution } from "@/components/mdx/exercise";
+import { GitGraph } from "@/components/mdx/git-graph";
 import { Pre } from "@/components/mdx/pre";
 import { Quiz } from "@/components/mdx/quiz";
 import { TryIt } from "@/components/mdx/try-it";
@@ -24,6 +25,7 @@ const components = {
   Callout,
   CodeExample,
   Exercise,
+  GitGraph,
   Hint,
   Quiz,
   Solution,
