@@ -41,3 +41,8 @@ export function sandboxKeys(language: SandboxLanguage) {
   if (language === "sql") return [...common, ";", "*", "<", ">", "%"];
   return [...common, "{", "}", "[", "]", ";", "=>", "`"];
 }
+
+/** t.me/<bot>?startapp=run_<id>: the code a ▶ Run button opens. */
+export function snippetStart(param: string) {
+  return /^run_([\w-]{6,16})$/.exec(param)?.[1];
+}

@@ -8,10 +8,16 @@ type Share = {
   text: string;
 };
 
-/** Sends a Blitz result or the panda to a chat, the newest way the Telegram app supports. */
-export async function shareToChat(body: object) {
+/**
+ * Sends a Blitz result, the panda or code (path "snippet") to a chat, the
+ * newest way the Telegram app supports.
+ */
+export async function shareToChat(body: object, path = "share") {
   const tg = webApp();
-  const share = await callApi<Share>("share", body);
+  const share = await callApi<Pick<Share, "messageId" | "link" | "text">>(
+    path,
+    body,
+  );
   haptic("tap");
   if (share.messageId && tg?.shareMessage && tg.isVersionAtLeast("8.0")) {
     tg.shareMessage(share.messageId);

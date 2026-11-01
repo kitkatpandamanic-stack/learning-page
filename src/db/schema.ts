@@ -457,6 +457,38 @@ export const tgBugHunt = pgTable(
 );
 
 /**
+ * Code sent to the bot with /run (or shared from the Mini App's Code tab):
+ * its ▶ Run button opens it in the sandbox, where it runs on the opener's
+ * device, never here. Kept for 30 days.
+ */
+export const tgSnippet = pgTable(
+  "tg_snippet",
+  {
+    /** Short random id, used in t.me/<bot>?startapp=run_<id> */
+    id: text("id").primaryKey(),
+    /** Who sent it (for /run in reply to a message: who wrote that message) */
+    authorTelegramId: bigint("author_telegram_id", {
+      mode: "number",
+    }).notNull(),
+    /** Their Telegram first name, shown as "Code from …" */
+    authorName: text("author_name").notNull(),
+    /** Who asked for it: counts toward their snippets per day */
+    senderTelegramId: bigint("sender_telegram_id", {
+      mode: "number",
+    }).notNull(),
+    /** A sandbox language; empty until someone picks it */
+    language: text("language").notNull(),
+    code: text("code").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+  },
+  (table) => [
+    index("tg_snippet_sender_idx").on(table.senderTelegramId, table.createdAt),
+    index("tg_snippet_expires_idx").on(table.expiresAt),
+  ],
+);
+
+/**
  * What the health collector (.github/workflows/health.yml) found outside the
  * site: Vercel deployments, Neon usage, Sentry errors, GitHub security
  * alerts. One row per run, kept for 90 days; /admin/health reads the latest.

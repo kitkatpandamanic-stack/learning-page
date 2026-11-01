@@ -74,6 +74,7 @@ const { CHANNEL } = await import("@/lib/telegram/api");
 const { handleUpdate } = await import("@/lib/telegram/bot");
 const { cronSecret } = await import("@/lib/telegram/secret");
 const quizzes = await import("@/lib/telegram/quiz");
+const snippets = await import("@/lib/tg-app/snippet");
 
 const dir = join(__dirname, "..", "..", "..", "drizzle");
 for (const file of readdirSync(dir)
@@ -715,5 +716,152 @@ describe("group leagues in the bot", () => {
     });
     const [group] = await testDb.select().from(schema.tgGroup);
     expect(group.weekly).toBe(false);
+  });
+});
+
+describe("/run", () => {
+  const GROUP = -1001;
+  beforeEach(async () => {
+    await client.exec("TRUNCATE tg_snippet");
+  });
+  const message = (
+    text: string,
+    extra: Record<string, unknown> = {},
+    chat = { id: 11, type: "private" },
+  ) =>
+    handleUpdate({
+      message: {
+        chat,
+        from: { id: 11, first_name: "Mei" },
+        text,
+        ...extra,
+      },
+    });
+  const lastSent = () => sent.findLast((s) => s.method === "sendMessage")!;
+  const runLink = (s: Sent) =>
+    (
+      s.body.reply_markup as {
+        inline_keyboard: { url?: string; callback_data?: string }[][];
+      }
+    ).inline_keyboard[0][0];
+
+  it("saves code from a block and answers with ▶ Run", async () => {
+    const code = 'print("hi")';
+    await message(`/run\n${code}`, {
+      entities: [
+        { type: "pre", offset: 5, length: code.length, language: "python" },
+      ],
+    });
+    const [saved] = await testDb.select().from(schema.tgSnippet);
+    expect(saved).toMatchObject({
+      code,
+      language: "python",
+      authorName: "Mei",
+      authorTelegramId: 11,
+      senderTelegramId: 11,
+    });
+    const answer = lastSent();
+    expect(String(answer.body.text)).toContain("code from Mei");
+    expect(runLink(answer).url).toBe(
+      `https://t.me/panda_learning_bot?startapp=run_${saved.id}`,
+    );
+  });
+
+  it("takes a code block on its own in a private chat", async () => {
+    await message("SELECT 1;", {
+      entities: [{ type: "pre", offset: 0, length: 9, language: "sql" }],
+    });
+    const [saved] = await testDb.select().from(schema.tgSnippet);
+    expect(saved.language).toBe("sql");
+    // In a group, a code block without /run is just a message.
+    sent = [];
+    await message(
+      "SELECT 2;",
+      { entities: [{ type: "pre", offset: 0, length: 9, language: "sql" }] },
+      { id: GROUP, type: "supergroup" },
+    );
+    expect(sent).toHaveLength(0);
+  });
+
+  it("runs the message /run replies to, as its author's code", async () => {
+    await message(
+      "/run py",
+      {
+        reply_to_message: {
+          chat: { id: GROUP, type: "supergroup" },
+          from: { id: 22, first_name: "Bao" },
+          text: "for i in range(3):\n    print(i)",
+        },
+      },
+      { id: GROUP, type: "supergroup" },
+    );
+    const [saved] = await testDb.select().from(schema.tgSnippet);
+    expect(saved).toMatchObject({
+      code: "for i in range(3):\n    print(i)",
+      language: "python",
+      authorName: "Bao",
+      authorTelegramId: 22,
+      senderTelegramId: 11,
+    });
+    expect(lastSent().body.chat_id).toBe(GROUP);
+    expect(String(lastSent().body.text)).toContain("code from Bao");
+  });
+
+  it("asks for the language, and only the sender may pick it", async () => {
+    await message("/run print(1)");
+    const [saved] = await testDb.select().from(schema.tgSnippet);
+    expect(saved.language).toBe("");
+    const pick = runLink(lastSent()).callback_data!;
+    expect(pick).toBe(`run:${saved.id}:python`);
+    const press = (from: number) =>
+      handleUpdate({
+        callback_query: {
+          id: "cb",
+          from: { id: from },
+          data: pick,
+          message: { chat: { id: 11 }, message_id: 5 },
+        },
+      });
+    await press(99);
+    expect(sent.at(-1)!.body.text).toBe(
+      "Only the person who sent /run can pick the language.",
+    );
+    await press(11);
+    const edit = sent.find((s) => s.method === "editMessageText")!;
+    expect(runLink(edit).url).toContain(`run_${saved.id}`);
+    const [after] = await testDb.select().from(schema.tgSnippet);
+    expect(after.language).toBe("python");
+  });
+
+  it("explains itself, and refuses code that's too long", async () => {
+    await message("/run");
+    expect(String(lastSent().body.text)).toContain("/run</b> opens code");
+    await message(`/run js ${"x".repeat(4001)}`);
+    expect(String(lastSent().body.text)).toContain("too long");
+    expect(await testDb.select().from(schema.tgSnippet)).toHaveLength(0);
+  });
+
+  it("keeps to a daily limit, and forgets links after 30 days", async () => {
+    const now = new Date("2026-11-01T10:00:00Z");
+    const make = () =>
+      snippets.createSnippet(
+        {
+          author: { telegramId: 11, name: "Mei" },
+          senderTelegramId: 11,
+          language: "sql",
+          code: "SELECT 1;",
+        },
+        now,
+      );
+    for (let i = 0; i < snippets.SNIPPETS_PER_DAY; i++)
+      expect("error" in (await make())).toBe(false);
+    expect(await make()).toEqual({ error: "limit" });
+
+    const [first] = await testDb.select().from(schema.tgSnippet);
+    const later = new Date(now.getTime() + 31 * 86_400_000);
+    expect(await snippets.getSnippet(first.id, now)).not.toBeNull();
+    expect(await snippets.getSnippet(first.id, later)).toBeNull();
+    await snippets.forgetOldSnippets(later);
+    expect(await testDb.select().from(schema.tgSnippet)).toHaveLength(0);
   });
 });

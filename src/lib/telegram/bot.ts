@@ -27,6 +27,19 @@ import {
 } from "@/lib/telegram/links";
 import { pingAchievements } from "@/lib/telegram/notify";
 import { leagueParam, registerGroup, setWeeklyPost } from "@/lib/tg-app/league";
+import { appLink } from "@/lib/tg-app/share";
+import { createSnippet, setSnippetLanguage } from "@/lib/tg-app/snippet";
+import {
+  parseRunButton,
+  parseRunCode,
+  runLimitText,
+  runMessage,
+  runPickMessage,
+  runPickRefusal,
+  runTooLongText,
+  runUsageText,
+  type Entity,
+} from "@/lib/telegram/run";
 import {
   getQuizStats,
   recordPollAnswer,
@@ -75,15 +88,26 @@ const order = ["python", "javascript", "typescript", "sql"];
 /** "Today" for people who haven't linked an account: the channel's clock. */
 const DEFAULT_TIME_ZONE = CHANNEL_TIME_ZONE;
 
-type From = { id: number; username?: string; language_code?: string };
+type From = {
+  id: number;
+  first_name?: string;
+  username?: string;
+  language_code?: string;
+};
+
+type Message = {
+  chat: { id: number; type: string; title?: string };
+  from?: From;
+  text?: string;
+  /** Code blocks ("pre", with their language), links, … */
+  entities?: Entity[];
+  /** The message this one answers (in groups, for /run on someone's code) */
+  reply_to_message?: Omit<Message, "reply_to_message">;
+};
 
 /** The parts of a Telegram update the bot uses. */
 export type Update = {
-  message?: {
-    chat: { id: number; type: string; title?: string };
-    from?: From;
-    text?: string;
-  };
+  message?: Message;
   callback_query?: {
     id: string;
     from: From;
@@ -104,6 +128,7 @@ export async function handleUpdate(update: Update) {
       update.message.chat,
       update.message.from,
       update.message.text,
+      update.message,
     );
   if (update.callback_query) return onButton(update.callback_query);
   if (update.inline_query) return onInlineQuery(update.inline_query);
@@ -114,10 +139,13 @@ async function onMessage(
   chat: { id: number; type: string; title?: string },
   from: From,
   text: string,
+  message: Message = { chat },
 ) {
   // In groups, only commands meant for the bot; in private chats, anything.
   const parsed = parseCommand(text);
   if (!parsed && chat.type !== "private") return;
+  // In a private chat, a code block on its own means /run.
+  const codeBlock = !parsed && message.entities?.some((e) => e.type === "pre");
   const link = await getLinkByTelegramId(from.id);
   const locale: BotLocale = link
     ? (link.locale as BotLocale)
@@ -125,6 +153,7 @@ async function onMessage(
   const reply = (message: string, extra?: Record<string, unknown>) =>
     sendMessage(chat.id, message, extra);
   const profile = url("/profile", locale);
+  if (codeBlock) return run(from, message, text, false, locale, reply);
 
   switch (parsed?.command) {
     case "start":
@@ -179,6 +208,8 @@ async function onMessage(
       return league(chat, from, parsed.arg, locale, reply);
     case "quiz":
       return sendQuiz(chat.id, locale, link);
+    case "run":
+      return run(from, message, text, true, locale, reply);
     case "random":
       return reply(randomProblem(locale, parsed.arg));
     case "streak":
@@ -241,6 +272,54 @@ async function league(
     link: `https://t.me/${BOT_USERNAME}?startapp=${leagueParam(chat.id)}`,
   });
   return reply(message.text, { reply_markup: message.reply_markup });
+}
+
+/**
+ * /run: saves the code for a ▶ Run link that opens it in the Mini App's
+ * sandbox (it runs on the phone of whoever taps, never on the server). The
+ * code follows /run, or is the message /run replies to; when nothing says
+ * the language, the bot asks with buttons.
+ */
+async function run(
+  from: From,
+  message: Message,
+  text: string,
+  command: boolean,
+  locale: BotLocale,
+  reply: (text: string, extra?: Record<string, unknown>) => Promise<unknown>,
+) {
+  let input = parseRunCode(text, message.entities, command);
+  let author = from;
+  const replied = message.reply_to_message;
+  if (!input.code && replied?.text) {
+    const theirs = parseRunCode(replied.text, replied.entities, false);
+    input = { code: theirs.code, language: theirs.language ?? input.language };
+    author = replied.from ?? from;
+  }
+  if (!input.code) return reply(runUsageText(locale));
+  const snippet = await createSnippet({
+    author: { telegramId: author.id, name: author.first_name ?? "" },
+    senderTelegramId: from.id,
+    language: input.language,
+    code: input.code,
+  });
+  if ("error" in snippet)
+    return reply(
+      snippet.error === "too-long"
+        ? runTooLongText(locale)
+        : snippet.error === "limit"
+          ? runLimitText(locale)
+          : runUsageText(locale),
+    );
+  const answer = input.language
+    ? runMessage(locale, {
+        language: input.language,
+        author: snippet.authorName,
+        code: snippet.code,
+        link: appLink(`run_${snippet.id}`),
+      })
+    : runPickMessage(locale, snippet.id);
+  return reply(answer.text, { reply_markup: answer.reply_markup });
 }
 
 function today(locale: BotLocale, link: TelegramLink | null) {
@@ -341,6 +420,40 @@ async function onPollAnswer(answer: NonNullable<Update["poll_answer"]>) {
 
 async function onButton(query: NonNullable<Update["callback_query"]>) {
   const link = await getLinkByTelegramId(query.from.id);
+  // A language button under /run's question: the code's ▶ Run message.
+  const runPick = parseRunButton(query.data);
+  if (runPick) {
+    const locale = link
+      ? (link.locale as BotLocale)
+      : botLocale(query.from.language_code);
+    const snippet = await setSnippetLanguage(
+      runPick.id,
+      query.from.id,
+      runPick.language,
+    );
+    if ("error" in snippet)
+      return telegram("answerCallbackQuery", {
+        callback_query_id: query.id,
+        text: runPickRefusal(locale, snippet.error),
+      });
+    if (query.message) {
+      const answer = runMessage(locale, {
+        language: runPick.language,
+        author: snippet.authorName,
+        code: snippet.code,
+        link: appLink(`run_${snippet.id}`),
+      });
+      await telegram("editMessageText", {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        text: answer.text,
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+        reply_markup: answer.reply_markup,
+      });
+    }
+    return telegram("answerCallbackQuery", { callback_query_id: query.id });
+  }
   // 💡 under a daily post (in the channel or a chat): the hint, privately.
   const hintButton = parseHintButton(query.data);
   if (hintButton) {

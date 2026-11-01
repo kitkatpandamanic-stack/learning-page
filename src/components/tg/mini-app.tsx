@@ -18,7 +18,11 @@ import {
   webApp,
 } from "@/components/tg/telegram";
 import type { MiniAppHome } from "@/lib/tg-app/home";
-import { sandboxStart, type SandboxLanguage } from "@/lib/tg-app/sandbox";
+import {
+  sandboxStart,
+  snippetStart,
+  type SandboxLanguage,
+} from "@/lib/tg-app/sandbox";
 import { appTexts, type AppLocale } from "@/lib/tg-app/texts";
 
 const SPACE = "#070814";
@@ -52,6 +56,10 @@ export function MiniApp({ bot }: { bot: string }) {
   const [leagueInvite, setLeagueInvite] = useState<string | null>(null);
   const [wordleLanguage, setWordleLanguage] = useState<string | null>(null);
   const [codeLanguage, setCodeLanguage] = useState<SandboxLanguage>("python");
+  /** run_<id>: code from a ▶ Run button, open in the Code tab */
+  const [snippet, setSnippet] = useState<string | null>(null);
+  const closeSnippet = useCallback(() => setSnippet(null), []);
+  useBackButton(tab === "code" && snippet ? closeSnippet : null, 1);
   const [locale, setLocale] = useState<AppLocale>("en");
 
   const load = useCallback(async () => {
@@ -93,9 +101,10 @@ export function MiniApp({ bot }: { bot: string }) {
     );
     // t.me/<bot>?startapp=blitz_python opens that Blitz, duel_<id> a duel,
     // duelnew_python a new challenge (the bot's Rematch button), sandbox_sql
-    // the Code tab on SQL.
+    // the Code tab on SQL, run_<id> code from the bot's ▶ Run button.
     const param = tg.initDataUnsafe.start_param ?? "";
     const sandbox = sandboxStart(param);
+    const runId = snippetStart(param);
     const asked = /^blitz_([a-z]+)$/.exec(param);
     const opened = /^duel_([\w-]{6,16})$/.exec(param);
     const rematch = /^duelnew_([a-z]+)$/.exec(param);
@@ -113,6 +122,9 @@ export function MiniApp({ bot }: { bot: string }) {
     else if (sandbox) {
       setTab("code");
       if (sandbox.language) setCodeLanguage(sandbox.language);
+    } else if (runId) {
+      setTab("code");
+      setSnippet(runId);
     } else if (/^g_-?\d+_[\w-]+$/.test(param)) {
       setTab("league");
       setLeagueInvite(param);
@@ -201,6 +213,8 @@ export function MiniApp({ bot }: { bot: string }) {
               locale={appLocale}
               language={codeLanguage}
               onLanguage={setCodeLanguage}
+              snippet={snippet}
+              onCloseSnippet={closeSnippet}
             />
           )}
           {tab === "league" && <LeagueTab home={home} invite={leagueInvite} />}
