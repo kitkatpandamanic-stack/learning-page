@@ -33,6 +33,7 @@ export const languageLabel: Record<RunLanguage, string> = {
   react: "React",
   tsx: "React + TypeScript",
   sql: "SQL",
+  shell: "Bash",
 };
 
 export const runnerFrameClass =

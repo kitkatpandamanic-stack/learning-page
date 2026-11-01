@@ -6,7 +6,8 @@ import { undo } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
 import { PostgreSQL, sql } from "@codemirror/lang-sql";
-import { indentUnit } from "@codemirror/language";
+import { indentUnit, StreamLanguage } from "@codemirror/language";
+import { shell } from "@codemirror/legacy-modes/mode/shell";
 import { setDiagnostics } from "@codemirror/lint";
 import { EditorView } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
@@ -117,10 +118,12 @@ export function CodeEditor({
           [python(), indentUnit.of("    ")]
         : language === "sql"
           ? sql({ dialect: PostgreSQL, upperCaseKeywords: true })
-          : javascript({
-              typescript: language === "typescript" || language === "tsx",
-              jsx: language === "react" || language === "tsx",
-            }),
+          : language === "shell"
+            ? StreamLanguage.define(shell)
+            : javascript({
+                typescript: language === "typescript" || language === "tsx",
+                jsx: language === "react" || language === "tsx",
+              }),
       glassTheme,
       EditorView.contentAttributes.of({ "aria-label": label }),
       phone ? EditorView.lineWrapping : [],

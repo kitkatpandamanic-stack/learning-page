@@ -106,6 +106,17 @@ errors with the line and a caret. Checks are JavaScript (they may `await`) and s
 which changes the data and runs the learner's last query again, so hard-coded answers fail;
 each check runs in a transaction that's rolled back afterwards (`src/lib/runner/execute-sql.ts`).
 
+Terminal exercises add `language="shell"` (```bash fences): bash commands and git, one per
+line, run in the browser on an in-memory filesystem (`src/lib/runner/shell/`). The shell is
+small and our own (files, folders, `grep`/`sort`/`wc`, pipes, redirects, variables; no loops),
+and `git` is real git from [isomorphic-git](https://isomorphic-git.org) with git's own
+messages. An optional `setup` runs first, unseen, to build the starting folder or repository;
+commit times come from a sandbox clock, so the same steps make the same hashes. Each command
+is shown after a prompt (`~/project $ git status`). Checks see `file(path)`, `exists`, `isDir`,
+`ls`, `cwd`, `run(command)`, `git` (`branch()`, `branches()`, `log(ref)`, `status()` as
+`git status -s` codes, `show(ref, path)`, `tags()`, `conflicts()`, `isRepo()`), `commands`,
+`status` and `__output` (`src/lib/runner/execute-shell.ts`).
+
 JavaScript can `fetch` the built-in practice API at `https://api.pandadev.test`
 (`/movies`, `/weather?city=`, `/recipes`, `/users`, `/posts`, `/todos` with full CRUD,
 `/status/404`, `/delay/1500`, `/flaky`, `/offline`; see `src/lib/runner/fake-api.ts`). It answers

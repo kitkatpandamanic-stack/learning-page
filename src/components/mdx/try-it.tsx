@@ -6,16 +6,19 @@ import type { RunLanguage } from "@/lib/runner/execute";
  * React component (`language="react"`, or `"tsx"` in TypeScript), or,
  * without `html`, code the learner
  * runs themselves (e.g. Python that draws a chart, which a static
- * CodeExample can't show).
+ * CodeExample can't show, or terminal commands after a `setup`).
  */
 export function TryIt({
   html,
   code,
   language = "javascript",
+  setup,
 }: {
   html?: string;
   code: string;
   language?: RunLanguage;
+  /** Terminal demos: commands run first, unseen */
+  setup?: string;
 }) {
   return (
     <div className="my-6">
@@ -28,7 +31,12 @@ export function TryIt({
           minHeight="80px"
         />
       ) : (
-        <LazyCodeRunner starter={code} language={language} minHeight="80px" />
+        <LazyCodeRunner
+          starter={code}
+          language={language}
+          setup={setup}
+          minHeight="80px"
+        />
       )}
     </div>
   );

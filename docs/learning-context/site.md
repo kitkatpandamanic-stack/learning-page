@@ -98,6 +98,15 @@ recursion, algorithms, text, filtering, joins, grouping, subqueries, windows, ch
 - SQL: `language="sql"`, checks are JS over `rows`, `columns`, `results`, `query()`, `rerun(setupSql)` (so hard-coded answers fail).
 - Built-in fakes: practice API `https://api.pandadev.test` (movies, weather, recipes, users, posts, todos, status, delay, flaky, offline),
   vitest, express + supertest, ws WebSockets, React 19; Python: requests/httpx, FastAPI TestClient, BeautifulSoup shop, pandas etc.
+- Terminal (bash + git, for the planned Git & Terminal course): `language="shell"`, an optional `setup` (commands run
+  first, unseen: the starting folder and repository), and the learner's commands, one per line, each shown after a
+  prompt like `~/project $ git status`. Runs in-browser over an in-memory filesystem with real git (isomorphic-git);
+  commit times come from a sandbox clock, so the same steps always make the same hashes. Checks are JS over `file(path)`,
+  `exists`, `isDir`, `ls`, `cwd` ("~/project"), `run(cmd)`, `git.branch()`/`branches()`/`log(ref)`/`status()` (XY codes
+  like `git status -s`)/`show(ref, path)`/`tags()`/`conflicts()`/`isRepo()`, `commands` (lines run), `status`,
+  `__output`. Paths in checks are relative to where `setup` ended. No loops, `$(…)`, editors or network: the runner
+  says so. Not built in yet: reset, revert, rebase, stash, remotes, bisect, reflog, blame (later steps of the plan).
+  Solutions use a ```bash fence.
 - `npm test` checks every solution passes and every starter fails; `npm run content` validates structure.
 
 ## Conventions
@@ -125,6 +134,7 @@ recursion, algorithms, text, filtering, joins, grouping, subqueries, windows, ch
 | (observed) | Design patterns & architecture are taught at Level 3 in all courses, not Level 2 as ROADMAP lists | course.yml files                                 |
 | (observed) | Level 0 DOM is used via provided "glue code" in the JS L0 capstone, explained in L1               | `number-guessing-game/03-playing-in-the-browser` |
 | 2026-10-11 | Learning-context files created in `docs/learning-context/`                                        | this run                                         |
+| 2026-11-01 | Terminal runner (`language="shell"`): own small bash + isomorphic-git, in-browser, no new servers | git course plan, step 1                          |
 
 ## Open questions for the site owner
 

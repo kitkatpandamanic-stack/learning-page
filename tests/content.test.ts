@@ -17,6 +17,7 @@ import {
 } from "@/lib/runner/execute";
 import { REACT_HTML } from "@/lib/runner/dom-harness";
 import { executePython } from "@/lib/runner/execute-python";
+import { executeShell } from "@/lib/runner/execute-shell";
 import { createSqlSandbox, executeSql } from "@/lib/runner/execute-sql";
 import { SQL_SEED } from "@/lib/runner/sql-seed";
 import { typeErrorResult } from "@/lib/runner/typecheck";
@@ -35,7 +36,13 @@ let sqlSandbox: Promise<() => Promise<PGlite>> | undefined;
  * Runs lesson code the same way the browser does, in the right language.
  * TypeScript with type errors doesn't run, just like in the browser.
  */
-async function run(code: string, language: RunLanguage, tests?: TestSpec[]) {
+async function run(
+  code: string,
+  language: RunLanguage,
+  tests?: TestSpec[],
+  setup?: string,
+) {
+  if (language === "shell") return executeShell(code, { setup, tests });
   if (language === "python") {
     pyodide ??= loadPyodide();
     return executePython(await pyodide, code, { tests });
@@ -66,10 +73,11 @@ async function runAnywhere(
   language: RunLanguage,
   html: string | undefined,
   tests: TestSpec[] = [],
+  setup?: string,
 ) {
   const react = language === "react" || language === "tsx";
   const typescript = language === "typescript" || language === "tsx";
-  if (!react && html === undefined) return run(code, language, tests);
+  if (!react && html === undefined) return run(code, language, tests, setup);
   if (typescript) {
     const diagnostics = checkTypes(code, react ? "react" : "page");
     if (diagnostics.length) return typeErrorResult(diagnostics, tests);
@@ -143,6 +151,8 @@ type Exercise = {
   expectedOutput?: string;
   /** DOM exercises: the page the code runs against */
   html?: string;
+  /** Terminal exercises: commands run first, unseen */
+  setup?: string;
   solution?: string;
 };
 
@@ -159,7 +169,7 @@ function exercisesIn(file: string): Exercise[] {
     if (typeof attrs.starter !== "string") return [];
     const body = block.slice(0, block.indexOf("</Exercise>"));
     const solution =
-      /<Solution>\s*```(?:js|jsx|ts|tsx|python|sql)[^\n]*\n([\s\S]*?)```/.exec(
+      /<Solution>\s*```(?:js|jsx|ts|tsx|python|sql|bash|sh|shell)[^\n]*\n([\s\S]*?)```/.exec(
         body,
       )?.[1];
     return [
@@ -171,6 +181,7 @@ function exercisesIn(file: string): Exercise[] {
         tests: attrs.tests as TestSpec[] | undefined,
         expectedOutput: attrs.expectedOutput as string | undefined,
         html: attrs.html as string | undefined,
+        setup: attrs.setup as string | undefined,
         solution,
       },
     ];
@@ -178,7 +189,13 @@ function exercisesIn(file: string): Exercise[] {
 }
 
 async function solves(code: string, ex: Exercise) {
-  const result = await runAnywhere(code, ex.language, ex.html, ex.tests);
+  const result = await runAnywhere(
+    code,
+    ex.language,
+    ex.html,
+    ex.tests,
+    ex.setup,
+  );
   const output =
     ex.expectedOutput !== undefined
       ? compareOutput(result.output, ex.expectedOutput)
@@ -318,6 +335,7 @@ describe("TryIt live previews", () => {
           html: attrs.html as string | undefined,
           code: attrs.code as string,
           language: (attrs.language as RunLanguage) ?? "javascript",
+          setup: attrs.setup as string | undefined,
         };
       });
   });
@@ -328,7 +346,7 @@ describe("TryIt live previews", () => {
     "%s runs without errors",
     async (_name, b) => {
       expect(typeof b.code, "TryIt needs code").toBe("string");
-      const result = await runAnywhere(b.code, b.language, b.html);
+      const result = await runAnywhere(b.code, b.language, b.html, [], b.setup);
       expect(result.error, JSON.stringify(result.output)).toBeUndefined();
     },
     PACKAGE_TIMEOUT_MS,

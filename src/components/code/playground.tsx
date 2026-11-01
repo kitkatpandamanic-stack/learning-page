@@ -163,6 +163,31 @@ FROM products
 GROUP BY category
 ORDER BY avg_price DESC;
 `,
+    shell: ru
+      ? `# Терминал: команды bash и git, всё безопасно. 🐼
+# Каждый запуск начинается с пустой домашней папки. Список команд: help
+
+mkdir garden && cd garden
+echo "помидоры" > plants.txt
+ls
+
+git init
+git add plants.txt
+git commit -m "Посадить помидоры"
+git log --oneline
+`
+      : `# Terminal playground: bash commands and git, safe to try. 🐼
+# Every run starts in an empty home folder. Type help to see the commands.
+
+mkdir garden && cd garden
+echo "tomatoes" > plants.txt
+ls
+
+git init
+git add plants.txt
+git commit -m "Plant tomatoes"
+git log --oneline
+`,
   };
 }
 
@@ -179,7 +204,15 @@ export function Playground() {
         className="inline-flex max-w-full self-start overflow-x-auto rounded-full p-1 glass"
       >
         {(
-          ["javascript", "python", "typescript", "react", "tsx", "sql"] as const
+          [
+            "javascript",
+            "python",
+            "typescript",
+            "react",
+            "tsx",
+            "sql",
+            "shell",
+          ] as const
         ).map((lang) => (
           <button
             key={lang}
@@ -200,6 +233,7 @@ export function Playground() {
                 react: "React",
                 tsx: "React + TS",
                 sql: "SQL",
+                shell: locale === "ru" ? "Терминал" : "Terminal",
               }[lang]
             }
           </button>
