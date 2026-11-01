@@ -10,6 +10,7 @@ import { GamesHub, type Game } from "@/components/tg/games-tab";
 import { LeagueTab } from "@/components/tg/league-tab";
 import { WordleTab } from "@/components/tg/wordle-tab";
 import { PandaTab } from "@/components/tg/panda-tab";
+import { SandboxTab } from "@/components/tg/sandbox-tab";
 import {
   callApi,
   telegramScript,
@@ -17,15 +18,16 @@ import {
   webApp,
 } from "@/components/tg/telegram";
 import type { MiniAppHome } from "@/lib/tg-app/home";
+import { sandboxStart, type SandboxLanguage } from "@/lib/tg-app/sandbox";
 import { appTexts, type AppLocale } from "@/lib/tg-app/texts";
 
 const SPACE = "#070814";
 
-type Tab = "panda" | "games" | "league";
+type Tab = "panda" | "games" | "code" | "league";
 
 /**
  * PandaDev inside Telegram: the learner's panda, the games (Blitz, duels,
- * Wordle, Bug Hunt) and group leagues. Runs
+ * Wordle, Bug Hunt), a code sandbox and group leagues. Runs
  * only in Telegram (it needs the signed launch data); elsewhere it points
  * to the bot.
  */
@@ -49,6 +51,7 @@ export function MiniApp({ bot }: { bot: string }) {
   /** g_<chat id>_<signature>: opened from a group's /league button */
   const [leagueInvite, setLeagueInvite] = useState<string | null>(null);
   const [wordleLanguage, setWordleLanguage] = useState<string | null>(null);
+  const [codeLanguage, setCodeLanguage] = useState<SandboxLanguage>("python");
   const [locale, setLocale] = useState<AppLocale>("en");
 
   const load = useCallback(async () => {
@@ -89,8 +92,10 @@ export function MiniApp({ bot }: { bot: string }) {
       tg.initDataUnsafe.user?.language_code?.startsWith("ru") ? "ru" : "en",
     );
     // t.me/<bot>?startapp=blitz_python opens that Blitz, duel_<id> a duel,
-    // duelnew_python a new challenge (the bot's Rematch button).
+    // duelnew_python a new challenge (the bot's Rematch button), sandbox_sql
+    // the Code tab on SQL.
     const param = tg.initDataUnsafe.start_param ?? "";
+    const sandbox = sandboxStart(param);
     const asked = /^blitz_([a-z]+)$/.exec(param);
     const opened = /^duel_([\w-]{6,16})$/.exec(param);
     const rematch = /^duelnew_([a-z]+)$/.exec(param);
@@ -105,7 +110,10 @@ export function MiniApp({ bot }: { bot: string }) {
       openGame("wordle");
       setWordleLanguage(param.split("_")[1] ?? null);
     } else if (param === "bughunt") openGame("bughunt");
-    else if (/^g_-?\d+_[\w-]+$/.test(param)) {
+    else if (sandbox) {
+      setTab("code");
+      if (sandbox.language) setCodeLanguage(sandbox.language);
+    } else if (/^g_-?\d+_[\w-]+$/.test(param)) {
       setTab("league");
       setLeagueInvite(param);
     }
@@ -188,9 +196,16 @@ export function MiniApp({ bot }: { bot: string }) {
             <WordleTab home={home} language={wordleLanguage} />
           )}
           {tab === "games" && game === "bughunt" && <BugHuntTab home={home} />}
+          {tab === "code" && (
+            <SandboxTab
+              locale={appLocale}
+              language={codeLanguage}
+              onLanguage={setCodeLanguage}
+            />
+          )}
           {tab === "league" && <LeagueTab home={home} invite={leagueInvite} />}
           <nav className="fixed inset-x-0 bottom-0 z-10 mx-auto flex max-w-md gap-2 bg-[#070814]/90 px-4 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur">
-            {(["panda", "games", "league"] as const).map((name) => (
+            {(["panda", "games", "code", "league"] as const).map((name) => (
               <button
                 key={name}
                 type="button"
@@ -215,6 +230,7 @@ export function MiniApp({ bot }: { bot: string }) {
                     {
                       panda: "🐼",
                       games: "🎮",
+                      code: "💻",
                       league: "👥",
                     }[name]
                   }

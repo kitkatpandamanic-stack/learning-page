@@ -14,6 +14,9 @@ export type WebApp = {
   setHeaderColor(color: string): void;
   setBackgroundColor(color: string): void;
   setBottomBarColor?(color: string): void;
+  /** Bot API 7.7: swiping down no longer closes (or folds) the app */
+  disableVerticalSwipes?(): void;
+  enableVerticalSwipes?(): void;
   openLink(url: string): void;
   openTelegramLink(url: string): void;
   shareMessage?(id: string, callback?: (sent: boolean) => void): void;

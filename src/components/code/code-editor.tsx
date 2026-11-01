@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import CodeMirror, { type ReactCodeMirrorRef } from "@uiw/react-codemirror";
+import { undo } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
 import { python } from "@codemirror/lang-python";
 import { PostgreSQL, sql } from "@codemirror/lang-sql";
@@ -57,6 +58,9 @@ export type EditorDiagnostic = {
   message: string;
 };
 
+/** How the key bar shows its keys */
+const keyLabels: Record<string, string> = { tab: "⇥", undo: "↶" };
+
 export function CodeEditor({
   value,
   onChange,
@@ -65,6 +69,7 @@ export function CodeEditor({
   minHeight = "160px",
   label = "Code editor",
   diagnostics,
+  keys,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -75,6 +80,12 @@ export function CodeEditor({
   label?: string;
   /** Underlined in the editor, with the message on hover */
   diagnostics?: EditorDiagnostic[];
+  /**
+   * For phones: a row of keys under the editor (text to type, "tab" for one
+   * indent, and "undo", always added first; `label` names the row), and
+   * long lines wrap instead of scrolling sideways
+   */
+  keys?: { list: string[]; label: string };
 }) {
   const editor = React.useRef<ReactCodeMirrorRef>(null);
 
@@ -98,6 +109,7 @@ export function CodeEditor({
     );
   }, [diagnostics]);
 
+  const phone = Boolean(keys);
   const extensions = React.useMemo(
     () => [
       language === "python"
@@ -111,9 +123,24 @@ export function CodeEditor({
             }),
       glassTheme,
       EditorView.contentAttributes.of({ "aria-label": label }),
+      phone ? EditorView.lineWrapping : [],
     ],
-    [language, label],
+    [language, label, phone],
   );
+
+  function press(key: string) {
+    const view = editor.current?.view;
+    if (!view) return;
+    if (key === "undo") undo(view);
+    else {
+      const text = key === "tab" ? view.state.facet(indentUnit) : key;
+      view.dispatch(view.state.replaceSelection(text), {
+        scrollIntoView: true,
+        userEvent: "input.type",
+      });
+    }
+    view.focus();
+  }
 
   return (
     // Ctrl/Cmd + Enter runs the code. Handled in the capture phase so it wins
@@ -145,6 +172,27 @@ export function CodeEditor({
         }}
         indentWithTab={false}
       />
+      {keys && (
+        <div
+          role="toolbar"
+          aria-label={keys.label}
+          className="flex [scrollbar-width:none] gap-1.5 overflow-x-auto border-t border-white/10 px-3 py-2"
+        >
+          {["undo", ...keys.list].map((key) => (
+            <button
+              key={key}
+              type="button"
+              // Keeps the editor focused, so the phone keyboard stays open.
+              onPointerDown={(event) => event.preventDefault()}
+              onClick={() => press(key)}
+              aria-label={key === "tab" ? "Tab" : key === "undo" ? "Undo" : key}
+              className="min-w-10 shrink-0 rounded-lg bg-white/8 px-2.5 py-2 font-mono text-sm text-white/85 active:bg-white/20"
+            >
+              {keyLabels[key] ?? key}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

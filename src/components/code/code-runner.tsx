@@ -90,6 +90,8 @@ type CodeRunnerProps = {
   html?: string;
   /** Preview only: run the code as soon as the editor appears (demos) */
   autoRun?: boolean;
+  /** A row of keys under the editor, for phones (see CodeEditor) */
+  keys?: React.ComponentProps<typeof CodeEditor>["keys"];
 };
 
 /**
@@ -122,6 +124,7 @@ function RunnerBody({
   activityId,
   html: page,
   autoRun = false,
+  keys,
   initialCode,
   onCodeChange,
   saveStatus,
@@ -376,6 +379,7 @@ function RunnerBody({
         minHeight={minHeight}
         diagnostics={result?.diagnostics}
         label={t("editorLabel")}
+        keys={keys}
       />
 
       {hasPreview && <RunnerPreview ref={previewRef} />}
