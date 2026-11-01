@@ -442,6 +442,11 @@ export const USAGE: Record<string, string> = {
   grep: "grep [-i -v -n -c -l -r -w -E -F] pattern [file...]  find lines",
   sort: "sort [-r] [-n] [-u] [file...]  sort lines",
   uniq: "uniq [-c] [file...]      drop repeated neighbouring lines (-c: count them)",
+  cut: "cut -d X -f N[,N] | -c N-M [file...]  pick fields (split at X) or characters",
+  tr: "tr [-d] set1 [set2]      swap or (-d) delete characters, like tr a-z A-Z",
+  tee: "tee [-a] file...         copy what comes in to files and the screen (-a: add to the end)",
+  printf:
+    "printf format [text...]  print with a format: %s text, %d number, \\n new line",
   chmod: "chmod mode file...       change permissions (755, +x, u-w …)",
   history: "history                  the commands you've run",
   export: "export NAME=value        set a variable",
@@ -523,6 +528,21 @@ function inputs(
     out.push({ label: path, text: ctx.shell.fs.readText(full) });
   }
   return failed && !out.length ? null : out;
+}
+
+/** tr's character sets: "a-z" → a…z, "\\n" → a new line. */
+function expandSet(set: string) {
+  const chars = [...set.replace(/\\n/g, "\n").replace(/\\t/g, "\t")];
+  const out: string[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    if (chars[i + 1] === "-" && chars[i + 2] !== undefined) {
+      const from = chars[i].codePointAt(0)!;
+      const to = chars[i + 2].codePointAt(0)!;
+      for (let c = from; c <= to; c++) out.push(String.fromCodePoint(c));
+      i += 2;
+    } else out.push(chars[i]);
+  }
+  return out;
 }
 
 const splitLines = (text: string) => {
@@ -1021,6 +1041,135 @@ const builtins: Record<string, CommandFn> = {
     if (parsed.set.has("u"))
       all = all.filter((line, i) => i === 0 || key(line) !== key(all[i - 1]));
     if (all.length) io.out(`${all.join("\n")}\n`);
+    return 0;
+  },
+
+  cut: (ctx) => {
+    const { args, io } = ctx;
+    if (args.includes("--help")) return usage(io, "cut");
+    const parsed = flags("cut", args, "", "dfc", {
+      delimiter: "d",
+      fields: "f",
+      characters: "c",
+    });
+    if (typeof parsed === "string") {
+      io.err(parsed);
+      return 1;
+    }
+    const list = parsed.values.get("f") ?? parsed.values.get("c");
+    if (!list) {
+      io.err(
+        "cut: you must specify a list of bytes, characters, or fields\nTry 'cut --help' for more information.\n",
+      );
+      return 1;
+    }
+    // "2", "1,3", "2-4", "3-" (1-based)
+    const ranges = list.split(",").map((part) => {
+      const [a, b] = part.split("-");
+      const from = a ? Number(a) : 1;
+      const to = part.includes("-") ? (b ? Number(b) : Infinity) : from;
+      return [from, to] as const;
+    });
+    if (ranges.some(([a, b]) => !(a >= 1) || !(b >= a))) {
+      io.err(
+        `cut: invalid field range\nTry 'cut --help' for more information.\n`,
+      );
+      return 1;
+    }
+    const picked = (n: number) => ranges.some(([a, b]) => n >= a && n <= b);
+    const delimiter = parsed.values.get("d") ?? "\t";
+    if (delimiter.length !== 1) {
+      io.err("cut: the delimiter must be a single character\n");
+      return 1;
+    }
+    const read = inputs(ctx, "cut", parsed.rest);
+    if (!read) return 1;
+    for (const { text } of read)
+      for (const line of splitLines(text)) {
+        if (parsed.values.has("c")) {
+          io.out(`${[...line].filter((_, i) => picked(i + 1)).join("")}\n`);
+          continue;
+        }
+        // Like cut: a line without the delimiter is printed whole.
+        if (!line.includes(delimiter)) {
+          io.out(`${line}\n`);
+          continue;
+        }
+        const fields = line.split(delimiter);
+        io.out(`${fields.filter((_, i) => picked(i + 1)).join(delimiter)}\n`);
+      }
+    return read.length < parsed.rest.length ? 1 : 0;
+  },
+
+  tr: ({ args, io }) => {
+    if (args.includes("--help")) return usage(io, "tr");
+    const del = args[0] === "-d";
+    const sets = (del ? args.slice(1) : args).map(expandSet);
+    if (sets.length < (del ? 1 : 2) || sets.length > (del ? 1 : 2)) {
+      io.err(
+        `tr: ${sets.length ? "extra operand" : "missing operand"}\nTry 'tr --help' for more information.\n`,
+      );
+      return 1;
+    }
+    const [from, to = []] = sets;
+    let out = "";
+    for (const ch of io.stdin) {
+      const i = from.indexOf(ch);
+      if (i === -1) out += ch;
+      else if (!del) out += to[Math.min(i, to.length - 1)] ?? "";
+    }
+    io.out(out);
+    return 0;
+  },
+
+  tee: ({ shell, args, io }) => {
+    if (args.includes("--help")) return usage(io, "tee");
+    const append = args.includes("-a") || args.includes("--append");
+    let status = 0;
+    for (const path of args.filter((a) => !a.startsWith("-"))) {
+      const full = shell.resolve(path);
+      if (shell.fs.isDir(full)) {
+        io.err(`tee: ${path}: Is a directory\n`);
+        status = 1;
+        continue;
+      }
+      const before =
+        append && shell.fs.isFile(full) ? shell.fs.readText(full) : "";
+      try {
+        shell.fs.writeFile(full, before + io.stdin);
+      } catch {
+        io.err(`tee: ${path}: No such file or directory\n`);
+        status = 1;
+      }
+    }
+    io.out(io.stdin);
+    return status;
+  },
+
+  printf: ({ args, io }) => {
+    if (!args.length) {
+      io.err("printf: usage: printf format [arguments]\n");
+      return 2;
+    }
+    const [format, ...values] = args;
+    let used = 0;
+    // Like bash, the format repeats until every value is used.
+    do {
+      const start = used;
+      const text = format.replace(/%([%sd])|\\(.)/g, (_, spec, escape) => {
+        if (escape !== undefined)
+          return (
+            ({ n: "\n", t: "\t", "\\": "\\" } as Record<string, string>)[
+              escape
+            ] ?? `\\${escape}`
+          );
+        if (spec === "%") return "%";
+        const value = values[used++] ?? "";
+        return spec === "d" ? String(parseInt(value, 10) || 0) : value;
+      });
+      io.out(text);
+      if (used === start) break;
+    } while (used < values.length);
     return 0;
   },
 

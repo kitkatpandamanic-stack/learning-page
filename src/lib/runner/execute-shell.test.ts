@@ -605,6 +605,146 @@ describe("line diffs", () => {
   });
 });
 
+describe("Level 1 commands", () => {
+  // The repository the outputs were checked against in git 2.50.
+  const MENU = PROJECT.replace("# Menu app", "# Menu");
+
+  it("amends like git: same author date, a Date line, no root-commit", async () => {
+    const r = await sh(
+      `echo more >> README.md
+git add README.md
+git commit --amend -m "First commit, fixed"
+echo x > b.txt
+git add b.txt
+git commit -m "Add b"
+echo y >> b.txt
+git commit -a --amend --no-edit`,
+      MENU,
+    );
+    // Hashes and output checked against git 2.50.
+    expect(r.printed.slice(0, 2)).toEqual([
+      "[main 33e0abf] First commit, fixed",
+      " Date: Mon Jan 5 09:01:00 2026 +0000",
+    ]);
+    expect(r.printed).toContain("[main 9531a46] Add b");
+    expect(r.printed).toContain(" Date: Mon Jan 5 09:03:00 2026 +0000");
+  });
+
+  it("lists branches with -v, renames with -m and goes back with switch -", async () => {
+    const r = await sh(
+      `git switch -
+git branch menu
+git branch feature-long
+git branch -v
+git branch -m feature-long main
+git branch -m feature-long food
+git branch -m nope new
+git switch menu
+git switch -
+git checkout -
+git branch`,
+      MENU,
+    );
+    expect(r.printed.slice(0, 3)).toEqual([
+      "  feature-long 4a4936d First commit",
+      "* main         4a4936d First commit",
+      "  menu         4a4936d First commit",
+    ]);
+    expect(r.errors).toEqual([
+      "fatal: invalid reference: @{-1}",
+      "fatal: a branch named 'main' already exists",
+      "fatal: no branch named 'nope'",
+    ]);
+    expect(r.printed.slice(3)).toEqual([
+      "Switched to branch 'menu'",
+      "Switched to branch 'main'",
+      "Switched to branch 'menu'",
+      "  food",
+      "  main",
+      "* menu",
+    ]);
+  });
+
+  it("diffs against commits and between them", async () => {
+    const r = await sh(
+      `echo x > b.txt
+git add b.txt
+git commit -m "Add b"
+echo z >> app.py
+git add app.py
+echo w >> app.py
+git diff HEAD
+git diff HEAD~1 HEAD --stat
+git diff HEAD~1..HEAD --stat
+git diff nothing`,
+      MENU,
+    );
+    expect(r.printed.slice(3)).toEqual([
+      "diff --git a/app.py b/app.py",
+      "index 11b15b1..3501232 100644",
+      "--- a/app.py",
+      "+++ b/app.py",
+      "@@ -1 +1,3 @@",
+      ' print("hello")',
+      "+z",
+      "+w",
+      " b.txt | 1 +",
+      " 1 file changed, 1 insertion(+)",
+      " b.txt | 1 +",
+      " 1 file changed, 1 insertion(+)",
+    ]);
+    expect(r.errors[0]).toBe(
+      "fatal: ambiguous argument 'nothing': unknown revision or path not in the working tree.",
+    );
+  });
+
+  it("checks what .gitignore leaves out", async () => {
+    const r = await sh(
+      `echo "*.log" > .gitignore
+touch debug.log
+git check-ignore debug.log app.py
+echo $?
+git check-ignore app.py
+echo $?`,
+      MENU,
+    );
+    expect(r.printed).toEqual(["debug.log", "0", "1"]);
+  });
+
+  it("cuts, translates, tees and printfs like coreutils", async () => {
+    const r = await sh(`printf "a,b\\nc,d\\n" | cut -d, -f2
+echo panda | cut -c1-3
+echo "a b  c" | cut -d" " -f2,3
+echo hello | tr -d l
+echo hello | tr el ip
+echo "a:b" | tr ":" "\\n"
+echo hi | tr a-z A-Z
+echo hi | tee t.txt
+echo more | tee -a t.txt
+cat t.txt
+printf "%s is %d\\n" panda 5 koala 7
+printf "100%%\\n"`);
+    expect(r.printed).toEqual([
+      "b",
+      "d",
+      "pan",
+      "b ",
+      "heo",
+      "hippo",
+      "a",
+      "b",
+      "HI",
+      "hi",
+      "more",
+      "hi",
+      "more",
+      "panda is 5",
+      "koala is 7",
+      "100%",
+    ]);
+  });
+});
+
 describe("the commit graph", () => {
   /** Each row as "lane message (labels)", newest first. */
   async function graph(code: string, setup = PROJECT) {

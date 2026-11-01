@@ -116,6 +116,16 @@ export class GitSandbox {
     return (await git.listBranches({ fs: this.fs, dir })).sort();
   }
 
+  /** The branch (or commit) before the last switch, for `git switch -`. */
+  previous(dir: string) {
+    const file = `${dir}/.git/PANDA_PREVIOUS`;
+    return this.fs.isFile(file) ? this.fs.readText(file).trim() : null;
+  }
+
+  remember(dir: string, where: string) {
+    this.fs.writeFile(`${dir}/.git/PANDA_PREVIOUS`, `${where}\n`);
+  }
+
   /** State files of a merge that stopped on conflicts. */
   merging(dir: string) {
     const head = `${dir}/.git/MERGE_HEAD`;
@@ -311,11 +321,16 @@ export class GitSandbox {
     const merge = this.merging(dir);
     const signature = await this.signature(dir);
     const head = await this.head(dir);
+    // Like git, --amend keeps the original author and date.
+    const author =
+      options.amend && head
+        ? (await git.readCommit({ fs: this.fs, dir, oid: head })).commit.author
+        : signature;
     const oid = await git.commit({
       fs: this.fs,
       dir,
       message,
-      author: signature,
+      author,
       committer: signature,
       amend: options.amend,
       ...(merge && head ? { parent: [head, merge.theirs] } : {}),
@@ -614,14 +629,24 @@ const COMMANDS: Record<string, Sub> = {
     const branch = await this.branch(dir);
     const where = branch ?? "detached HEAD";
     io.out(
-      `[${where}${parent ? "" : " (root-commit)"} ${oid.slice(0, 7)}] ${message.split("\n")[0]}\n`,
+      `[${where}${parent || amend ? "" : " (root-commit)"} ${oid.slice(0, 7)}] ${message.split("\n")[0]}\n`,
     );
+    if (amend) {
+      const { author } = (await git.readCommit({ fs: this.fs, dir, oid }))
+        .commit;
+      io.out(` Date: ${gitDate(author.timestamp * 1000)}\n`);
+    }
     // Like git, a merge commit gets no summary of changed files.
     if (!merge) io.out(await summary(this, dir, parent, oid, true));
     return 0;
   },
 
   async log({ io }, args, dir) {
+    if (args.includes("--graph"))
+      throw new GitExit(
+        1,
+        "git log --graph isn't in this practice terminal: the Commits picture under the output shows the graph.\n",
+      );
     const parsed = flags("git log", args, "", "n", {
       oneline: "o",
       all: "a",
@@ -633,11 +658,6 @@ const COMMANDS: Record<string, Sub> = {
     const max = parsed.values.has("n")
       ? Number(parsed.values.get("n"))
       : Infinity;
-    if (args.includes("--graph"))
-      throw new GitExit(
-        1,
-        "git log --graph isn't in this practice terminal yet: the picture under the output shows the graph.\n",
-      );
     const head = await this.head(dir);
     let commits: Awaited<ReturnType<typeof git.log>> = [];
     if (parsed.set.has("a")) {
@@ -675,6 +695,25 @@ const COMMANDS: Record<string, Sub> = {
     return 0;
   },
 
+  async "check-ignore"({ io }, args, dir) {
+    const paths = args.filter((a) => !a.startsWith("-"));
+    if (args.some((a) => a.startsWith("-")))
+      throw new GitExit(
+        1,
+        "git check-ignore here takes just file names (no options).\n",
+      );
+    if (!paths.length) fatal("no path specified");
+    let found = false;
+    for (const path of paths) {
+      const filepath = this.rel(dir, path);
+      if (await git.isIgnored({ fs: this.fs, dir, filepath })) {
+        io.out(`${path}\n`);
+        found = true;
+      }
+    }
+    return found ? 0 : 1;
+  },
+
   async show({ io }, args, dir) {
     const ref = args.find((a) => !a.startsWith("-")) ?? "HEAD";
     const oid = await this.resolveCommit(dir, ref);
@@ -701,13 +740,48 @@ const COMMANDS: Record<string, Sub> = {
   async diff({ io }, args, dir) {
     const staged = args.includes("--staged") || args.includes("--cached");
     const stat = args.includes("--stat");
-    const paths = args
-      .filter((a) => !a.startsWith("-") && a !== "--")
-      .map((p) => this.rel(dir, p));
+    // Words before `--` that name commits (HEAD~1, main, a..b) are commits;
+    // the rest are paths.
+    const dash = args.indexOf("--");
+    const refs: string[] = [];
+    const specs: string[] = dash === -1 ? [] : args.slice(dash + 1);
+    for (const word of dash === -1 ? args : args.slice(0, dash)) {
+      if (word.startsWith("-")) continue;
+      const range = /^(.+?)\.\.(.+)$/.exec(word);
+      const names = range ? [range[1], range[2]] : [word];
+      const oids = await Promise.all(
+        names.map((n) => this.resolveCommit(dir, n)),
+      );
+      if (
+        oids.every(Boolean) &&
+        (range || !this.fs.exists(this.shell.resolve(word)))
+      )
+        refs.push(...(oids as string[]));
+      else if (
+        this.fs.exists(this.shell.resolve(word)) ||
+        refs.length ||
+        specs.length
+      )
+        specs.push(word);
+      else
+        throw new GitExit(
+          128,
+          `fatal: ambiguous argument '${word}': unknown revision or path not in the working tree.\nUse '--' to separate paths from revisions, like this:\n'git <command> [<revision>...] -- [<file>...]'\n`,
+        );
+    }
+    const paths = specs.map((p) => this.rel(dir, p));
     const index = await this.stage(dir);
     let before: Map<string, string>;
     let after: Map<string, string>;
-    if (staged) {
+    if (refs.length >= 2) {
+      before = await this.tree(dir, refs[0]);
+      after = await this.tree(dir, refs[1]);
+    } else if (refs.length === 1) {
+      before = await this.tree(dir, refs[0]);
+      after = staged
+        ? index
+        : this.work(dir, new Set([...index.keys(), ...before.keys()]));
+    } else if (staged) {
       before = await this.tree(dir, await this.head(dir));
       after = index;
     } else {
@@ -796,9 +870,30 @@ const COMMANDS: Record<string, Sub> = {
 
   async branch({ io }, args, dir) {
     const del = args.find((a) => a === "-d" || a === "-D" || a === "--delete");
+    const move = args.find((a) => a === "-m" || a === "-M" || a === "--move");
+    const verbose = args.some(
+      (a) => a === "-v" || a === "-vv" || a === "--verbose",
+    );
     const names = args.filter((a) => !a.startsWith("-"));
     const current = await this.branch(dir);
     const head = await this.head(dir);
+    if (move) {
+      const [from, to] = names.length >= 2 ? names : [current, names[0]];
+      if (!to) fatal("branch name required");
+      const all = await this.branches(dir);
+      if (!from || !all.includes(from)) fatal(`no branch named '${from}'`);
+      if (from === to) return 0;
+      if (all.includes(to!) && move !== "-M")
+        fatal(`a branch named '${to}' already exists`);
+      await git.renameBranch({
+        fs: this.fs,
+        dir,
+        oldref: from!,
+        ref: to!,
+        checkout: from === current,
+      });
+      return 0;
+    }
     if (del) {
       for (const name of names) {
         if (!(await this.branches(dir)).includes(name))
@@ -830,10 +925,26 @@ const COMMANDS: Record<string, Sub> = {
       return 0;
     }
     if (!names.length) {
+      const rows: [string, string, string | null][] = [];
       if (!current && head)
-        io.out(`* (HEAD detached at ${head.slice(0, 7)})\n`);
+        rows.push(["*", `(HEAD detached at ${head.slice(0, 7)})`, head]);
       for (const name of await this.branches(dir))
-        io.out(`${name === current ? "*" : " "} ${name}\n`);
+        rows.push([
+          name === current ? "*" : " ",
+          name,
+          verbose ? await this.resolveCommit(dir, name) : null,
+        ]);
+      const width = Math.max(...rows.map((r) => r[1].length));
+      for (const [mark, name, oid] of rows) {
+        if (!verbose || !oid) {
+          io.out(`${mark} ${name}\n`);
+          continue;
+        }
+        const { commit } = await git.readCommit({ fs: this.fs, dir, oid });
+        io.out(
+          `${mark} ${name.padEnd(width)} ${oid.slice(0, 7)} ${commit.message.split("\n")[0]}\n`,
+        );
+      }
       return 0;
     }
     if (!head) fatal(`not a valid object name: '${current ?? "main"}'`);
@@ -849,13 +960,21 @@ const COMMANDS: Record<string, Sub> = {
       (a) => a === "-c" || a === "--create" || a === "-C",
     );
     const detach = args.includes("--detach");
-    const [name, start] = args.filter((a) => !a.startsWith("-"));
+    const words = args.filter((a) => a === "-" || !a.startsWith("-"));
+    const start = words[1];
+    let name = words[0];
     if (!name) fatal("missing branch or commit argument");
+    if (name === "-") {
+      const previous = this.previous(dir);
+      if (!previous) fatal("invalid reference: @{-1}");
+      name = previous!;
+      if (!(await this.branches(dir)).includes(name))
+        return checkoutDetached(this, ctx, dir, name);
+    }
     if (create)
       return checkoutBranch(this, ctx, dir, name, { create: true, start });
     if ((await this.branches(dir)).includes(name))
       return checkoutBranch(this, ctx, dir, name, {});
-    if (name === "-") return checkoutBranch(this, ctx, dir, name, {});
     const oid = await this.resolveCommit(dir, name);
     if (oid && detach) return checkoutDetached(this, ctx, dir, oid);
     if (oid)
@@ -881,6 +1000,13 @@ const COMMANDS: Record<string, Sub> = {
         create: true,
         start: words[1],
       });
+    }
+    if (!files.length && words.length === 0 && args.includes("-")) {
+      const previous = this.previous(dir);
+      if (!previous) fatal("invalid reference: @{-1}");
+      return (await this.branches(dir)).includes(previous!)
+        ? checkoutBranch(this, ctx, dir, previous!, {})
+        : checkoutDetached(this, ctx, dir, previous!);
     }
     if (!files.length && words.length === 1) {
       const name = words[0];
@@ -1367,6 +1493,7 @@ async function checkoutBranch(
   options: { create?: boolean; start?: string },
 ) {
   const current = await sandbox.branch(dir);
+  const was = current ?? (await sandbox.head(dir));
   if (options.create) {
     const head = await sandbox.head(dir);
     const at = options.start
@@ -1405,6 +1532,7 @@ async function checkoutBranch(
     }
     throw error;
   }
+  if (was) sandbox.remember(dir, was);
   io.out(
     options.create
       ? `Switched to a new branch '${name}'\n`
@@ -1419,6 +1547,7 @@ async function checkoutDetached(
   dir: string,
   oid: string,
 ) {
+  const was = (await sandbox.branch(dir)) ?? (await sandbox.head(dir));
   try {
     await git.checkout({ fs: sandbox.fs, dir, ref: oid });
   } catch (error) {
@@ -1431,6 +1560,7 @@ async function checkoutDetached(
     }
     throw error;
   }
+  if (was && was !== oid) sandbox.remember(dir, was);
   const { commit } = await git.readCommit({ fs: sandbox.fs, dir, oid });
   io.out(
     `Note: switching to '${oid.slice(0, 7)}'.\n\nYou are in 'detached HEAD' state. You can look around, make experimental\nchanges and commit them, and you can discard any commits you make in this\nstate without impacting any branches by switching back to a branch.\n\nHEAD is now at ${oid.slice(0, 7)} ${commit.message.split("\n")[0]}\n`,
