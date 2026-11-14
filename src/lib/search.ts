@@ -46,6 +46,16 @@ export function normalize(text: string) {
     .replace(/[\u0300-\u036f]/g, "");
 }
 
+/** Without dots and dashes at either end: "-x." → "x" (plain loops, no regex to backtrack). */
+function trimMarks(piece: string) {
+  const mark = (ch: string | undefined) => ch === "." || ch === "-";
+  let start = 0;
+  let end = piece.length;
+  while (start < end && mark(piece[start])) start++;
+  while (end > start && mark(piece[end - 1])) end--;
+  return piece.slice(start, end);
+}
+
 /**
  * Words in `text`. A hyphenated word also counts as its parts, so "f-strings"
  * is found by "f-string" and "strings"; queries keep it whole (`parts: false`).
@@ -53,7 +63,7 @@ export function normalize(text: string) {
 function words(text: string, { parts = true } = {}) {
   const out: string[] = [];
   for (const piece of normalize(text).split(/[^\p{L}\p{N}_$.#+-]+/u)) {
-    const word = piece.replace(/^[.-]+|[.-]+$/g, "");
+    const word = trimMarks(piece);
     if (!word) continue;
     out.push(word);
     if (parts && word.includes("-"))

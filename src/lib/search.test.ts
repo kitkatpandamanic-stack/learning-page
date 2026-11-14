@@ -73,6 +73,14 @@ const urls = (query: string, options?: { language?: string }) =>
   );
 
 describe("search", () => {
+  it("trims dots and dashes around words, fast on long runs of them", () => {
+    expect(urls("-loops.")[0]).toMatch(/\/loops$/);
+    const started = performance.now();
+    expect(urls(`${"-".repeat(50_000)}x${"-".repeat(50_000)}`)).toEqual([]);
+    expect(urls(".-".repeat(50_000))).toEqual([]);
+    expect(performance.now() - started).toBeLessThan(200);
+  });
+
   it("ranks a title match above a passing mention", () => {
     expect(urls("loops")[0]).toMatch(/\/loops$/);
     expect(urls("comprehension")[0]).toBe("/learn/python/comprehensions");
